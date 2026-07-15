@@ -67,14 +67,15 @@ h4 { font-size: .86rem; line-height: 1.35; }
   display: inline-flex;
   font-weight: 720;
   justify-content: center;
-  min-height: 42px;
+  min-height: 44px;
   padding: 8px 14px;
   text-decoration: none;
 }
 .button-primary { background: var(--green); color: white; }
 .button-danger { background: var(--danger-bg); border-color: #e2b1ab; color: var(--danger); }
 .button-quiet { background: var(--surface); border-color: var(--line); color: var(--ink); }
-.button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 3px solid #74a88f; outline-offset: 2px; }
+.button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible,
+.table-scroll:focus-visible { outline: 3px solid #74a88f; outline-offset: 2px; }
 
 .queue-heading, .detail-heading { align-items: flex-start; display: flex; justify-content: space-between; gap: 24px; }
 .request-list { display: grid; gap: 10px; list-style: none; margin: 24px 0 0; padding: 0; }

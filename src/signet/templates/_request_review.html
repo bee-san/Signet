@@ -94,7 +94,7 @@
   <section class="attachment-band" aria-labelledby="attachments-{{ id_suffix }}">
     <h3 id="attachments-{{ id_suffix }}">Attachments</h3>
     {% if item.attachments %}
-    <div class="table-scroll">
+    <div class="table-scroll" role="region" aria-label="Attachment details" tabindex="0">
       <table class="attachments-table">
         <thead><tr><th>Name</th><th>Type</th><th>Bytes</th><th>SHA-256</th><th>State</th></tr></thead>
         <tbody>
@@ -128,7 +128,7 @@
     <p>No approval, denial, edit, or policy action is available without an authenticated exact-revision review.</p>
     {% if item.content_purged and item.attachments %}
     <h4>Retained attachment metadata</h4>
-    <div class="table-scroll">
+    <div class="table-scroll" role="region" aria-label="Retained attachment metadata" tabindex="0">
       <table class="attachments-table">
         <thead><tr><th>Name</th><th>Type</th><th>Bytes</th><th>SHA-256</th><th>Content</th></tr></thead>
         <tbody>
