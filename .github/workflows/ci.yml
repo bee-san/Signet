@@ -37,6 +37,14 @@ jobs:
         run: uv run mypy
       - name: Test
         run: uv run pytest -q
+      - name: Build distributions
+        run: uv build --no-sources
+      - name: Smoke-test the isolated wheel
+        shell: bash
+        run: |
+          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          uv run --isolated --no-project --with "$wheel" signet --help
       - name: Scan source
         run: uv run --with bandit==1.9.4 bandit -r src/signet -ll
       - name: Export runtime dependencies
