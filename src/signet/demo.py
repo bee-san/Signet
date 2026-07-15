@@ -59,7 +59,6 @@ from signet.credential_broker import (
 from signet.crypto import PayloadCipher
 from signet.db import Database, DatabaseError
 from signet.delivery import DeliveryDispatcher, DeliveryError, FrozenRequestLoader
-from signet.expiry import ExpirySweeper
 from signet.freezer import RequestFreezer
 from signet.gateway import GatewayCallPipeline
 from signet.gateway_tools import (
@@ -237,7 +236,7 @@ class FakeOnlyProviderClient:
             raise DemoError("fake provider alias is invalid")
         self.alias = alias
         self._mutation_calls = 0
-        self._sent_emails: dict[str, dict[str, str]] = {}
+        self._sent_emails: dict[str, dict[str, Any]] = {}
 
     @property
     def mutation_calls(self) -> int:
@@ -297,8 +296,18 @@ class FakeOnlyProviderClient:
                 "threadId": f"fake:thread:{digest}",
                 "status": "sent",
             }
-            self._sent_emails[result["messageId"]] = result
-            self._sent_emails[result["submissionId"]] = result
+            sent_record = {
+                **result,
+                "folder": "Sent",
+                "from": detached.get("from"),
+                "to": detached.get("to", []),
+                "cc": detached.get("cc", []),
+                "bcc": detached.get("bcc", []),
+                "subject": detached.get("subject"),
+                "body": detached.get("body"),
+            }
+            self._sent_emails[result["messageId"]] = sent_record
+            self._sent_emails[result["submissionId"]] = sent_record
             return result
         if self.alias == "fastmail" and tool_name == "upload_attachment":
             self._mutation_calls += 1
@@ -435,21 +444,20 @@ class DemoWorkers:
         self._next_maintenance_at = 0
         self._consecutive_failures = 0
         self._stopped = False
-        self.expiry = ExpirySweeper(
-            state_machine,
-            batch_limit=100,
-            interval_seconds=5,
-        )
 
     async def serve(self, stop: asyncio.Event) -> None:
         if not isinstance(stop, asyncio.Event):
             raise TypeError("demo workers require an asyncio stop event")
-        expiry_task = asyncio.create_task(self.expiry.serve(stop), name="demo-expiry")
         self._stopped = False
         try:
             while not stop.is_set():
                 try:
-                    await self.run_once()
+                    selected_now = int(time.time())
+                    # Recovery is a serving-lifespan operation. Constructors and
+                    # offline backup, restore, and smoke commands never cross this
+                    # execution-fencing boundary.
+                    self.state_machine.recover_startup(now=selected_now)
+                    await self.run_once(now=selected_now)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -469,7 +477,6 @@ class DemoWorkers:
         finally:
             self._stopped = True
             stop.set()
-            await expiry_task
 
     def healthy(self) -> bool:
         """Return coarse readiness without exposing request or maintenance data."""
@@ -481,9 +488,6 @@ class DemoWorkers:
         if not isinstance(selected_now, int) or isinstance(selected_now, bool) or selected_now < 0:
             raise ValueError("demo worker time is invalid")
 
-        # Repeated recovery is intentional: it also routes leases which were
-        # active during startup but expire while this process remains alive.
-        self.state_machine.recover_startup(now=selected_now)
         self.state_machine.sweep_expired(now=selected_now, limit=100)
         with self.database.read() as connection:
             request_ids = tuple(
@@ -678,7 +682,6 @@ def build_demo(
             minimum_free_bytes=1024 * 1024,
         ),
     )
-    state_machine.recover_startup(now=int(time.time()))
     reviewer = EncryptedPayloadReviewer(
         state_machine,
         payload_cipher,
@@ -1864,6 +1867,19 @@ def _demo_server_lock(root: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise DemoError("this demo data directory is already being served") from None
+        locked = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (locked.st_dev, locked.st_ino)
+            or locked.st_uid != os.geteuid()
+            or current.st_uid != locked.st_uid
+            or stat.S_IMODE(locked.st_mode) != 0o600
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or locked.st_nlink != 1
+            or current.st_nlink != 1
+        ):
+            raise DemoError("demo serve lock is unavailable or unsafe")
         yield
     except OSError as exc:
         raise DemoError("demo serve lock is unavailable or unsafe") from exc

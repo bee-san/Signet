@@ -22,6 +22,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
 
+import signet.demo as demo_module
 from signet.app import main
 from signet.backup import BackupError
 from signet.credential_broker import CredentialError
@@ -379,6 +380,7 @@ async def test_immediate_browser_deny_then_approve_has_zero_then_one_provider_ca
 @pytest.mark.asyncio
 async def test_workers_reclaim_only_pre_dispatch_and_reconcile_abandoned_dispatch(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assembly = build_demo(new_demo(tmp_path))
     async with mcp_client(assembly) as client:
@@ -411,8 +413,27 @@ async def test_workers_reclaim_only_pre_dispatch_and_reconcile_abandoned_dispatc
         lease_seconds=1,
     )
     assembly.state_machine.mark_dispatch_started(unknown_lease, now=started_at)
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE execution_attempts SET lease_expires_at = ? WHERE request_id IN (?, ?)",
+            (started_at - 1, reclaimable_id, unknown_id),
+        )
 
-    delivered, _notifications = await assembly.workers.run_once(now=started_at + 2)
+    stop = asyncio.Event()
+    result: tuple[int, int] | None = None
+    original_run_once = assembly.workers.run_once
+
+    async def run_one_supervised_cycle(*, now: int | None = None) -> tuple[int, int]:
+        nonlocal result
+        result = await original_run_once(now=now)
+        stop.set()
+        return result
+
+    monkeypatch.setattr(assembly.workers, "run_once", run_one_supervised_cycle)
+    await assembly.workers.serve(stop)
+    monkeypatch.setattr(assembly.workers, "run_once", original_run_once)
+    assert result is not None
+    delivered, _notifications = result
     assert delivered == 1
     assert request_state(assembly, reclaimable_id) == "succeeded"
     assert request_state(assembly, unknown_id) == "outcome_unknown"
@@ -556,19 +577,20 @@ async def test_worker_supervision_retries_and_health_reports_persistent_failure(
     third_failure = asyncio.Event()
     calls = 0
 
-    async def flaky_run_once(*, now: int | None = None) -> tuple[int, int]:
+    original_sweep = assembly.state_machine.sweep_expired
+
+    def flaky_expiry_sweep(*, now: int, limit: int) -> int:
         nonlocal calls
-        del now
         calls += 1
         if calls <= 3:
             if calls == 3:
                 third_failure.set()
-            raise RuntimeError("private fake maintenance failure")
+            raise RuntimeError("private fake expiry failure")
         stop.set()
-        return 0, 0
+        return original_sweep(now=now, limit=limit)
 
     assembly.workers.interval_seconds = 0.05
-    monkeypatch.setattr(assembly.workers, "run_once", flaky_run_once)
+    monkeypatch.setattr(assembly.state_machine, "sweep_expired", flaky_expiry_sweep)
     task = asyncio.create_task(assembly.workers.serve(stop))
     await asyncio.wait_for(third_failure.wait(), timeout=2)
 
@@ -586,6 +608,82 @@ async def test_worker_supervision_retries_and_health_reports_persistent_failure(
 
     await asyncio.wait_for(task, timeout=2)
     assert calls == 4
+
+
+@pytest.mark.asyncio
+async def test_offline_operations_under_serve_lock_never_recover_execution(
+    tmp_path: Path,
+) -> None:
+    root = new_demo(tmp_path, "live-source")
+    assembly = build_demo(root)
+    async with mcp_client(assembly) as client:
+        request_id = await enqueue(client, "whatsapp", "send_text", WHATSAPP_ARGUMENTS)
+    assert (await web_action(assembly, request_id, "approve")).status_code == 303
+
+    now = int(time.time())
+    lease = assembly.state_machine.claim_execution(
+        request_id,
+        worker_id="fake:live-dispatch",
+        now=now,
+        lease_seconds=30,
+    )
+    assembly.state_machine.mark_dispatch_started(lease, now=now)
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE execution_attempts SET lease_expires_at = ? WHERE request_id = ?",
+            (now - 1, request_id),
+        )
+
+    private = tmp_path / "offline-artifacts"
+    private.mkdir(mode=0o700)
+    with demo_module._demo_server_lock(root):
+        assert request_state(build_demo(root), request_id) == "executing"
+        assert offline_smoke(root)["status"] == "ok"
+        assert request_state(assembly, request_id) == "executing"
+        bundle = backup_demo(root, private / "concurrent.signet-backup")
+        assert request_state(assembly, request_id) == "executing"
+        restored = restore_demo(root, bundle, private / "restored")
+        assert request_state(build_demo(restored.root), request_id) == "executing"
+        assert request_state(assembly, request_id) == "executing"
+
+    recovered = assembly.state_machine.recover_startup(now=now)
+    assert recovered.routed_to_reconciliation == (request_id,)
+    assert request_state(assembly, request_id) == "outcome_unknown"
+
+
+def test_demo_serve_lock_rejects_links_and_reuses_stale_regular_file(tmp_path: Path) -> None:
+    root = new_demo(tmp_path)
+    lock_path = root / ".serve.lock"
+    outside = tmp_path / "outside-lock"
+    outside.write_text("not a lock\n", encoding="utf-8")
+    os.chmod(outside, 0o600)
+
+    lock_path.symlink_to(outside)
+    with (
+        pytest.raises(DemoError, match="unavailable or unsafe"),
+        demo_module._demo_server_lock(root),
+    ):
+        pass
+    lock_path.unlink()
+
+    os.link(outside, lock_path)
+    with (
+        pytest.raises(DemoError, match="unavailable or unsafe"),
+        demo_module._demo_server_lock(root),
+    ):
+        pass
+    lock_path.unlink()
+
+    lock_path.write_text("stale owner metadata is ignored\n", encoding="utf-8")
+    os.chmod(lock_path, 0o600)
+    with (
+        demo_module._demo_server_lock(root),
+        pytest.raises(DemoError, match="already being served"),
+        demo_module._demo_server_lock(root),
+    ):
+        pass
+    with demo_module._demo_server_lock(root):
+        pass
 
 
 @pytest.mark.asyncio

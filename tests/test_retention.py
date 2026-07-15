@@ -259,6 +259,155 @@ def test_scheduler_persists_exact_matrix_due_times_and_is_idempotent(
     )
 
 
+def test_scheduler_finds_untombstoned_idempotency_after_payload_was_purged(
+    database: Database,
+    staging: StagingStore,
+) -> None:
+    _request(
+        database,
+        request_id="partial-idempotency",
+        state=RequestState.DENIED,
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE payload_versions
+            SET encrypted_payload = NULL, purged_at = ?, purge_reason = 'partial_recovery'
+            WHERE request_id = ?
+            """,
+            (COMPLETED_AT, "partial-idempotency"),
+        )
+    manager = RetentionManager(database, staging, matrix=_matrix())
+
+    assert manager.schedule(now=COMPLETED_AT) == 1
+    with database.read() as connection:
+        jobs = connection.execute(
+            "SELECT intent FROM purge_jobs WHERE request_id = ?",
+            ("partial-idempotency",),
+        ).fetchall()
+    assert [row["intent"] for row in jobs] == [PurgeIntent.SENSITIVE_ROWS.value]
+
+
+def test_scheduler_finds_isolated_staged_key_after_other_data_was_purged(
+    database: Database,
+    staging: StagingStore,
+) -> None:
+    staged = _stage(staging, "partial-staged-key")
+    _request(
+        database,
+        request_id="partial-staged-key",
+        state=RequestState.DENIED,
+        staged=staged,
+        key_reference="keychain://Signet/partial-payload-key",
+    )
+    staging.purge_verified(
+        staged.opaque_id,
+        expected_path=staged.path,
+        expected_size=staged.size,
+        expected_sha256=staged.sha256,
+        purged_at=COMPLETED_AT,
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE attachments SET storage_path = NULL, purged_at = ?
+            WHERE request_id = ?
+            """,
+            (COMPLETED_AT, "partial-staged-key"),
+        )
+        connection.execute(
+            """
+            UPDATE payload_versions
+            SET encrypted_payload = NULL, encryption_key_ref = NULL,
+                purged_at = ?, key_destroyed_at = ?, purge_reason = 'partial_recovery'
+            WHERE request_id = ?
+            """,
+            (COMPLETED_AT, COMPLETED_AT, "partial-staged-key"),
+        )
+        connection.execute(
+            "UPDATE idempotency_records SET tombstoned_at = ? WHERE request_id = ?",
+            (COMPLETED_AT, "partial-staged-key"),
+        )
+    destroyer = FakeKeyDestroyer()
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(payload_delays={state: 0 for state in _PURGEABLE_FIXTURE_STATES}),
+        mode=RetentionMode.ISOLATED_PER_REQUEST_KEY,
+        key_destroyer=destroyer,
+    )
+
+    assert manager.schedule(now=COMPLETED_AT) == 1
+    report = manager.run_due(now=COMPLETED_AT)
+    assert report.completed == 1
+    assert destroyer.calls[0][0] == FAKE_ATTACHMENT_KEY_REF
+
+
+def test_scheduler_pages_bounded_rows_and_wraps_to_revisit_partial_state(
+    database: Database,
+    staging: StagingStore,
+) -> None:
+    _request(
+        database,
+        request_id="cursor-00",
+        state=RequestState.DENIED,
+        idempotency=False,
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE payload_versions
+            SET encrypted_payload = NULL, purged_at = ?, purge_reason = 'partial_recovery'
+            WHERE request_id = 'cursor-00'
+            """,
+            (COMPLETED_AT,),
+        )
+    for index in range(1, 5):
+        _request(
+            database,
+            request_id=f"cursor-{index:02d}",
+            state=RequestState.DENIED,
+        )
+    manager = RetentionManager(database, staging, matrix=_matrix())
+
+    assert manager.schedule(now=COMPLETED_AT, limit=2) == 1
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO idempotency_records(
+                origin_namespace, downstream_alias, tool_name, invocation_key,
+                payload_fingerprint, request_id, pending_result, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "profile:fake",
+                "fake-service",
+                "fake_write",
+                "late-partial-record",
+                "late-partial-fingerprint",
+                "cursor-00",
+                b'{"status":"pending_approval"}',
+                100,
+                10_000,
+            ),
+        )
+    assert manager.schedule(now=COMPLETED_AT, limit=2) == 2
+    assert manager.schedule(now=COMPLETED_AT, limit=2) == 1
+    assert manager.schedule(now=COMPLETED_AT, limit=2) == 1
+    with database.read() as connection:
+        jobs = connection.execute(
+            """
+            SELECT request_id FROM purge_jobs
+            WHERE intent = 'sensitive_rows' ORDER BY request_id
+            """
+        ).fetchall()
+    assert [row["request_id"] for row in jobs] == [f"cursor-{index:02d}" for index in range(5)]
+
+    for invalid in (0, 1_001, True):
+        with pytest.raises(ValueError, match="page limit"):
+            manager.schedule(now=COMPLETED_AT, limit=invalid)
+
+
 def test_attachment_retention_boundaries_match_each_terminal_state(
     database: Database, staging: StagingStore
 ) -> None:

@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from threading import Lock
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -23,6 +24,7 @@ from signet.staging import StagingError, StagingStore
 _MICROSECONDS = 1_000_000
 _MAX_UNIX_SECONDS = 9_000_000_000_000
 _ONE_DAY = 24 * 60 * 60
+_DEFAULT_SCHEDULE_PAGE_SIZE = 256
 _SAFE_ERROR_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 _NONTERMINAL_STATES = frozenset(
@@ -296,78 +298,120 @@ class RetentionManager:
         self.claim_lease_seconds = claim_lease_seconds
         self.retry_delay_seconds = retry_delay_seconds
         self._fault_injector = fault_injector
+        self._schedule_cursor: str | None = None
+        self._schedule_lock = Lock()
 
-    def schedule(self, *, now: int) -> int:
+    def schedule(self, *, now: int, limit: int = _DEFAULT_SCHEDULE_PAGE_SIZE) -> int:
         _validate_time(now, "purge scheduling time")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0 or limit > 1_000:
+            raise ValueError("purge scheduling page limit is invalid")
         inserted = 0
-        with self.database.transaction() as connection:
-            requests = connection.execute(
-                """
-                SELECT request_id, state, completed_at FROM approval_requests
-                WHERE state IN ('succeeded', 'failed', 'denied', 'expired', 'cancelled')
-                  AND (
+        with self._schedule_lock:
+            with self.database.transaction() as connection:
+                requests = self._schedule_page(
+                    connection,
+                    after_request_id=self._schedule_cursor,
+                    limit=limit,
+                )
+                if not requests and self._schedule_cursor is not None:
+                    requests = self._schedule_page(
+                        connection,
+                        after_request_id=None,
+                        limit=limit,
+                    )
+                for request in requests:
+                    try:
+                        state = RequestState(request["state"])
+                    except ValueError as exc:
+                        raise RetentionError("stored request state is invalid") from exc
+                    completed_at = request["completed_at"]
+                    if state not in _PURGEABLE_STATES or not isinstance(completed_at, int):
+                        continue
+                    request_id = str(request["request_id"])
+                    if bool(request["has_unpurged_attachments"]):
+                        inserted += self._schedule_intent(
+                            connection,
+                            request_id=request_id,
+                            intent=PurgeIntent.ATTACHMENTS,
+                            due_at=completed_at
+                            + self._required_delay(PurgeIntent.ATTACHMENTS, state),
+                        )
+                    if bool(request["has_sensitive_payload"]) or bool(
+                        request["has_untombstoned_idempotency"]
+                    ):
+                        inserted += self._schedule_intent(
+                            connection,
+                            request_id=request_id,
+                            intent=PurgeIntent.SENSITIVE_ROWS,
+                            due_at=completed_at
+                            + self._required_delay(PurgeIntent.SENSITIVE_ROWS, state),
+                        )
+                    if self.mode is RetentionMode.ISOLATED_PER_REQUEST_KEY and bool(
+                        request["has_undestroyed_keys"]
+                    ):
+                        inserted += self._schedule_intent(
+                            connection,
+                            request_id=request_id,
+                            intent=PurgeIntent.ENCRYPTION_KEY,
+                            due_at=completed_at
+                            + self._required_delay(PurgeIntent.ENCRYPTION_KEY, state),
+                        )
+            self._schedule_cursor = (
+                str(requests[-1]["request_id"]) if len(requests) == limit else None
+            )
+        return inserted
+
+    def _schedule_page(
+        self,
+        connection: Any,
+        *,
+        after_request_id: str | None,
+        limit: int,
+    ) -> list[Any]:
+        key_mode = int(self.mode is RetentionMode.ISOLATED_PER_REQUEST_KEY)
+        rows: list[Any] = connection.execute(
+            """
+            SELECT
+                request.request_id,
+                request.state,
+                request.completed_at,
                 EXISTS (
                     SELECT 1 FROM payload_versions AS payload
-                    WHERE payload.request_id = approval_requests.request_id
+                    WHERE payload.request_id = request.request_id
                       AND payload.encrypted_payload IS NOT NULL
-                      AND payload.purged_at IS NULL
-                )
-                OR
+                ) AS has_sensitive_payload,
+                EXISTS (
+                    SELECT 1 FROM idempotency_records AS idempotency
+                    WHERE idempotency.request_id = request.request_id
+                      AND idempotency.tombstoned_at IS NULL
+                ) AS has_untombstoned_idempotency,
                 EXISTS (
                     SELECT 1 FROM attachments AS attachment
-                    WHERE attachment.request_id = approval_requests.request_id
+                    WHERE attachment.request_id = request.request_id
                       AND attachment.storage_path IS NOT NULL
                       AND attachment.purged_at IS NULL
-                )
-                OR
-                (? = 1 AND
+                ) AS has_unpurged_attachments,
+                (? = 1 AND (
                     EXISTS (
                         SELECT 1 FROM payload_versions AS payload_key
-                        WHERE payload_key.request_id = approval_requests.request_id
+                        WHERE payload_key.request_id = request.request_id
                           AND payload_key.encryption_key_ref IS NOT NULL
                           AND payload_key.key_destroyed_at IS NULL
+                    ) OR EXISTS (
+                        SELECT 1 FROM staged_objects AS staged_key
+                        WHERE staged_key.consumed_request_id = request.request_id
+                          AND staged_key.encryption_key_ref IS NOT NULL
+                          AND staged_key.key_destroyed_at IS NULL
                     )
-                )
-                  )
-                ORDER BY request_id
-                """,
-                (int(self.mode is RetentionMode.ISOLATED_PER_REQUEST_KEY),),
-            ).fetchall()
-            for request in requests:
-                try:
-                    state = RequestState(request["state"])
-                except ValueError as exc:
-                    raise RetentionError("stored request state is invalid") from exc
-                completed_at = request["completed_at"]
-                if state not in _PURGEABLE_STATES or not isinstance(completed_at, int):
-                    continue
-                request_id = str(request["request_id"])
-                if self._has_unpurged_attachments(connection, request_id):
-                    inserted += self._schedule_intent(
-                        connection,
-                        request_id=request_id,
-                        intent=PurgeIntent.ATTACHMENTS,
-                        due_at=completed_at + self._required_delay(PurgeIntent.ATTACHMENTS, state),
-                    )
-                if self._has_sensitive_rows(connection, request_id):
-                    inserted += self._schedule_intent(
-                        connection,
-                        request_id=request_id,
-                        intent=PurgeIntent.SENSITIVE_ROWS,
-                        due_at=completed_at
-                        + self._required_delay(PurgeIntent.SENSITIVE_ROWS, state),
-                    )
-                if self.mode is RetentionMode.ISOLATED_PER_REQUEST_KEY and (
-                    self._has_undestroyed_keys(connection, request_id)
-                ):
-                    inserted += self._schedule_intent(
-                        connection,
-                        request_id=request_id,
-                        intent=PurgeIntent.ENCRYPTION_KEY,
-                        due_at=completed_at
-                        + self._required_delay(PurgeIntent.ENCRYPTION_KEY, state),
-                    )
-        return inserted
+                )) AS has_undestroyed_keys
+            FROM approval_requests AS request
+            WHERE request.request_id > ?
+            ORDER BY request.request_id
+            LIMIT ?
+            """,
+            (key_mode, after_request_id or "", limit),
+        ).fetchall()
+        return rows
 
     def claim_due(self, *, now: int) -> PurgeClaim | None:
         _validate_time(now, "purge claim time")
@@ -458,7 +502,7 @@ class RetentionManager:
         _validate_time(now, "purge run time")
         if limit <= 0 or limit > 1_000:
             raise ValueError("purge batch limit is invalid")
-        scheduled = self.schedule(now=now)
+        scheduled = self.schedule(now=now, limit=limit)
         claimed = completed = failed = 0
         for _ in range(limit):
             claim = self.claim_due(now=now)
