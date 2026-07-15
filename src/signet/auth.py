@@ -43,7 +43,15 @@ class ActionBinding:
     prospective_payload_hash: str | None = None
 
     def __post_init__(self) -> None:
-        if self.action not in {"login", "approve", "edit", "deny", "human_cancel"}:
+        if self.action not in {
+            "login",
+            "approve",
+            "edit",
+            "deny",
+            "human_cancel",
+            "promote_approval",
+            "promote_passthrough",
+        }:
             raise ValueError("a supported bounded action is required")
         request_fields = (self.request_id, self.version, self.payload_hash)
         if self.action == "login" and any(

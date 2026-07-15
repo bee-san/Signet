@@ -178,6 +178,8 @@ class WebAuthnRepository(Protocol):
 
     def find_challenge(self, challenge_id: str) -> WebAuthnChallenge | None: ...
 
+    def invalidate_challenge(self, challenge_id: str, *, now: int) -> bool: ...
+
     def find_credential(self, credential_id: str) -> WebAuthnCredential | None: ...
 
     def credentials_for_user(self, user_id: str) -> tuple[WebAuthnCredential, ...]: ...
@@ -214,6 +216,18 @@ class InMemoryWebAuthnRepository:
     def find_challenge(self, challenge_id: str) -> WebAuthnChallenge | None:
         with self._lock:
             return self._challenges.get(challenge_id)
+
+    def invalidate_challenge(self, challenge_id: str, *, now: int) -> bool:
+        with self._lock:
+            challenge = self._challenges.get(challenge_id)
+            if (
+                challenge is None
+                or challenge.consumed_at is not None
+                or challenge.invalidated_at is not None
+            ):
+                return False
+            self._challenges[challenge_id] = replace(challenge, invalidated_at=now)
+            return True
 
     def find_credential(self, credential_id: str) -> WebAuthnCredential | None:
         with self._lock:
@@ -385,6 +399,18 @@ class SQLiteWebAuthnRepository:
                 int(row["invalidated_at"]) if row["invalidated_at"] is not None else None
             ),
         )
+
+    def invalidate_challenge(self, challenge_id: str, *, now: int) -> bool:
+        with self.database.transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE auth_challenges SET invalidated_at = ?
+                WHERE challenge_id = ? AND consumed_at IS NULL
+                  AND invalidated_at IS NULL
+                """,
+                (now, challenge_id),
+            ).rowcount
+        return int(updated) == 1
 
     def find_credential(self, credential_id: str) -> WebAuthnCredential | None:
         with self.database.read() as connection:

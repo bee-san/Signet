@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -13,6 +15,8 @@ from urllib.parse import urlsplit
 import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
+
+from signet.canonical import canonical_json
 
 
 class PolicyError(ValueError):
@@ -558,10 +562,114 @@ def parse_policy(data: Any) -> PolicySnapshot:
 
 def load_policy(path: Path) -> PolicySnapshot:
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            return parse_policy(yaml.load(handle, Loader=_UniqueKeySafeLoader))
+        return parse_policy_yaml(path.read_bytes())
+    except UnicodeDecodeError as exc:
+        raise PolicyError(f"invalid UTF-8 YAML in {path}") from exc
     except yaml.YAMLError as exc:
         raise PolicyError(f"invalid YAML in {path}") from exc
+
+
+def parse_policy_yaml(document: bytes) -> PolicySnapshot:
+    if not isinstance(document, bytes) or not document:
+        raise PolicyError("policy YAML must be non-empty bytes")
+    return parse_policy(
+        yaml.load(document.decode("utf-8", errors="strict"), Loader=_UniqueKeySafeLoader)
+    )
+
+
+def policy_document(snapshot: PolicySnapshot) -> dict[str, Any]:
+    """Return the complete strict document represented by a parsed snapshot."""
+
+    document: dict[str, Any] = {
+        "version": snapshot.version,
+        "default_mode": snapshot.default_mode.value,
+    }
+    if snapshot.mode_contracts:
+        document["mode_contracts"] = {
+            mode.value: copy.deepcopy(contract)
+            for mode, contract in snapshot.mode_contracts.items()
+        }
+    downstreams: dict[str, Any] = {}
+    for alias, downstream in snapshot.downstreams.items():
+        downstream_data: dict[str, Any] = {"transport": downstream.transport}
+        if downstream.url is not None:
+            downstream_data["url"] = downstream.url
+        if downstream.command_ref is not None:
+            downstream_data["command_ref"] = downstream.command_ref
+        if downstream.credential_ref is not None:
+            downstream_data["credential_ref"] = downstream.credential_ref
+        if downstream.schema_review is not None:
+            downstream_data["schema_review"] = {
+                "source": downstream.schema_review.source,
+                "fixture_status": downstream.schema_review.fixture_status,
+                "fail_closed_on_digest_change": (
+                    downstream.schema_review.fail_closed_on_digest_change
+                ),
+            }
+        if downstream.account_ref is not None:
+            downstream_data["account_ref"] = downstream.account_ref
+        if downstream.wrapper_contract is not None:
+            contract = downstream.wrapper_contract
+            downstream_data["wrapper_contract"] = {
+                "id": contract.contract_id,
+                "ownership": contract.ownership,
+                "executable": contract.executable,
+                "executable_version": contract.executable_version,
+                "output": contract.output,
+                "shell_interpolation": contract.shell_interpolation,
+                "fixture_source": contract.fixture_source,
+            }
+        tools: dict[str, Any] = {}
+        for name, tool in downstream.tools.items():
+            tool_data: dict[str, Any] = {"mode": tool.mode.value}
+            if tool.adapter is not None:
+                tool_data["adapter"] = tool.adapter
+            if tool.reviewed_read_only:
+                tool_data["reviewed_read_only"] = True
+            if tool.communication_send:
+                tool_data["communication_send"] = True
+            if tool.schema_digest is not None:
+                tool_data["schema_digest"] = tool.schema_digest
+            if tool.limits:
+                tool_data["limits"] = dict(tool.limits)
+            if tool.account_ref is not None:
+                tool_data["account_ref"] = tool.account_ref
+            if tool.reviewed_classification is not None:
+                tool_data["reviewed_classification"] = tool.reviewed_classification
+            tools[name] = tool_data
+        downstream_data["tools"] = tools
+        downstreams[alias] = downstream_data
+    document["downstreams"] = downstreams
+    if snapshot.policy_changes is not None:
+        changes = snapshot.policy_changes
+        document["policy_changes"] = {
+            "approval_channel": changes.approval_channel,
+            "require_fresh_human_confirmation": changes.require_fresh_human_confirmation,
+            "passthrough_requires_reviewed_read_only": (
+                changes.passthrough_requires_reviewed_read_only
+            ),
+            "communication_sends_may_be_passthrough": (
+                changes.communication_sends_may_be_passthrough
+            ),
+        }
+    return document
+
+
+def dump_policy(snapshot: PolicySnapshot) -> bytes:
+    """Serialize a strict snapshot deterministically for durable writeback."""
+
+    return yaml.safe_dump(
+        policy_document(snapshot),
+        allow_unicode=False,
+        default_flow_style=False,
+        sort_keys=False,
+    ).encode("utf-8")
+
+
+def policy_config_hash(snapshot: PolicySnapshot) -> str:
+    """Hash the semantic strict policy document, independent of YAML layout."""
+
+    return hashlib.sha256(canonical_json(policy_document(snapshot))).hexdigest()
 
 
 class PolicyEngine:
@@ -589,6 +697,25 @@ class PolicyEngine:
         actor: str,
         reviewed_read_only: bool | None = None,
     ) -> PolicySnapshot:
+        snapshot, current, updated = self.preview_promotion(
+            alias,
+            tool,
+            mode,
+            reviewed_read_only=reviewed_read_only,
+        )
+        self.install_reviewed_snapshot(snapshot, current, updated, actor=actor)
+        return snapshot
+
+    def preview_promotion(
+        self,
+        alias: str,
+        tool: str,
+        mode: PolicyMode,
+        *,
+        reviewed_read_only: bool | None = None,
+    ) -> tuple[PolicySnapshot, ToolPolicy, ToolPolicy]:
+        """Build one guarded next version without mutating active policy."""
+
         current = self._snapshot.configured(alias, tool)
         if current is None:
             raise PolicyError("only a discovered, reviewed tool can be promoted")
@@ -602,6 +729,8 @@ class PolicyEngine:
         if mode in {PolicyMode.APPROVAL, PolicyMode.VIRTUALIZE_LOCAL} and not current.adapter:
             raise PolicyError(f"{mode.value} requires a reviewed adapter")
         updated = replace(current, mode=mode, reviewed_read_only=effective_read_only)
+        if updated == current:
+            raise PolicyError("policy promotion must change one reviewed tool mode")
         old_downstream = self._snapshot.downstreams[alias]
         new_tools = dict(old_downstream.tools)
         new_tools[tool] = updated
@@ -612,7 +741,24 @@ class PolicyEngine:
             version=self._snapshot.version + 1,
             downstreams=new_downstreams,
         )
-        if self._on_change:
-            self._on_change(snapshot, current, updated, actor)
+        return snapshot, current, updated
+
+    def install_reviewed_snapshot(
+        self,
+        snapshot: PolicySnapshot,
+        previous: ToolPolicy,
+        updated: ToolPolicy,
+        *,
+        actor: str,
+    ) -> None:
+        """Install a snapshot already committed by the durable policy boundary."""
+
+        if (
+            snapshot.version != self._snapshot.version + 1
+            or previous != self._snapshot.configured(previous.alias, previous.tool)
+            or updated != snapshot.configured(updated.alias, updated.tool)
+        ):
+            raise PolicyError("reviewed policy snapshot is stale or inconsistent")
         self._snapshot = snapshot
-        return snapshot
+        if self._on_change:
+            self._on_change(snapshot, previous, updated, actor)

@@ -189,6 +189,7 @@ class ApprovalStateMachine:
                     request=request,
                     reviewed_limits=selected_tool_limits,
                 )
+                self._require_attachment_catalog(connection, request)
 
                 connection.execute(
                     """
@@ -874,6 +875,40 @@ class ApprovalStateMachine:
                     """,
                     (scope, confirmation.attempt_id),
                 )
+
+    def consume_policy_confirmation(
+        self,
+        connection: Any,
+        confirmation: ApprovalConfirmation,
+        *,
+        action: str,
+        request_id: str,
+        expected_version: int,
+        expected_payload_hash: str,
+        now: int,
+    ) -> None:
+        """Consume one web-only policy proof in the caller's transaction.
+
+        Policy persistence owns a larger atomic boundary than an ordinary
+        request transition.  Keeping proof verification here preserves the
+        exact credential/session/replay checks without opening a nested
+        transaction.
+        """
+
+        if action not in {"promote_approval", "promote_passthrough"}:
+            raise InvalidConfirmation("policy confirmation action is invalid")
+        if confirmation.path != "web":
+            raise InvalidConfirmation("policy changes require web confirmation")
+        self._consume_confirmation(
+            connection,
+            confirmation,
+            action=action,
+            request_id=request_id,
+            expected_version=expected_version,
+            expected_payload_hash=expected_payload_hash,
+            prospective_payload_hash=None,
+            now=now,
+        )
 
     def _verify_confirmation_capability(
         self,
@@ -1903,6 +1938,32 @@ class ApprovalStateMachine:
             self._require_current(request, version, payload_hash)
             if request["state"] != RequestState.PENDING_APPROVAL.value:
                 raise InvalidTransition("attachments can only be staged while pending")
+            catalog = connection.execute(
+                """
+                SELECT adapter, filename, declared_mime, size_bytes, sha256,
+                       storage_path, encryption_key_ref, consumed_request_id,
+                       purged_at, key_destroyed_at
+                FROM staged_objects WHERE attachment_id = ?
+                """,
+                (attachment_id,),
+            ).fetchone()
+            if (
+                catalog is None
+                or catalog["adapter"] != request["downstream_alias"]
+                or catalog["filename"] != filename
+                or catalog["declared_mime"] != mime_type
+                or catalog["size_bytes"] != size_bytes
+                or catalog["sha256"] != sha256
+                or catalog["storage_path"] != storage_path
+                or not isinstance(catalog["encryption_key_ref"], str)
+                or not catalog["encryption_key_ref"]
+                or catalog["purged_at"] is not None
+                or catalog["key_destroyed_at"] is not None
+                or catalog["consumed_request_id"] not in {None, request_id}
+            ):
+                raise InvalidTransition(
+                    "a staged attachment is unavailable, changed, or already consumed"
+                )
             connection.execute(
                 """
                 INSERT INTO attachments(
@@ -2438,6 +2499,36 @@ class ApprovalStateMachine:
             ):
                 raise ValueError("invalid attachment reference")
             attachment_ids.add(attachment.attachment_id)
+
+    @staticmethod
+    def _require_attachment_catalog(connection: Any, request: EnqueueRequest) -> None:
+        for attachment in request.attachments:
+            row = connection.execute(
+                """
+                SELECT adapter, filename, declared_mime, size_bytes, sha256,
+                       storage_path, encryption_key_ref, consumed_request_id,
+                       purged_at, key_destroyed_at
+                FROM staged_objects WHERE attachment_id = ?
+                """,
+                (attachment.attachment_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["adapter"] != request.downstream_alias
+                or row["filename"] != attachment.filename
+                or row["declared_mime"] != attachment.mime_type
+                or row["size_bytes"] != attachment.size_bytes
+                or row["sha256"] != attachment.sha256
+                or row["storage_path"] != attachment.storage_path
+                or not isinstance(row["encryption_key_ref"], str)
+                or not row["encryption_key_ref"]
+                or row["purged_at"] is not None
+                or row["key_destroyed_at"] is not None
+                or row["consumed_request_id"] not in {None, request.request_id}
+            ):
+                raise InvalidTransition(
+                    "a staged attachment is unavailable, changed, or already consumed"
+                )
 
     @staticmethod
     def _insert_attachments(
