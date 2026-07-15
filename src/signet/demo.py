@@ -69,7 +69,7 @@ from signet.gateway_tools import (
     SafeRequestSummary,
 )
 from signet.mcp_mirror import AliasToolSurface, SchemaMirror
-from signet.models import InvalidTransition
+from signet.models import InvalidTransition, RequestState
 from signet.notification_outbox import NotificationOutboxWorker, SQLiteNotificationOutbox
 from signet.notifications import (
     NotificationDispatcher,
@@ -89,6 +89,8 @@ from signet.policy_persistence import (
     SQLiteActionDraftRepository,
     SQLitePolicyPromotionBoundary,
 )
+from signet.reconcile import ReconciliationCoordinator
+from signet.retention import RetentionManager, RetentionMatrix
 from signet.runtime import (
     APPROVALS_ALIAS,
     MCPRuntime,
@@ -369,13 +371,15 @@ class FakePushTransport:
 
 
 class DemoWorkers:
-    """Bounded delivery, expiry, and notification workers owned by web lifespan."""
+    """Bounded recovery, delivery, maintenance, and notification workers."""
 
     def __init__(
         self,
         database: Database,
         state_machine: ApprovalStateMachine,
         delivery: DeliveryDispatcher,
+        reconciliation: ReconciliationCoordinator,
+        retention: RetentionManager,
         notifications: NotificationOutboxWorker,
         *,
         interval_seconds: float = 0.25,
@@ -394,6 +398,8 @@ class DemoWorkers:
         self.database = database
         self.state_machine = state_machine
         self.delivery = delivery
+        self.reconciliation = reconciliation
+        self.retention = retention
         self.notifications = notifications
         self.interval_seconds = interval_seconds
         self.delivery_batch = delivery_batch
@@ -421,16 +427,34 @@ class DemoWorkers:
 
     async def run_once(self, *, now: int | None = None) -> tuple[int, int]:
         selected_now = int(time.time()) if now is None else now
+        if not isinstance(selected_now, int) or isinstance(selected_now, bool) or selected_now < 0:
+            raise ValueError("demo worker time is invalid")
+
+        # Repeated recovery is intentional: it also routes leases which were
+        # active during startup but expire while this process remains alive.
+        self.state_machine.recover_startup(now=selected_now)
+        self.state_machine.sweep_expired(now=selected_now, limit=100)
         with self.database.read() as connection:
             request_ids = tuple(
                 str(row["request_id"])
                 for row in connection.execute(
                     """
-                    SELECT request_id FROM approval_requests
-                    WHERE state = 'approved'
-                    ORDER BY approved_at, request_id LIMIT ?
+                    SELECT request.request_id
+                    FROM approval_requests AS request
+                    LEFT JOIN execution_attempts AS attempt
+                      ON attempt.request_id = request.request_id
+                     AND attempt.version = request.current_version
+                    WHERE request.state = 'approved'
+                       OR (
+                           request.state = 'executing'
+                           AND attempt.phase IN ('preparing', 'redispatch_preparing')
+                           AND attempt.lease_expires_at <= ?
+                       )
+                    ORDER BY COALESCE(request.approved_at, request.execution_started_at),
+                             request.request_id
+                    LIMIT ?
                     """,
-                    (self.delivery_batch,),
+                    (selected_now, self.delivery_batch),
                 ).fetchall()
             )
         delivered = 0
@@ -445,6 +469,22 @@ class DemoWorkers:
             except (DeliveryError, InvalidTransition):
                 continue
             delivered += 1
+
+        await self.reconciliation.run_due(
+            worker_id="fake:demo-reconciliation",
+            now=selected_now,
+            limit=self.delivery_batch,
+        )
+        self.notifications.outbox.schedule_approaching_expiry(
+            user_id=DEMO_USER_ID,
+            now=selected_now,
+            limit=1_000,
+        )
+        self.notifications.outbox.schedule_daily_digest(
+            user_id=DEMO_USER_ID,
+            now=selected_now,
+        )
+        self.retention.run_due(now=selected_now, limit=100)
         report = await self.notifications.run_due(
             now=selected_now,
             limit=self.notification_batch,
@@ -724,6 +764,37 @@ def build_demo(
         loader,
         cast(Mapping[str, MCPClient], downstream_clients),
     )
+    reconciliation = ReconciliationCoordinator(
+        state_machine,
+        loader,
+        delivery,
+        cast(Mapping[str, MCPClient], downstream_clients),
+        reviewed_tools={},
+    )
+    retention_delays: dict[RequestState, int | None] = dict.fromkeys(RequestState)
+    retention_delays.update(
+        {
+            RequestState.SUCCEEDED: 7 * 24 * 60 * 60,
+            RequestState.FAILED: 7 * 24 * 60 * 60,
+            RequestState.DENIED: 7 * 24 * 60 * 60,
+            RequestState.EXPIRED: 7 * 24 * 60 * 60,
+            RequestState.CANCELLED: 7 * 24 * 60 * 60,
+        }
+    )
+    attachment_delays = dict(retention_delays)
+    attachment_delays.update(
+        {
+            RequestState.SUCCEEDED: 0,
+            RequestState.DENIED: 0,
+            RequestState.EXPIRED: 24 * 60 * 60,
+            RequestState.CANCELLED: 24 * 60 * 60,
+        }
+    )
+    retention = RetentionManager(
+        database,
+        staging,
+        matrix=RetentionMatrix(attachment_delays, retention_delays),
+    )
     pushes = SQLitePushRepository(database)
     notification_dispatcher = NotificationDispatcher(pushes, FakePushTransport())
     notification_worker = NotificationOutboxWorker(
@@ -731,7 +802,14 @@ def build_demo(
         notification_dispatcher,
         worker_id="fake:demo-notifications",
     )
-    workers = DemoWorkers(database, state_machine, delivery, notification_worker)
+    workers = DemoWorkers(
+        database,
+        state_machine,
+        delivery,
+        reconciliation,
+        retention,
+        notification_worker,
+    )
     _attach_worker_lifespan(web, workers)
     return DemoAssembly(
         root=demo_root,

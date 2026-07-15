@@ -375,6 +375,126 @@ async def test_immediate_browser_deny_then_approve_has_zero_then_one_provider_ca
 
 
 @pytest.mark.asyncio
+async def test_workers_reclaim_only_pre_dispatch_and_reconcile_abandoned_dispatch(
+    tmp_path: Path,
+) -> None:
+    assembly = build_demo(new_demo(tmp_path))
+    async with mcp_client(assembly) as client:
+        reclaimable_id = await enqueue(
+            client,
+            "fastmail",
+            "send_email",
+            {**FASTMAIL_ARGUMENTS, "subject": "Reclaim before fake dispatch"},
+        )
+        unknown_id = await enqueue(
+            client,
+            "fastmail",
+            "send_email",
+            {**FASTMAIL_ARGUMENTS, "subject": "Recover after fake dispatch boundary"},
+        )
+    assert (await web_action(assembly, reclaimable_id, "approve")).status_code == 303
+    assert (await web_action(assembly, unknown_id, "approve")).status_code == 303
+
+    started_at = int(time.time())
+    assembly.state_machine.claim_execution(
+        reclaimable_id,
+        worker_id="fake:crashed-before-dispatch",
+        now=started_at,
+        lease_seconds=1,
+    )
+    unknown_lease = assembly.state_machine.claim_execution(
+        unknown_id,
+        worker_id="fake:crashed-after-dispatch",
+        now=started_at,
+        lease_seconds=1,
+    )
+    assembly.state_machine.mark_dispatch_started(unknown_lease, now=started_at)
+
+    delivered, _notifications = await assembly.workers.run_once(now=started_at + 2)
+    assert delivered == 1
+    assert request_state(assembly, reclaimable_id) == "succeeded"
+    assert request_state(assembly, unknown_id) == "outcome_unknown"
+    assert assembly.provider_clients["fastmail"].mutation_calls == 1
+    with assembly.database.read() as connection:
+        reclaimed = connection.execute(
+            "SELECT worker_generation, phase FROM execution_attempts WHERE request_id = ?",
+            (reclaimable_id,),
+        ).fetchone()
+        unknown = connection.execute(
+            """
+            SELECT reconciliation_attempt_count, reconciliation_next_at,
+                   reconciliation_resolution
+            FROM execution_attempts WHERE request_id = ?
+            """,
+            (unknown_id,),
+        ).fetchone()
+    assert tuple(reclaimed) == (2, "succeeded")
+    assert unknown["reconciliation_attempt_count"] == 1
+    assert unknown["reconciliation_resolution"] == "inconclusive"
+
+    while unknown["reconciliation_resolution"] != "exhausted":
+        next_at = int(unknown["reconciliation_next_at"])
+        await assembly.workers.run_once(now=next_at)
+        with assembly.database.read() as connection:
+            unknown = connection.execute(
+                """
+                SELECT reconciliation_attempt_count, reconciliation_next_at,
+                       reconciliation_resolution
+                FROM execution_attempts WHERE request_id = ?
+                """,
+                (unknown_id,),
+            ).fetchone()
+    assert unknown["reconciliation_attempt_count"] == 5
+    assert unknown["reconciliation_next_at"] is None
+    assert assembly.provider_clients["fastmail"].mutation_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_workers_schedule_private_notifications_and_retention_once(
+    tmp_path: Path,
+) -> None:
+    assembly = build_demo(new_demo(tmp_path))
+    async with mcp_client(assembly) as client:
+        request_id = await enqueue(client, "whatsapp", "send_text", WHATSAPP_ARGUMENTS)
+
+    now = int(time.time())
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE approval_requests SET expires_at = ? WHERE request_id = ?",
+            (now + 60, request_id),
+        )
+    _delivered, notifications = await assembly.workers.run_once(now=now)
+    assert notifications == 3
+    with assembly.database.read() as connection:
+        kinds = [
+            str(row["kind"])
+            for row in connection.execute(
+                "SELECT kind FROM notification_outbox ORDER BY kind"
+            ).fetchall()
+        ]
+    assert kinds == ["approaching_expiry", "daily_digest", "new_pending"]
+    assert (await assembly.workers.run_once(now=now))[1] == 0
+
+    await assembly.workers.run_once(now=now + 61)
+    assert request_state(assembly, request_id) == "expired"
+    with assembly.database.read() as connection:
+        payload = connection.execute(
+            "SELECT encrypted_payload, purged_at FROM payload_versions WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        retention = connection.execute(
+            """
+            SELECT intent, completed_at FROM purge_jobs
+            WHERE request_id = ? ORDER BY intent
+            """,
+            (request_id,),
+        ).fetchall()
+    assert payload["encrypted_payload"] is not None
+    assert payload["purged_at"] is None
+    assert [tuple(row) for row in retention] == [("sensitive_rows", None)]
+
+
+@pytest.mark.asyncio
 async def test_corrupt_approved_payload_fails_before_fake_provider_call(
     tmp_path: Path,
 ) -> None:
