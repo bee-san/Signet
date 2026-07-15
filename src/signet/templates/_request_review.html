@@ -8,7 +8,19 @@
     </div>
     <div class="truth-state">
       <strong>{{ item.state|replace('_', ' ') }}</strong>
-      {% if item.state == 'pending_approval' %}<span>Not sent</span>{% endif %}
+      {% if item.state in ['denied', 'cancelled', 'expired'] %}
+      <span>Nothing was executed downstream</span>
+      {% elif item.state == 'succeeded' %}
+      <span>Downstream effect confirmed</span>
+      {% elif item.state in ['executing', 'outcome_unknown'] %}
+      <span>Downstream effect may have occurred</span>
+      {% elif item.state == 'approved' %}
+      <span>Approved; execution not started</span>
+      {% elif item.state == 'failed' %}
+      <span>Downstream success not confirmed</span>
+      {% else %}
+      <span>No downstream execution</span>
+      {% endif %}
     </div>
   </header>
 
@@ -33,6 +45,11 @@
       <div><dt>Expires</dt><dd><time datetime="{{ item.expires_at }}">{{ item.expires_at }}</time></dd></div>
       <div><dt>Version</dt><dd>{{ item.version }}</dd></div>
       <div class="context-wide"><dt>Payload hash</dt><dd class="hash-value">{{ item.payload_hash }}</dd></div>
+      <div><dt>Reviewed content</dt><dd>{{ 'Available' if item.review_available else ('Purged' if item.content_purged else 'Unavailable') }}</dd></div>
+      {% if item.canonical_size is not none %}<div><dt>Canonical bytes</dt><dd>{{ item.canonical_size }}</dd></div>{% endif %}
+      {% if item.editor_actor %}<div><dt>Revision actor</dt><dd>{{ item.editor_actor }}</dd></div>{% endif %}
+      {% if item.content_purged_at %}<div><dt>Content purged</dt><dd><time datetime="{{ item.content_purged_at }}">{{ item.content_purged_at }}</time></dd></div>{% endif %}
+      {% if item.content_purge_reason %}<div class="context-wide"><dt>Purge reason</dt><dd>{{ item.content_purge_reason }}</dd></div>{% endif %}
       <div><dt>Downstream</dt><dd>{{ item.downstream_alias }}</dd></div>
       <div><dt>Tool</dt><dd>{{ item.tool_name }}</dd></div>
       {% if item.account_context %}<div><dt>Account</dt><dd>{{ item.account_context }}</dd></div>{% endif %}
@@ -52,6 +69,7 @@
     </dl>
   </section>
 
+  {% if item.review_available %}
   <section class="detail-content" aria-labelledby="content-{{ id_suffix }}">
     <h3 id="content-{{ id_suffix }}" class="band-heading">Reviewed content</h3>
     {% for block in item.detail_blocks %}
@@ -66,10 +84,12 @@
     {% endfor %}
   </section>
 
+  {% if item.reviewed_arguments_json %}
   <section class="arguments-band" aria-labelledby="arguments-{{ id_suffix }}">
     <h3 id="arguments-{{ id_suffix }}">Frozen execution arguments</h3>
     <pre>{{ item.reviewed_arguments_json }}</pre>
   </section>
+  {% endif %}
 
   <section class="attachment-band" aria-labelledby="attachments-{{ id_suffix }}">
     <h3 id="attachments-{{ id_suffix }}">Attachments</h3>
@@ -102,6 +122,31 @@
     <p class="muted-value">None</p>
     {% endif %}
   </section>
+  {% else %}
+  <section class="unavailable-band" aria-labelledby="unavailable-{{ id_suffix }}">
+    <h3 id="unavailable-{{ id_suffix }}">Reviewed content {{ 'purged' if item.content_purged else 'unavailable' }}</h3>
+    <p>No approval, denial, edit, or policy action is available without an authenticated exact-revision review.</p>
+    {% if item.content_purged and item.attachments %}
+    <h4>Retained attachment metadata</h4>
+    <div class="table-scroll">
+      <table class="attachments-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Bytes</th><th>SHA-256</th><th>Content</th></tr></thead>
+        <tbody>
+          {% for attachment in item.attachments %}
+          <tr>
+            <td>{{ attachment.filename }}</td>
+            <td>{{ attachment.mime_type }}</td>
+            <td>{{ attachment.size_bytes }}</td>
+            <td class="hash-value">{{ attachment.sha256 }}</td>
+            <td>{{ 'Purged' if attachment.purged else 'Retained' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
 
   {% if item.failure_reason or item.safe_outcome_json %}
   <section class="outcome-band" aria-labelledby="outcome-{{ id_suffix }}">
@@ -111,13 +156,15 @@
   </section>
   {% endif %}
 
-  {% if item.state == 'pending_approval' %}
+  {% if item.review_available and item.state == 'pending_approval' %}
   <section class="action-band" aria-labelledby="action-{{ id_suffix }}">
     <h3 id="action-{{ id_suffix }}">Confirm action</h3>
     <div hidden aria-hidden="true">
       <input type="hidden" name="expected_version" value="{{ item.version }}">
       <input type="hidden" name="expected_payload_hash" value="{{ item.payload_hash }}">
     </div>
+    <label for="decision-note-{{ id_suffix }}">Decision rationale (optional)</label>
+    <textarea id="decision-note-{{ id_suffix }}" data-decision-note name="decision_note" form="totp-action-{{ id_suffix }}" rows="3" maxlength="1000"></textarea>
     {% if not fake_only_ui %}
     <div class="passkey-actions">
       <button class="button button-primary" type="button" data-passkey-action="approve">Approve</button>
@@ -127,7 +174,7 @@
     {% endif %}
     <details class="authenticator-fallback"{% if fake_only_ui %} open{% endif %}>
       <summary>{{ 'Use fake action proof' if fake_only_ui else 'Use authenticator code' }}</summary>
-      <form class="totp-action" action="/requests/{{ item.request_id }}/actions/totp" method="post">
+      <form id="totp-action-{{ id_suffix }}" class="totp-action" action="/requests/{{ item.request_id }}/actions/totp" method="post">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="expected_version" value="{{ item.version }}">
         <input type="hidden" name="expected_payload_hash" value="{{ item.payload_hash }}">
@@ -190,6 +237,9 @@
           <div><dt>Version</dt><dd>{{ event.version }}</dd></div>
           <div><dt>Payload hash</dt><dd class="hash-value">{{ event.payload_hash }}</dd></div>
         </dl>
+        {% if event.decision_note %}
+        <div class="decision-note"><h4>Decision note</h4><pre>{{ event.decision_note }}</pre></div>
+        {% endif %}
         {% if event.details_json %}<pre>{{ event.details_json }}</pre>{% endif %}
       </li>
       {% endfor %}

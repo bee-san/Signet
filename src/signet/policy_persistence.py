@@ -20,6 +20,7 @@ import yaml
 
 from signet.auth import ActionBinding
 from signet.db import Database, IntegrityError
+from signet.decision_notes import normalize_decision_note
 from signet.models import (
     ApprovalConfirmation,
     InvalidConfirmation,
@@ -129,8 +130,9 @@ class SQLiteActionDraftRepository:
                         payload_hash, prospective_payload_hash, user_id, session_id,
                         policy_change, edit_encrypted_payload, edit_payload_hash,
                         edit_canonical_size, edit_policy_version, edit_adapter_version,
-                        edit_schema_version, edit_encryption_key_ref, created_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        edit_schema_version, edit_encryption_key_ref, created_at, expires_at,
+                        decision_note
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         draft.challenge_id,
@@ -152,6 +154,7 @@ class SQLiteActionDraftRepository:
                         edit.encryption_key_ref if edit is not None else None,
                         draft.created_at,
                         draft.expires_at,
+                        draft.decision_note,
                     ),
                 )
         except IntegrityError as exc:
@@ -198,6 +201,9 @@ class SQLiteActionDraftRepository:
             prepared_edit=prepared,
             created_at=int(row["created_at"]),
             expires_at=int(row["expires_at"]),
+            decision_note=(
+                str(row["decision_note"]) if row["decision_note"] is not None else None
+            ),
         )
         _validate_draft(draft)
         return draft
@@ -1182,6 +1188,10 @@ class SQLitePolicyPromotionBoundary:
 def _validate_draft(draft: WebActionDraft) -> None:
     binding = draft.binding
     edit = draft.prepared_edit
+    try:
+        normalized_note = normalize_decision_note(draft.decision_note)
+    except ValueError:
+        raise ValueError("action draft is invalid") from None
     if (
         not draft.challenge_id
         or len(draft.challenge_id) < 16
@@ -1196,6 +1206,11 @@ def _validate_draft(draft: WebActionDraft) -> None:
         or draft.policy_change
         != (binding.action in _POLICY_ACTIONS or draft.action in _POLICY_ACTIONS)
         or (draft.action == "edit") != (edit is not None)
+        or normalized_note != draft.decision_note
+        or (
+            normalized_note is not None
+            and (draft.action not in {"approve", "deny"} or draft.policy_change)
+        )
     ):
         raise ValueError("action draft is invalid")
     if edit is not None and (

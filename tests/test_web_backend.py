@@ -59,6 +59,9 @@ from signet.web_backend import (
     ActionDraftRepository,
     EncryptedPayloadReviewer,
     PolicyPromotionBoundary,
+    PreparedEdit,
+    PrivatePayloadReviewer,
+    ReviewedPayload,
     WebActionDraft,
     WebBackend,
     WebPayloadError,
@@ -151,6 +154,37 @@ class ReviewOnlyAdapter:
             self.downstream_calls.append(name)
             raise AssertionError("the web backend crossed a downstream boundary")
         raise AttributeError(name)
+
+
+@dataclass
+class ReviewerSpy:
+    delegate: PrivatePayloadReviewer
+    review_calls: list[tuple[str, int, str]] = field(default_factory=list)
+
+    def review(
+        self,
+        request_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+    ) -> ReviewedPayload:
+        self.review_calls.append((request_id, version, payload_hash))
+        return self.delegate.review(request_id, version=version, payload_hash=payload_hash)
+
+    def prepare_edit(
+        self,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        prospective_arguments_json: str,
+    ) -> PreparedEdit:
+        return self.delegate.prepare_edit(
+            request_id,
+            expected_version=expected_version,
+            expected_payload_hash=expected_payload_hash,
+            prospective_arguments_json=prospective_arguments_json,
+        )
 
 
 @dataclass
@@ -631,9 +665,10 @@ def test_queue_detail_and_audit_only_expose_authenticated_private_review(
         bundle.backend.authenticate("not-a-session", now=NOW)
 
     queue = bundle.backend.list_queue(principal, now=NOW)
-    assert [(item.request_id, item.destination_summary) for item in queue] == [
-        (request_id, "private@example.test")
+    assert [(item.request_id, item.downstream_alias, item.tool_name) for item in queue.items] == [
+        (request_id, "fake-service", "create_item")
     ]
+    assert queue.has_more is False and queue.next_cursor is None
     detail = bundle.backend.get_detail(principal, request_id)
     assert detail.detail_blocks[0].value == "private body that must remain encrypted"
     assert json.loads(cast(str, detail.editable_arguments_json)) == {
@@ -668,13 +703,66 @@ def test_unresolved_unknowns_are_pinned_ahead_of_pending_requests(
 
     queue = bundle.backend.list_queue(principal, now=NOW)
 
-    assert [(item.request_id, item.state) for item in queue] == [
+    assert [(item.request_id, item.state) for item in queue.items] == [
         (unknown_id, "outcome_unknown"),
         (pending_id, "pending_approval"),
     ]
 
 
-def test_wrong_payload_key_fails_closed_without_private_data(
+def test_queue_is_hard_capped_keyset_paginated_and_never_reviews_payloads(
+    bundle: BackendBundle,
+) -> None:
+    request_ids = {bundle.enqueue(recipient=f"private-{index}@example.test") for index in range(55)}
+    unknown_id = max(request_ids)
+    with bundle.database.transaction() as connection:
+        connection.execute(
+            "UPDATE approval_requests SET state = 'outcome_unknown' WHERE request_id = ?",
+            (unknown_id,),
+        )
+    original = cast(PrivatePayloadReviewer, cast(Any, bundle.backend)._payloads)
+    reviewer = ReviewerSpy(original)
+    cast(Any, bundle.backend)._payloads = reviewer
+    _, principal = bundle.session()
+
+    first = bundle.backend.list_queue(principal, now=NOW)
+    second = bundle.backend.list_queue(principal, now=NOW, cursor=first.next_cursor)
+
+    assert len(first.items) == 50
+    assert first.items[0].request_id == unknown_id
+    assert first.has_more is True and first.next_cursor is not None
+    assert len(second.items) == 5
+    assert second.has_more is False and second.next_cursor is None
+    assert {item.request_id for item in first.items + second.items} == request_ids
+    assert reviewer.review_calls == []
+
+    bundle.backend.get_detail(principal, first.items[0].request_id)
+    assert reviewer.review_calls == [
+        (
+            first.items[0].request_id,
+            first.items[0].version,
+            bundle.state_machine.get_request(first.items[0].request_id)["current_payload_hash"],
+        )
+    ]
+
+
+def test_queue_cursor_rejects_sqlite_integer_overflow(bundle: BackendBundle) -> None:
+    _, principal = bundle.session()
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "priority": 0,
+                "created_at": 2**63,
+                "request_id": "req_overflow",
+            },
+            separators=(",", ":"),
+        ).encode()
+    ).decode().rstrip("=")
+
+    with pytest.raises(WebConflict, match="cursor is invalid"):
+        bundle.backend.list_queue(principal, now=NOW, cursor=encoded)
+
+
+def test_wrong_payload_key_returns_non_actionable_metadata_without_private_data(
     bundle: BackendBundle,
 ) -> None:
     request_id = bundle.enqueue(body="never disclose this payload")
@@ -690,10 +778,186 @@ def test_wrong_payload_key_fails_closed_without_private_data(
         adapter=bundle.adapter,
         cipher=wrong_cipher,
     )
-    with pytest.raises(WebConflict) as raised:
-        wrong.backend.get_detail(principal, request_id)
-    assert "never disclose" not in str(raised.value)
-    assert raised.value.__cause__ is None
+    detail = wrong.backend.get_detail(principal, request_id)
+    assert detail.review_available is False
+    assert detail.content_purged is False
+    assert detail.editable_arguments_json is None
+    assert detail.detail_blocks == ()
+    assert "never disclose" not in detail.destination_summary
+    assert "never disclose" not in str(detail)
+    assert bundle.adapter.downstream_calls == []
+
+    row = bundle.state_machine.get_request(request_id)
+    with pytest.raises(WebConflict, match="unavailable for review"):
+        wrong.backend.complete_totp_action(
+            principal,
+            request_id,
+            "approve",
+            "fake:404",
+            expected_version=1,
+            expected_payload_hash=str(row["current_payload_hash"]),
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+    assert bundle.state_machine.get_request(request_id)["state"] == "pending_approval"
+
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "approve",
+            "fake:404",
+            expected_version=1,
+            expected_payload_hash=str(row["current_payload_hash"]),
+            prospective_arguments_json=None,
+            now=NOW + 2,
+        )
+        == "approved"
+    )
+
+
+def test_decision_history_is_metadata_only_until_exact_request_expansion(
+    bundle: BackendBundle,
+) -> None:
+    approved_id = bundle.enqueue(body="approved private body")
+    denied_id = bundle.enqueue(body="denied private body")
+    _, principal = bundle.session()
+    approved_hash = str(bundle.state_machine.get_request(approved_id)["current_payload_hash"])
+    denied_hash = str(bundle.state_machine.get_request(denied_id)["current_payload_hash"])
+
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            approved_id,
+            "approve",
+            "fake:501",
+            expected_version=1,
+            expected_payload_hash=approved_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+            decision_note="Release scope reviewed <script>alert(1)</script>",
+        )
+        == "approved"
+    )
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            denied_id,
+            "deny",
+            "fake:502",
+            expected_version=1,
+            expected_payload_hash=denied_hash,
+            prospective_arguments_json=None,
+            now=NOW + 2,
+            decision_note="Recipient does not match the requested change.",
+        )
+        == "denied"
+    )
+    original = cast(PrivatePayloadReviewer, cast(Any, bundle.backend)._payloads)
+    reviewer = ReviewerSpy(original)
+    cast(Any, bundle.backend)._payloads = reviewer
+
+    decisions = bundle.backend.list_decisions(principal)
+
+    assert [(entry.request_id, entry.decision) for entry in decisions] == [
+        (denied_id, "denied"),
+        (approved_id, "approved"),
+    ]
+    assert decisions[1].confirmation_path == "web"
+    assert reviewer.review_calls == []
+    approved = bundle.backend.get_detail(principal, approved_id)
+    denied = bundle.backend.get_detail(principal, denied_id)
+    approved_event = next(
+        event for event in approved.events if event["action"] == "approved_via_web"
+    )
+    denied_event = next(event for event in denied.events if event["action"] == "denied")
+    assert approved_event["decision_note"] == "Release scope reviewed <script>alert(1)</script>"
+    assert denied_event["decision_note"] == "Recipient does not match the requested change."
+    assert approved_event["details_json"] is None
+    assert denied_event["details_json"] is None
+    assert len(reviewer.review_calls) == 2
+    assert bundle.adapter.downstream_calls == []
+
+
+@pytest.mark.parametrize("invalid_note", ["x" * 1_001, "unsafe\x00control"])
+def test_invalid_decision_note_fails_before_proof_consumption(
+    bundle: BackendBundle,
+    invalid_note: str,
+) -> None:
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+
+    with pytest.raises(WebConflict, match="rationale is invalid"):
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "deny",
+            "fake:503",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+            decision_note=invalid_note,
+        )
+
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "deny",
+            "fake:503",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 2,
+            decision_note=None,
+        )
+        == "denied"
+    )
+
+
+def test_terminal_purged_request_retains_decision_metadata_and_timeline(
+    bundle: BackendBundle,
+) -> None:
+    request_id = bundle.enqueue(body="purge this private body")
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    bundle.backend.complete_totp_action(
+        principal,
+        request_id,
+        "deny",
+        "fake:504",
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+        prospective_arguments_json=None,
+        now=NOW + 1,
+        decision_note="Request is outside the approved scope.",
+    )
+    with bundle.database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE payload_versions
+            SET encrypted_payload = NULL, purged_at = ?, purge_reason = ?
+            WHERE request_id = ? AND version = 1
+            """,
+            (NOW + 2, "retention_denied", request_id),
+        )
+
+    detail = bundle.backend.get_detail(principal, request_id)
+
+    assert detail.state == "denied"
+    assert detail.review_available is False
+    assert detail.content_purged is True
+    assert detail.content_purged_at == NOW + 2
+    assert detail.content_purge_reason == "retention_denied"
+    assert detail.reviewed_arguments_json is None
+    assert detail.editable_arguments_json is None
+    assert detail.detail_blocks == ()
+    assert "purge this private body" not in str(detail)
+    decision = next(event for event in detail.events if event["action"] == "denied")
+    assert decision["decision_note"] == "Request is outside the approved scope."
+    assert bundle.backend.list_decisions(principal)[0].request_id == request_id
     assert bundle.adapter.downstream_calls == []
 
 

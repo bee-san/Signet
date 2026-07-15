@@ -23,6 +23,7 @@ from .auth import (
     webauthn_proof_claims,
 )
 from .db import Database, IntegrityError
+from .decision_notes import normalize_decision_note
 from .models import (
     AdmissionRejected,
     ApprovalConfirmation,
@@ -667,7 +668,9 @@ class ApprovalStateMachine:
         confirmation: ApprovalConfirmation,
         actor: str,
         now: int,
+        decision_note: str | None = None,
     ) -> None:
+        normalized_note = normalize_decision_note(decision_note)
         with self.database.transaction() as connection:
             request = self._request_for_update(connection, request_id)
             self._require_current(request, expected_version, expected_payload_hash)
@@ -731,6 +734,7 @@ class ApprovalStateMachine:
                 now,
                 expected_version,
                 expected_payload_hash,
+                {"decision_note": normalized_note} if normalized_note is not None else None,
             )
             if confirmation.path == "mcp":
                 self._notification(
@@ -1127,7 +1131,9 @@ class ApprovalStateMachine:
         confirmation: ApprovalConfirmation,
         actor: str,
         now: int,
+        decision_note: str | None = None,
     ) -> None:
+        normalized_note = normalize_decision_note(decision_note)
         self._finish_pending(
             request_id,
             expected_version=expected_version,
@@ -1137,6 +1143,9 @@ class ApprovalStateMachine:
             now=now,
             confirmation=confirmation,
             confirmation_action="deny",
+            safe_details=(
+                {"decision_note": normalized_note} if normalized_note is not None else None
+            ),
         )
 
     def cancel(
@@ -2083,6 +2092,7 @@ class ApprovalStateMachine:
         require_expired: bool = False,
         confirmation: ApprovalConfirmation | None = None,
         confirmation_action: str | None = None,
+        safe_details: Mapping[str, Any] | None = None,
     ) -> None:
         if state not in {
             RequestState.DENIED,
@@ -2168,6 +2178,7 @@ class ApprovalStateMachine:
                 now,
                 expected_version,
                 expected_payload_hash,
+                safe_details,
             )
             self._fault(f"{state.value}:before_commit")
 

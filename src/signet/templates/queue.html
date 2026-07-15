@@ -14,13 +14,18 @@
     <details class="request-expander">
       <summary>
         <span class="request-summary-main">
-          <span class="service-label">{{ item.service }}</span>
-          <strong>{{ item.action }}</strong>
+          <span class="service-label">{{ item.downstream_alias }}</span>
+          <strong>{{ item.tool_name }}</strong>
+          <span class="hash-value">{{ item.request_id }} / {{ item.payload_hash_prefix }}</span>
         </span>
         <span class="request-summary-meta">
           <span class="state state-{{ item.state }}">{{ item.state|replace('_', ' ') }}</span>
           <span>v{{ item.version }}</span>
+          {% if item.state == 'pending_approval' %}
           <time datetime="{{ item.expires_at }}">Expires in {{ [item.expires_at - now, 0]|max }}s</time>
+          {% else %}
+          <span>Reconciliation required</span>
+          {% endif %}
         </span>
       </summary>
       <div class="request-expansion" data-review-fragment data-review-url="/requests/{{ item.request_id }}/review">
@@ -31,6 +36,12 @@
   </li>
   {% endfor %}
 </ol>
+{% if has_more and next_cursor %}
+<nav class="queue-pagination" aria-label="Approval queue pages">
+  <span>Additional queued requests remain</span>
+  <a class="button button-quiet" href="/?after={{ next_cursor }}">Next page</a>
+</nav>
+{% endif %}
 {% else %}
 <section class="empty-state">
   <h1>Queue clear</h1>

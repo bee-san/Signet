@@ -24,6 +24,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from signet.auth import InvalidSession, SessionPrincipal
+from signet.decision_notes import MAX_DECISION_NOTE_CHARS, normalize_decision_note
 from signet.http_security import RequestBodyLimitMiddleware
 
 type HumanAction = Literal[
@@ -71,14 +72,20 @@ class WebRateLimited(WebError):
 @dataclass(frozen=True, slots=True)
 class QueueItem:
     request_id: str
-    service: str
-    action: str
-    destination_summary: str
+    downstream_alias: str
+    tool_name: str
     state: str
     created_at: int
     expires_at: int
     version: int
-    payload_hash: str
+    payload_hash_prefix: str
+
+
+@dataclass(frozen=True, slots=True)
+class QueuePage:
+    items: tuple[QueueItem, ...]
+    has_more: bool
+    next_cursor: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +122,7 @@ class RequestDetail:
     editable_arguments_json: str | None = None
     gateway_internal: bool = False
     warnings: tuple[str, ...] = ()
-    reviewed_arguments_json: str = "{}"
+    reviewed_arguments_json: str | None = "{}"
     attachments: tuple[RequestAttachment, ...] = ()
     staged_file_hashes: tuple[str, ...] = ()
     downstream_alias: str = ""
@@ -134,6 +141,12 @@ class RequestDetail:
     failure_reason: str | None = None
     manual_retry_allowed: bool = False
     duplicate_warning_required: bool = False
+    review_available: bool = True
+    content_purged: bool = False
+    content_purged_at: int | None = None
+    content_purge_reason: str | None = None
+    canonical_size: int | None = None
+    editor_actor: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +156,20 @@ class AuditEntry:
     action: str
     request_id: str | None
     payload_hash_prefix: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionEntry:
+    occurred_at: int
+    actor: str
+    decision: Literal["approved", "denied"]
+    confirmation_path: str | None
+    request_id: str
+    current_state: str
+    downstream_alias: str
+    tool_name: str
+    version: int
+    payload_hash_prefix: str
 
 
 class LoginOptions(BaseModel):
@@ -211,11 +238,19 @@ class WebBackend(Protocol):
 
     def logout(self, token: str | None, *, now: int) -> None: ...
 
-    def list_queue(self, principal: SessionPrincipal, *, now: int) -> tuple[QueueItem, ...]: ...
+    def list_queue(
+        self,
+        principal: SessionPrincipal,
+        *,
+        now: int,
+        cursor: str | None = None,
+    ) -> QueuePage: ...
 
     def get_detail(self, principal: SessionPrincipal, request_id: str) -> RequestDetail: ...
 
     def list_audit(self, principal: SessionPrincipal) -> tuple[AuditEntry, ...]: ...
+
+    def list_decisions(self, principal: SessionPrincipal) -> tuple[DecisionEntry, ...]: ...
 
     def begin_passkey_action(
         self,
@@ -228,6 +263,7 @@ class WebBackend(Protocol):
         prospective_arguments_json: str | None,
         http_method: str,
         now: int,
+        decision_note: str | None = None,
     ) -> ActionOptions: ...
 
     def complete_passkey_action(
@@ -252,6 +288,7 @@ class WebBackend(Protocol):
         expected_payload_hash: str,
         prospective_arguments_json: str | None,
         now: int,
+        decision_note: str | None = None,
     ) -> str: ...
 
     def subscribe_push(
@@ -403,12 +440,13 @@ class WebSettings:
             or self.login_csrf_cookie.startswith("__Host-")
         ):
             raise ValueError("insecure web cookies are restricted to named loopback cookies")
-        if self.fake_only_ui and self.secure_cookies:
-            raise ValueError("fake-only web UI requires explicit loopback demo mode")
+        if self.fake_only_ui == self.secure_cookies:
+            raise ValueError("insecure loopback cookies and fake-only UI must be enabled together")
         cookie_names = (self.session_cookie, self.login_csrf_cookie)
         if (
             not self.allowed_hosts
             or hostname not in self.allowed_hosts
+            or len({host.lower() for host in self.allowed_hosts}) != len(self.allowed_hosts)
             or len(set(cookie_names)) != len(cookie_names)
             or any(not _valid_allowed_host(host) for host in self.allowed_hosts)
             or any(
@@ -669,9 +707,9 @@ def create_web_app(
         return response
 
     @app.get("/", response_class=HTMLResponse)
-    async def queue(request: Request) -> Response:
+    async def queue(request: Request, after: str | None = None) -> Response:
         selected = principal(request)
-        items = backend.list_queue(selected, now=now_fn())
+        page = backend.list_queue(selected, now=now_fn(), cursor=after)
         return cast(
             Response,
             templates.TemplateResponse(
@@ -679,7 +717,9 @@ def create_web_app(
                 "queue.html",
                 {
                     **context(request, selected),
-                    "items": items,
+                    "items": page.items,
+                    "has_more": page.has_more,
+                    "next_cursor": page.next_cursor,
                     "now": now_fn(),
                     "logout_csrf": csrf.session_token(selected.session_id, "logout"),
                     "push_csrf": csrf.session_token(selected.session_id, "push"),
@@ -737,6 +777,7 @@ def create_web_app(
                 "audit.html",
                 {
                     **context(request, selected),
+                    "decisions": backend.list_decisions(selected),
                     "entries": backend.list_audit(selected),
                     "logout_csrf": csrf.session_token(selected.session_id, "logout"),
                 },
@@ -756,10 +797,15 @@ def create_web_app(
             str | None,
             Form(max_length=4_000_000),
         ] = None,
+        decision_note: Annotated[
+            str | None,
+            Form(max_length=MAX_DECISION_NOTE_CHARS),
+        ] = None,
     ) -> Response:
         selected = principal(request)
         require_csrf(request, selected, f"request:{request_id}", csrf_token)
-        backend.complete_totp_action(
+        normalized_note = _decision_note_input(action, decision_note)
+        final_state = backend.complete_totp_action(
             selected,
             request_id,
             action,
@@ -768,10 +814,11 @@ def create_web_app(
             expected_payload_hash=expected_payload_hash,
             prospective_arguments_json=prospective_arguments_json,
             now=now_fn(),
+            decision_note=normalized_note,
         )
         return Response(
             status_code=status.HTTP_303_SEE_OTHER,
-            headers={"Location": f"/requests/{request_id}"},
+            headers={"Location": _action_redirect(request_id, final_state)},
         )
 
     @app.post("/requests/{request_id}/actions/passkey/options")
@@ -785,14 +832,17 @@ def create_web_app(
         expected_version = body.get("expected_version")
         payload_hash = body.get("expected_payload_hash")
         prospective = body.get("prospective_arguments_json")
+        decision_note = body.get("decision_note")
         if (
             not isinstance(expected_version, int)
             or expected_version < 1
             or not isinstance(payload_hash, str)
             or len(payload_hash) != 64
             or (prospective is not None and not isinstance(prospective, str))
+            or (decision_note is not None and not isinstance(decision_note, str))
         ):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        normalized_note = _decision_note_input(action, decision_note)
         return backend.begin_passkey_action(
             selected,
             request_id,
@@ -802,6 +852,7 @@ def create_web_app(
             prospective_arguments_json=prospective,
             http_method=request.method,
             now=now_fn(),
+            decision_note=normalized_note,
         )
 
     @app.post("/requests/{request_id}/actions/passkey/complete")
@@ -821,7 +872,11 @@ def create_web_app(
             http_method=request.method,
             now=now_fn(),
         )
-        return {"status": final_state, "request_id": request_id}
+        return {
+            "status": final_state,
+            "request_id": request_id,
+            "redirect_url": _action_redirect(request_id, final_state),
+        }
 
     @app.post("/push/subscriptions", status_code=status.HTTP_204_NO_CONTENT)
     async def subscribe_push(request: Request, payload: PushSubscriptionInput) -> Response:
@@ -854,6 +909,22 @@ _HUMAN_ACTIONS: frozenset[str] = frozenset(
         "promote_passthrough",
     }
 )
+
+
+def _decision_note_input(action: HumanAction, value: str | None) -> str | None:
+    try:
+        normalized = normalize_decision_note(value)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY) from None
+    if normalized is not None and action not in {"approve", "deny"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+    return normalized
+
+
+def _action_redirect(request_id: str, final_state: str) -> str:
+    if final_state in {"approved", "denied"}:
+        return f"/audit#decision-{request_id}"
+    return f"/requests/{request_id}"
 
 
 async def _json_object(request: Request) -> dict[str, Any]:

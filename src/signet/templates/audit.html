@@ -1,8 +1,42 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="audit-view">
-  <p class="eyebrow">Append-only events</p>
+  <p class="eyebrow">Review history</p>
   <h1>Audit</h1>
+  <section class="decision-history" aria-labelledby="decision-history-heading">
+    <h2 id="decision-history-heading">Recent approvals and denials</h2>
+    {% if decisions %}
+    <ol class="request-list">
+      {% for decision in decisions %}
+      <li id="decision-{{ decision.request_id }}">
+        <details class="request-expander decision-{{ decision.decision }}">
+          <summary>
+            <span class="request-summary-main">
+              <span class="service-label">{{ decision.decision }}</span>
+              <strong>{{ decision.downstream_alias }} / {{ decision.tool_name }}</strong>
+              <span class="hash-value">{{ decision.request_id }} / {{ decision.payload_hash_prefix }}</span>
+            </span>
+            <span class="request-summary-meta">
+              <span class="state state-{{ decision.current_state }}">{{ decision.current_state|replace('_', ' ') }}</span>
+              <time datetime="{{ decision.occurred_at }}">{{ decision.occurred_at }}</time>
+              <span>{{ decision.actor }}{% if decision.confirmation_path %} via {{ decision.confirmation_path }}{% endif %}</span>
+            </span>
+          </summary>
+          <div class="request-expansion" data-review-fragment data-review-url="/requests/{{ decision.request_id }}/review">
+            <p class="review-loading" role="status">Loading request context</p>
+            <noscript><p><a href="/requests/{{ decision.request_id }}">Open dedicated request view</a></p></noscript>
+          </div>
+        </details>
+      </li>
+      {% endfor %}
+    </ol>
+    {% else %}
+    <p class="muted-value">No approval or denial decision is retained.</p>
+    {% endif %}
+  </section>
+  <section class="event-log" aria-labelledby="event-log-heading">
+  <p class="eyebrow">Append-only events</p>
+  <h2 id="event-log-heading">Event log</h2>
   <div class="table-scroll">
     <table>
       <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Request</th><th>Hash</th></tr></thead>
@@ -19,5 +53,6 @@
       </tbody>
     </table>
   </div>
+  </section>
 </section>
 {% endblock %}

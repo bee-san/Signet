@@ -90,6 +90,8 @@ h4 { font-size: .86rem; line-height: 1.35; }
   overflow: clip;
   width: 100%;
 }
+.decision-approved { border-left-color: var(--green-2); }
+.decision-denied { border-left-color: var(--danger); }
 .request-expander > summary {
   align-items: center;
   cursor: pointer;
@@ -111,6 +113,12 @@ h4 { font-size: .86rem; line-height: 1.35; }
 .destination { overflow-wrap: anywhere; }
 .state { border-radius: 4px; font-weight: 760; padding: 3px 6px; }
 .state-pending_approval { background: #fff4d8; color: #694d12; }
+.state-approved, .state-succeeded { background: #e6f3ec; color: var(--green); }
+.state-denied, .state-failed, .state-cancelled, .state-expired { background: var(--danger-bg); color: var(--danger); }
+.state-outcome_unknown { background: #f1e8f7; color: #5d356e; }
+.queue-pagination { align-items: center; display: flex; justify-content: space-between; margin-top: 18px; }
+.decision-history { margin: 24px 0 44px; }
+.event-log { border-top: 1px solid var(--line); padding-top: 28px; }
 .empty-state, .error-state { border-top: 3px solid var(--gold); margin-top: 48px; padding-top: 24px; }
 
 .page-heading { font-size: 1.45rem; margin-bottom: 24px; }
@@ -137,7 +145,8 @@ h4 { font-size: .86rem; line-height: 1.35; }
   word-break: break-word;
 }
 .warning-band, .context-band, .arguments-band, .attachment-band, .outcome-band,
-.action-band, .edit-band, .policy-band, .timeline { border-bottom: 1px solid var(--line); padding: 24px 0; }
+.action-band, .edit-band, .policy-band, .timeline, .unavailable-band { border-bottom: 1px solid var(--line); padding: 24px 0; }
+.unavailable-band { border-left: 4px solid var(--danger); padding-left: 14px; }
 .warning-band { border-left: 4px solid var(--gold); padding-left: 14px; }
 .warning-band ul { margin: 0; padding-left: 20px; }
 .context-grid { display: grid; gap: 18px 24px; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; }
@@ -193,6 +202,8 @@ th { color: var(--muted); font-size: .78rem; }
   .timeline-heading { grid-template-columns: 1fr; gap: 4px; }
   .event-integrity { grid-template-columns: 1fr; }
   .button-row .button, .passkey-actions .button { flex: 1 1 120px; }
+  .queue-pagination { align-items: stretch; display: grid; }
+  .queue-pagination a { display: inline-flex; }
 }
 
 @media (max-width: 430px) {

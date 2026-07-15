@@ -7,6 +7,8 @@ mutations to persistence boundaries that own their transaction.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -31,6 +33,7 @@ from signet.auth import (
 )
 from signet.canonical import CanonicalizationError, canonical_json
 from signet.db import Database
+from signet.decision_notes import normalize_decision_note
 from signet.models import (
     ApprovalConfirmation,
     AttachmentReference,
@@ -57,11 +60,13 @@ from signet.totp import (
 from signet.web import (
     ActionOptions,
     AuditEntry,
+    DecisionEntry,
     DetailBlock,
     HumanAction,
     LoginOptions,
     PushSubscriptionInput,
     QueueItem,
+    QueuePage,
     RequestAttachment,
     RequestDetail,
     WebConflict,
@@ -104,6 +109,7 @@ _ENVELOPE_FIELDS = frozenset(
 )
 _PREAUTH_PREFIX = "preauth:"
 _SHA256 = frozenset("0123456789abcdef")
+_MAX_QUEUE_PAGE_SIZE = 50
 
 
 class WebPayloadError(RuntimeError):
@@ -409,6 +415,7 @@ class WebActionDraft:
     prepared_edit: PreparedEdit | None
     created_at: int
     expires_at: int
+    decision_note: str | None = None
 
     def __repr__(self) -> str:
         return (
@@ -431,12 +438,12 @@ class ActionDraftRepository(Protocol):
 
 
 class PolicyPromotionBoundary(Protocol):
-    """Atomic durable boundary for one passkey-authorized policy promotion.
+    """Atomic durable boundary for one human-confirmed policy promotion.
 
     An implementation must recheck the exact pending request revision, verify
     and consume the unchanged confirmation capability/challenge/credential
     state, apply the reviewed policy change, and append its audit record in one
-    transaction.  No in-memory implementation is supplied here.
+    transaction.
     """
 
     def binding_action(
@@ -489,6 +496,8 @@ class WebBackend:
         policy_promotions: PolicyPromotionBoundary,
         pushes: PushRepository,
         max_audit_entries: int = 1_000,
+        max_decision_entries: int = 100,
+        max_queue_entries: int = _MAX_QUEUE_PAGE_SIZE,
         passkey_login_window_seconds: int = 10 * 60,
         passkey_login_source_limit: int = 20,
         passkey_login_account_limit: int = 10,
@@ -496,6 +505,10 @@ class WebBackend:
     ) -> None:
         if max_audit_entries <= 0 or max_audit_entries > 10_000:
             raise ValueError("audit read limit is invalid")
+        if max_decision_entries <= 0 or max_decision_entries > 1_000:
+            raise ValueError("decision read limit is invalid")
+        if max_queue_entries <= 0 or max_queue_entries > _MAX_QUEUE_PAGE_SIZE:
+            raise ValueError("queue read limit is invalid")
         if (
             passkey_login_window_seconds < 60
             or passkey_login_window_seconds > 60 * 60
@@ -521,6 +534,8 @@ class WebBackend:
         self._policy_promotions = policy_promotions
         self._pushes = pushes
         self.max_audit_entries = max_audit_entries
+        self.max_decision_entries = max_decision_entries
+        self.max_queue_entries = max_queue_entries
         self._passkey_login_window_seconds = passkey_login_window_seconds
         self._passkey_login_source_limit = passkey_login_source_limit
         self._passkey_login_account_limit = passkey_login_account_limit
@@ -870,56 +885,129 @@ class WebBackend:
         principal: SessionPrincipal,
         *,
         now: int,
-    ) -> tuple[QueueItem, ...]:
+        cursor: str | None = None,
+    ) -> QueuePage:
         _require_ui_principal(principal)
+        cursor_values = _decode_queue_cursor(cursor) if cursor is not None else None
         with self._database.read() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM approval_requests
-                WHERE state = 'outcome_unknown'
-                   OR (state = 'pending_approval' AND expires_at > ?)
-                ORDER BY CASE state WHEN 'outcome_unknown' THEN 0 ELSE 1 END,
-                         created_at, request_id
-                """,
-                (now,),
-            ).fetchall()
-        items: list[QueueItem] = []
-        for row in rows:
-            try:
-                reviewed = self._payloads.review(
-                    str(row["request_id"]),
-                    version=int(row["current_version"]),
-                    payload_hash=str(row["current_payload_hash"]),
-                )
-            except (RequestNotFound, WebPayloadError):
-                raise WebConflict("a queued request could not be reviewed") from None
-            items.append(
+            if cursor_values is None:
+                rows = connection.execute(
+                    """
+                    SELECT request_id, downstream_alias, tool_name, state, created_at,
+                           expires_at, current_version, current_payload_hash
+                    FROM approval_requests
+                    WHERE state = 'outcome_unknown'
+                       OR (state = 'pending_approval' AND expires_at > ?)
+                    ORDER BY CASE state WHEN 'outcome_unknown' THEN 0 ELSE 1 END,
+                             created_at, request_id
+                    LIMIT ?
+                    """,
+                    (now, self.max_queue_entries + 1),
+                ).fetchall()
+            else:
+                priority, created_at, after_request_id = cursor_values
+                rows = connection.execute(
+                    """
+                    SELECT request_id, downstream_alias, tool_name, state, created_at,
+                           expires_at, current_version, current_payload_hash
+                    FROM approval_requests
+                    WHERE (state = 'outcome_unknown'
+                           OR (state = 'pending_approval' AND expires_at > ?))
+                      AND (
+                          CASE state WHEN 'outcome_unknown' THEN 0 ELSE 1 END > ?
+                          OR (
+                              CASE state WHEN 'outcome_unknown' THEN 0 ELSE 1 END = ?
+                              AND (
+                                  created_at > ?
+                                  OR (created_at = ? AND request_id > ?)
+                              )
+                          )
+                      )
+                    ORDER BY CASE state WHEN 'outcome_unknown' THEN 0 ELSE 1 END,
+                             created_at, request_id
+                    LIMIT ?
+                    """,
+                    (
+                        now,
+                        priority,
+                        priority,
+                        created_at,
+                        created_at,
+                        after_request_id,
+                        self.max_queue_entries + 1,
+                    ),
+                ).fetchall()
+        visible = rows[: self.max_queue_entries]
+        has_more = len(rows) > self.max_queue_entries
+        return QueuePage(
+            items=tuple(
                 QueueItem(
                     request_id=str(row["request_id"]),
-                    service=reviewed.summary.service,
-                    action=reviewed.summary.action,
-                    destination_summary=reviewed.summary.destination_summary,
+                    downstream_alias=str(row["downstream_alias"]),
+                    tool_name=str(row["tool_name"]),
                     state=str(row["state"]),
                     created_at=int(row["created_at"]),
                     expires_at=int(row["expires_at"]),
                     version=int(row["current_version"]),
-                    payload_hash=str(row["current_payload_hash"]),
+                    payload_hash_prefix=str(row["current_payload_hash"])[:12],
                 )
-            )
-        return tuple(items)
+                for row in visible
+            ),
+            has_more=has_more,
+            next_cursor=(
+                _encode_queue_cursor(visible[-1]) if has_more and visible else None
+            ),
+        )
 
     def get_detail(self, principal: SessionPrincipal, request_id: str) -> RequestDetail:
         _require_ui_principal(principal)
         try:
             request = self._state_machine.get_request(request_id)
+            events = self._state_machine.list_events(request_id)
+        except RequestNotFound:
+            raise WebConflict("request details are unavailable") from None
+        version = int(request["current_version"])
+        payload_hash = str(request["current_payload_hash"])
+        with self._database.read() as connection:
+            payload_metadata = connection.execute(
+                """
+                SELECT canonical_size, policy_version, adapter_version, schema_version,
+                       editor_actor, purged_at, purge_reason
+                FROM payload_versions
+                WHERE request_id = ? AND version = ? AND payload_hash = ?
+                """,
+                (request_id, version, payload_hash),
+            ).fetchone()
+            attachment_rows = connection.execute(
+                """
+                SELECT attachment_id, filename, mime_type, size_bytes, sha256, purged_at
+                FROM attachments
+                WHERE request_id = ? AND version = ?
+                ORDER BY attachment_id
+                """,
+                (request_id, version),
+            ).fetchall()
+        rendered_events = tuple(_render_request_event(event) for event in events)
+        if payload_metadata is None:
+            return _unavailable_request_detail(
+                request,
+                events=rendered_events,
+                payload_metadata=None,
+                attachment_rows=(),
+            )
+        try:
             reviewed = self._payloads.review(
                 request_id,
-                version=int(request["current_version"]),
-                payload_hash=str(request["current_payload_hash"]),
+                version=version,
+                payload_hash=payload_hash,
             )
-            events = self._state_machine.list_events(request_id)
         except (RequestNotFound, WebPayloadError):
-            raise WebConflict("request details are unavailable") from None
+            return _unavailable_request_detail(
+                request,
+                events=rendered_events,
+                payload_metadata=payload_metadata,
+                attachment_rows=attachment_rows,
+            )
         arguments_json = json.dumps(
             dict(reviewed.arguments),
             ensure_ascii=False,
@@ -930,16 +1018,6 @@ class WebBackend:
         editable = None
         if request["state"] == "pending_approval":
             editable = arguments_json
-        with self._database.read() as connection:
-            attachment_rows = connection.execute(
-                """
-                SELECT attachment_id, filename, mime_type, size_bytes, sha256, purged_at
-                FROM attachments
-                WHERE request_id = ? AND version = ?
-                ORDER BY attachment_id
-                """,
-                (request_id, int(request["current_version"])),
-            ).fetchall()
         account = getattr(reviewed.adapter, "account", None)
         if not isinstance(account, str) or not account:
             account = None
@@ -952,23 +1030,13 @@ class WebBackend:
             state=str(request["state"]),
             created_at=int(request["created_at"]),
             expires_at=int(request["expires_at"]),
-            version=int(request["current_version"]),
-            payload_hash=str(request["current_payload_hash"]),
+            version=version,
+            payload_hash=payload_hash,
             detail_blocks=tuple(
                 DetailBlock(block.label, block.kind, block.value)
                 for block in reviewed.summary.detail_blocks
             ),
-            events=tuple(
-                {
-                    "occurred_at": int(event["occurred_at"]),
-                    "actor": str(event["actor"]),
-                    "action": str(event["action"]),
-                    "version": int(event["version"]),
-                    "payload_hash": str(event["payload_hash"]),
-                    "details_json": _event_details_json(event["safe_details_json"]),
-                }
-                for event in events
-            ),
+            events=rendered_events,
             editable_arguments_json=editable,
             gateway_internal=bool(request["gateway_internal"]),
             warnings=reviewed.summary.warnings,
@@ -1007,6 +1075,8 @@ class WebBackend:
             ),
             manual_retry_allowed=bool(request["manual_retry_allowed"]),
             duplicate_warning_required=bool(request["duplicate_warning_required"]),
+            canonical_size=int(payload_metadata["canonical_size"]),
+            editor_actor=str(payload_metadata["editor_actor"]),
         )
 
     def list_audit(self, principal: SessionPrincipal) -> tuple[AuditEntry, ...]:
@@ -1030,6 +1100,44 @@ class WebBackend:
             for row in rows
         )
 
+    def list_decisions(self, principal: SessionPrincipal) -> tuple[DecisionEntry, ...]:
+        _require_ui_principal(principal)
+        with self._database.read() as connection:
+            rows = connection.execute(
+                """
+                SELECT event.occurred_at, event.actor, event.action,
+                       event.request_id, event.version, event.payload_hash,
+                       request.state, request.downstream_alias, request.tool_name
+                FROM request_events AS event
+                JOIN approval_requests AS request
+                  ON request.request_id = event.request_id
+                WHERE event.action = 'denied'
+                   OR event.action LIKE 'approved_via_%'
+                ORDER BY event.event_id DESC
+                LIMIT ?
+                """,
+                (self.max_decision_entries,),
+            ).fetchall()
+        decisions: list[DecisionEntry] = []
+        for row in rows:
+            action = str(row["action"])
+            approved = action.startswith("approved_via_")
+            decisions.append(
+                DecisionEntry(
+                    occurred_at=int(row["occurred_at"]),
+                    actor=str(row["actor"]),
+                    decision="approved" if approved else "denied",
+                    confirmation_path=action.removeprefix("approved_via_") if approved else None,
+                    request_id=str(row["request_id"]),
+                    current_state=str(row["state"]),
+                    downstream_alias=str(row["downstream_alias"]),
+                    tool_name=str(row["tool_name"]),
+                    version=int(row["version"]),
+                    payload_hash_prefix=str(row["payload_hash"])[:12],
+                )
+            )
+        return tuple(decisions)
+
     def begin_passkey_action(
         self,
         principal: SessionPrincipal,
@@ -1041,6 +1149,7 @@ class WebBackend:
         prospective_arguments_json: str | None,
         http_method: str,
         now: int,
+        decision_note: str | None = None,
     ) -> ActionOptions:
         _require_ui_principal(principal)
         request = self._require_pending_revision(
@@ -1049,6 +1158,12 @@ class WebBackend:
             expected_payload_hash=expected_payload_hash,
             now=now,
         )
+        if action != "edit":
+            self._require_reviewable_revision(
+                request_id,
+                expected_version=expected_version,
+                expected_payload_hash=expected_payload_hash,
+            )
         gateway_internal = bool(request["gateway_internal"])
         if gateway_internal and action in {
             "edit",
@@ -1060,6 +1175,11 @@ class WebBackend:
             "promote_approval",
             "promote_passthrough",
         } or (gateway_internal and action == "approve")
+        normalized_note = _decision_note_for_action(
+            action,
+            decision_note,
+            policy_change=policy_change,
+        )
         binding_action = (
             self._policy_binding_action(
                 request_id,
@@ -1107,6 +1227,7 @@ class WebBackend:
             prepared_edit=prepared,
             created_at=now,
             expires_at=issued.expires_at,
+            decision_note=normalized_note,
         )
         try:
             self._action_drafts.save(draft)
@@ -1152,6 +1273,11 @@ class WebBackend:
             or now >= draft.expires_at
         ):
             raise WebConflict("passkey action is stale or unavailable")
+        self._require_reviewable_revision(
+            request_id,
+            expected_version=cast(int, draft.binding.version),
+            expected_payload_hash=cast(str, draft.binding.payload_hash),
+        )
         try:
             proof = self._webauthn_verifier.verify(
                 cast(AssertionInput, assertion),
@@ -1175,6 +1301,7 @@ class WebBackend:
                 draft.binding,
                 confirmation,
                 prepared_edit=draft.prepared_edit,
+                decision_note=draft.decision_note,
                 actor=_actor(principal),
                 now=now,
             )
@@ -1202,6 +1329,7 @@ class WebBackend:
         expected_payload_hash: str,
         prospective_arguments_json: str | None,
         now: int,
+        decision_note: str | None = None,
     ) -> str:
         _require_ui_principal(principal)
         request = self._require_pending_revision(
@@ -1210,6 +1338,12 @@ class WebBackend:
             expected_payload_hash=expected_payload_hash,
             now=now,
         )
+        if action != "edit":
+            self._require_reviewable_revision(
+                request_id,
+                expected_version=expected_version,
+                expected_payload_hash=expected_payload_hash,
+            )
         gateway_internal = bool(request["gateway_internal"])
         if gateway_internal and action in {
             "edit",
@@ -1221,6 +1355,11 @@ class WebBackend:
             "promote_approval",
             "promote_passthrough",
         } or (gateway_internal and action == "approve")
+        normalized_note = _decision_note_for_action(
+            action,
+            decision_note,
+            policy_change=policy_change,
+        )
         binding_action = (
             self._policy_binding_action(
                 request_id,
@@ -1270,6 +1409,7 @@ class WebBackend:
                 binding,
                 confirmation,
                 prepared_edit=prepared,
+                decision_note=normalized_note,
                 actor=_actor(principal),
                 now=now,
             )
@@ -1349,6 +1489,22 @@ class WebBackend:
             raise WebConflict("request changed after review")
         return request
 
+    def _require_reviewable_revision(
+        self,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+    ) -> None:
+        try:
+            self._payloads.review(
+                request_id,
+                version=expected_version,
+                payload_hash=expected_payload_hash,
+            )
+        except (RequestNotFound, WebPayloadError):
+            raise WebConflict("request content is unavailable for review") from None
+
     def _revoke_preauth_session(
         self,
         session_id: str,
@@ -1420,6 +1576,7 @@ class WebBackend:
         confirmation: ApprovalConfirmation,
         *,
         prepared_edit: PreparedEdit | None,
+        decision_note: str | None,
         actor: str,
         now: int,
     ) -> str:
@@ -1434,6 +1591,7 @@ class WebBackend:
                 confirmation=confirmation,
                 actor=actor,
                 now=now,
+                decision_note=decision_note,
             )
             return "approved"
         if action == "deny":
@@ -1444,6 +1602,7 @@ class WebBackend:
                 confirmation=confirmation,
                 actor=actor,
                 now=now,
+                decision_note=decision_note,
             )
             return "denied"
         if action == "cancel":
@@ -1481,22 +1640,151 @@ class WebBackend:
         raise InvalidConfirmation("action draft does not match its confirmation")
 
 
-def _event_details_json(value: object) -> str | None:
+def _unavailable_request_detail(
+    request: Mapping[str, Any],
+    *,
+    events: tuple[dict[str, Any], ...],
+    payload_metadata: Any | None,
+    attachment_rows: tuple[Any, ...] | list[Any],
+) -> RequestDetail:
+    purged = payload_metadata is not None and payload_metadata["purged_at"] is not None
+    unavailable_message = (
+        "Private reviewed content was purged under the retention policy."
+        if purged
+        else "Private reviewed content is unavailable and could not be authenticated."
+    )
+
+    def metadata_text(name: str) -> str:
+        if payload_metadata is None:
+            return "unavailable"
+        value = payload_metadata[name]
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            return str(value)
+        return "unavailable"
+
+    retained_attachments = (
+        tuple(
+            RequestAttachment(
+                attachment_id=str(row["attachment_id"]),
+                filename=str(row["filename"]),
+                mime_type=str(row["mime_type"]),
+                size_bytes=int(row["size_bytes"]),
+                sha256=str(row["sha256"]),
+                purged=row["purged_at"] is not None,
+            )
+            for row in attachment_rows
+        )
+        if purged
+        else ()
+    )
+    return RequestDetail(
+        request_id=str(request["request_id"]),
+        service=str(request["downstream_alias"]),
+        action=str(request["tool_name"]),
+        title="Reviewed content purged" if purged else "Reviewed content unavailable",
+        destination_summary=unavailable_message,
+        state=str(request["state"]),
+        created_at=int(request["created_at"]),
+        expires_at=int(request["expires_at"]),
+        version=int(request["current_version"]),
+        payload_hash=str(request["current_payload_hash"]),
+        detail_blocks=(),
+        events=events,
+        editable_arguments_json=None,
+        gateway_internal=bool(request["gateway_internal"]),
+        warnings=(unavailable_message,),
+        reviewed_arguments_json=None,
+        attachments=retained_attachments,
+        staged_file_hashes=tuple(attachment.sha256 for attachment in retained_attachments),
+        downstream_alias=str(request["downstream_alias"]),
+        tool_name=str(request["tool_name"]),
+        policy_mode=str(request["policy_mode"]),
+        policy_version=metadata_text("policy_version"),
+        adapter_version=metadata_text("adapter_version"),
+        schema_version=metadata_text("schema_version"),
+        origin_namespace=str(request["origin_namespace"]),
+        retry_of_request_id=(
+            str(request["retry_of_request_id"])
+            if request["retry_of_request_id"] is not None
+            else None
+        ),
+        approved_at=_optional_int(request["approved_at"]),
+        execution_started_at=_optional_int(request["execution_started_at"]),
+        completed_at=_optional_int(request["completed_at"]),
+        safe_outcome_json=_stored_json_for_display(request["safe_outcome_json"]),
+        failure_reason=(
+            str(request["failure_reason"]) if request["failure_reason"] is not None else None
+        ),
+        manual_retry_allowed=bool(request["manual_retry_allowed"]),
+        duplicate_warning_required=bool(request["duplicate_warning_required"]),
+        review_available=False,
+        content_purged=purged,
+        content_purged_at=(
+            _optional_int(payload_metadata["purged_at"])
+            if payload_metadata is not None
+            else None
+        ),
+        content_purge_reason=(
+            str(payload_metadata["purge_reason"])
+            if payload_metadata is not None and payload_metadata["purge_reason"] is not None
+            else None
+        ),
+        canonical_size=(
+            _optional_int(payload_metadata["canonical_size"])
+            if payload_metadata is not None
+            else None
+        ),
+        editor_actor=(
+            str(payload_metadata["editor_actor"])
+            if payload_metadata is not None and payload_metadata["editor_actor"] is not None
+            else None
+        ),
+    )
+
+
+def _render_request_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    details_json, decision_note = _event_details(event["safe_details_json"])
+    return {
+        "occurred_at": int(event["occurred_at"]),
+        "actor": str(event["actor"]),
+        "action": str(event["action"]),
+        "version": int(event["version"]),
+        "payload_hash": str(event["payload_hash"]),
+        "details_json": details_json,
+        "decision_note": decision_note,
+    }
+
+
+def _event_details(value: object) -> tuple[str | None, str | None]:
     if value is None:
-        return None
+        return None, None
     if not isinstance(value, str):
         raise WebConflict("request event details are unavailable")
     try:
         details = _strict_json_object(value)
     except WebPayloadError:
         raise WebConflict("request event details are unavailable") from None
-    return json.dumps(
-        details,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        indent=2,
+    note_value = details.pop("decision_note", None)
+    decision_note = None
+    if isinstance(note_value, str):
+        try:
+            candidate = normalize_decision_note(note_value)
+        except ValueError:
+            candidate = None
+        if candidate == note_value:
+            decision_note = candidate
+    details_json = (
+        json.dumps(
+            details,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            indent=2,
+        )
+        if details
+        else None
     )
+    return details_json, decision_note
 
 
 def _stored_json_for_display(value: object) -> str | None:
@@ -1525,6 +1813,58 @@ def _optional_int(value: object) -> int | None:
     return value
 
 
+def _encode_queue_cursor(row: Any) -> str:
+    priority = 0 if str(row["state"]) == "outcome_unknown" else 1
+    raw = json.dumps(
+        {
+            "priority": priority,
+            "created_at": int(row["created_at"]),
+            "request_id": str(row["request_id"]),
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_queue_cursor(value: str) -> tuple[int, int, str]:
+    if not value or len(value) > 512 or any(
+        character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        for character in value
+    ):
+        raise WebConflict("queue page cursor is invalid")
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        raw = base64.b64decode(padded, altchars=b"-_", validate=True)
+        decoded = _strict_json_object(raw)
+    except (binascii.Error, ValueError, WebPayloadError):
+        raise WebConflict("queue page cursor is invalid") from None
+    if set(decoded) != {"priority", "created_at", "request_id"}:
+        raise WebConflict("queue page cursor is invalid")
+    priority = decoded["priority"]
+    created_at = decoded["created_at"]
+    request_id = decoded["request_id"]
+    if (
+        not isinstance(priority, int)
+        or isinstance(priority, bool)
+        or priority not in {0, 1}
+        or not isinstance(created_at, int)
+        or isinstance(created_at, bool)
+        or created_at < 0
+        or created_at > (2**63) - 1
+        or not isinstance(request_id, str)
+        or len(request_id) < 5
+        or len(request_id) > 132
+        or not request_id.startswith("req_")
+        or not request_id[4:].isalnum()
+        or not request_id.isascii()
+    ):
+        raise WebConflict("queue page cursor is invalid")
+    return priority, created_at, request_id
+
+
 def _confirmation_action(action: HumanAction) -> ConfirmationAction:
     values: dict[str, ConfirmationAction] = {
         "approve": "approve",
@@ -1538,6 +1878,21 @@ def _confirmation_action(action: HumanAction) -> ConfirmationAction:
         return values[action]
     except KeyError:
         raise WebForbidden("unsupported human action") from None
+
+
+def _decision_note_for_action(
+    action: HumanAction,
+    value: str | None,
+    *,
+    policy_change: bool,
+) -> str | None:
+    try:
+        normalized = normalize_decision_note(value)
+    except ValueError:
+        raise WebConflict("decision rationale is invalid") from None
+    if normalized is not None and (action not in {"approve", "deny"} or policy_change):
+        raise WebConflict("decision rationale does not match this action")
+    return normalized
 
 
 def _totp_confirmation(proof: VerifiedTotp) -> ApprovalConfirmation:

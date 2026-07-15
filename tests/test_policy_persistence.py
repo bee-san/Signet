@@ -266,6 +266,47 @@ def test_sqlite_action_draft_is_immutable_and_survives_restart(
         )
 
 
+def test_passkey_approval_note_survives_draft_restart_and_reaches_event(
+    durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
+) -> None:
+    bundle, _, _ = durable_bundle
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    row = bundle.state_machine.get_request(request_id)
+    options = bundle.backend.begin_passkey_action(
+        principal,
+        request_id,
+        "approve",
+        expected_version=1,
+        expected_payload_hash=str(row["current_payload_hash"]),
+        prospective_arguments_json=None,
+        http_method="POST",
+        now=NOW + 1,
+        decision_note="Exact destination and request scope reviewed.",
+    )
+    assertion = bundle.assertion(options.challenge_id)
+    restarted = SQLiteActionDraftRepository(Database(bundle.database.path))
+    stored = restarted.find(options.challenge_id)
+    assert stored is not None
+    assert stored.decision_note == "Exact destination and request scope reviewed."
+    bundle.backend._action_drafts = restarted
+
+    assert (
+        bundle.backend.complete_passkey_action(
+            principal,
+            request_id,
+            options.challenge_id,
+            cast(Any, assertion),
+            http_method="POST",
+            now=NOW + 2,
+        )
+        == "approved"
+    )
+    detail = bundle.backend.get_detail(principal, request_id)
+    approved = next(event for event in detail.events if event["action"] == "approved_via_web")
+    assert approved["decision_note"] == "Exact destination and request scope reviewed."
+
+
 def test_failed_draft_save_invalidates_the_issued_challenge(
     durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
 ) -> None:

@@ -90,6 +90,7 @@ document.addEventListener("click", async (event) => {
     const payloadHash = root.querySelector("input[name='expected_payload_hash']")?.value;
     const expectedVersion = Number(root.querySelector("input[name='expected_version']")?.value);
     const editArguments = action === "edit" ? root.querySelector("[data-edit-json]")?.value : null;
+    const decisionNote = root.querySelector("[data-decision-note]")?.value || null;
     if (!payloadHash || !Number.isInteger(expectedVersion)) {
       throw new Error("Request binding is unavailable");
     }
@@ -97,14 +98,15 @@ document.addEventListener("click", async (event) => {
       action,
       expected_version: expectedVersion,
       expected_payload_hash: payloadHash,
-      prospective_arguments_json: editArguments
+      prospective_arguments_json: editArguments,
+      decision_note: decisionNote
     }, root.dataset.csrf);
     const credential = await navigator.credentials.get({ publicKey: preparePublicKey(options.public_key) });
-    await postJson(`/requests/${requestId}/actions/passkey/complete`, {
+    const completed = await postJson(`/requests/${requestId}/actions/passkey/complete`, {
       challenge_id: options.challenge_id,
       assertion: assertionJson(credential)
     }, root.dataset.csrf);
-    window.location.reload();
+    window.location.assign(completed.redirect_url || `/requests/${requestId}`);
   } catch (error) {
     showMessage(error.message);
   }
@@ -131,6 +133,12 @@ document.querySelectorAll(".request-expander").forEach((expander) => {
     }
   });
 });
+
+if (window.location.hash.startsWith("#decision-")) {
+  const target = document.getElementById(window.location.hash.slice(1));
+  const expander = target?.querySelector(".request-expander");
+  if (expander) expander.open = true;
+}
 
 const pushButton = document.querySelector("[data-enable-push]");
 if (pushButton && "serviceWorker" in navigator && "PushManager" in window) {
