@@ -502,6 +502,14 @@ class StagingStore:
         )
         return encoded.encode("utf-8")
 
+    @classmethod
+    def metadata_document(cls, record: StagedFile) -> bytes:
+        """Serialize one validated sidecar for backup restoration."""
+
+        if not isinstance(record, StagedFile):
+            raise TypeError("staged object metadata record is invalid")
+        return cls._metadata_document(record)
+
     def _write_metadata(self, record: StagedFile) -> None:
         metadata_fd = self._open_metadata_root()
         temporary_name = f".{record.opaque_id}.tmp"
@@ -877,8 +885,16 @@ class StagingStore:
             )
         finally:
             os.close(descriptor)
+        return self.authenticate_envelope(record, envelope)
+
+    def authenticate_envelope(self, record: StagedFile, envelope: bytes) -> bytes:
+        """Authenticate externally copied envelope bytes against catalog metadata."""
+
+        if not isinstance(record, StagedFile) or not isinstance(envelope, bytes):
+            raise TypeError("staged object envelope verification input is invalid")
         if (
-            len(envelope) != record.envelope_size
+            record.envelope_format != ATTACHMENT_ENVELOPE_FORMAT
+            or len(envelope) != record.envelope_size
             or not hmac.compare_digest(
                 hashlib.sha256(envelope).hexdigest(), record.envelope_sha256
             )

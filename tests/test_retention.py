@@ -94,7 +94,7 @@ def _stage(staging: StagingStore, name: str, content: bytes | None = None) -> St
     source.write_bytes(content or f"fake attachment {name}".encode())
     return staging.stage_path(
         source,
-        adapter="fake-adapter",
+        adapter="fake-service",
         account="fake-account",
         filename=f"{name}.txt",
         declared_mime="text/plain",
