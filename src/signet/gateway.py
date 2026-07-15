@@ -23,7 +23,13 @@ from signet.mcp_mirror import (
     SchemaMirror,
     pending_call_result,
 )
-from signet.models import AdmissionRejected, EnqueueRequest, EnqueueResult, IdempotencyConflict
+from signet.models import (
+    AdmissionRejected,
+    EnqueueRequest,
+    EnqueueResult,
+    IdempotencyConflict,
+    InvalidTransition,
+)
 from signet.policy import PolicyMode, ToolPolicy
 
 
@@ -331,6 +337,11 @@ class GatewayCallPipeline:
         except AdmissionRejected as exc:
             code, message = _admission_error(exc)
             raise DomainToolError(code, message) from None
+        except InvalidTransition:
+            raise DomainToolError(
+                "request_rejected",
+                "A staged object is unavailable, changed, or already consumed.",
+            ) from None
         return _stored_pending_call_result(stored)
 
 

@@ -23,7 +23,6 @@ from signet.auth import (
 from signet.db import Database, IntegrityError
 from signet.models import (
     ApprovalConfirmation,
-    AttachmentReference,
     ConfirmationKind,
     ConfirmationReplay,
     EnqueueRequest,
@@ -41,6 +40,7 @@ from signet.models import (
     StaleVersion,
 )
 from signet.state_machine import ApprovalStateMachine, ReadOnlyMCPClient
+from tests.attachment_fixtures import register_catalog_attachment
 
 NOW = 1_800_000_000
 HUMAN_USER = "owner"
@@ -312,24 +312,23 @@ def test_pending_ack_is_returned_only_after_full_durable_commit(database: Databa
 
 
 def test_attachment_references_commit_atomically_with_pending_ack(database: Database) -> None:
+    attachment_id = "stg_" + "f" * 20
+    attachment = register_catalog_attachment(
+        database,
+        attachment_id=attachment_id,
+        storage_path=f"/private/staging/{attachment_id}",
+    )
     candidate = replace(
         request("with-attachment", invocation_key="attachment-call"),
         attachments=(
-            AttachmentReference(
-                attachment_id="stg_fixture",
-                filename="fixture.txt",
-                mime_type="text/plain",
-                size_bytes=7,
-                sha256="b" * 64,
-                storage_path="/private/staging/stg_fixture",
-            ),
+            attachment,
         ),
     )
     ApprovalStateMachine(database).enqueue(candidate)
     with database.read() as connection:
         row = connection.execute(
             "SELECT request_id, version, sha256 FROM attachments WHERE attachment_id = ?",
-            ("stg_fixture",),
+            (attachment_id,),
         ).fetchone()
     assert tuple(row) == ("with-attachment", 1, "b" * 64)
 
@@ -338,17 +337,16 @@ def test_body_edit_preserves_attachment_snapshot_and_explicit_empty_removes_it(
     machine: ApprovalStateMachine,
     database: Database,
 ) -> None:
+    attachment_id = "stg_" + "e" * 20
+    attachment = register_catalog_attachment(
+        database,
+        attachment_id=attachment_id,
+        storage_path=f"/private/staging/{attachment_id}",
+    )
     candidate = replace(
         request("edit-attachment"),
         attachments=(
-            AttachmentReference(
-                "stg_edit",
-                "fixture.txt",
-                "text/plain",
-                7,
-                "b" * 64,
-                "/private/staging/stg_edit",
-            ),
+            attachment,
         ),
     )
     machine.enqueue(candidate)
@@ -381,7 +379,7 @@ def test_body_edit_preserves_attachment_snapshot_and_explicit_empty_removes_it(
             SELECT version, payload_hash
             FROM attachments WHERE attachment_id = ? ORDER BY version
             """,
-            ("stg_edit",),
+            (attachment_id,),
         ).fetchall()
     assert [tuple(row) for row in versions] == [
         (1, digest("body-one")),

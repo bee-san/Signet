@@ -31,6 +31,7 @@ from signet.models import (
     ResultAlias,
 )
 from signet.state_machine import ApprovalStateMachine
+from tests.attachment_fixtures import register_catalog_attachment
 
 TEST_CAPABILITIES = ProofCapability(b"test-only-proof-capability-key-0001")
 
@@ -38,6 +39,7 @@ CORE_TABLES = {
     "approval_requests",
     "payload_versions",
     "attachments",
+    "staged_objects",
     "idempotency_records",
     "execution_attempts",
     "result_aliases",
@@ -378,16 +380,25 @@ def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None
             idempotency_key="stable-call",
         )
     )
+    attachment_id = "stg_" + "d" * 20
+    storage_path = f"/private/staging/{attachment_id}"
+    register_catalog_attachment(
+        database,
+        attachment_id=attachment_id,
+        storage_path=storage_path,
+        filename="review.txt",
+        size_bytes=5,
+    )
     machine.add_attachment(
         "row-fixture",
         version=1,
         payload_hash=payload_hash,
-        attachment_id="attachment-1",
+        attachment_id=attachment_id,
         filename="review.txt",
         mime_type="text/plain",
         size_bytes=5,
         sha256="b" * 64,
-        storage_path="/private/staging/attachment-1",
+        storage_path=storage_path,
         created_at=101,
     )
     machine.enqueue(

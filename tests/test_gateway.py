@@ -13,6 +13,7 @@ from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from signet.adapters.base import ApprovalAdapter
+from signet.adapters.fastmail import FastmailAdapter
 from signet.admission import ReviewedToolLimits
 from signet.credential_broker import Secret
 from signet.crypto import PayloadCipher
@@ -27,13 +28,16 @@ from signet.gateway import (
 from signet.mcp_mirror import (
     SIGNET_INVOCATION_ID_META,
     AliasToolSurface,
+    DomainToolError,
     SchemaMirror,
     derive_invocation_identity,
     raw_model,
 )
 from signet.models import EnqueueRequest, EnqueueResult
 from signet.policy import parse_policy
+from signet.staging import StagingStore
 from signet.state_machine import ApprovalStateMachine
+from tests.attachment_fixtures import attachment_cipher
 
 MASTER_KEY = "gateway-test-master-key-material-000000000001"
 KEY_REFERENCE = "keychain://Signet/gateway-test-payload"
@@ -284,6 +288,122 @@ async def test_end_to_end_routes_all_modes_and_never_mutates_before_approval(
         with pytest.raises(McpError) as unknown:
             await client.call_tool("unknown", {})
         assert unknown.value.error.code == types.INVALID_PARAMS
+
+
+@pytest.mark.asyncio
+async def test_gateway_atomically_claims_encrypted_attachment_catalog_object(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "gateway-attachments.sqlite3")
+    database.initialize()
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "review.txt"
+    source.write_bytes(b"attachment gateway fixture")
+    staging = StagingStore(
+        tmp_path / "staging",
+        database=database,
+        cipher=attachment_cipher(),
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    adapter = FastmailAdapter(staging_store=staging, account="primary")
+    reference = adapter.stage_attachment(
+        source,
+        filename="review.txt",
+        mime_type="text/plain",
+    )
+    arguments = {
+        "from": "sender@example.test",
+        "to": ["recipient@example.test"],
+        "cc": [],
+        "bcc": [],
+        "subject": "Review",
+        "body": "Frozen body",
+        "attachments": [reference],
+    }
+    policy = parse_policy(
+        {
+            "version": 1,
+            "default_mode": "deny",
+            "downstreams": {
+                "fastmail": {
+                    "transport": "http",
+                    "url": "https://provider.test/mcp",
+                    "tools": {
+                        "send_email": {
+                            "mode": "approval",
+                            "adapter": adapter.adapter_id,
+                            "communication_send": True,
+                        }
+                    },
+                }
+            },
+        }
+    )
+    mirror = SchemaMirror(policy)
+    raw_tool = {
+        "name": "send_email",
+        "inputSchema": dict(adapter.input_schema),
+        "outputSchema": {"type": "object"},
+    }
+    mirror.capture("fastmail", [raw_tool])
+    mirror.approve_schema(
+        "fastmail",
+        "send_email",
+        mirror.captured_digest("fastmail", "send_email"),
+    )
+    pipeline = GatewayCallPipeline(
+        mirror=mirror,
+        downstream_clients={},
+        local_handlers={},
+        adapters={adapter.adapter_id: adapter},
+        freezer=RequestFreezer(PayloadCipher(Secret(MASTER_KEY), KEY_REFERENCE)),
+        enqueuer=ApprovalStateMachine(database),
+    )
+
+    def identity(value: str) -> Any:
+        return derive_invocation_identity(
+            namespace="profile:test",
+            alias="fastmail",
+            tool="send_email",
+            explicit_id=value,
+            explicit_id_present=True,
+            session_scope="attachment-session",
+            request_id=1,
+        )
+
+    pending = await pipeline.handle_call(
+        "fastmail",
+        "send_email",
+        arguments,
+        "profile:test",
+        identity("attachment-send-one"),
+    )
+    request_id = pending["structuredContent"]["request_id"]
+    with database.read() as connection:
+        owner = connection.execute(
+            "SELECT consumed_request_id FROM staged_objects WHERE attachment_id = ?",
+            (reference["staged_id"],),
+        ).fetchone()[0]
+        attachment = connection.execute(
+            "SELECT request_id, sha256 FROM attachments WHERE attachment_id = ?",
+            (reference["staged_id"],),
+        ).fetchone()
+    assert owner == request_id
+    assert tuple(attachment) == (request_id, reference["sha256"])
+
+    with pytest.raises(DomainToolError) as reused:
+        await pipeline.handle_call(
+            "fastmail",
+            "send_email",
+            arguments,
+            "profile:test",
+            identity("attachment-send-two"),
+        )
+    assert reused.value.code == "request_rejected"
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM approval_requests").fetchone()[0] == 1
 
 
 @pytest.mark.asyncio
