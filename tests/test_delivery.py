@@ -187,7 +187,19 @@ class FakeAdapter:
 def machine(tmp_path: Path) -> ApprovalStateMachine:
     database = Database(tmp_path / "delivery.sqlite3")
     database.initialize()
-    return ApprovalStateMachine(database)
+    return ApprovalStateMachine(database, notification_user_id="human:test")
+
+
+def notification_kinds(machine: ApprovalStateMachine, request_id: str) -> list[str]:
+    with machine.database.read() as connection:
+        rows = connection.execute(
+            """
+            SELECT kind FROM notification_outbox
+            WHERE request_id = ? ORDER BY created_at, kind
+            """,
+            (request_id,),
+        ).fetchall()
+    return [str(row["kind"]) for row in rows]
 
 
 def enqueue_approved(
@@ -344,6 +356,10 @@ async def test_post_boundary_errors_are_classified_without_retry(
     assert result.outcome.value == (
         "definite_failure" if expected_state == "failed" else "outcome_unknown"
     )
+    expected_notifications = ["new_pending"]
+    if expected_state == "outcome_unknown":
+        expected_notifications.append("outcome_unknown_entered")
+    assert notification_kinds(machine, f"error-{expected_state}") == expected_notifications
 
 
 @pytest.mark.asyncio
@@ -367,6 +383,10 @@ async def test_cancellation_after_boundary_records_unknown_and_propagates(
     request = machine.get_request("cancelled")
     assert request["state"] == "outcome_unknown"
     assert request["failure_reason"] == "dispatch_cancelled"
+    assert notification_kinds(machine, "cancelled") == [
+        "new_pending",
+        "outcome_unknown_entered",
+    ]
 
 
 @pytest.mark.asyncio
@@ -392,6 +412,10 @@ async def test_hard_exit_after_boundary_is_reconciled_without_another_send(
     assert recovered.routed_to_reconciliation == ("hard-exit",)
     assert client.calls == 1
     assert machine.get_request("hard-exit")["state"] == "outcome_unknown"
+    assert notification_kinds(machine, "hard-exit") == [
+        "new_pending",
+        "outcome_unknown_entered",
+    ]
 
 
 @pytest.mark.asyncio

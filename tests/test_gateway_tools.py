@@ -27,7 +27,6 @@ from signet.db import Database
 from signet.gateway_tools import (
     GATEWAY_TOOL_DEFINITIONS,
     AccessRequestDraft,
-    ApprovalNotification,
     GatewayPrincipal,
     GatewayTools,
     GatewayToolSurface,
@@ -102,14 +101,6 @@ class FakeSummaries:
     def get(self, request_id: str, *, version: int, payload_hash: str) -> SafeRequestSummary:
         self.calls.append((request_id, version, payload_hash))
         return self.values[request_id]
-
-
-class FakeNotifications:
-    def __init__(self) -> None:
-        self.queued: list[ApprovalNotification] = []
-
-    def enqueue(self, notification: ApprovalNotification) -> None:
-        self.queued.append(notification)
 
 
 class FakeTotpVerifier:
@@ -245,7 +236,6 @@ class Harness:
     machine: ApprovalStateMachine
     summaries: FakeSummaries
     totp: FakeTotpVerifier
-    notifications: FakeNotifications
     access_requests: FakeAccessRequests
     tools: GatewayTools
 
@@ -266,7 +256,11 @@ def machine(tmp_path: Path) -> ApprovalStateMachine:
             """,
             (NOW,),
         )
-    return ApprovalStateMachine(database, capabilities=TEST_CAPABILITIES)
+    return ApprovalStateMachine(
+        database,
+        capabilities=TEST_CAPABILITIES,
+        notification_user_id="human:one",
+    )
 
 
 def make_harness(
@@ -276,17 +270,15 @@ def make_harness(
 ) -> Harness:
     summaries = FakeSummaries()
     verifier = totp or FakeTotpVerifier()
-    notifications = FakeNotifications()
     access_requests = FakeAccessRequests(summaries)
     tools = GatewayTools(
         state_machine=machine,
         totp_verifier=verifier,
         summaries=summaries,
         access_requests=access_requests,
-        notifications=notifications,
         clock=lambda: NOW + 10,
     )
-    return Harness(machine, summaries, verifier, notifications, access_requests, tools)
+    return Harness(machine, summaries, verifier, access_requests, tools)
 
 
 def own_principal() -> GatewayPrincipal:
@@ -586,19 +578,26 @@ async def test_approve_binds_exact_revision_consumes_once_and_returns_safe_recei
         "version_hash_prefix": digest("body-one")[:12],
         "approval_notification_queued": True,
     }
-    assert harness.notifications.queued == [
-        ApprovalNotification(service="Fastmail", action="send_email", count=1)
-    ]
     assert machine.get_request("req_Approve")["state"] == "approved"
     with machine.database.read() as connection:
         consumed = connection.execute(
             "SELECT request_id, version, payload_hash, path FROM confirmation_consumptions"
         ).fetchall()
         attempts = connection.execute("SELECT * FROM execution_attempts").fetchall()
+        notifications = connection.execute(
+            """
+            SELECT kind, service, action FROM notification_outbox
+            WHERE request_id = 'req_Approve' ORDER BY created_at, kind
+            """
+        ).fetchall()
     assert [tuple(row) for row in consumed] == [
         ("req_Approve", 1, digest("body-one"), "mcp")
     ]
     assert attempts == []
+    assert [tuple(row) for row in notifications] == [
+        ("new_pending", "fastmail", "send_email"),
+        ("mcp_approved", "fastmail", "send_email"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -821,10 +820,12 @@ async def test_totp_failures_are_stable_errors_with_no_transition(
 
     assert error_code(result) == expected_code
     assert machine.get_request("req_Failure")["state"] == "pending_approval"
-    assert harness.notifications.queued == []
     with machine.database.read() as connection:
         assert connection.execute("SELECT * FROM confirmation_consumptions").fetchall() == []
         assert connection.execute("SELECT * FROM execution_attempts").fetchall() == []
+        assert connection.execute(
+            "SELECT count(*) FROM notification_outbox WHERE kind = 'mcp_approved'"
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.asyncio
@@ -839,7 +840,6 @@ async def test_failed_proofs_escalate_to_shared_lockout_without_state_change(
         totp_verifier=verifier,
         summaries=summaries,
         access_requests=FakeAccessRequests(summaries),
-        notifications=FakeNotifications(),
         clock=lambda: NOW + 10,
     )
     arguments = {

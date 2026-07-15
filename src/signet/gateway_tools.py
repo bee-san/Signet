@@ -299,28 +299,6 @@ class SafeSummaryProvider(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class ApprovalNotification:
-    """The complete payload allowed for an MCP-path approval notification."""
-
-    service: str
-    action: str
-    count: int = 1
-
-    def __post_init__(self) -> None:
-        if not self.service or not self.action or self.count < 1:
-            raise ValueError("invalid privacy-safe approval notification")
-
-
-class ApprovalNotificationSink(Protocol):
-    def enqueue(
-        self, notification: ApprovalNotification
-    ) -> None | Awaitable[None]:
-        """Durably queue a notification before returning successfully."""
-
-        ...
-
-
-@dataclass(frozen=True, slots=True)
 class AccessRequestDraft:
     """Gateway-internal policy proposal passed to the encrypted payload freezer."""
 
@@ -383,17 +361,17 @@ class GatewayTools:
         totp_verifier: TotpProofVerifier,
         summaries: SafeSummaryProvider,
         access_requests: AccessRequestFactory,
-        notifications: ApprovalNotificationSink,
         clock: Callable[[], int] | None = None,
         hash_prefix_length: int = 12,
     ) -> None:
         if hash_prefix_length < 8 or hash_prefix_length > 64:
             raise ValueError("version hash prefix length must be between 8 and 64")
+        if not state_machine.notifications_enabled:
+            raise ValueError("gateway approval tools require the transactional notification outbox")
         self._state_machine = state_machine
         self._totp = totp_verifier
         self._summaries = summaries
         self._access_requests = access_requests
-        self._notifications = notifications
         self._clock = clock or (lambda: int(time.time()))
         self._hash_prefix_length = hash_prefix_length
 
@@ -658,11 +636,6 @@ class GatewayTools:
             )
 
         self._totp.record_consumed_success(proof, now=now)
-        await _resolve(
-            self._notifications.enqueue(
-                ApprovalNotification(service=summary.service, action=request.tool)
-            )
-        )
         return _success_result(
             {
                 "status": "approved",

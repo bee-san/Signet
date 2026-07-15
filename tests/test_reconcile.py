@@ -136,7 +136,19 @@ class FakeAdapter:
 def machine(tmp_path: Path) -> ApprovalStateMachine:
     database = Database(tmp_path / "reconcile.sqlite3")
     database.initialize()
-    return ApprovalStateMachine(database)
+    return ApprovalStateMachine(database, notification_user_id="human:test")
+
+
+def notification_kinds(machine: ApprovalStateMachine, request_id: str) -> list[str]:
+    with machine.database.read() as connection:
+        rows = connection.execute(
+            """
+            SELECT kind FROM notification_outbox
+            WHERE request_id = ? ORDER BY created_at, kind
+            """,
+            (request_id,),
+        ).fetchall()
+    return [str(row["kind"]) for row in rows]
 
 
 def enqueue_approved(machine: ApprovalStateMachine, request_id: str) -> None:
@@ -235,6 +247,11 @@ async def test_confirmed_effect_uses_read_only_lookup_and_records_safe_alias(
     request = machine.get_request("effect")
     assert request["state"] == "succeeded"
     assert request["safe_outcome_json"] is not None
+    assert notification_kinds(machine, "effect") == [
+        "new_pending",
+        "outcome_unknown_entered",
+        "outcome_unknown_resolved",
+    ]
     with machine.database.read() as connection:
         alias = connection.execute(
             "SELECT identifier_kind, downstream_identifier FROM result_aliases"
@@ -261,6 +278,11 @@ async def test_confirmed_no_effect_without_key_is_terminal_and_never_redispatche
     assert run.redispatch is None
     assert [call[0] for call in provider.calls] == ["send", "lookup"]
     assert machine.get_request("no-key")["failure_reason"] == "reconciled_no_effect"
+    assert notification_kinds(machine, "no-key") == [
+        "new_pending",
+        "outcome_unknown_entered",
+        "outcome_unknown_resolved",
+    ]
 
 
 @pytest.mark.asyncio
@@ -324,6 +346,11 @@ async def test_inconclusive_schedule_exhausts_and_blocks_unreviewed_mutation(
             """
         ).fetchone()
     assert tuple(attempt) == (2, NOW + 5, 1)
+    assert notification_kinds(machine, "exhaust") == [
+        "new_pending",
+        "outcome_unknown_entered",
+        "outcome_unknown_exhausted",
+    ]
 
 
 @pytest.mark.asyncio

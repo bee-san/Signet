@@ -122,7 +122,7 @@ def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Pat
             "SELECT * FROM schema_meta ORDER BY migration_id"
         ).fetchall()
     assert tables >= CORE_TABLES
-    assert [migration["migration_id"] for migration in migrations] == [1, 2]
+    assert [migration["migration_id"] for migration in migrations] == [1, 2, 3]
     assert all(len(migration["checksum"]) == 64 for migration in migrations)
 
 

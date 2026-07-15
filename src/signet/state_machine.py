@@ -15,6 +15,7 @@ from .auth import (
     WEBAUTHN_PROOF_DOMAIN,
     ActionBinding,
     ProofCapability,
+    canonical_user_id,
     totp_proof_claims,
     totp_rate_limit_key,
     webauthn_proof_claims,
@@ -46,6 +47,8 @@ from .models import (
     ResultAlias,
     StaleVersion,
 )
+from .notification_outbox import enqueue_notification
+from .notifications import NotificationKind, PushMessage
 
 FaultInjector = Callable[[str], None]
 TokenFactory = Callable[[], str]
@@ -76,6 +79,7 @@ class ApprovalStateMachine:
         token_factory: TokenFactory | None = None,
         web_session_idle_timeout: int = 30 * 60,
         capabilities: ProofCapability | None = None,
+        notification_user_id: str | None = None,
     ) -> None:
         if web_session_idle_timeout <= 0:
             raise ValueError("web session idle timeout must be positive")
@@ -84,6 +88,15 @@ class ApprovalStateMachine:
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
         self._web_session_idle_timeout = web_session_idle_timeout
         self._capabilities = capabilities
+        self._notification_user_id = (
+            canonical_user_id(notification_user_id)
+            if notification_user_id is not None
+            else None
+        )
+
+    @property
+    def notifications_enabled(self) -> bool:
+        return self._notification_user_id is not None
 
     def enqueue(self, request: EnqueueRequest) -> EnqueueResult:
         """Durably enqueue or replay a caller-scoped invocation.
@@ -245,6 +258,15 @@ class ApprovalStateMachine:
                     request.created_at,
                     1,
                     request.payload_hash,
+                )
+                self._notification(
+                    connection,
+                    kind=NotificationKind.NEW_PENDING,
+                    request_id=request.request_id,
+                    service=request.downstream_alias,
+                    action=request.tool_name,
+                    now=request.created_at,
+                    dedupe_key=f"new_pending:{request.request_id}:1",
                 )
                 self._fault("enqueue:before_commit")
 
@@ -624,6 +646,16 @@ class ApprovalStateMachine:
                 expected_version,
                 expected_payload_hash,
             )
+            if confirmation.path == "mcp":
+                self._notification(
+                    connection,
+                    kind=NotificationKind.MCP_APPROVED,
+                    request_id=request_id,
+                    service=request["downstream_alias"],
+                    action=request["tool_name"],
+                    now=now,
+                    dedupe_key=f"mcp_approved:{request_id}:{expected_version}",
+                )
             self._fault("approve:before_commit")
 
     def _consume_confirmation(
@@ -1455,6 +1487,20 @@ class ApprovalStateMachine:
                 lease.payload_hash,
                 {"classification": classification.value},
             )
+            if request_state == RequestState.OUTCOME_UNKNOWN:
+                request = self._request_for_update(connection, lease.request_id)
+                self._notification(
+                    connection,
+                    kind=NotificationKind.OUTCOME_UNKNOWN_ENTERED,
+                    request_id=lease.request_id,
+                    service=request["downstream_alias"],
+                    action=request["tool_name"],
+                    now=now,
+                    dedupe_key=(
+                        f"outcome_unknown_entered:{lease.attempt_id}:"
+                        f"{lease.worker_generation}"
+                    ),
+                )
             self._fault("outcome:before_commit")
 
     def reconcile(
@@ -1655,6 +1701,31 @@ class ApprovalStateMachine:
                 request["current_payload_hash"],
                 {"decision": decision.value, "attempt": count},
             )
+            if decision in {
+                ReconciliationDecision.CONFIRMED_EFFECT,
+                ReconciliationDecision.CONFIRMED_NO_EFFECT,
+            }:
+                self._notification(
+                    connection,
+                    kind=NotificationKind.OUTCOME_UNKNOWN_RESOLVED,
+                    request_id=request_id,
+                    service=request["downstream_alias"],
+                    action=request["tool_name"],
+                    now=now,
+                    dedupe_key=(
+                        f"outcome_unknown_resolved:{attempt['attempt_id']}:{count}"
+                    ),
+                )
+            elif action == ReconciliationAction.EXHAUSTED:
+                self._notification(
+                    connection,
+                    kind=NotificationKind.OUTCOME_UNKNOWN_EXHAUSTED,
+                    request_id=request_id,
+                    service=request["downstream_alias"],
+                    action=request["tool_name"],
+                    now=now,
+                    dedupe_key=f"outcome_unknown_exhausted:{attempt['attempt_id']}",
+                )
             self._fault("reconciliation:before_commit")
 
         return ReconciliationResult(action=action, reconciliation_count=count, lease=lease)
@@ -1667,7 +1738,8 @@ class ApprovalStateMachine:
             attempts = connection.execute(
                 """
                 SELECT attempt.*, request.current_version,
-                       request.current_payload_hash, request.state
+                       request.current_payload_hash, request.state,
+                       request.downstream_alias, request.tool_name
                 FROM execution_attempts AS attempt
                 JOIN approval_requests AS request
                   ON request.request_id = attempt.request_id
@@ -1721,6 +1793,18 @@ class ApprovalStateMachine:
                     now,
                     attempt["current_version"],
                     attempt["current_payload_hash"],
+                )
+                self._notification(
+                    connection,
+                    kind=NotificationKind.OUTCOME_UNKNOWN_ENTERED,
+                    request_id=attempt["request_id"],
+                    service=attempt["downstream_alias"],
+                    action=attempt["tool_name"],
+                    now=now,
+                    dedupe_key=(
+                        f"outcome_unknown_entered:{attempt['attempt_id']}:"
+                        f"{attempt['worker_generation']}"
+                    ),
                 )
                 routed.append(attempt["request_id"])
             self._fault("startup_recovery:before_commit")
@@ -1956,6 +2040,28 @@ class ApprovalStateMachine:
             request["current_payload_hash"], expected_payload_hash
         ):
             raise StaleVersion(request["request_id"])
+
+    def _notification(
+        self,
+        connection: Any,
+        *,
+        kind: NotificationKind,
+        request_id: str,
+        service: str,
+        action: str,
+        now: int,
+        dedupe_key: str,
+    ) -> None:
+        if self._notification_user_id is None:
+            return
+        enqueue_notification(
+            connection,
+            dedupe_key=dedupe_key,
+            user_id=self._notification_user_id,
+            message=PushMessage(kind, service=service, action=action),
+            request_id=request_id,
+            created_at=now,
+        )
 
     @staticmethod
     def _event(
