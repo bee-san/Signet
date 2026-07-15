@@ -1,0 +1,348 @@
+"""Privacy-safe browser push messages and best-effort delivery."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import re
+import secrets
+import threading
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from enum import StrEnum
+from typing import Protocol
+from urllib.parse import urlsplit
+
+from pywebpush import WebPushException, webpush  # type: ignore[import-untyped]
+
+from signet.credential_broker import Secret
+
+_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-/]{0,63}$")
+_CATEGORY_VALUES = frozenset(
+    {
+        "new_pending",
+        "approaching_expiry",
+        "mcp_approved",
+        "outcome_unknown_entered",
+        "outcome_unknown_resolved",
+        "outcome_unknown_exhausted",
+        "daily_digest",
+    }
+)
+
+
+class NotificationKind(StrEnum):
+    NEW_PENDING = "new_pending"
+    APPROACHING_EXPIRY = "approaching_expiry"
+    MCP_APPROVED = "mcp_approved"
+    OUTCOME_UNKNOWN_ENTERED = "outcome_unknown_entered"
+    OUTCOME_UNKNOWN_RESOLVED = "outcome_unknown_resolved"
+    OUTCOME_UNKNOWN_EXHAUSTED = "outcome_unknown_exhausted"
+    DAILY_DIGEST = "daily_digest"
+
+
+@dataclass(frozen=True, slots=True)
+class PushMessage:
+    kind: NotificationKind
+    service: str | None = None
+    action: str | None = None
+    count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is NotificationKind.DAILY_DIGEST:
+            if (
+                self.count is None
+                or self.count < 0
+                or self.service is not None
+                or self.action is not None
+            ):
+                raise ValueError("daily digest requires only a non-negative count")
+            return
+        if (
+            self.service is None
+            or self.action is None
+            or not _LABEL_RE.fullmatch(self.service)
+            or not _LABEL_RE.fullmatch(self.action)
+            or self.count is not None
+        ):
+            raise ValueError("event notifications require bounded service and action labels")
+
+    def payload(self) -> dict[str, str | int]:
+        body_by_kind = {
+            NotificationKind.NEW_PENDING: "New request waiting for approval",
+            NotificationKind.APPROACHING_EXPIRY: "Request approaching expiry",
+            NotificationKind.MCP_APPROVED: "Request approved via chat and dispatched",
+            NotificationKind.OUTCOME_UNKNOWN_ENTERED: "Delivery outcome needs attention",
+            NotificationKind.OUTCOME_UNKNOWN_RESOLVED: "Unknown delivery outcome resolved",
+            NotificationKind.OUTCOME_UNKNOWN_EXHAUSTED: "Delivery reconciliation exhausted",
+        }
+        payload: dict[str, str | int] = {
+            "title": "Signet",
+            "kind": self.kind.value,
+            "tag": f"signet-{self.kind.value}",
+            "url": "/",
+        }
+        if self.kind is NotificationKind.DAILY_DIGEST:
+            assert self.count is not None
+            payload.update(
+                {
+                    "body": f"{self.count} requests waiting for approval",
+                    "count": self.count,
+                }
+            )
+        else:
+            assert self.service is not None and self.action is not None
+            payload.update(
+                {
+                    "body": body_by_kind[self.kind],
+                    "service": self.service,
+                    "action": self.action,
+                }
+            )
+        return payload
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PushSubscription:
+    subscription_id: str
+    user_id: str
+    endpoint: str
+    p256dh: str
+    auth: str
+    device_label: str
+    categories: frozenset[NotificationKind]
+    created_at: int
+    failure_count: int = 0
+    disabled_at: int | None = None
+
+    def __repr__(self) -> str:
+        return (
+            "PushSubscription("
+            f"subscription_id={self.subscription_id!r}, user_id={self.user_id!r}, "
+            "endpoint=<redacted>, keys=<redacted>, "
+            f"device_label={self.device_label!r}, failure_count={self.failure_count!r}, "
+            f"disabled_at={self.disabled_at!r})"
+        )
+
+
+class PushRepository(Protocol):
+    def save(self, subscription: PushSubscription) -> None: ...
+
+    def active_for(self, user_id: str, kind: NotificationKind) -> tuple[PushSubscription, ...]: ...
+
+    def mark_success(self, subscription_id: str, *, now: int) -> None: ...
+
+    def mark_failure(self, subscription_id: str, *, now: int, disable_after: int) -> None: ...
+
+    def unsubscribe(self, user_id: str, endpoint: str, *, now: int) -> bool: ...
+
+
+class InMemoryPushRepository:
+    def __init__(self) -> None:
+        self._records: dict[str, PushSubscription] = {}
+        self._lock = threading.Lock()
+
+    def save(self, subscription: PushSubscription) -> None:
+        _validate_subscription(subscription)
+        with self._lock:
+            existing_id = next(
+                (
+                    record.subscription_id
+                    for record in self._records.values()
+                    if record.endpoint == subscription.endpoint
+                ),
+                None,
+            )
+            if existing_id is not None and existing_id != subscription.subscription_id:
+                del self._records[existing_id]
+            self._records[subscription.subscription_id] = subscription
+
+    def active_for(self, user_id: str, kind: NotificationKind) -> tuple[PushSubscription, ...]:
+        with self._lock:
+            return tuple(
+                record
+                for record in self._records.values()
+                if record.user_id == user_id
+                and record.disabled_at is None
+                and (not record.categories or kind in record.categories)
+            )
+
+    def mark_success(self, subscription_id: str, *, now: int) -> None:
+        del now
+        with self._lock:
+            record = self._records.get(subscription_id)
+            if record is not None and record.disabled_at is None:
+                self._records[subscription_id] = replace(record, failure_count=0)
+
+    def mark_failure(self, subscription_id: str, *, now: int, disable_after: int) -> None:
+        with self._lock:
+            record = self._records.get(subscription_id)
+            if record is None or record.disabled_at is not None:
+                return
+            failures = record.failure_count + 1
+            self._records[subscription_id] = replace(
+                record,
+                failure_count=failures,
+                disabled_at=now if failures >= disable_after else None,
+            )
+
+    def unsubscribe(self, user_id: str, endpoint: str, *, now: int) -> bool:
+        with self._lock:
+            for identifier, record in self._records.items():
+                if record.user_id == user_id and record.endpoint == endpoint:
+                    self._records[identifier] = replace(record, disabled_at=now)
+                    return True
+        return False
+
+    def get(self, subscription_id: str) -> PushSubscription | None:
+        with self._lock:
+            return self._records.get(subscription_id)
+
+
+class PushTransport(Protocol):
+    async def send(
+        self,
+        subscription: PushSubscription,
+        payload: Mapping[str, str | int],
+    ) -> None: ...
+
+
+class WebPushTransport:
+    """Production pywebpush transport with injected VAPID private material."""
+
+    def __init__(self, vapid_private_key: Secret, *, subject: str) -> None:
+        parsed = urlsplit(subject)
+        if not (
+            subject.startswith("mailto:")
+            or (parsed.scheme == "https" and parsed.netloc and not parsed.username)
+        ):
+            raise ValueError("VAPID subject must be mailto: or an HTTPS URL")
+        self._key = vapid_private_key
+        self.subject = subject
+
+    async def send(
+        self,
+        subscription: PushSubscription,
+        payload: Mapping[str, str | int],
+    ) -> None:
+        serialized = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":"))
+
+        def deliver() -> None:
+            try:
+                webpush(
+                    subscription_info={
+                        "endpoint": subscription.endpoint,
+                        "keys": {"p256dh": subscription.p256dh, "auth": subscription.auth},
+                    },
+                    data=serialized,
+                    vapid_private_key=self._key.reveal(),
+                    vapid_claims={"sub": self.subject},
+                    timeout=10,
+                )
+            except WebPushException as exc:
+                raise PushDeliveryError("browser push delivery failed") from exc
+
+        await asyncio.to_thread(deliver)
+
+    def __repr__(self) -> str:
+        return f"WebPushTransport(subject={self.subject!r}, vapid_private_key=<redacted>)"
+
+
+class PushDeliveryError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationReport:
+    attempted: int
+    delivered: int
+    failed: int
+
+
+class NotificationDispatcher:
+    """Deliver after state commits; per-device failures never escape this boundary."""
+
+    def __init__(
+        self,
+        repository: PushRepository,
+        transport: PushTransport,
+        *,
+        disable_after: int = 5,
+    ) -> None:
+        if disable_after < 1 or disable_after > 100:
+            raise ValueError("push disable threshold must be between 1 and 100")
+        self._repository = repository
+        self._transport = transport
+        self.disable_after = disable_after
+
+    async def notify(self, user_id: str, message: PushMessage, *, now: int) -> NotificationReport:
+        subscriptions = self._repository.active_for(user_id, message.kind)
+        payload = message.payload()
+        delivered = 0
+        for subscription in subscriptions:
+            try:
+                await self._transport.send(subscription, payload)
+            except Exception:
+                self._repository.mark_failure(
+                    subscription.subscription_id,
+                    now=now,
+                    disable_after=self.disable_after,
+                )
+            else:
+                delivered += 1
+                self._repository.mark_success(subscription.subscription_id, now=now)
+        return NotificationReport(
+            attempted=len(subscriptions),
+            delivered=delivered,
+            failed=len(subscriptions) - delivered,
+        )
+
+
+def new_subscription(
+    *,
+    user_id: str,
+    endpoint: str,
+    p256dh: str,
+    auth: str,
+    device_label: str,
+    categories: frozenset[NotificationKind] = frozenset(),
+    created_at: int,
+) -> PushSubscription:
+    record = PushSubscription(
+        subscription_id=f"push_{secrets.token_urlsafe(18)}",
+        user_id=user_id,
+        endpoint=endpoint,
+        p256dh=p256dh,
+        auth=auth,
+        device_label=device_label,
+        categories=categories,
+        created_at=created_at,
+    )
+    _validate_subscription(record)
+    return record
+
+
+def _validate_subscription(subscription: PushSubscription) -> None:
+    parsed = urlsplit(subscription.endpoint)
+    if (
+        not subscription.subscription_id
+        or not subscription.user_id
+        or len(subscription.user_id) > 256
+        or parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or len(subscription.endpoint) > 4096
+        or not subscription.device_label
+        or len(subscription.device_label) > 80
+        or subscription.failure_count < 0
+        or any(kind.value not in _CATEGORY_VALUES for kind in subscription.categories)
+    ):
+        raise ValueError("invalid push subscription")
+    for value in (subscription.p256dh, subscription.auth):
+        if not value or len(value) > 512:
+            raise ValueError("invalid push subscription key")
+        try:
+            base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        except (ValueError, TypeError):
+            raise ValueError("invalid push subscription key") from None
