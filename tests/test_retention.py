@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -16,6 +18,7 @@ from signet.models import (
 )
 from signet.retention import (
     BackupPinConflict,
+    BackupPinLease,
     BackupPins,
     PurgeIntent,
     RetentionError,
@@ -1300,6 +1303,152 @@ def test_attachment_purge_verifies_hash_and_path_and_stores_only_generic_error(
     assert outside.exists()
 
 
+def test_purge_retry_status_matches_failure_backoff_and_due_replay(
+    database: Database, staging: StagingStore
+) -> None:
+    staged = _stage(staging, "retry-status")
+    _request(
+        database,
+        request_id="retry-status",
+        state=RequestState.DENIED,
+        staged=staged,
+    )
+    failed_once = False
+
+    def fail_after_unlink(stage: str) -> None:
+        nonlocal failed_once
+        if stage == "attachment_unlinked" and not failed_once:
+            failed_once = True
+            raise RuntimeError("synthetic worker failure")
+
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(
+            payload_delays={state: 0 for state in _PURGEABLE_FIXTURE_STATES},
+        ),
+        claim_lease_seconds=10,
+        retry_delay_seconds=60,
+        fault_injector=fail_after_unlink,
+    )
+    assert manager.schedule(now=COMPLETED_AT) == 2
+    with database.read() as connection:
+        keys = tuple(
+            str(row["idempotency_key"])
+            for row in connection.execute(
+                """
+                SELECT idempotency_key FROM purge_jobs
+                WHERE request_id = 'retry-status' AND intent != 'backup_pin'
+                ORDER BY intent
+                """
+            ).fetchall()
+        )
+
+    failed = manager.claim_due(now=COMPLETED_AT, request_id="retry-status")
+    assert failed is not None and failed.intent is PurgeIntent.ATTACHMENTS
+    assert manager.process(failed, now=COMPLETED_AT) is False
+    remaining = manager.claim_due(now=COMPLETED_AT, request_id="retry-status")
+    assert remaining is not None and remaining.intent is PurgeIntent.SENSITIVE_ROWS
+    assert manager.process(remaining, now=COMPLETED_AT)
+
+    status = manager.pending_retry_status(idempotency_keys=keys, now=COMPLETED_AT)
+    assert status is not None
+    assert status.reason == "worker_failure"
+    assert status.retry_after == 60
+    assert manager.claim_due(now=COMPLETED_AT + 59, request_id="retry-status") is None
+    early = manager.pending_retry_status(
+        idempotency_keys=keys,
+        now=COMPLETED_AT + 59,
+    )
+    assert early is not None and early.retry_after == 1
+
+    replay = manager.claim_due(now=COMPLETED_AT + 60, request_id="retry-status")
+    assert replay is not None and replay.intent is PurgeIntent.ATTACHMENTS
+    assert manager.process(replay, now=COMPLETED_AT + 60)
+    assert manager.pending_retry_status(idempotency_keys=keys, now=COMPLETED_AT + 60) is None
+
+
+def test_purge_retry_status_matches_strict_abandoned_claim_lease(
+    database: Database, staging: StagingStore
+) -> None:
+    staged = _stage(staging, "claim-retry-status")
+    _request(
+        database,
+        request_id="claim-retry-status",
+        state=RequestState.DENIED,
+        staged=staged,
+    )
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(
+            payload_delays={state: 0 for state in _PURGEABLE_FIXTURE_STATES},
+        ),
+        claim_lease_seconds=10,
+    )
+    assert manager.schedule(now=COMPLETED_AT) == 2
+    with database.read() as connection:
+        keys = tuple(
+            str(row["idempotency_key"])
+            for row in connection.execute(
+                """
+                SELECT idempotency_key FROM purge_jobs
+                WHERE request_id = 'claim-retry-status' AND intent != 'backup_pin'
+                ORDER BY intent
+                """
+            ).fetchall()
+        )
+    abandoned = manager.claim_due(now=COMPLETED_AT, request_id="claim-retry-status")
+    assert abandoned is not None
+
+    active = manager.pending_retry_status(idempotency_keys=keys, now=COMPLETED_AT)
+    assert active is not None
+    assert active.reason == "claim_lease_active"
+    assert active.retry_after == 11
+    assert manager.claim_due(now=COMPLETED_AT + 10, request_id="claim-retry-status") is None
+    boundary = manager.pending_retry_status(
+        idempotency_keys=keys,
+        now=COMPLETED_AT + 10,
+    )
+    assert boundary is not None and boundary.retry_after == 1
+    reclaimed = manager.claim_due(now=COMPLETED_AT + 11, request_id="claim-retry-status")
+    assert reclaimed is not None and reclaimed.purge_job_id == abandoned.purge_job_id
+    assert manager.process(reclaimed, now=COMPLETED_AT + 11)
+
+
+def test_purge_retry_status_rejects_unbounded_keys_and_never_echoes_unsafe_errors(
+    database: Database, staging: StagingStore
+) -> None:
+    _request(database, request_id="retry-status-safe", state=RequestState.DENIED)
+    manager = RetentionManager(database, staging, matrix=_matrix())
+    assert manager.schedule(now=COMPLETED_AT) == 1
+    with database.transaction() as connection:
+        job = connection.execute(
+            """
+            SELECT idempotency_key FROM purge_jobs
+            WHERE request_id = 'retry-status-safe'
+            """
+        ).fetchone()
+        connection.execute(
+            """
+            UPDATE purge_jobs SET created_at = ?, last_error = ?
+            WHERE idempotency_key = ?
+            """,
+            (COMPLETED_AT + 5, "private/path\noperator-secret", job["idempotency_key"]),
+        )
+    status = manager.pending_retry_status(
+        idempotency_keys=(str(job["idempotency_key"]),),
+        now=COMPLETED_AT,
+    )
+    assert status is not None
+    assert status.reason == "retry_backoff"
+    assert status.retry_after == 5
+    assert "private" not in repr(status)
+    for invalid in ((), ("",), ("x" * 1_025,), tuple("x" for _ in range(17))):
+        with pytest.raises(ValueError, match="keys are invalid"):
+            manager.pending_retry_status(idempotency_keys=invalid, now=COMPLETED_AT)
+
+
 def test_attachment_unlink_before_database_commit_recovers_after_restart(
     database: Database, staging: StagingStore
 ) -> None:
@@ -1406,6 +1555,114 @@ def test_abandoned_backup_pin_requires_explicit_release_after_restart(
     )
     claim = restarted_manager.claim_due(now=COMPLETED_AT + 10_000)
     assert claim is not None
+
+
+def test_authorization_and_backup_pin_creation_are_atomic_across_threads(
+    database: Database, staging: StagingStore
+) -> None:
+    request_id = "unknown-threaded-pin-race"
+    payload_hash = _exhausted_unknown(
+        database,
+        request_id=request_id,
+        staged=_stage(staging, "unknown-threaded-pin-race"),
+    )
+    _request(
+        database,
+        request_id="threaded-unrelated-pin-target",
+        state=RequestState.PENDING_APPROVAL,
+    )
+    barrier = Barrier(2)
+
+    def authorize() -> bool:
+        manager = RetentionManager(
+            Database(database.path),
+            staging,
+            matrix=_matrix(),
+            allow_fake_only_unknown_purge=True,
+        )
+        barrier.wait()
+        try:
+            manager.authorize_fake_only_exhausted_unknown_purge(
+                request_id=request_id,
+                expected_version=1,
+                expected_payload_hash=payload_hash,
+                acknowledge_possible_external_effect=True,
+                now=COMPLETED_AT,
+            )
+        except RetentionError as exc:
+            assert str(exc) == "fake-only purge cannot start while a backup is active"
+            return False
+        return True
+
+    def pin() -> BackupPinLease | None:
+        pins = BackupPins(Database(database.path))
+        barrier.wait()
+        try:
+            return pins.acquire(now=COMPLETED_AT)
+        except BackupPinConflict as exc:
+            assert str(exc) == "attachment purge is already in progress"
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        authorization_future = pool.submit(authorize)
+        pin_future = pool.submit(pin)
+        authorized = authorization_future.result(timeout=10)
+        lease = pin_future.result(timeout=10)
+
+    assert authorized is (lease is None)
+    with database.read() as connection:
+        authorized_events = connection.execute(
+            """
+            SELECT count(*) FROM request_events
+            WHERE request_id = ?
+              AND action = 'fake_only_unknown_content_purge_authorized'
+            """,
+            (request_id,),
+        ).fetchone()[0]
+        purge_jobs = connection.execute(
+            """
+            SELECT count(*) FROM purge_jobs
+            WHERE request_id = ? AND intent != 'backup_pin'
+            """,
+            (request_id,),
+        ).fetchone()[0]
+    if authorized:
+        assert authorized_events == 1
+        assert purge_jobs == 2
+        manager = RetentionManager(
+            Database(database.path),
+            staging,
+            matrix=_matrix(),
+            allow_fake_only_unknown_purge=True,
+        )
+        while claim := manager.claim_due(now=COMPLETED_AT, request_id=request_id):
+            assert manager.process(claim, now=COMPLETED_AT)
+        post_purge_pins = BackupPins(Database(database.path))
+        post_purge_lease = post_purge_pins.acquire(now=COMPLETED_AT + 1)
+        assert post_purge_lease.request_ids == ("threaded-unrelated-pin-target",)
+        post_purge_pins.release(post_purge_lease, now=COMPLETED_AT + 2)
+    else:
+        assert lease is not None
+        assert authorized_events == 0
+        assert purge_jobs == 0
+        restarted_pins = BackupPins(Database(database.path))
+        restarted_pins.release(lease, now=COMPLETED_AT + 1)
+        restarted_manager = RetentionManager(
+            Database(database.path),
+            staging,
+            matrix=_matrix(),
+            allow_fake_only_unknown_purge=True,
+        )
+        assert (
+            restarted_manager.authorize_fake_only_exhausted_unknown_purge(
+                request_id=request_id,
+                expected_version=1,
+                expected_payload_hash=payload_hash,
+                acknowledge_possible_external_effect=True,
+                now=COMPLETED_AT + 1,
+            )
+            == 2
+        )
 
 
 _PURGEABLE_FIXTURE_STATES = {

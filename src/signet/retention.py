@@ -136,6 +136,14 @@ class PurgeRunReport:
 
 
 @dataclass(frozen=True, slots=True)
+class PurgeRetryStatus:
+    """Safe operator guidance derived from incomplete purge job clocks."""
+
+    reason: str
+    retry_after: int
+
+
+@dataclass(frozen=True, slots=True)
 class BackupPinLease:
     group_id: str
     purge_job_ids: tuple[str, ...]
@@ -699,6 +707,56 @@ class RetentionManager:
                 failed += 1
         return PurgeRunReport(scheduled, claimed, completed, failed)
 
+    def pending_retry_status(
+        self,
+        *,
+        idempotency_keys: tuple[str, ...],
+        now: int,
+    ) -> PurgeRetryStatus | None:
+        """Return bounded guidance for an exact set of incomplete purge jobs."""
+
+        _validate_time(now, "purge retry status time")
+        if (
+            not isinstance(idempotency_keys, tuple)
+            or not idempotency_keys
+            or len(idempotency_keys) > 16
+            or any(
+                not isinstance(key, str) or not key or len(key) > 1_024 for key in idempotency_keys
+            )
+        ):
+            raise ValueError("purge retry status keys are invalid")
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """
+                SELECT created_at, started_at, last_error
+                FROM purge_jobs
+                WHERE idempotency_key IN (SELECT value FROM json_each(?))
+                  AND intent != 'backup_pin' AND completed_at IS NULL
+                """,
+                (json.dumps(idempotency_keys, separators=(",", ":")),),
+            ).fetchall()
+        if not rows:
+            return None
+
+        blockers: list[tuple[int, str]] = []
+        for row in rows:
+            started_at = row["started_at"]
+            if isinstance(started_at, int):
+                retry_at = started_at // _MICROSECONDS + self.claim_lease_seconds + 1
+                reason = "claim_lease_active" if retry_at > now else "purge_incomplete"
+            else:
+                created_at = row["created_at"]
+                retry_at = int(created_at) if isinstance(created_at, int) else now + 1
+                last_error = row["last_error"]
+                if isinstance(last_error, str) and _SAFE_ERROR_RE.fullmatch(last_error):
+                    reason = last_error
+                else:
+                    reason = "retry_backoff" if retry_at > now else "purge_incomplete"
+            blockers.append((retry_at, reason))
+
+        retry_at, reason = max(blockers, key=lambda blocker: blocker[0])
+        return PurgeRetryStatus(reason=reason, retry_after=max(1, retry_at - now))
+
     def _purge_attachments(self, claim: PurgeClaim, *, now: int) -> None:
         with self.database.transaction() as connection:
             self._ensure_claim(connection, claim)
@@ -1102,14 +1160,7 @@ class RetentionManager:
         ).fetchone()
         if row is None or row["request_id"] != request_id or row["intent"] != intent.value:
             raise RetentionError("fake-only purge job identity conflicts with durable state")
-        if row["completed_at"] is None and row["started_at"] is None:
-            connection.execute(
-                """
-                UPDATE purge_jobs SET created_at = MIN(created_at, ?), last_error = NULL
-                WHERE idempotency_key = ? AND started_at IS NULL AND completed_at IS NULL
-                """,
-                (now, idempotency_key),
-            )
+        # An authorized replay must not erase a worker failure or bypass its backoff.
         return inserted
 
     @staticmethod
