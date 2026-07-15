@@ -615,8 +615,8 @@ class RetentionManager:
                 SELECT request_id FROM payload_versions
                 WHERE encryption_key_ref = ?
                 UNION
-                SELECT consumed_request_id AS request_id FROM staged_objects
-                WHERE encryption_key_ref = ? AND consumed_request_id IS NOT NULL
+                SELECT COALESCE(consumed_request_id, '') AS request_id FROM staged_objects
+                WHERE encryption_key_ref = ?
                 """,
                 (reference, reference),
             ).fetchall()

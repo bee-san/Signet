@@ -18,7 +18,7 @@ from signet.retention import (
 )
 from signet.staging import StagedFile, StagingStore
 from signet.state_machine import ApprovalStateMachine
-from tests.attachment_fixtures import attachment_cipher
+from tests.attachment_fixtures import FAKE_ATTACHMENT_KEY_REF, attachment_cipher
 
 DAY = 24 * 60 * 60
 COMPLETED_AT = 1_000
@@ -456,6 +456,78 @@ def test_shared_key_ref_is_refused_without_calling_destroyer_or_leaking_details(
         row = _payload_rows(database, f"shared-{suffix}")[0]
         assert row["key_destroyed_at"] is None
         assert row["encryption_key_ref"] == shared
+
+
+def test_isolated_purge_destroys_payload_and_attachment_keys_after_unlink(
+    database: Database, staging: StagingStore
+) -> None:
+    staged = _stage(staging, "isolated-attachment")
+    payload_key = "keychain://Signet/fake-isolated-payload"
+    _request(
+        database,
+        request_id="isolated-attachment",
+        state=RequestState.DENIED,
+        staged=staged,
+        key_reference=payload_key,
+    )
+    destroyer = FakeKeyDestroyer()
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(payload_delays={state: 0 for state in _PURGEABLE_FIXTURE_STATES}),
+        mode=RetentionMode.ISOLATED_PER_REQUEST_KEY,
+        key_destroyer=destroyer,
+    )
+
+    report = manager.run_due(now=COMPLETED_AT)
+    assert report.completed == 3
+    assert {call[0] for call in destroyer.calls} == {
+        payload_key,
+        FAKE_ATTACHMENT_KEY_REF,
+    }
+    assert not staged.path.exists()
+    with database.read() as connection:
+        catalog = connection.execute(
+            """
+            SELECT storage_path, encryption_key_ref, purged_at, key_destroyed_at
+            FROM staged_objects WHERE attachment_id = ?
+            """,
+            (staged.opaque_id,),
+        ).fetchone()
+    assert tuple(catalog) == (None, None, COMPLETED_AT, COMPLETED_AT)
+
+
+def test_isolated_key_destruction_refuses_a_ref_used_by_unconsumed_staging(
+    database: Database, staging: StagingStore
+) -> None:
+    _stage(staging, "unconsumed-shared-key")
+    _request(
+        database,
+        request_id="payload-sharing-staging-key",
+        state=RequestState.DENIED,
+        key_reference=FAKE_ATTACHMENT_KEY_REF,
+    )
+    destroyer = FakeKeyDestroyer()
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(payload_delays={state: 0 for state in _PURGEABLE_FIXTURE_STATES}),
+        mode=RetentionMode.ISOLATED_PER_REQUEST_KEY,
+        key_destroyer=destroyer,
+    )
+
+    report = manager.run_due(now=COMPLETED_AT)
+    assert report.failed == 1
+    assert destroyer.calls == []
+    with database.read() as connection:
+        error = connection.execute(
+            """
+            SELECT last_error FROM purge_jobs
+            WHERE request_id = 'payload-sharing-staging-key'
+              AND intent = 'encryption_key'
+            """
+        ).fetchone()[0]
+    assert error == "key_reference_shared"
 
 
 def test_attachment_purge_verifies_hash_and_path_and_stores_only_generic_error(
