@@ -415,6 +415,7 @@ class DemoWorkers:
         retention: RetentionManager,
         notifications: NotificationOutboxWorker,
         *,
+        serve_root: Path,
         interval_seconds: float = 0.25,
         maintenance_interval_seconds: int = 60,
         delivery_batch: int = 16,
@@ -437,6 +438,7 @@ class DemoWorkers:
         self.reconciliation = reconciliation
         self.retention = retention
         self.notifications = notifications
+        self.serve_root = serve_root
         self.interval_seconds = interval_seconds
         self.maintenance_interval_seconds = maintenance_interval_seconds
         self.delivery_batch = delivery_batch
@@ -448,6 +450,10 @@ class DemoWorkers:
     async def serve(self, stop: asyncio.Event) -> None:
         if not isinstance(stop, asyncio.Event):
             raise TypeError("demo workers require an asyncio stop event")
+        with self._serve_lock():
+            await self._serve_locked(stop)
+
+    async def _serve_locked(self, stop: asyncio.Event) -> None:
         self._stopped = False
         try:
             while not stop.is_set():
@@ -477,6 +483,11 @@ class DemoWorkers:
         finally:
             self._stopped = True
             stop.set()
+
+    @contextmanager
+    def _serve_lock(self) -> Iterator[None]:
+        with _demo_server_lock(self.serve_root):
+            yield
 
     def healthy(self) -> bool:
         """Return coarse readiness without exposing request or maintenance data."""
@@ -870,6 +881,7 @@ def build_demo(
         reconciliation,
         retention,
         notification_worker,
+        serve_root=demo_root,
     )
     web.state.signet_health_probe = workers.healthy
     _attach_worker_lifespan(web, workers)
@@ -1023,11 +1035,15 @@ async def serve_demo(
     web_port: int = DEFAULT_WEB_PORT,
 ) -> None:
     demo_root, _state, _secrets = _load_demo(root)
+    # Preserve a direct, bounded CLI error for the common already-running case.
+    # The worker lifespan acquires the authoritative lock again before it can
+    # recover or dispatch, so a concurrent startup race still fails closed.
     with _demo_server_lock(demo_root):
-        await _serve_demo_locked(demo_root, mcp_port=mcp_port, web_port=web_port)
+        pass
+    await _serve_demo_process(demo_root, mcp_port=mcp_port, web_port=web_port)
 
 
-async def _serve_demo_locked(
+async def _serve_demo_process(
     root: Path,
     *,
     mcp_port: int,
@@ -1738,12 +1754,16 @@ def _attach_worker_lifespan(app: FastAPI, workers: DemoWorkers) -> None:
     async def lifespan(selected: FastAPI) -> AsyncIterator[None]:
         async with original(selected):
             stop = asyncio.Event()
-            task = asyncio.create_task(workers.serve(stop), name="signet-demo-workers")
-            try:
-                yield
-            finally:
-                stop.set()
-                await task
+            with workers._serve_lock():
+                task = asyncio.create_task(
+                    workers._serve_locked(stop),
+                    name="signet-demo-workers",
+                )
+                try:
+                    yield
+                finally:
+                    stop.set()
+                    await task
 
     app.router.lifespan_context = lifespan
 
