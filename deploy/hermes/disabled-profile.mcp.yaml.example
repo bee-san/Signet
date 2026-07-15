@@ -1,5 +1,5 @@
-# Review and merge this one server only into the intended disabled-staging profile.
-# Store the one-time token output in that profile's mode-0600 .env, never here.
+# Private-copy and validate this one route with configure-disabled-profile.py.
+# The helper streams the one-time token into the dedicated profile's .env, never here.
 mcp_servers:
   signet_disabled_approvals:
     url: "http://127.0.0.1:8789/mcp/approvals"

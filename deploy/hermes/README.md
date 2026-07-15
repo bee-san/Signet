@@ -7,10 +7,11 @@ version with `hermes --version` and `hermes mcp --help` before a reviewed change
 Hermes is external software and its interface may change.
 
 Hermes' official standard source installer includes its `mcp` extra. A PyPI
-installation must request that extra explicitly; the integration was independently
-validated with `hermes-agent[mcp]==0.16.0`. Bare `hermes-agent==0.16.0` lacks the
-MCP SDK. Do not install an arbitrary standalone `mcp` version around Hermes' pinned
-dependency contract.
+installation must request that extra explicitly. The procedures below were
+independently exercised with `hermes-agent[mcp]==0.18.2` and retain compatibility
+with `hermes-agent[mcp]==0.16.0`. A bare PyPI install lacks the MCP SDK. Do not
+install an arbitrary standalone `mcp` version around Hermes' pinned dependency
+contract. Revalidate this guide before using another release.
 
 ## Disposable no-live demo
 
@@ -38,19 +39,25 @@ is running, create an isolated blank profile and locate its files:
 hermes profile create signet-demo --no-alias --no-skills
 export SIGNET_DEMO_HERMES_CONFIG="$(hermes -p signet-demo config path)"
 export SIGNET_DEMO_HERMES_ENV="$(hermes -p signet-demo config env-path)"
-for path in "$SIGNET_DEMO_HERMES_CONFIG" "$SIGNET_DEMO_HERMES_ENV"; do
-  if test -e "$path"; then
-    printf 'refusing to overwrite existing Hermes profile file: %s\n' "$path" >&2
-    exit 1
-  fi
-done
+if test -e "$SIGNET_DEMO_HERMES_CONFIG" || test -L "$SIGNET_DEMO_HERMES_CONFIG"; then
+  printf 'refusing existing Hermes config: %s\n' "$SIGNET_DEMO_HERMES_CONFIG" >&2
+  exit 1
+fi
 install -m 0600 /dev/null "$SIGNET_DEMO_HERMES_CONFIG"
-install -m 0600 /dev/null "$SIGNET_DEMO_HERMES_ENV"
+if test -L "$SIGNET_DEMO_HERMES_ENV"; then
+  printf 'refusing linked Hermes environment: %s\n' "$SIGNET_DEMO_HERMES_ENV" >&2
+  exit 1
+fi
+if ! test -e "$SIGNET_DEMO_HERMES_ENV"; then
+  install -m 0600 /dev/null "$SIGNET_DEMO_HERMES_ENV"
+fi
 ```
 
-Hermes Agent v0.16.0 reports the paths but does not create these files. The
-preflight checks therefore stop on either existing path before `install` creates
-the two blank mode-`0600` files.
+Hermes Agent v0.16.0 reports both paths without creating either file. Version
+v0.18.2 still leaves `config.yaml` absent but creates a mode-`0600`, comment-only
+`.env`. The branch above preserves that reviewed seed file; the configurator checks
+its content, ownership, mode, link count, and identity before changing it. Stop if
+the profile name already existed or either check rejects its file.
 
 Generate a mode-`0600` private fragment, then use
 `configure-demo-profile.py`. The helper performs a structured merge only when the
@@ -82,13 +89,13 @@ hermes -p signet-demo mcp list
 ```
 
 The deliberately minimal profile can produce a successful `config check` with a
-config-version update advisory. Do not run `config migrate` for this demo: it
-expands the blank file into broad release defaults. Keep the disposable profile's
-environment free of live provider keys and other credentials because omitted
-settings inherit Hermes defaults.
+`Config version: 0 -> N (update available)` advisory; `N` is release-specific. Do
+not run `config migrate` for this demo: it expands the blank file into broad release
+defaults. Keep the disposable profile's environment free of live provider keys and
+other credentials because omitted settings inherit Hermes defaults.
 
 The three connection tests also preflight streamable-HTTP support and must report
-`3`, `3`, and `4` discovered tools respectively. If Hermes reports that
+`4`, `3`, and `4` discovered tools respectively. If Hermes reports that
 `mcp.client.streamable_http` is unavailable, reinstall the reviewed Hermes release
 with its `[mcp]` extra or use the official standard installer; do not independently
 upgrade the SDK.
@@ -107,21 +114,99 @@ absent, not merely hidden. The disabled approval server lists the five normative
 gateway schemas, but every call returns `deployment_disabled` and creates no local
 request or external action.
 
-First create and validate disabled state using `docs/deployment.md`, start
-`signet deployment serve-mcp`, and issue a token for the profile's exact namespace.
-The issue command prints the raw value once. In a human-reviewed shell, direct that
-stdout into the profile's mode-`0600` secret-ingest procedure as
-`SIGNET_DISABLED_MCP_CALLER_TOKEN`; do not place the value in argv, `config.yaml`, a
-diff, terminal output, chat, or a prompt. The checked-in demo configurator refuses
-non-fake tokens and therefore cannot be used for this persistent profile.
-
-Make a private backup of the selected Hermes `config.yaml` and `.env`, perform a
-structured merge of only the reviewed example, and validate without a model call:
+Use one new dedicated profile with the default disabled MCP port `8789`. Set
+`SIGNET_DISABLED_PROFILE=signet-disabled` before the `deployment init` sequence in
+`docs/deployment.md`; that binds the one supported caller namespace to
+`profile:signet-disabled`. Do not reuse or clone an existing Hermes profile. From
+the repository root, prepare the profile and a private copy of the reviewed fragment:
 
 ```console
-hermes -p PROFILE config check
-hermes -p PROFILE mcp test signet_disabled_approvals
-hermes -p PROFILE mcp list
+export SIGNET_DISABLED_PROFILE=signet-disabled
+export SIGNET_DISABLED_CONFIG="$HOME/.hermes/services/signet/config/disabled.json"
+hermes --version
+hermes mcp --help
+hermes profile list
+hermes profile create "$SIGNET_DISABLED_PROFILE" --no-alias --no-skills
+export SIGNET_DISABLED_HERMES_CONFIG="$(
+  hermes -p "$SIGNET_DISABLED_PROFILE" config path
+)"
+export SIGNET_DISABLED_HERMES_ENV="$(
+  hermes -p "$SIGNET_DISABLED_PROFILE" config env-path
+)"
+if test -e "$SIGNET_DISABLED_HERMES_CONFIG" || \
+   test -L "$SIGNET_DISABLED_HERMES_CONFIG"; then
+  printf 'refusing existing Hermes config: %s\n' \
+    "$SIGNET_DISABLED_HERMES_CONFIG" >&2
+  exit 1
+fi
+install -m 0600 /dev/null "$SIGNET_DISABLED_HERMES_CONFIG"
+if test -L "$SIGNET_DISABLED_HERMES_ENV"; then
+  printf 'refusing linked Hermes environment: %s\n' \
+    "$SIGNET_DISABLED_HERMES_ENV" >&2
+  exit 1
+fi
+if ! test -e "$SIGNET_DISABLED_HERMES_ENV"; then
+  install -m 0600 /dev/null "$SIGNET_DISABLED_HERMES_ENV"
+fi
+export SIGNET_DISABLED_HERMES_FRAGMENT="$HOME/.hermes/services/signet/config/disabled-profile.mcp.yaml"
+if test -L "$SIGNET_DISABLED_HERMES_FRAGMENT"; then
+  printf 'refusing linked private fragment: %s\n' \
+    "$SIGNET_DISABLED_HERMES_FRAGMENT" >&2
+  exit 1
+fi
+if ! test -e "$SIGNET_DISABLED_HERMES_FRAGMENT"; then
+  install -m 0600 "$PWD/deploy/hermes/disabled-profile.mcp.yaml.example" \
+    "$SIGNET_DISABLED_HERMES_FRAGMENT"
+fi
+```
+
+Version 0.16.0 creates neither profile file; version 0.18.2 seeds only the
+comment-only `.env`. The branches handle both. The configurator independently
+requires canonical absolute paths, one owned non-writable profile directory, safe
+single-link mode-`0600` files, a blank config, and an empty/comment-only environment.
+It rejects any pre-existing MCP route or environment assignment, so the profile
+cannot silently retain a direct mutation bypass.
+
+Confirm there is no unexpected active token for this new namespace. Then use one
+pipeline with `pipefail`; the token never enters argv, the process environment,
+YAML, terminal output, or the helper's fixed success message:
+
+```console
+uv run signet deployment token list --config "$SIGNET_DISABLED_CONFIG"
+(umask 077 && set -o pipefail && \
+  uv run signet deployment token issue \
+    --config "$SIGNET_DISABLED_CONFIG" \
+    --namespace "profile:$SIGNET_DISABLED_PROFILE" | \
+  uv run python deploy/hermes/configure-disabled-profile.py \
+    --profile "$SIGNET_DISABLED_PROFILE" \
+    --config "$SIGNET_DISABLED_HERMES_CONFIG" \
+    --env-file "$SIGNET_DISABLED_HERMES_ENV" \
+    --fragment "$SIGNET_DISABLED_HERMES_FRAGMENT")
+```
+
+The helper accepts only the exact current `sgt_` token on stdin and the exact
+`signet_disabled_approvals` loopback fragment. It uses a private profile lock,
+compare-before-replace snapshots, same-directory exclusive temporaries, fsync, and
+atomic replacement. The raw token is stored only as
+`SIGNET_DISABLED_MCP_CALLER_TOKEN` in the dedicated mode-`0600` `.env`; YAML retains
+only its placeholder. On any pipeline failure, do not issue again or start Hermes.
+Use `token list` to identify and revoke any new record, then run
+`hermes profile delete "$SIGNET_DISABLED_PROFILE" -y` and recreate only that
+dedicated profile. The already-validated private fragment may be reused. See the
+precise recovery boundary in `docs/deployment.md` before retrying.
+
+In terminal A, start the disabled MCP process:
+
+```console
+uv run signet deployment serve-mcp --config "$SIGNET_DISABLED_CONFIG"
+```
+
+In terminal B, validate the profile without a model call:
+
+```console
+hermes -p "$SIGNET_DISABLED_PROFILE" config check
+hermes -p "$SIGNET_DISABLED_PROFILE" mcp test signet_disabled_approvals
+hermes -p "$SIGNET_DISABLED_PROFILE" mcp list
 ```
 
 The connection test must discover exactly five tools. It proves only loopback MCP
@@ -129,12 +214,13 @@ transport and bearer authentication. It does not prove human authentication,
 queue behavior, provider readiness, or live cutover. There is no reason to call an
 approval tool during this check; if one is called, a `deployment_disabled` error is
 the only acceptable result. Use Hermes' reviewed `/reload-mcp` workflow to activate
-the profile change. `token revoke` takes effect at the next Signet authentication
-check. `token rotate` stages a replacement without revoking the old token. Ingest
-the replacement into a new secret destination, reload and test Hermes, and only
-then explicitly revoke the old token. Never redirect over the active secret file.
-If output or ingestion fails, revoke the linked replacement record and retry while
-the old route remains usable.
+the profile change. `token revoke --token-id=TOKEN_ID` takes effect at the next
+Signet authentication check. The bootstrap helper intentionally refuses to replace
+an installed assignment. `token rotate --token-id=TOKEN_ID` stages a replacement
+without revoking the old token; use a separately reviewed new secret destination,
+reload and test Hermes, and only then explicitly revoke the old token. Never use
+shell redirection over the active `.env`. If replacement output or ingestion fails,
+revoke the linked replacement record and retry while the old route remains usable.
 
 ## Deferred live route change
 

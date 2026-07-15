@@ -42,6 +42,9 @@ local, bounded fixtures only; it has no discovery network client or host scanner
   edit, retry, manage credentials, or approve a policy change.
 - Dispatch crosses a durable fenced boundary before network I/O. A possible
   post-dispatch crash becomes `outcome_unknown`, never a blind retry.
+- Production retains exhausted unknown content indefinitely. The demo-only
+  redaction drill is marker-guarded fake functionality, preserves "may have sent",
+  and is not production human authorization.
 - Push messages contain category and count information only. The authenticated
   queue remains authoritative if push delivery fails.
 - Provider credentials are references such as `keychain://Signet/fastmail`, not
@@ -66,17 +69,23 @@ uv run ruff check .
 uv run mypy
 ```
 
-The package entry point serves only an explicitly supplied application factory:
+The generic package entry point serves only an explicitly supplied application
+factory. After creating the disabled state below, its two shipped factories can be
+run explicitly with:
 
 ```console
-uv run signet serve-mcp --factory deployment.assembly:create_mcp_app \
+export SIGNET_DISABLED_CONFIG="$HOME/.hermes/services/signet/config/disabled.json"
+uv run signet serve-mcp --factory signet.deployment:create_mcp_app \
   --host 127.0.0.1 --port 8789
-uv run signet serve-web --factory deployment.assembly:create_web_app \
+uv run signet serve-web --factory signet.deployment:create_web_app \
   --host 127.0.0.1 --port 8790
 ```
 
-Those example factories remain deployment responsibilities. The MCP command rejects
-a non-loopback numeric host. Do not point an ad hoc factory at live credentials.
+`SIGNET_DISABLED_CONFIG` is the absolute non-secret config path, not configuration
+JSON or a credential. The dedicated `signet deployment serve-*` commands below are
+preferred because they use the verified listener settings from that file. The MCP
+command rejects a non-loopback numeric host. Do not point an ad hoc factory at live
+credentials.
 
 ## Downstream-disabled deployment staging
 
@@ -84,23 +93,27 @@ Create private, persistent staging state without enrolling a human credential or
 creating a downstream client:
 
 ```console
+export SIGNET_DISABLED_PROFILE=signet-disabled
 install -d -m 0700 "$HOME/.hermes/services/signet/config"
 uv run signet deployment init \
   --config "$HOME/.hermes/services/signet/config/disabled.json" \
   --data-dir "$HOME/.hermes/services/signet/data" \
-  --namespace profile:hermes
+  --namespace "profile:$SIGNET_DISABLED_PROFILE"
 uv run signet deployment validate \
   --config "$HOME/.hermes/services/signet/config/disabled.json"
 uv run signet deployment serve-mcp \
   --config "$HOME/.hermes/services/signet/config/disabled.json"
 ```
 
-Issue a random MCP caller token with `signet deployment token issue`. The command
-prints only the raw token, exactly once, so redirect it directly into the intended
-new mode-`0600` secret mechanism with shell `noclobber`; do not overwrite the active
-secret or paste it into a command argument, config file, shell history, log, or
-documentation. `token list` returns metadata only. `token
-revoke` takes effect on the next authentication check. `token rotate` stages and
+One initialized disabled state supports exactly that one dedicated Hermes profile;
+the CLI does not add principals to an existing config. Follow the tested
+[`deploy/hermes/README.md`](deploy/hermes/README.md#persistent-downstream-disabled-profile)
+sequence to create the blank profile and stream `token issue` directly into the
+checked-in atomic configurator. The raw token is accepted only on stdin and is never
+written to YAML or output by the helper. Do not paste it into an argument, shell
+history, log, chat, or documentation. `token list` returns metadata only. `token
+revoke --token-id=TOKEN_ID` takes effect on the next authentication check. `token
+rotate --token-id=TOKEN_ID` stages and
 prints a linked replacement while deliberately leaving the old token valid; install,
 reload, and test the replacement before explicitly revoking the old token.
 

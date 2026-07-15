@@ -7,11 +7,13 @@ commands. Their absolute-path placeholders still prevent startup until an operat
 creates private disabled state, reviews the files, and authorizes installation.
 They cannot create a provider client or dispatch an action.
 
-- `launchd/` contains separate user-agent templates for the MCP and web listeners.
+- `launchd/` contains separate user-agent templates and a no-install structural
+  renderer for the MCP and web listeners.
 - `homepage/` contains one ordinary Signet service card and no widget credential.
 - `tailscale/` documents a merge-safe tailnet-only Serve route and exact removal.
-- `hermes/` contains a validated disposable-profile configurator, a persistent
-  disabled-profile fragment, and redacted forward/reverse live route-diff examples.
+- `hermes/` contains validated disposable and persistent disabled-profile
+  configurators, reviewed route fragments, and redacted forward/reverse live
+  route-diff examples.
 - `operations/` contains fail-closed inventory and human-evidence skeletons.
 
 Start with `docs/operator-runbook.md` for fake-only local verification, then use

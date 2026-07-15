@@ -110,12 +110,12 @@ commands below use a blank profile with no alias and no bundled skills; they nev
 clone or select the default profile.
 
 Use an installation that includes Hermes' MCP extra. The official standard source
-installer includes `.[all]`, which includes `.[mcp]`. For the independently
-validated PyPI release, install `hermes-agent[mcp]==0.16.0`; the bare
-`hermes-agent==0.16.0` package does not include the MCP SDK. Do not repair this by
-installing or upgrading the standalone `mcp` package to an arbitrary version:
-Hermes pins the compatible SDK through its extra. Stop if the installed Hermes
-version or installation method is not one you have reviewed.
+installer includes `.[all]`, which includes `.[mcp]`. The procedure is independently
+validated with `hermes-agent[mcp]==0.18.2` and remains compatible with
+`hermes-agent[mcp]==0.16.0`; a bare PyPI install does not include the MCP SDK. Do not
+repair this by installing or upgrading the standalone `mcp` package to an arbitrary
+version: Hermes pins the compatible SDK through its extra. Stop if the installed
+Hermes version or installation method is not one you have reviewed.
 
 ```console
 hermes --version
@@ -124,22 +124,27 @@ hermes profile list
 hermes profile create signet-demo --no-alias --no-skills
 export SIGNET_DEMO_HERMES_CONFIG="$(hermes -p signet-demo config path)"
 export SIGNET_DEMO_HERMES_ENV="$(hermes -p signet-demo config env-path)"
-for path in "$SIGNET_DEMO_HERMES_CONFIG" "$SIGNET_DEMO_HERMES_ENV"; do
-  if test -e "$path"; then
-    printf 'refusing to overwrite existing Hermes profile file: %s\n' "$path" >&2
-    exit 1
-  fi
-done
+if test -e "$SIGNET_DEMO_HERMES_CONFIG" || test -L "$SIGNET_DEMO_HERMES_CONFIG"; then
+  printf 'refusing existing Hermes config: %s\n' "$SIGNET_DEMO_HERMES_CONFIG" >&2
+  exit 1
+fi
 install -m 0600 /dev/null "$SIGNET_DEMO_HERMES_CONFIG"
-install -m 0600 /dev/null "$SIGNET_DEMO_HERMES_ENV"
+if test -L "$SIGNET_DEMO_HERMES_ENV"; then
+  printf 'refusing linked Hermes environment: %s\n' "$SIGNET_DEMO_HERMES_ENV" >&2
+  exit 1
+fi
+if ! test -e "$SIGNET_DEMO_HERMES_ENV"; then
+  install -m 0600 /dev/null "$SIGNET_DEMO_HERMES_ENV"
+fi
 ```
 
 Stop if `signet-demo` already exists. Do not repurpose it or substitute another
 profile path. Hermes Agent v0.16.0 reports the new profile paths without creating
-these two files; the loop intentionally refuses to overwrite either path before
-`install` creates both with mode `0600`. Generate the exact current-port fragment
-into the private demo tree, then stream the token directly into the checked-in
-structured merge helper:
+either file. Version v0.18.2 leaves `config.yaml` absent and seeds a mode-`0600`,
+comment-only `.env`; the branches preserve that reviewed seed. The configurator
+then verifies content, ownership, mode, link count, and identity. Generate the exact
+current-port fragment into the private demo tree, then stream the token directly
+into the checked-in structured merge helper:
 
 ```console
 export SIGNET_DEMO_DIR="$PWD/var/operator-demo"
@@ -171,15 +176,15 @@ hermes -p signet-demo mcp test signet_demo_approvals
 hermes -p signet-demo mcp list
 ```
 
-For the intentionally minimal profile, Hermes Agent v0.16.0 may print
-`Config version: 0 -> 27 (update available)` while `config check` exits `0`. That
-advisory is expected here. Do not run `config migrate`: it interactively expands
-the blank file into the release's broad default configuration. The minimal file
-still inherits Hermes' built-in defaults, so keep the profile disposable and keep
-its environment free of live provider keys or other credentials.
+For the intentionally minimal profile, Hermes may print a release-specific
+`Config version: 0 -> N (update available)` advisory while `config check` exits `0`.
+That advisory is expected here. Do not run `config migrate`: it interactively
+expands the blank file into broad release defaults. The minimal file still inherits
+Hermes' built-in defaults, so keep the profile disposable and keep its environment
+free of live provider keys or other credentials.
 
 The three tests are the MCP dependency preflight as well as transport/authenticated
-discovery tests. They must connect and report `3`, `3`, and `4` tools respectively.
+discovery tests. They must connect and report `4`, `3`, and `4` tools respectively.
 The approvals surface intentionally omits `approve_request`; demo automation cannot
 manufacture a six-digit TOTP code. It still exposes caller-scoped list, status,
 cancel, and access request tools. An MCP `401` means the selected profile/token is
@@ -223,8 +228,9 @@ The read returns only `fake:`/`.invalid` fixture data. The send returns a durabl
 the complete frozen arguments, reason, warnings, policy/adapter/schema versions,
 hashes, attachments, origin, and event timeline.
 
-First deny one fake request in the web form with the value returned by
-`web-action-proof`. Then call the status tool with its ID:
+First enter a specific fake decision rationale and deny one fake request in the web
+form with the value returned by `web-action-proof`. Then call the status tool with
+its ID:
 
 ```text
 Call mcp_signet_demo_approvals_check_approval_status with
@@ -234,12 +240,19 @@ Call mcp_signet_demo_approvals_check_approval_status with
 It must return `denied`, and the expanded timeline must show zero provider calls.
 The action proof is visibly constant, but every accepted use receives a distinct
 durable fake-only use ID, including across restart. Retrieve `web-action-proof`
-again, then create a second identical fake send, review its full context, and
-approve it in the web form. The bounded fake delivery worker must make exactly one
-in-process fake-provider call and reach `succeeded`; status returns only safe result
-metadata, not the frozen private payload. Calling
+again, then create a second identical fake send, review its full context, enter a
+different explicit approval rationale, and approve it in the web form. The bounded
+fake delivery worker must make exactly one in-process fake-provider call and reach
+`succeeded`; status returns only safe result metadata, not the frozen private
+payload. Calling
 `mcp_signet_demo_fastmail_delete_email` with
 `{"message_id":"fake:message:never-delete"}` must return `policy_denied`.
+
+Open **Audit**, find **Recent approvals and denials**, and expand both retained
+decisions. For each, verify the decision actor, confirmation method and path, full
+frozen request content, entered rationale, outcome, attachment metadata/content
+references, and complete event timeline. The queue is for pending work; retained
+approved and denied context remains discoverable from this audit section.
 
 The WhatsApp path can be checked the same way:
 
@@ -261,7 +274,52 @@ to stop, and run the same `demo serve` command again. Recheck the terminal reque
 by ID. Its state and timeline must persist, and the fake effect count must remain
 one.
 
-## 6. Back up and restore demo state
+## 6. Redact an exhausted fake unknown
+
+This command exists only for disposable fake-only fault-injection drills. It is not
+production authorization. A normal demo should never need it. First stop the demo
+server. In the expanded authenticated review, record the exact request ID, version,
+and full payload hash before shutdown. Run the command only after the event timeline
+shows that bounded reconciliation is exhausted:
+
+```console
+uv run signet demo purge-unknown --data-dir "$SIGNET_DEMO_DIR" \
+  --request-id 'REPLACE_WITH_EXACT_FAKE_REQUEST_ID' \
+  --expected-version 'REPLACE_WITH_EXACT_VERSION' \
+  --expected-payload-hash 'REPLACE_WITH_EXACT_64_CHARACTER_HASH' \
+  --acknowledge-possible-delivery
+```
+
+The marker-guarded command acquires the demo serve lock, requires the exact current
+revision and durable exhaustion, records authorization and completion events, and
+redacts the fake payload and safe outcome metadata. It never changes
+`outcome_unknown`: the external effect **may have happened**, reconciliation becomes
+permanently unavailable, and the request/hash/timeline remain. Repeating the exact
+command is idempotent. A stale hash, active backup pin, running server, non-exhausted
+attempt, missing acknowledgement, or non-demo tree rejects before purge
+authorization is recorded or work is queued.
+
+A first successful run prints only this non-sensitive JSON (field order may differ):
+
+```json
+{"claimed":2,"completed":2,"failed":0,"scheduled":2,"state":"outcome_unknown","status":"fake_only_content_purged","uncertainty_preserved":true}
+```
+
+An exact replay succeeds with `scheduled`, `claimed`, and `completed` all set to
+`0`. An active-backup rejection is not an incomplete purge: keep the server stopped,
+wait for the verified backup operation to release its pin (or release it only
+through that operation's reviewed normal procedure), then repeat the exact bound
+command. Only an `incomplete` result indicates a storage or retention-worker failure
+after authorization. Resolve that failure and repeat the same bound command; do not
+edit queued jobs, backup pins, authorization events, or the timeline directly.
+
+This is logical deletion in the bundled demo. Bytes may remain in SQLite free pages,
+WAL history, APFS snapshots, swap, crash dumps, or prior encrypted backups. Apply
+retention separately to those copies. Production keeps exhausted unknown content
+indefinitely until a future release supplies schema-backed, request-bound human
+authorization; never reproduce this operation with SQL or direct file deletion.
+
+## 7. Back up and restore demo state
 
 Stop the original demo server cleanly before this drill. Choose new output paths;
 both commands refuse overwrite. The bundle parent must be a private, operator-owned
@@ -315,7 +373,7 @@ stricter procedure in [deployment.md](deployment.md#backup-and-restore); never
 restore an older database that could forget a pending acknowledgement or ambiguous
 downstream outcome.
 
-## 7. Stop and roll back the demo
+## 8. Stop and roll back the demo
 
 Stop each demo process with one normal interrupt and wait for bounded workers to
 exit. Do not use `kill -9` unless deliberately recording a crash-recovery test.

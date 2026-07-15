@@ -204,7 +204,7 @@ def _read_private_file(path: Path, *, label: str, maximum: int) -> PrivateFile:
             raise ConfigurationError(f"{label} must have exactly one filesystem link")
         if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
             raise ConfigurationError(f"{label} must be owned by the current user")
-        if stat.S_IMODE(metadata.st_mode) & 0o077:
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
             raise ConfigurationError(f"{label} must have mode 0600")
         if metadata.st_size > maximum:
             raise ConfigurationError(f"{label} exceeds its size limit")
@@ -529,7 +529,7 @@ def _open_private_target(directory: int, name: str, *, label: str) -> int:
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or stat.S_IMODE(metadata.st_mode) != 0o600
         or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
     ):
         os.close(descriptor)

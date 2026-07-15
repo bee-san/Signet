@@ -112,11 +112,12 @@ service user with exact mode `0700`; the config and SQLite database are exact mo
 listeners, unknown fields, unknown namespaces, and alias expansion are rejected.
 
 ```console
+export SIGNET_DISABLED_PROFILE=signet-disabled
 install -d -m 0700 "$HOME/.hermes/services/signet/config"
 uv run signet deployment init \
   --config "$HOME/.hermes/services/signet/config/disabled.json" \
   --data-dir "$HOME/.hermes/services/signet/data" \
-  --namespace profile:hermes
+  --namespace "profile:$SIGNET_DISABLED_PROFILE"
 uv run signet deployment validate \
   --config "$HOME/.hermes/services/signet/config/disabled.json"
 ```
@@ -125,7 +126,10 @@ uv run signet deployment validate \
 or database and does not create a password, TOTP secret, passkey, session key,
 provider credential, policy, downstream alias, or queued request. `validate`
 reports database integrity and the fixed disabled invariants without reporting
-paths or verifier material.
+paths or verifier material. The initializer provisions exactly one caller namespace.
+There is no principal-add command and no supported procedure for hand-editing the
+private config; use a separate config/data directory and listener-port pair for a
+second dedicated profile.
 
 Start and stop the two loopback processes in the foreground while staging:
 
@@ -147,28 +151,53 @@ though it were the live authenticated UI.
 
 ### Persistent caller tokens
 
-The disabled config declares the exact caller namespaces and grants each only the
-gateway-owned `approvals` alias. Issue one high-entropy token per profile:
+The disabled config declares one exact caller namespace and grants it only the
+gateway-owned `approvals` alias. First prepare the dedicated blank Hermes profile
+and private fragment exactly as described in
+[`deploy/hermes/README.md`](../deploy/hermes/README.md#persistent-downstream-disabled-profile).
+Confirm `token list` has no unexpected active record for the namespace, then issue
+one high-entropy token directly into the checked-in configurator:
 
 ```console
-(umask 077 && set -o noclobber && \
+uv run signet deployment token list \
+  --config "$HOME/.hermes/services/signet/config/disabled.json"
+(umask 077 && set -o pipefail && \
   uv run signet deployment token issue \
     --config "$HOME/.hermes/services/signet/config/disabled.json" \
-    --namespace profile:hermes > /PRIVATE/NEW/SECRET/INGEST/PATH)
+    --namespace "profile:$SIGNET_DISABLED_PROFILE" | \
+  uv run python deploy/hermes/configure-disabled-profile.py \
+    --profile "$SIGNET_DISABLED_PROFILE" \
+    --config "$SIGNET_DISABLED_HERMES_CONFIG" \
+    --env-file "$SIGNET_DISABLED_HERMES_ENV" \
+    --fragment "$SIGNET_DISABLED_HERMES_FRAGMENT")
 ```
 
 `token issue` writes the raw token and one newline to standard output exactly once.
-It writes no label or metadata alongside it. Direct stdout into the reviewed
-mode-`0600` Hermes secret-ingest path; never put the raw value in argv, an ordinary
-config file, shell history, logs, chat, tickets, or documentation. Signet persists
-only a SHA-256 verifier and non-secret metadata in SQLite.
+It writes no label or metadata alongside it. The helper reads that exact value only
+from stdin, validates the one reviewed loopback route, and atomically replaces the
+mode-`0600` blank profile files without printing the token or writing it to YAML.
+It refuses existing MCP routes, unrelated environment assignments, symlinks,
+hardlinks, unsafe modes, ambiguous YAML, and a noncanonical path. Never put the raw
+value in argv, a normal config file, shell history, logs, chat, tickets, or
+documentation. Signet persists only a SHA-256 verifier and non-secret metadata in
+SQLite.
+
+`pipefail` is required. If either side of the initial pipeline fails, do not issue
+again immediately and do not start Hermes. Run `token list`, identify any new active
+record by namespace and creation metadata, and revoke it by token ID. Because the
+profile is dedicated and contains no other state, delete and recreate that profile
+before retrying; do not inspect or hand-edit a possibly partial `.env`. This also
+covers a broken stdout sink: the database record is committed before the one-time
+raw value is written, and the CLI error directs the operator to list and revoke it.
+Never run initial issue operations concurrently for one namespace.
 
 ```console
 uv run signet deployment token list --config /ABSOLUTE/PATH/disabled.json
-uv run signet deployment token revoke --config /ABSOLUTE/PATH/disabled.json TOKEN_ID
+uv run signet deployment token revoke --config /ABSOLUTE/PATH/disabled.json \
+  --token-id=TOKEN_ID
 (umask 077 && set -o noclobber && \
   uv run signet deployment token rotate \
-    --config /ABSOLUTE/PATH/disabled.json TOKEN_ID \
+    --config /ABSOLUTE/PATH/disabled.json --token-id=TOKEN_ID \
     > /PRIVATE/NEW/SECRET/INGEST/PATH)
 ```
 
@@ -176,8 +205,9 @@ uv run signet deployment token revoke --config /ABSOLUTE/PATH/disabled.json TOKE
 request, so revocation does not wait for a process restart. `rotate` inserts a
 linked replacement and prints its raw token once, but deliberately leaves the old
 token valid. Securely ingest the replacement, reload Hermes, and test the new route;
-only then run `token revoke ... OLD_TOKEN_ID`. This two-step distribution prevents
-an output, storage, or reload failure from immediately taking the caller offline.
+only then run `token revoke ... --token-id=OLD_TOKEN_ID`. This two-step distribution
+prevents an output, storage, or reload failure from immediately taking the caller
+offline.
 A replacement destination must be new: never redirect rotation output over the
 active token's secret file, because shell redirection truncates it before Signet
 runs. The examples use `noclobber` to reject an existing destination.
@@ -306,25 +336,63 @@ Separate processes keep browser routes off the MCP listener. Both templates use
 `Umask=077`, background process type, throttled restart, and distinct logs. Their
 absolute executable, config, working-directory, and log paths are placeholders.
 Their `ProgramArguments` already invoke the installed `signet deployment
-serve-mcp` and `serve-web` commands. Do not load a template directly.
+serve-mcp` and `serve-web` commands. Do not edit or load a template directly. The
+checked-in renderer parses the plists structurally, validates every supplied path,
+refuses existing outputs, and creates mode-`0600` review files; it never copies them
+to `~/Library/LaunchAgents` or calls `launchctl`.
 
 During an authorized installation only:
 
-1. Create and validate the downstream-disabled state as shown above. Replace every
-   template placeholder with an absolute reviewed path. Verify no credential value
-   appears in the plist; the config path is non-secret.
-2. Create data, staging, backup, and log directories as the service user with mode
-   `0700`. Create log files mode `0600`, or verify launchd creates them under the
-   restrictive umask.
-3. Validate both files:
+1. Create and validate the downstream-disabled state as shown above. From the
+   reviewed repository root, create a new private render directory and the log
+   directory, then render both files from canonical absolute paths:
 
    ```console
-   plutil -lint ./ai.hermes.signet.mcp.plist
-   plutil -lint ./ai.hermes.signet.web.plist
+   export SIGNET_REPO="$(pwd -P)"
+   export SIGNET_SERVICE_ROOT="$HOME/.hermes/services/signet"
+   export SIGNET_LAUNCHD_REVIEW="$SIGNET_SERVICE_ROOT/launchd-review"
+   install -d -m 0700 "$SIGNET_SERVICE_ROOT/logs"
+   test ! -e "$SIGNET_LAUNCHD_REVIEW"
+   install -d -m 0700 "$SIGNET_LAUNCHD_REVIEW"
+   uv run python deploy/launchd/render-disabled-plists.py \
+     --signet-executable "$SIGNET_REPO/.venv/bin/signet" \
+     --config "$SIGNET_SERVICE_ROOT/config/disabled.json" \
+     --working-directory "$SIGNET_REPO" \
+     --logs-directory "$SIGNET_SERVICE_ROOT/logs" \
+     --output-directory "$SIGNET_LAUNCHD_REVIEW"
    ```
 
-4. Place reviewed user-agent files in `~/Library/LaunchAgents/` mode `0600`.
-5. Only after the human authorizes service start, load them with the current macOS
+   The renderer rejects relative/noncanonical paths, symlinks, multiply linked
+   files, wrong ownership or modes, a writable checkout/executable, changed template
+   structure, and any existing output. Verify no credential value appears in either
+   plist; the config path is non-secret.
+2. Parse and inspect the exact rendered files:
+
+   ```console
+   plutil -lint "$SIGNET_LAUNCHD_REVIEW/ai.hermes.signet.mcp.plist"
+   plutil -lint "$SIGNET_LAUNCHD_REVIEW/ai.hermes.signet.web.plist"
+   plutil -p "$SIGNET_LAUNCHD_REVIEW/ai.hermes.signet.mcp.plist"
+   plutil -p "$SIGNET_LAUNCHD_REVIEW/ai.hermes.signet.web.plist"
+   ```
+
+3. Refuse an existing destination, then place the reviewed files in the user-agent
+   directory with mode `0600`:
+
+   ```console
+   install -d -m 0700 "$HOME/Library/LaunchAgents"
+   for name in ai.hermes.signet.mcp.plist ai.hermes.signet.web.plist; do
+     destination="$HOME/Library/LaunchAgents/$name"
+     if test -e "$destination" || test -L "$destination"; then
+       printf 'refusing existing launchd destination: %s\n' "$destination" >&2
+       exit 1
+     fi
+     install -m 0600 "$SIGNET_LAUNCHD_REVIEW/$name" "$destination"
+   done
+   ```
+
+   This is an initial-install procedure. Updating an existing agent needs a separate
+   reviewed replacement and rollback plan; do not bypass the refusal check.
+4. Only after the human authorizes service start, load them with the current macOS
    user domain:
 
    ```console
@@ -334,7 +402,7 @@ During an authorized installation only:
      "$HOME/Library/LaunchAgents/ai.hermes.signet.web.plist"
    ```
 
-6. Inspect `launchctl print gui/"$(id -u)"/ai.hermes.signet.mcp` and the web label,
+5. Inspect `launchctl print gui/"$(id -u)"/ai.hermes.signet.mcp` and the web label,
    then inspect only bounded, privacy-safe startup logs. Repeated restart is a hard
    failure, not a reason to bypass initialization.
 
@@ -519,6 +587,12 @@ policy independently to backup generations, APFS snapshots, WAL remnants, and
 backup keys. A shared wrapping key does not provide per-request cryptographic
 erasure.
 
+Production retains unresolved and exhausted `outcome_unknown` content indefinitely.
+The `signet demo purge-unknown` command is marker-guarded fake-test functionality,
+not an operator procedure for this assembly and not evidence of human authorization.
+Do not enable its internal fake-only retention flag, copy its events, or perform an
+equivalent SQL/file deletion in a provider-capable deployment.
+
 ## Staged Hermes routing
 
 The redacted examples under `deploy/hermes/` preserve downstream aliases and
@@ -579,9 +653,12 @@ The token placeholder is resolved from the selected Hermes profile's mode-`0600`
 disabling parallel calls, resources, prompts, and sampling narrows the client side
 of the integration as well as the Signet server. Use `hermes -p PROFILE mcp test`
 for each alias before `/reload-mcp` inside a Hermes session. See the reviewed
-operator sequence in `deploy/hermes/README.md`. The checked-in structured merge
-helper accepts only the blank `signet-demo` profile and explicit fake credentials;
-it is not a live profile editor.
+operator sequence in `deploy/hermes/README.md`. The fake configurator accepts only
+the blank `signet-demo` profile and explicit fake credentials. The persistent
+configurator accepts only a separate blank downstream-disabled profile, the one
+approval route, and an exact real caller token on stdin. Neither is a live profile
+editor; the helpers are not live profile editors or tools for changing the deferred
+three-alias route.
 
 Do not remove direct credentials before the local aliases, human authentication,
 live schema digests, fake providers, backup restore, and rollback packet pass. Do

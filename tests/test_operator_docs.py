@@ -74,6 +74,7 @@ def test_operator_commands_use_shipped_entrypoints_and_exact_paths() -> None:
         "http://127.0.0.1:8789/mcp/approvals",
         "hermes profile create signet-demo --no-alias --no-skills",
         "hermes-agent[mcp]==0.16.0",
+        "hermes-agent[mcp]==0.18.2",
         "hermes -p signet-demo config path",
         "hermes -p signet-demo config env-path",
         'install -m 0600 /dev/null "$SIGNET_DEMO_HERMES_CONFIG"',
@@ -89,14 +90,64 @@ def test_operator_commands_use_shipped_entrypoints_and_exact_paths() -> None:
     assert "tailscale serve reset" not in runbook
     assert "kill -9" in runbook and "Do not use" in runbook
     assert "configure-demo-profile.py" in runbook
-    assert "refusing to overwrite existing Hermes profile file" in runbook
+    assert "refusing existing Hermes config" in runbook
+    assert "refusing linked Hermes environment" in runbook
     assert "mcp.client.streamable_http" in runbook
     assert "Do not independently upgrade the SDK" in runbook
-    assert "Config version: 0 -> 27 (update available)" in runbook
+    assert "Config version: 0 -> N (update available)" in runbook
     assert "Do not run `config migrate`" in runbook
     assert "BackupBundleManager" in runbook
     assert "no key enters argv or the environment" in runbook
     assert "--mcp-port 8889 --web-port 8890" in runbook
+    assert "`4`, `3`, and `4` tools respectively" in runbook
+    assert "Recent approvals and denials" in runbook
+    assert "confirmation method and path" in runbook
+    assert "active-backup rejection is not an incomplete purge" in runbook
+    assert "storage or retention-worker failure after authorization" in " ".join(runbook.split())
+
+
+def test_persistent_disabled_hermes_path_is_executable_and_single_profile() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    deployment = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
+    hermes = (ROOT / "deploy" / "hermes" / "README.md").read_text(encoding="utf-8")
+    combined = "\n".join((readme, deployment, hermes))
+
+    for expected in (
+        "signet.deployment:create_mcp_app",
+        "signet.deployment:create_web_app",
+        "configure-disabled-profile.py",
+        "SIGNET_DISABLED_MCP_CALLER_TOKEN",
+        "set -o pipefail",
+        '--namespace "profile:$SIGNET_DISABLED_PROFILE"',
+        'hermes profile create "$SIGNET_DISABLED_PROFILE" --no-alias --no-skills',
+        "mcp test signet_disabled_approvals",
+        "discover exactly five tools",
+        "exactly one caller namespace",
+        "no principal-add command",
+    ):
+        assert expected in combined
+
+    assert "deployment.assembly:create_mcp_app" not in readme
+    assert "deployment.assembly:create_web_app" not in readme
+    assert (ROOT / "deploy" / "hermes" / "configure-disabled-profile.py").is_file()
+
+
+def test_launchd_guide_renders_then_lints_exact_private_outputs() -> None:
+    deployment = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
+
+    for expected in (
+        "deploy/launchd/render-disabled-plists.py",
+        '--signet-executable "$SIGNET_REPO/.venv/bin/signet"',
+        '--config "$SIGNET_SERVICE_ROOT/config/disabled.json"',
+        '--output-directory "$SIGNET_LAUNCHD_REVIEW"',
+        'plutil -lint "$SIGNET_LAUNCHD_REVIEW/ai.hermes.signet.mcp.plist"',
+        'plutil -lint "$SIGNET_LAUNCHD_REVIEW/ai.hermes.signet.web.plist"',
+        "refusing existing launchd destination",
+    ):
+        assert expected in deployment
+
+    assert "plutil -lint ./ai.hermes.signet.mcp.plist" not in deployment
+    assert (ROOT / "deploy" / "launchd" / "render-disabled-plists.py").is_file()
 
 
 def test_operator_docs_do_not_claim_demo_or_live_readiness() -> None:
@@ -125,7 +176,7 @@ def test_live_deployment_guide_does_not_misrepresent_demo_backup_as_live() -> No
     assert "There is no general or live `signet backup` shell command" in deployment
     assert "deliberately restricted to state marked" in deployment
     assert "they are not deployment commands" in deployment
-    assert "not a live profile editor" in deployment
+    assert "not live profile editors" in deployment
 
 
 def test_policy_guide_documents_shipped_durable_coordinators() -> None:
