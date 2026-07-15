@@ -56,6 +56,14 @@ _MAX_SCHEMA_REFERENCES = 32
 _MAX_SCHEMA_PATTERNS = 16
 _MAX_PATTERN_BYTES = 1_024
 _MAX_PATTERN_EXPANDED_ATOMS = 4_096
+_MAX_CAPTURE_SCHEMA_VALIDATORS = 1_024
+_MAX_CAPTURE_SCHEMA_BYTES = 8 * 1024 * 1024
+_MAX_CAPTURE_SCHEMA_NODES = 65_536
+_MAX_CAPTURE_SCHEMA_PATTERNS = 512
+_MAX_CAPTURE_PATTERN_BYTES = 128 * 1024
+_MAX_CAPTURE_PATTERN_EXPANDED_ATOMS = 65_536
+_MAX_CAPTURE_SCHEMA_COMBINATOR_BRANCHES = 1_024
+_MAX_CAPTURE_SCHEMA_REFERENCES = 1_024
 _MAX_JSON_INTEGER_BITS = 4_096
 _MAX_UNIQUE_ITEMS = 256
 _MAX_INSTANCE_NODES = 20_000
@@ -63,6 +71,28 @@ _MAX_INSTANCE_DEPTH = 64
 _MAX_INSTANCE_KEY_BYTES = 4 * 1024
 _MAX_INSTANCE_SCALAR_BYTES = 8 * 1024 * 1024
 _MAX_INSTANCE_SCALAR_BYTES_TOTAL = 16 * 1024 * 1024
+
+_SCHEMA_SINGLE_KEYWORDS = frozenset(
+    {
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_SCHEMA_MAP_KEYWORDS = frozenset(
+    {"$defs", "definitions", "dependentSchemas", "patternProperties", "properties"}
+)
+_SCHEMA_LIST_KEYWORDS = _SCHEMA_COMBINATOR_KEYS | frozenset({"prefixItems"})
+
+_SchemaPosition = Literal["data", "schema", "schema_list", "schema_map"]
 
 
 class MirrorError(RuntimeError):
@@ -143,14 +173,73 @@ _CLOSED_SCHEMA_REGISTRY: Registry[Any] = Registry(  # type: ignore[call-arg]
 )
 
 
-def _closed_schema_validator(schema: Mapping[str, Any]) -> Draft202012Validator:
-    _validate_schema_complexity(schema)
+@dataclass(frozen=True, slots=True)
+class _SchemaValidationWork:
+    nodes: int
+    patterns: int
+    pattern_bytes: int
+    pattern_expanded_atoms: int
+    combinator_branches: int
+    references: int
+
+
+@dataclass(slots=True)
+class _CaptureSchemaBudget:
+    validators: int = 0
+    schema_bytes: int = 0
+    nodes: int = 0
+    patterns: int = 0
+    pattern_bytes: int = 0
+    pattern_expanded_atoms: int = 0
+    combinator_branches: int = 0
+    references: int = 0
+
+    def consume(self, work: _SchemaValidationWork, *, schema_bytes: int) -> None:
+        validators = self.validators + 1
+        total_schema_bytes = self.schema_bytes + schema_bytes
+        nodes = self.nodes + work.nodes
+        patterns = self.patterns + work.patterns
+        pattern_bytes = self.pattern_bytes + work.pattern_bytes
+        pattern_expanded_atoms = self.pattern_expanded_atoms + work.pattern_expanded_atoms
+        combinator_branches = self.combinator_branches + work.combinator_branches
+        references = self.references + work.references
+        if (
+            validators > _MAX_CAPTURE_SCHEMA_VALIDATORS
+            or total_schema_bytes > _MAX_CAPTURE_SCHEMA_BYTES
+            or nodes > _MAX_CAPTURE_SCHEMA_NODES
+            or patterns > _MAX_CAPTURE_SCHEMA_PATTERNS
+            or pattern_bytes > _MAX_CAPTURE_PATTERN_BYTES
+            or pattern_expanded_atoms > _MAX_CAPTURE_PATTERN_EXPANDED_ATOMS
+            or combinator_branches > _MAX_CAPTURE_SCHEMA_COMBINATOR_BRANCHES
+            or references > _MAX_CAPTURE_SCHEMA_REFERENCES
+        ):
+            raise SchemaDriftError(
+                "captured JSON schemas exceed the aggregate validation work limit"
+            )
+        self.validators = validators
+        self.schema_bytes = total_schema_bytes
+        self.nodes = nodes
+        self.patterns = patterns
+        self.pattern_bytes = pattern_bytes
+        self.pattern_expanded_atoms = pattern_expanded_atoms
+        self.combinator_branches = combinator_branches
+        self.references = references
+
+
+def _closed_schema_validator(
+    schema: Mapping[str, Any],
+    *,
+    capture_budget: _CaptureSchemaBudget | None = None,
+) -> Draft202012Validator:
+    work = _validate_schema_complexity(schema)
     try:
         encoded = canonical_json(dict(schema))
     except Exception:
         raise SchemaDriftError("the reviewed JSON schema is invalid") from None
     if len(encoded) > _MAX_SCHEMA_BYTES:
         raise SchemaDriftError("the reviewed JSON schema exceeds its byte limit")
+    if capture_budget is not None:
+        capture_budget.consume(work, schema_bytes=len(encoded))
     return _compile_closed_schema(encoded)
 
 
@@ -164,16 +253,18 @@ def _compile_closed_schema(encoded: bytes) -> Draft202012Validator:
     return Draft202012Validator(schema, registry=_CLOSED_SCHEMA_REGISTRY)
 
 
-def _validate_schema_complexity(schema: Mapping[str, Any]) -> None:
+def _validate_schema_complexity(schema: Mapping[str, Any]) -> _SchemaValidationWork:
     nodes = 0
     combinator_branches = 0
     patterns = 0
+    pattern_bytes = 0
+    pattern_expanded_atoms = 0
     references: list[str] = []
     active_containers: set[int] = set()
-    stack: list[tuple[Any, int, bool]] = [(schema, 0, False)]
+    stack: list[tuple[Any, int, bool, _SchemaPosition]] = [(schema, 0, False, "schema")]
 
     while stack:
-        value, depth, exiting = stack.pop()
+        value, depth, exiting, position = stack.pop()
         if exiting:
             active_containers.remove(id(value))
             continue
@@ -182,16 +273,18 @@ def _validate_schema_complexity(schema: Mapping[str, Any]) -> None:
             raise SchemaDriftError("the reviewed JSON schema exceeds structural limits")
 
         if isinstance(value, Mapping):
+            if position == "schema_list":
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
             container_id = id(value)
             if container_id in active_containers:
                 raise SchemaDriftError("the reviewed JSON schema contains a cycle")
             active_containers.add(container_id)
-            stack.append((value, depth, True))
+            stack.append((value, depth, True, position))
             nodes += len(value)
             if nodes > _MAX_SCHEMA_NODES:
                 raise SchemaDriftError("the reviewed JSON schema exceeds structural limits")
 
-            if value.get("uniqueItems") is True:
+            if position == "schema" and value.get("uniqueItems") is True:
                 max_items = value.get("maxItems")
                 if (
                     isinstance(max_items, bool)
@@ -207,6 +300,12 @@ def _validate_schema_complexity(schema: Mapping[str, Any]) -> None:
                 if not isinstance(key, str):
                     raise SchemaDriftError("the reviewed JSON schema is invalid")
                 _bounded_schema_text(key)
+                if position == "schema_map":
+                    stack.append((child, depth + 1, False, "schema"))
+                    continue
+                if position == "data":
+                    stack.append((child, depth + 1, False, "data"))
+                    continue
                 if key in {"$dynamicRef", "$recursiveRef"}:
                     raise SchemaDriftError(
                         "reviewed JSON schemas do not support dynamic references"
@@ -233,7 +332,9 @@ def _validate_schema_complexity(schema: Mapping[str, Any]) -> None:
                         raise SchemaDriftError(
                             "the reviewed JSON schema exceeds its pattern limit"
                         )
-                    _validate_linear_pattern(child)
+                    child_bytes, child_atoms = _validate_linear_pattern(child)
+                    pattern_bytes += child_bytes
+                    pattern_expanded_atoms += child_atoms
                 elif key == "patternProperties":
                     if not isinstance(child, Mapping):
                         raise SchemaDriftError("the reviewed JSON schema is invalid")
@@ -245,7 +346,9 @@ def _validate_schema_complexity(schema: Mapping[str, Any]) -> None:
                     for pattern in child:
                         if not isinstance(pattern, str):
                             raise SchemaDriftError("the reviewed JSON schema is invalid")
-                        _validate_linear_pattern(pattern)
+                        child_bytes, child_atoms = _validate_linear_pattern(pattern)
+                        pattern_bytes += child_bytes
+                        pattern_expanded_atoms += child_atoms
                 elif key in _SCHEMA_COMBINATOR_KEYS:
                     if not isinstance(child, list):
                         raise SchemaDriftError("the reviewed JSON schema is invalid")
@@ -258,22 +361,38 @@ def _validate_schema_complexity(schema: Mapping[str, Any]) -> None:
                         raise SchemaDriftError(
                             "the reviewed JSON schema exceeds its combinator limit"
                         )
-                stack.append((child, depth + 1, False))
+                stack.append((child, depth + 1, False, _schema_keyword_position(key)))
         elif isinstance(value, list):
+            if position not in {"data", "schema_list"}:
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
             container_id = id(value)
             if container_id in active_containers:
                 raise SchemaDriftError("the reviewed JSON schema contains a cycle")
             active_containers.add(container_id)
-            stack.append((value, depth, True))
-            stack.extend((child, depth + 1, False) for child in reversed(value))
+            stack.append((value, depth, True, position))
+            child_position: _SchemaPosition = "schema" if position == "schema_list" else "data"
+            stack.extend(
+                (child, depth + 1, False, child_position) for child in reversed(value)
+            )
         elif isinstance(value, str):
+            if position != "data":
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
             _bounded_schema_text(value)
-        elif isinstance(value, bool) or value is None:
+        elif isinstance(value, bool):
+            if position not in {"data", "schema"}:
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
+        elif value is None:
+            if position != "data":
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
             continue
         elif isinstance(value, int):
+            if position != "data":
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
             if value.bit_length() > _MAX_JSON_INTEGER_BITS:
                 raise SchemaDriftError("the reviewed JSON schema exceeds scalar limits")
         elif isinstance(value, float):
+            if position != "data":
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
             if not math.isfinite(value):
                 raise SchemaDriftError("the reviewed JSON schema is invalid")
         else:
@@ -285,6 +404,24 @@ def _validate_schema_complexity(schema: Mapping[str, Any]) -> None:
             raise SchemaDriftError(
                 "reviewed in-document references may not be recursive or chained"
             )
+    return _SchemaValidationWork(
+        nodes=nodes,
+        patterns=patterns,
+        pattern_bytes=pattern_bytes,
+        pattern_expanded_atoms=pattern_expanded_atoms,
+        combinator_branches=combinator_branches,
+        references=len(references),
+    )
+
+
+def _schema_keyword_position(keyword: str) -> _SchemaPosition:
+    if keyword in _SCHEMA_SINGLE_KEYWORDS:
+        return "schema"
+    if keyword in _SCHEMA_MAP_KEYWORDS:
+        return "schema_map"
+    if keyword in _SCHEMA_LIST_KEYWORDS:
+        return "schema_list"
+    return "data"
 
 
 def _bounded_schema_text(value: str) -> None:
@@ -300,11 +437,18 @@ def _resolve_schema_reference(schema: Mapping[str, Any], reference: str) -> Any:
     if "%" in reference:
         raise SchemaDriftError("reviewed in-document references must use JSON Pointer syntax")
     target: Any = schema
+    position: _SchemaPosition = "schema"
     for encoded_token in reference[2:].split("/"):
         if re.search(r"~(?![01])", encoded_token):
             raise SchemaDriftError("reviewed in-document references must use JSON Pointer syntax")
         token = encoded_token.replace("~1", "/").replace("~0", "~")
         if isinstance(target, Mapping) and token in target:
+            if position == "schema":
+                position = _schema_keyword_position(token)
+            elif position == "schema_map":
+                position = "schema"
+            elif position != "data":
+                raise SchemaDriftError("reviewed JSON schema reference does not resolve")
             target = target[token]
         elif isinstance(target, list) and token.isascii() and token.isdecimal():
             if len(token) > 6 or (len(token) > 1 and token.startswith("0")):
@@ -312,32 +456,46 @@ def _resolve_schema_reference(schema: Mapping[str, Any], reference: str) -> Any:
             index = int(token)
             if index >= len(target):
                 raise SchemaDriftError("reviewed JSON schema reference does not resolve")
+            if position == "schema_list":
+                position = "schema"
+            elif position != "data":
+                raise SchemaDriftError("reviewed JSON schema reference does not resolve")
             target = target[index]
         else:
             raise SchemaDriftError("reviewed JSON schema reference does not resolve")
+    if position != "schema":
+        raise SchemaDriftError("reviewed JSON schema reference does not resolve to a subschema")
     return target
 
 
 def _contains_schema_reference(value: Any) -> bool:
     remaining = _MAX_SCHEMA_NODES
-    stack = [value]
+    stack: list[tuple[Any, _SchemaPosition]] = [(value, "schema")]
     while stack:
         remaining -= 1
         if remaining < 0:
             raise SchemaDriftError("the reviewed JSON schema exceeds structural limits")
-        child = stack.pop()
+        child, position = stack.pop()
         if isinstance(child, Mapping):
-            if any(key in _SCHEMA_REFERENCE_KEYS for key in child):
+            if position == "schema" and any(key in _SCHEMA_REFERENCE_KEYS for key in child):
                 return True
-            stack.extend(child.values())
-        elif isinstance(child, list):
-            stack.extend(child)
+            if position == "schema":
+                stack.extend(
+                    (nested, _schema_keyword_position(key))
+                    for key, nested in child.items()
+                    if _schema_keyword_position(key) != "data"
+                )
+            elif position == "schema_map":
+                stack.extend((nested, "schema") for nested in child.values())
+        elif isinstance(child, list) and position == "schema_list":
+            stack.extend((nested, "schema") for nested in child)
     return False
 
 
-def _validate_linear_pattern(pattern: str) -> None:
+def _validate_linear_pattern(pattern: str) -> tuple[int, int]:
     try:
-        if len(pattern.encode("utf-8")) > _MAX_PATTERN_BYTES:
+        pattern_bytes = len(pattern.encode("utf-8"))
+        if pattern_bytes > _MAX_PATTERN_BYTES:
             raise SchemaDriftError("reviewed JSON schema pattern exceeds its byte limit")
     except UnicodeError:
         raise SchemaDriftError("the reviewed JSON schema pattern is invalid") from None
@@ -419,6 +577,7 @@ def _validate_linear_pattern(pattern: str) -> None:
         r"\Z",
     }:
         raise SchemaDriftError("reviewed JSON schema pattern is outside the linear-time subset")
+    return pattern_bytes, expanded_atoms
 
 
 def _consume_safe_pattern_escape(pattern: str, index: int) -> int:
@@ -691,45 +850,54 @@ class SchemaMirror:
 
     def capture(self, alias: str, tools: Sequence[Mapping[str, Any] | types.Tool]) -> set[str]:
         seen: set[str] = set()
-        changed: set[str] = set()
+        prepared: list[CapturedTool] = []
+        capture_budget = _CaptureSchemaBudget()
         for tool in tools:
             candidate = raw_model(tool) if isinstance(tool, types.Tool) else dict(tool)
+            name = candidate.get("name")
+            if not isinstance(name, str) or not name or name in seen:
+                raise MirrorError("downstream tools/list contained a missing or duplicate name")
+            seen.add(name)
             input_schema = candidate.get("inputSchema")
             if not isinstance(input_schema, Mapping):
                 raise SchemaDriftError("the reviewed JSON schema is invalid")
-            input_validator = _closed_schema_validator(input_schema)
+            input_validator = _closed_schema_validator(
+                input_schema,
+                capture_budget=capture_budget,
+            )
             output_schema = candidate.get("outputSchema")
             if output_schema is not None and not isinstance(output_schema, Mapping):
                 raise SchemaDriftError("the reviewed JSON schema is invalid")
             output_validator = (
-                _closed_schema_validator(output_schema)
+                _closed_schema_validator(output_schema, capture_budget=capture_budget)
                 if isinstance(output_schema, Mapping)
                 else None
             )
             raw = validate_lossless_tool(candidate)
-            name = raw.get("name")
-            if not isinstance(name, str) or not name or name in seen:
-                raise MirrorError("downstream tools/list contained a missing or duplicate name")
-            seen.add(name)
-            digest = tool_schema_digest(raw)
-            key = (alias, name)
-            previous = self._captured.get(key)
-            self._captured[key] = CapturedTool(
-                alias=alias,
-                name=name,
-                raw=raw,
-                digest=digest,
-                input_validator=input_validator,
-                output_validator=output_validator,
+            prepared.append(
+                CapturedTool(
+                    alias=alias,
+                    name=name,
+                    raw=raw,
+                    digest=tool_schema_digest(raw),
+                    input_validator=input_validator,
+                    output_validator=output_validator,
+                )
             )
+
+        changed: set[str] = set()
+        for captured in prepared:
+            key = (alias, captured.name)
+            previous = self._captured.get(key)
+            self._captured[key] = captured
             reviewed = self._reviewed_digests.get(key)
-            if reviewed is not None and reviewed != digest:
+            if reviewed is not None and reviewed != captured.digest:
                 self._drifted.add(key)
-                changed.add(name)
-            elif reviewed == digest:
+                changed.add(captured.name)
+            elif reviewed == captured.digest:
                 self._drifted.discard(key)
-            if previous is not None and previous.digest != digest:
-                changed.add(name)
+            if previous is not None and previous.digest != captured.digest:
+                changed.add(captured.name)
         for key in tuple(self._captured):
             if key[0] == alias and key[1] not in seen:
                 del self._captured[key]

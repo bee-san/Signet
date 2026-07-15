@@ -216,6 +216,66 @@ def test_schema_validation_permits_only_closed_in_document_refs() -> None:
         mirror.validate_input("example", "read", {"query": "too-long-query"})
 
 
+def test_schema_keyword_names_are_data_inside_properties_and_defs() -> None:
+    raw = _raw_tool("read")
+    raw["inputSchema"] = {
+        "$defs": {
+            "$ref": {"type": "string", "pattern": "^[a-z]+$"},
+            "pattern": {"type": "integer"},
+        },
+        "type": "object",
+        "properties": {
+            "$dynamicRef": {"type": "boolean"},
+            "$id": {"type": "string"},
+            "$ref": {"$ref": "#/$defs/$ref"},
+            "pattern": {"$ref": "#/$defs/pattern"},
+            "uniqueItems": {"type": "boolean"},
+        },
+        "additionalProperties": False,
+    }
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [raw])
+    mirror.validate_input(
+        "example",
+        "read",
+        {
+            "$dynamicRef": True,
+            "$id": "ordinary property data",
+            "$ref": "lowercase",
+            "pattern": 7,
+            "uniqueItems": False,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("keyword", "annotation"),
+    [
+        ("const", {"pattern": "^(a+)+$", "$ref": "https://metadata.test/schema"}),
+        ("default", {"$dynamicRef": "#", "$id": "nested-annotation"}),
+        ("examples", [{"uniqueItems": True, "patternProperties": {"(x+)+": {}}}]),
+        ("enum", [{"$recursiveRef": "#", "pattern": "a+$"}]),
+    ],
+)
+def test_schema_keywords_are_not_applied_to_annotation_data(
+    keyword: str,
+    annotation: Any,
+) -> None:
+    raw = _raw_tool("read")
+    raw["inputSchema"] = {"type": "object", keyword: annotation}
+    SchemaMirror(_policy()).capture("example", [raw])
+
+
+def test_schema_reference_must_target_an_actual_subschema_position() -> None:
+    raw = _raw_tool("read")
+    raw["inputSchema"] = {
+        "const": {"target": {"type": "string"}},
+        "$ref": "#/const/target",
+    }
+    with pytest.raises(SchemaDriftError, match="subschema"):
+        SchemaMirror(_policy()).capture("example", [raw])
+
+
 @pytest.mark.parametrize(
     "schema",
     [
@@ -288,6 +348,77 @@ def test_schema_capture_accepts_bounded_linear_regex_subset() -> None:
         "read",
         {"request_id": "req_123", "digest": "01234567abcdef"},
     )
+
+
+@pytest.mark.parametrize(
+    "limit_name",
+    [
+        "_MAX_CAPTURE_SCHEMA_BYTES",
+        "_MAX_CAPTURE_SCHEMA_NODES",
+        "_MAX_CAPTURE_SCHEMA_VALIDATORS",
+    ],
+)
+def test_capture_enforces_aggregate_schema_compilation_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+) -> None:
+    first = _raw_tool("read")
+    input_schema = first["inputSchema"]
+    output_schema = first["outputSchema"]
+    if limit_name == "_MAX_CAPTURE_SCHEMA_NODES":
+        limit = (
+            mcp_mirror_module._validate_schema_complexity(input_schema).nodes
+            + mcp_mirror_module._validate_schema_complexity(output_schema).nodes
+        )
+    elif limit_name == "_MAX_CAPTURE_SCHEMA_BYTES":
+        limit = len(mcp_mirror_module.canonical_json(input_schema)) + len(
+            mcp_mirror_module.canonical_json(output_schema)
+        )
+    else:
+        limit = 2
+    monkeypatch.setattr(mcp_mirror_module, limit_name, limit)
+    mirror = SchemaMirror(_policy())
+    with pytest.raises(SchemaDriftError, match="aggregate validation work"):
+        mirror.capture("example", [first, _raw_tool("stage")])
+    with pytest.raises(MirrorError, match="not been discovered"):
+        mirror.captured_digest("example", "read")
+
+
+def test_capture_aggregate_pattern_budget_fails_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mirror = SchemaMirror(_policy())
+    original = _raw_tool("read")
+    mirror.capture("example", [original])
+    original_digest = mirror.captured_digest("example", "read")
+    mirror.approve_schema("example", "read", original_digest)
+
+    changed = _raw_tool("read")
+    changed["description"] = "changed but must not be partially published"
+    staged = _raw_tool("stage")
+    for index, tool in enumerate((changed, staged)):
+        tool["inputSchema"] = {
+            "type": "object",
+            "properties": {
+                "value": {"type": "string", "pattern": f"^value_{index}[0-9]+$"}
+            },
+        }
+
+    monkeypatch.setattr(mcp_mirror_module, "_MAX_CAPTURE_SCHEMA_PATTERNS", 1)
+    with pytest.raises(SchemaDriftError, match="aggregate validation work"):
+        mirror.capture("example", [changed, staged])
+
+    assert mirror.captured_digest("example", "read") == original_digest
+    assert mirror.is_enabled("example", "read") is True
+    with pytest.raises(MirrorError, match="not been discovered"):
+        mirror.captured_digest("example", "stage")
+
+
+def test_capture_budget_allows_the_supported_tool_count() -> None:
+    tools = [_raw_tool(f"tool_{index}") for index in range(512)]
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", tools)
+    assert mirror.captured_digest("example", "tool_511")
 
 
 @pytest.mark.parametrize(
