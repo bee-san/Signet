@@ -396,11 +396,14 @@ def test_host_origin_preflight_and_csrf_fail_before_mutation(
         "csrf_token": csrf.session_token("session-id", "request:req_test"),
     }
     assert client.post("/requests/req_test/actions/totp", data=form).status_code == 403
-    assert client.post(
-        "/requests/req_test/actions/totp",
-        data={**form, "csrf_token": "wrong"},
-        headers={"Origin": ORIGIN},
-    ).status_code == 403
+    assert (
+        client.post(
+            "/requests/req_test/actions/totp",
+            data={**form, "csrf_token": "wrong"},
+            headers={"Origin": ORIGIN},
+        ).status_code
+        == 403
+    )
     assert backend.actions == []
 
 
@@ -486,12 +489,118 @@ def test_login_csrf_session_cookie_and_fixation_input(client: TestClient) -> Non
     assert "SameSite=strict" in response.headers["set-cookie"]
 
 
+def test_insecure_cookies_are_available_only_on_named_loopback_http(
+    backend: FakeBackend,
+    csrf: CsrfManager,
+) -> None:
+    origin = "http://127.0.0.1:8790"
+    app = create_web_app(
+        backend,
+        settings=WebSettings(
+            public_origin=origin,
+            allowed_hosts=("127.0.0.1", "localhost"),
+            session_cookie="signet_demo_session",
+            login_csrf_cookie="signet_demo_login_csrf",
+            secure_cookies=False,
+        ),
+        csrf=csrf,
+        clock=lambda: NOW,
+    )
+    with TestClient(app, base_url=origin) as loopback:
+        page = loopback.get("/login")
+        token = loopback.cookies.get("signet_demo_login_csrf")
+        assert page.status_code == 200 and token
+        assert "Secure" not in page.headers["set-cookie"]
+
+        wrong_origin = loopback.post(
+            "/login/password",
+            data={
+                "user_id": "autumn",
+                "password": "fake-password",
+                "totp_proof": "fake:totp",
+                "csrf_token": token,
+            },
+            headers={"Origin": "http://evil.test"},
+        )
+        assert wrong_origin.status_code == 403
+
+        response = loopback.post(
+            "/login/password",
+            data={
+                "user_id": "autumn",
+                "password": "fake-password",
+                "totp_proof": "fake:totp",
+                "csrf_token": token,
+            },
+            headers={"Origin": origin},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert "signet_demo_session=session-good" in response.headers["set-cookie"]
+        assert "Secure" not in response.headers["set-cookie"]
+        assert loopback.get("/").status_code == 200
+        assert loopback.get("/", headers={"Host": "evil.test"}).status_code == 400
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {
+            "public_origin": "http://example.test",
+            "allowed_hosts": ("example.test",),
+            "session_cookie": "demo_session",
+            "login_csrf_cookie": "demo_login",
+            "secure_cookies": False,
+        },
+        {
+            "public_origin": "http://127.0.0.1:8790",
+            "allowed_hosts": ("127.0.0.1",),
+            "secure_cookies": False,
+        },
+        {
+            "public_origin": "https://signet.test",
+            "allowed_hosts": ("signet.test",),
+            "session_cookie": "not-host-prefixed",
+        },
+        {
+            "public_origin": "https://signet.test",
+            "allowed_hosts": ("other.test",),
+        },
+        {
+            "public_origin": "https://signet.test",
+            "allowed_hosts": ("signet.test", "*"),
+        },
+        {
+            "public_origin": "https://signet.test",
+            "allowed_hosts": ("signet.test",),
+            "session_cookie": "__Host-bad;cookie",
+        },
+        {
+            "public_origin": "https://signet.test",
+            "allowed_hosts": ("signet.test",),
+            "session_cookie": "__Host-same",
+            "login_csrf_cookie": "__Host-same",
+        },
+        {
+            "public_origin": "https://signet.test",
+            "allowed_hosts": ("signet.test",),
+            "fake_only_ui": True,
+        },
+    ),
+)
+def test_web_settings_reject_unsafe_origin_host_and_cookie_combinations(
+    kwargs: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError):
+        WebSettings(**kwargs)  # type: ignore[arg-type]
+
+
 def test_hostile_detail_is_opaque_text_without_remote_fetch_surface(client: TestClient) -> None:
     authenticate(client)
     response = client.get("/requests/req_test")
     assert response.status_code == 200
     assert '<script src="https://evil.test' not in response.text
-    assert "<form action=\"//evil.test\"" not in response.text
+    assert '<form action="//evil.test"' not in response.text
     assert "&lt;script" in response.text
     assert "https://evil.test" in response.text
     assert "<title>Signet</title>" in response.text
@@ -511,11 +620,14 @@ def test_push_subscription_is_session_and_csrf_scoped(
         "device_label": "Test phone",
         "categories": [],
     }
-    assert client.post(
-        "/push/subscriptions",
-        json=payload,
-        headers={"Origin": ORIGIN, "X-CSRF-Token": token},
-    ).status_code == 204
+    assert (
+        client.post(
+            "/push/subscriptions",
+            json=payload,
+            headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+        ).status_code
+        == 204
+    )
     assert backend.push_endpoints == [payload["endpoint"]]
 
 

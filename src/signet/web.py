@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import secrets
 import time
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Form, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -35,6 +38,9 @@ type HumanAction = Literal[
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _LOGIN_CSRF_COOKIE = "__Host-signet_login_csrf"
 _SESSION_COOKIE = "__Host-signet_session"
+_COOKIE_NAME_CHARACTERS = frozenset(
+    "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
 
 
 class WebError(RuntimeError):
@@ -358,6 +364,80 @@ class WebSettings:
     allowed_hosts: tuple[str, ...]
     vapid_public_key: str = ""
     session_cookie: str = _SESSION_COOKIE
+    login_csrf_cookie: str = _LOGIN_CSRF_COOKIE
+    secure_cookies: bool = True
+    fake_only_ui: bool = False
+
+    def __post_init__(self) -> None:
+        parsed = urlsplit(self.public_origin)
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("web public origin is invalid") from None
+        hostname = parsed.hostname
+        if (
+            hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or port is not None
+            and not 1 <= port <= 65535
+        ):
+            raise ValueError("web public origin is invalid")
+        loopback = hostname == "localhost"
+        with suppress(ValueError):
+            loopback = loopback or ipaddress.ip_address(hostname).is_loopback
+        if self.secure_cookies:
+            if parsed.scheme != "https":
+                raise ValueError("secure web cookies require an HTTPS public origin")
+            if not self.session_cookie.startswith(
+                "__Host-"
+            ) or not self.login_csrf_cookie.startswith("__Host-"):
+                raise ValueError("secure web cookies require __Host- cookie names")
+        elif (
+            parsed.scheme != "http"
+            or not loopback
+            or self.session_cookie.startswith("__Host-")
+            or self.login_csrf_cookie.startswith("__Host-")
+        ):
+            raise ValueError("insecure web cookies are restricted to named loopback cookies")
+        if self.fake_only_ui and self.secure_cookies:
+            raise ValueError("fake-only web UI requires explicit loopback demo mode")
+        cookie_names = (self.session_cookie, self.login_csrf_cookie)
+        if (
+            not self.allowed_hosts
+            or hostname not in self.allowed_hosts
+            or len(set(cookie_names)) != len(cookie_names)
+            or any(not _valid_allowed_host(host) for host in self.allowed_hosts)
+            or any(
+                not name
+                or len(name) > 128
+                or any(character not in _COOKIE_NAME_CHARACTERS for character in name)
+                for name in cookie_names
+            )
+        ):
+            raise ValueError("web host or cookie configuration is invalid")
+
+
+def _valid_allowed_host(host: str) -> bool:
+    if not host or len(host) > 253 or host.endswith("."):
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        labels = host.split(".")
+        return all(
+            label
+            and len(label) <= 63
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and all(character.isalnum() or character == "-" for character in label)
+            and label.isascii()
+            for label in labels
+        )
+    return True
 
 
 def create_agent_health_app() -> FastAPI:
@@ -428,6 +508,7 @@ def create_web_app(
             "request": request,
             "principal": selected,
             "vapid_public_key": settings.vapid_public_key,
+            "fake_only_ui": settings.fake_only_ui,
         }
 
     @app.exception_handler(WebError)
@@ -477,9 +558,9 @@ def create_web_app(
             ),
         )
         response.set_cookie(
-            _LOGIN_CSRF_COOKIE,
+            settings.login_csrf_cookie,
             token,
-            secure=True,
+            secure=settings.secure_cookies,
             httponly=True,
             samesite="strict",
             path="/",
@@ -495,7 +576,7 @@ def create_web_app(
         totp_proof: Annotated[str, Form(min_length=1, max_length=128)],
         csrf_token: Annotated[str, Form()],
     ) -> Response:
-        if not csrf.verify_login(request.cookies.get(_LOGIN_CSRF_COOKIE), csrf_token):
+        if not csrf.verify_login(request.cookies.get(settings.login_csrf_cookie), csrf_token):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
         token = backend.password_totp_login(
             user_id,
@@ -506,14 +587,24 @@ def create_web_app(
             now=now_fn(),
         )
         response = Response(status_code=status.HTTP_303_SEE_OTHER, headers={"Location": "/"})
-        _set_session_cookie(response, settings.session_cookie, token)
-        response.delete_cookie(_LOGIN_CSRF_COOKIE, path="/", secure=True, httponly=True)
+        _set_session_cookie(
+            response,
+            settings.session_cookie,
+            token,
+            secure=settings.secure_cookies,
+        )
+        response.delete_cookie(
+            settings.login_csrf_cookie,
+            path="/",
+            secure=settings.secure_cookies,
+            httponly=True,
+        )
         return response
 
     @app.post("/login/passkey/options")
     async def passkey_login_options(request: Request) -> LoginOptions:
         if not csrf.verify_login(
-            request.cookies.get(_LOGIN_CSRF_COOKIE),
+            request.cookies.get(settings.login_csrf_cookie),
             request.headers.get("x-csrf-token"),
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
@@ -531,7 +622,7 @@ def create_web_app(
     @app.post("/login/passkey/complete")
     async def passkey_login_complete(request: Request) -> Response:
         if not csrf.verify_login(
-            request.cookies.get(_LOGIN_CSRF_COOKIE),
+            request.cookies.get(settings.login_csrf_cookie),
             request.headers.get("x-csrf-token"),
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
@@ -549,8 +640,18 @@ def create_web_app(
             now=now_fn(),
         )
         response = JSONResponse({"status": "authenticated"})
-        _set_session_cookie(response, settings.session_cookie, token)
-        response.delete_cookie(_LOGIN_CSRF_COOKIE, path="/", secure=True, httponly=True)
+        _set_session_cookie(
+            response,
+            settings.session_cookie,
+            token,
+            secure=settings.secure_cookies,
+        )
+        response.delete_cookie(
+            settings.login_csrf_cookie,
+            path="/",
+            secure=settings.secure_cookies,
+            httponly=True,
+        )
         return response
 
     @app.post("/logout")
@@ -559,7 +660,12 @@ def create_web_app(
         require_csrf(request, selected, "logout", csrf_token)
         backend.logout(request.cookies.get(settings.session_cookie), now=now_fn())
         response = Response(status_code=status.HTTP_303_SEE_OTHER, headers={"Location": "/login"})
-        response.delete_cookie(settings.session_cookie, path="/", secure=True, httponly=True)
+        response.delete_cookie(
+            settings.session_cookie,
+            path="/",
+            secure=settings.secure_cookies,
+            httponly=True,
+        )
         return response
 
     @app.get("/", response_class=HTMLResponse)
@@ -760,11 +866,17 @@ async def _json_object(request: Request) -> dict[str, Any]:
     return value
 
 
-def _set_session_cookie(response: Response, name: str, token: str) -> None:
+def _set_session_cookie(
+    response: Response,
+    name: str,
+    token: str,
+    *,
+    secure: bool = True,
+) -> None:
     response.set_cookie(
         name,
         token,
-        secure=True,
+        secure=secure,
         httponly=True,
         samesite="strict",
         path="/",

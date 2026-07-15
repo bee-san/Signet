@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 
 import uvicorn
 
+from signet.demo import DemoError, add_demo_parser, run_demo_command
 from signet.runtime import RuntimeAssemblyError, _loopback_address
 
 _FACTORY_PATTERN = re.compile(
@@ -25,6 +26,12 @@ def main(
 
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "demo":
+        try:
+            run_demo_command(args)
+        except (DemoError, RuntimeAssemblyError, ValueError) as exc:
+            parser.error(str(exc))
+        return
     if _FACTORY_PATTERN.fullmatch(args.factory) is None:
         parser.error("--factory must be an explicit module.path:callable reference")
     if args.command == "serve-mcp":
@@ -52,6 +59,7 @@ def _parser() -> argparse.ArgumentParser:
 
     web = subcommands.add_parser("serve-web", help="serve an assembled authenticated web app")
     _factory_arguments(web, default_host="127.0.0.1", default_port=8790)
+    add_demo_parser(subcommands)
     return parser
 
 
