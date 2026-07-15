@@ -165,6 +165,7 @@ class FakeBackend:
     def complete_passkey_action(
         self,
         principal: SessionPrincipal,
+        request_id: str,
         challenge_id: str,
         assertion: Mapping[str, Any],
         *,
@@ -172,6 +173,7 @@ class FakeBackend:
         now: int,
     ) -> str:
         assert principal.user_id == "autumn"
+        assert request_id == "req_test"
         assert challenge_id == "challenge-action" and assertion == {"fake": True}
         assert http_method == "POST" and now == NOW
         self.actions.append(("passkey", "req_test", "approve"))

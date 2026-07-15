@@ -196,6 +196,7 @@ class WebBackend(Protocol):
     def complete_passkey_action(
         self,
         principal: SessionPrincipal,
+        request_id: str,
         challenge_id: str,
         assertion: Mapping[str, Any],
         *,
@@ -645,6 +646,7 @@ def create_web_app(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
         final_state = backend.complete_passkey_action(
             selected,
+            request_id,
             challenge_id,
             assertion,
             http_method=request.method,
