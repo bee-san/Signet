@@ -8,7 +8,10 @@ from collections.abc import Callable, Sequence
 
 import uvicorn
 
+from signet.credential_broker import CredentialError
+from signet.db import DatabaseError
 from signet.demo import DemoError, add_demo_parser, run_demo_command
+from signet.deployment import DeploymentError, add_deployment_parser, run_deployment_command
 from signet.runtime import RuntimeAssemblyError, _loopback_address
 
 _FACTORY_PATTERN = re.compile(
@@ -30,6 +33,18 @@ def main(
         try:
             run_demo_command(args)
         except (DemoError, RuntimeAssemblyError, ValueError) as exc:
+            parser.error(str(exc))
+        return
+    if args.command == "deployment":
+        try:
+            run_deployment_command(args, runner=runner or uvicorn.run)
+        except (
+            CredentialError,
+            DatabaseError,
+            DeploymentError,
+            RuntimeAssemblyError,
+            ValueError,
+        ) as exc:
             parser.error(str(exc))
         return
     if _FACTORY_PATTERN.fullmatch(args.factory) is None:
@@ -61,6 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     web = subcommands.add_parser("serve-web", help="serve an assembled authenticated web app")
     _factory_arguments(web, default_host="127.0.0.1", default_port=8790)
     add_demo_parser(subcommands)
+    add_deployment_parser(subcommands)
     return parser
 
 

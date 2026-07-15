@@ -8,13 +8,10 @@
   <key>ProgramArguments</key>
   <array>
     <string>/ABSOLUTE/PATH/TO/SIGNET/.venv/bin/signet</string>
+    <string>deployment</string>
     <string>serve-mcp</string>
-    <string>--factory</string>
-    <string>REVIEWED_DEPLOYMENT_MODULE:create_mcp_app</string>
-    <string>--host</string>
-    <string>127.0.0.1</string>
-    <string>--port</string>
-    <string>8789</string>
+    <string>--config</string>
+    <string>/ABSOLUTE/PATH/TO/SIGNET-DATA/config/disabled.json</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/ABSOLUTE/PATH/TO/SIGNET</string>

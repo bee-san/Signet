@@ -19,15 +19,24 @@ and fresh action confirmation. A proxy supplies TLS and reachability only.
 
 ## Current deployment status
 
-This repository ships application components and dependency-injected assembly
-functions, but it deliberately does not ship a live deployment factory or
-credential-enrollment command. `signet serve-mcp` and `signet serve-web` require an
-explicit `module:factory`; creating an ASGI app performs no discovery, credential
-lookup, or downstream connection by itself.
+This repository deliberately does not ship a live deployment factory or a
+credential-enrollment command. It does ship a runnable, persistent
+**downstream-disabled staging assembly** through `signet deployment`. That assembly
+has no downstream transport, credential resolver, provider client, delivery worker,
+or reconciliation worker. It publishes only the authenticated `approvals` MCP
+namespace; all five normative tools return `deployment_disabled`, and downstream
+paths such as `/mcp/fastmail` and `/mcp/whatsapp` do not exist. Its web process is a
+loopback status page, not the authenticated approval application.
+
+The same disabled apps are installed factories at
+`signet.deployment:create_mcp_app` and `signet.deployment:create_web_app`. Factory
+mode reads only the absolute non-secret config path from `SIGNET_DISABLED_CONFIG`.
+The dedicated commands are preferred because they take their bind address and port
+from the verified config instead of duplicating them on the command line.
 
 Everything under `deploy/` is an inert, secret-free template. The launchd examples
-contain nonexistent placeholders and cannot start until a deployment assembly is
-reviewed. Nothing in the repository has:
+contain nonexistent absolute-path placeholders and cannot start until the disabled
+state and templates are reviewed. Nothing in the repository has:
 
 - inspected a live Hermes, Tailscale, Homepage, launchd, Keychain, provider, or
   browser-session configuration;
@@ -38,8 +47,9 @@ reviewed. Nothing in the repository has:
 - replaced a Hermes route or removed a direct credential;
 - sent a real email or WhatsApp message.
 
-Those are deferred human-authorized cutover steps. Automated implementation and
-CI must remain fake-provider/downstream-disabled.
+Those are deferred human-authorized cutover steps. Running the disabled staging
+assembly or seeing a healthy process does not complete or authorize any of them.
+Automated implementation and CI remain fake-provider/downstream-disabled.
 
 For copy-pasteable fake-only startup, a disposable Hermes profile, command
 verification, troubleshooting, and a restore drill, use
@@ -94,7 +104,122 @@ uv run python -m signet.operations --help
 foreign keys on every connection, and refuses unknown/newer schemas. An upgrade
 from an older supported schema requires a verified pre-migration backup callback.
 
-## Deployment assembly responsibilities
+## Run the persistent disabled staging assembly
+
+Use absolute paths. The config parent and data directory must be owned by the
+service user with exact mode `0700`; the config and SQLite database are exact mode
+`0600`. Symbolic links, hard-linked config files, duplicate JSON keys, non-loopback
+listeners, unknown fields, unknown namespaces, and alias expansion are rejected.
+
+```console
+install -d -m 0700 "$HOME/.hermes/services/signet/config"
+uv run signet deployment init \
+  --config "$HOME/.hermes/services/signet/config/disabled.json" \
+  --data-dir "$HOME/.hermes/services/signet/data" \
+  --namespace profile:hermes
+uv run signet deployment validate \
+  --config "$HOME/.hermes/services/signet/config/disabled.json"
+```
+
+`init` creates a new config and schema-12 database. It refuses an existing config
+or database and does not create a password, TOTP secret, passkey, session key,
+provider credential, policy, downstream alias, or queued request. `validate`
+reports database integrity and the fixed disabled invariants without reporting
+paths or verifier material.
+
+Start and stop the two loopback processes in the foreground while staging:
+
+```console
+uv run signet deployment serve-mcp \
+  --config "$HOME/.hermes/services/signet/config/disabled.json"
+uv run signet deployment serve-web \
+  --config "$HOME/.hermes/services/signet/config/disabled.json"
+```
+
+Normal `SIGINT` and `SIGTERM` handling belongs to Uvicorn and drains the MCP session
+manager before exit. Restart uses the same commands and persistent database. The
+MCP listener exposes `/mcp/approvals` only. Every listed approval tool returns the
+stable `deployment_disabled` domain error. The web root returns `503` with a fixed
+disabled message; it has no login, session, queue, approval, denial, or enrollment
+route. Both apps also reject non-loopback peer addresses if a factory is
+accidentally bound more broadly than its config. Do not proxy that status app as
+though it were the live authenticated UI.
+
+### Persistent caller tokens
+
+The disabled config declares the exact caller namespaces and grants each only the
+gateway-owned `approvals` alias. Issue one high-entropy token per profile:
+
+```console
+(umask 077 && set -o noclobber && \
+  uv run signet deployment token issue \
+    --config "$HOME/.hermes/services/signet/config/disabled.json" \
+    --namespace profile:hermes > /PRIVATE/NEW/SECRET/INGEST/PATH)
+```
+
+`token issue` writes the raw token and one newline to standard output exactly once.
+It writes no label or metadata alongside it. Direct stdout into the reviewed
+mode-`0600` Hermes secret-ingest path; never put the raw value in argv, an ordinary
+config file, shell history, logs, chat, tickets, or documentation. Signet persists
+only a SHA-256 verifier and non-secret metadata in SQLite.
+
+```console
+uv run signet deployment token list --config /ABSOLUTE/PATH/disabled.json
+uv run signet deployment token revoke --config /ABSOLUTE/PATH/disabled.json TOKEN_ID
+(umask 077 && set -o noclobber && \
+  uv run signet deployment token rotate \
+    --config /ABSOLUTE/PATH/disabled.json TOKEN_ID \
+    > /PRIVATE/NEW/SECRET/INGEST/PATH)
+```
+
+`list` never returns a raw token or verifier. Authentication reads SQLite on every
+request, so revocation does not wait for a process restart. `rotate` inserts a
+linked replacement and prints its raw token once, but deliberately leaves the old
+token valid. Securely ingest the replacement, reload Hermes, and test the new route;
+only then run `token revoke ... OLD_TOKEN_ID`. This two-step distribution prevents
+an output, storage, or reload failure from immediately taking the caller offline.
+A replacement destination must be new: never redirect rotation output over the
+active token's secret file, because shell redirection truncates it before Signet
+runs. The examples use `noclobber` to reject an existing destination.
+A concurrent or repeated rotation of the old ID fails while its replacement is
+active. If replacement output is lost, use `token list` to identify the linked
+replacement, revoke that replacement ID, and retry; the old token remains valid.
+Do not reuse a token across profile namespaces.
+
+Legacy rows in the older unconstrained `caller_tokens` table are not loaded. The
+schema-12 `mcp_caller_tokens` table accepts only the current exact `sgt_` format and
+retains revoked records. To upgrade an existing schema-11 database, first choose a
+new private snapshot path and run:
+
+```console
+uv run signet deployment migrate --config /ABSOLUTE/PATH/disabled.json \
+  --backup-snapshot /ABSOLUTE/PRIVATE/PATH/pre-schema-12.sqlite3
+```
+
+That snapshot is an unencrypted SQLite migration primitive, not a completed Signet
+backup bundle. Keep it mode `0600` inside an owned directory, protect it under the
+deployment backup policy, and do not retain it longer than that policy requires.
+
+### Human-auth context is validation, not enrollment
+
+An operator may include the future exact HTTPS context at `init` time with all
+three non-secret flags: `--human-user-id`, `--public-origin`, and `--rp-id`. Signet
+requires an HTTPS origin with a lowercase host and an RP ID exactly equal to that
+host. `deployment auth-status` reports active credential counts and always reports
+that the disabled authenticated web app is not enabled. It does not read public
+credential bytes, password verifiers, or TOTP references.
+
+There is intentionally no password, TOTP, or passkey value accepted by these
+commands, whether through argv, environment, stdin, or config. A passkey cannot be
+pre-generated by an offline CLI: the human must complete a browser/authenticator
+WebAuthn creation ceremony at the final HTTPS origin, with the intended RP ID and a
+reviewed recovery path. Password and TOTP setup likewise require a separate,
+reviewed human-only bootstrap mechanism that writes verifiers/references at their
+narrow boundary and never exposes the secret to the agent. Until that mechanism is
+supplied, reviewed, and actually completed by the human, keep the authenticated web
+factory and all live aliases disabled.
+
+## Live deployment assembly responsibilities
 
 Create a small deployment-owned module outside public source control that wires
 the reviewed components. It must:
@@ -141,14 +266,11 @@ Do not configure `/opt/homebrew/bin/wacli`: Homebrew normally exposes that path 
 a mutable symlink, and Signet intentionally rejects it. Re-review the resolved path,
 version, and digest together after every upgrade.
 
-`TokenRegistry.issue()` is an API, not a shipped enrollment CLI. During the later
-human-authorized installation, issue one caller token per Hermes profile with the
-exact allowed alias set (for example `fastmail`, `whatsapp`, and `approvals`). Store
-the exported Argon2 verifier record in the private deployment state and place the
-one-time raw value into Hermes' supported secret interpolation. Do not reuse it
-across profiles, confuse it with a provider credential, or expose it to the web
-app. Rotation issues a replacement, updates Hermes through a reviewed diff/reload,
-then revokes the old token.
+The shipped persistent token CLI provisions only the `approvals` route in disabled
+mode. A later live assembly must explicitly migrate the same namespace to the exact
+reviewed downstream aliases (for example `fastmail` and `whatsapp`) and rotate the
+token through a human-reviewed Hermes reload. Merely adding an alias string to a
+token record does not create a route, approve a schema, or authorize cutover.
 
 ### Required web values
 
@@ -182,12 +304,15 @@ Two user-agent templates are under `deploy/launchd/`:
 
 Separate processes keep browser routes off the MCP listener. Both templates use
 `Umask=077`, background process type, throttled restart, and distinct logs. Their
-paths and factory names are placeholders. Do not load a template directly.
+absolute executable, config, working-directory, and log paths are placeholders.
+Their `ProgramArguments` already invoke the installed `signet deployment
+serve-mcp` and `serve-web` commands. Do not load a template directly.
 
 During an authorized installation only:
 
-1. Replace every placeholder with an absolute reviewed path and real assembly
-   module. Verify no credential value appears in the plist.
+1. Create and validate the downstream-disabled state as shown above. Replace every
+   template placeholder with an absolute reviewed path. Verify no credential value
+   appears in the plist; the config path is non-secret.
 2. Create data, staging, backup, and log directories as the service user with mode
    `0700`. Create log files mode `0600`, or verify launchd creates them under the
    restrictive umask.
@@ -236,10 +361,11 @@ curl --fail --silent http://127.0.0.1:8789/healthz
 curl --fail --silent http://127.0.0.1:8790/healthz
 ```
 
-The MCP response contains only `{"status":"ok"}`. The web response adds only the
-fixed service name. Neither endpoint reports queue contents, targets, database or
-credential paths, policy, downstream connectivity, or user identity. A healthy
-process does not prove that credentials, schemas, or providers are ready.
+The MCP response contains only `{"status":"ok"}`. The disabled web response is
+`{"status":"ok","service":"signet","mode":"disabled"}`. A later live web factory
+may omit the fixed mode field. Neither endpoint reports queue contents, targets,
+database or credential paths, policy, downstream connectivity, or user identity. A
+healthy process does not prove that credentials, schemas, or providers are ready.
 
 Metrics and logs may include bounded counts, state classes, ages, duration buckets,
 safe error codes, reconciliation counts, disk capacity, and schema drift. They must
@@ -254,7 +380,10 @@ Serve provides tailnet-only reachability and TLS. It is not an identity provider
 for Signet. The app ignores Tailscale identity headers and still requires its own
 login and fresh action confirmation.
 
-The staged packet `deploy/tailscale/serve-merge.md` uses a previously free HTTPS
+Do not publish the disabled status-only web app through Serve; it has no human
+authentication or action routes. After the separate live web assembly and human
+authentication ceremony are complete, the staged packet
+`deploy/tailscale/serve-merge.md` uses a previously free HTTPS
 listener on `8443` and proxies its root to `http://127.0.0.1:8790`. Using a separate
 listener avoids subpath rewriting and leaves an existing `443` root handler intact.
 It also gives WebAuthn one stable origin.

@@ -49,6 +49,7 @@ CORE_TABLES = {
     "auth_credentials",
     "auth_rate_windows",
     "caller_tokens",
+    "mcp_caller_tokens",
     "schema_cache",
     "purge_jobs",
     "schema_meta",

@@ -98,6 +98,44 @@ fixtures must not fabricate a six-digit TOTP code. Fake approve/deny actions are
 available only in the authenticated loopback web demo with an unmistakable
 `fake:` action proof. Connection tests do not require a Hermes model credential.
 
+## Persistent downstream-disabled profile
+
+`disabled-profile.mcp.yaml.example` is the only Hermes route that the shipped
+persistent disabled assembly can serve. It contains `signet_disabled_approvals`
+only. Do not add `fastmail`, `whatsapp`, or another downstream URL: those paths are
+absent, not merely hidden. The disabled approval server lists the five normative
+gateway schemas, but every call returns `deployment_disabled` and creates no local
+request or external action.
+
+First create and validate disabled state using `docs/deployment.md`, start
+`signet deployment serve-mcp`, and issue a token for the profile's exact namespace.
+The issue command prints the raw value once. In a human-reviewed shell, direct that
+stdout into the profile's mode-`0600` secret-ingest procedure as
+`SIGNET_DISABLED_MCP_CALLER_TOKEN`; do not place the value in argv, `config.yaml`, a
+diff, terminal output, chat, or a prompt. The checked-in demo configurator refuses
+non-fake tokens and therefore cannot be used for this persistent profile.
+
+Make a private backup of the selected Hermes `config.yaml` and `.env`, perform a
+structured merge of only the reviewed example, and validate without a model call:
+
+```console
+hermes -p PROFILE config check
+hermes -p PROFILE mcp test signet_disabled_approvals
+hermes -p PROFILE mcp list
+```
+
+The connection test must discover exactly five tools. It proves only loopback MCP
+transport and bearer authentication. It does not prove human authentication,
+queue behavior, provider readiness, or live cutover. There is no reason to call an
+approval tool during this check; if one is called, a `deployment_disabled` error is
+the only acceptable result. Use Hermes' reviewed `/reload-mcp` workflow to activate
+the profile change. `token revoke` takes effect at the next Signet authentication
+check. `token rotate` stages a replacement without revoking the old token. Ingest
+the replacement into a new secret destination, reload and test Hermes, and only
+then explicitly revoke the old token. Never redirect over the active secret file.
+If output or ingestion fails, revoke the linked replacement record and retry while
+the old route remains usable.
+
 ## Deferred live route change
 
 The forward and reverse diff files show direction without reading or naming any

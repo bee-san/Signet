@@ -45,6 +45,22 @@ jobs:
           wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
           test -n "$wheel"
           uv run --isolated --no-project --with "$wheel" signet --help
+          root="$(mktemp -d)"
+          chmod 700 "$root"
+          uv run --isolated --no-project --with "$wheel" signet deployment init \
+            --config "$root/disabled.json" --data-dir "$root/data" \
+            --namespace profile:wheel-smoke >/dev/null
+          uv run --isolated --no-project --with "$wheel" signet deployment validate \
+            --config "$root/disabled.json" >/dev/null
+          uv run --isolated --no-project --with "$wheel" \
+            signet deployment token issue --config "$root/disabled.json" \
+            --namespace profile:wheel-smoke | python -c \
+            'import re,sys; assert re.fullmatch(r"sgt_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}\n", sys.stdin.read())'
+          metadata="$(uv run --isolated --no-project --with "$wheel" \
+            signet deployment token list --config "$root/disabled.json")"
+          ! grep -Eq 'sgt_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}' <<<"$metadata"
+          unset metadata
+          rm -rf "$root"
       - name: Scan source
         run: uv run --with bandit==1.9.4 bandit -r src/signet -ll
       - name: Export runtime dependencies

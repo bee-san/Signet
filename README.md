@@ -22,10 +22,13 @@ identities and fake downstreams. No repository command enrolls a passkey or TOTP
 reads a live credential, sends a real message, changes a Hermes profile, installs
 a launchd job, changes Tailscale Serve, or performs cutover.
 
-The files under `deploy/` are inert review templates. Their placeholders make the
-launchd examples non-runnable until a deployment-specific assembly factory is
-provided and a human authorizes installation. `signet.operations` consumes local,
-bounded fixtures only; it has no discovery network client and no host scanner.
+The files under `deploy/` are inert review templates. Their placeholders prevent
+installation without review. The installed `signet deployment` commands provide a
+runnable downstream-disabled staging assembly: it has no provider transport,
+credential resolver, dispatch worker, or downstream MCP alias. Its authenticated
+`approvals` tools all return `deployment_disabled`. This is not a live deployment
+or a substitute for deferred human setup and cutover. `signet.operations` consumes
+local, bounded fixtures only; it has no discovery network client or host scanner.
 
 ## Guarantees
 
@@ -72,9 +75,40 @@ uv run signet serve-web --factory deployment.assembly:create_web_app \
   --host 127.0.0.1 --port 8790
 ```
 
-Those example factories are deployment responsibilities, not modules shipped by
-this repository. The MCP command rejects a non-loopback numeric host. Do not point
-an ad hoc factory at live credentials.
+Those example factories remain deployment responsibilities. The MCP command rejects
+a non-loopback numeric host. Do not point an ad hoc factory at live credentials.
+
+## Downstream-disabled deployment staging
+
+Create private, persistent staging state without enrolling a human credential or
+creating a downstream client:
+
+```console
+install -d -m 0700 "$HOME/.hermes/services/signet/config"
+uv run signet deployment init \
+  --config "$HOME/.hermes/services/signet/config/disabled.json" \
+  --data-dir "$HOME/.hermes/services/signet/data" \
+  --namespace profile:hermes
+uv run signet deployment validate \
+  --config "$HOME/.hermes/services/signet/config/disabled.json"
+uv run signet deployment serve-mcp \
+  --config "$HOME/.hermes/services/signet/config/disabled.json"
+```
+
+Issue a random MCP caller token with `signet deployment token issue`. The command
+prints only the raw token, exactly once, so redirect it directly into the intended
+new mode-`0600` secret mechanism with shell `noclobber`; do not overwrite the active
+secret or paste it into a command argument, config file, shell history, log, or
+documentation. `token list` returns metadata only. `token
+revoke` takes effect on the next authentication check. `token rotate` stages and
+prints a linked replacement while deliberately leaving the old token valid; install,
+reload, and test the replacement before explicitly revoking the old token.
+
+The optional `init` human-auth context flags validate only the exact HTTPS origin,
+RP ID, and user ID. `deployment auth-status` reads counts, not credential material.
+Neither command enrolls anything. A passkey requires a real browser/authenticator
+ceremony at the final HTTPS origin and cannot be created by an offline CLI. See
+[`docs/deployment.md`](docs/deployment.md).
 
 ## Fake-only operator path
 

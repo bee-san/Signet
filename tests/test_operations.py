@@ -481,21 +481,19 @@ def test_cli_cutover_readiness_without_live_evidence_exits_two(tmp_path: Path) -
     assert "live:human_cutover_authorization" in result["blockers"]
 
 
-def test_launchd_templates_are_separate_loopback_secret_free_agents() -> None:
+def test_launchd_templates_use_separate_strict_disabled_config_commands() -> None:
     launchd = ROOT / "deploy" / "launchd"
     expectations = {
         "ai.hermes.signet.mcp.plist.example": (
             "ai.hermes.signet.mcp",
             "serve-mcp",
-            "8789",
         ),
         "ai.hermes.signet.web.plist.example": (
             "ai.hermes.signet.web",
             "serve-web",
-            "8790",
         ),
     }
-    for filename, (label, command, port) in expectations.items():
+    for filename, (label, command) in expectations.items():
         with (launchd / filename).open("rb") as handle:
             value = plistlib.load(handle)
         arguments = value["ProgramArguments"]
@@ -503,9 +501,12 @@ def test_launchd_templates_are_separate_loopback_secret_free_agents() -> None:
         assert value["Umask"] == 0o77
         assert value["ProcessType"] == "Background"
         assert arguments[0].endswith("/.venv/bin/signet")
-        assert command in arguments
-        assert arguments[arguments.index("--host") + 1] == "127.0.0.1"
-        assert arguments[arguments.index("--port") + 1] == port
+        assert arguments[1:] == [
+            "deployment",
+            command,
+            "--config",
+            "/ABSOLUTE/PATH/TO/SIGNET-DATA/config/disabled.json",
+        ]
         serialized = json.dumps(value).lower()
         assert "keychain://" not in serialized
         assert "password" not in serialized
