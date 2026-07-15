@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -18,6 +19,9 @@ class DownstreamConfig(BaseModel):
     url: str | None = None
     command: tuple[str, ...] = ()
     working_directory: Path | None = None
+    executable_sha256: str | None = None
+    execution_snapshot_root: Path | None = None
+    test_only_allow_script: bool = False
     timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     output_limit_bytes: int = Field(default=1_048_576, gt=0, le=16_777_216)
 
@@ -26,6 +30,13 @@ class DownstreamConfig(BaseModel):
     def credential_is_reference_only(cls, value: str) -> str:
         if not value.startswith("keychain://"):
             raise ValueError("downstream credentials must use keychain:// references")
+        return value
+
+    @field_validator("executable_sha256")
+    @classmethod
+    def executable_digest_is_exact(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError("stdio executable digest must be a lowercase SHA-256")
         return value
 
 

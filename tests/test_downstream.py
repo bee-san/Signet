@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import json
 import traceback
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -50,6 +52,8 @@ def _stdio_config(**changes: Any) -> DownstreamConfig:
         "credential_ref": "keychain://Signet/example",
         "command": ("/opt/signet/bin/provider-mcp", "--mode", "json"),
         "working_directory": Path("/var/empty"),
+        "executable_sha256": "a" * 64,
+        "execution_snapshot_root": Path("/var/empty/signet-exec"),
         "timeout_seconds": 2,
     }
     values.update(changes)
@@ -58,6 +62,37 @@ def _stdio_config(**changes: Any) -> DownstreamConfig:
 
 def _store() -> MemorySecretStore:
     return MemorySecretStore({("Signet", "example"): SECRET})
+
+
+def _executable_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_fake_stdio_server(path: Path) -> None:
+    path.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import shutil
+import sys
+
+report = {"environment": dict(os.environ), "helper": shutil.which("signet-parent-helper")}
+with open(sys.argv[1], "w", encoding="utf-8") as sink:
+    json.dump(report, sink, sort_keys=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("method") != "initialize":
+        continue
+    result = {
+        "protocolVersion": request["params"]["protocolVersion"],
+        "capabilities": {},
+        "serverInfo": {"name": "fake-reviewed-stdio", "version": "1.0.0"},
+    }
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
 
 
 def _tool(name: str) -> types.Tool:
@@ -278,11 +313,88 @@ async def test_stdio_uses_pinned_direct_argv_and_minimal_redacted_alias_environm
         assert parameters.command == "/opt/signet/bin/provider-mcp"
         assert parameters.args == ["--mode", "json"]
         assert parameters.cwd == Path("/var/empty")
-        assert parameters.env == {"SIGNET_DOWNSTREAM_WHATSAPP_LOCAL_CREDENTIAL": SECRET}
+        assert parameters.env == {
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+            "SIGNET_DOWNSTREAM_WHATSAPP_LOCAL_CREDENTIAL": SECRET,
+        }
         assert SECRET not in parameters.args
         assert SECRET not in repr(parameters)
         assert SECRET not in repr(client)
         assert "keychain://" not in repr(client)
+
+
+@pytest.mark.asyncio
+async def test_official_stdio_launcher_uses_verified_snapshot_and_exact_clean_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "provider-mcp"
+    environment_report = tmp_path / "environment.json"
+    _write_fake_stdio_server(executable)
+    malicious_path = tmp_path / "parent-path"
+    malicious_path.mkdir()
+    helper = malicious_path / "signet-parent-helper"
+    helper.write_text("#!/bin/sh\necho hijacked\n", encoding="utf-8")
+    helper.chmod(0o700)
+    for name, value in {
+        "HOME": "/parent/home-must-not-leak",
+        "LOGNAME": "parent-logname-must-not-leak",
+        "PATH": str(malicious_path),
+        "SHELL": "/parent/shell-must-not-leak",
+        "TERM": "parent-term-must-not-leak",
+        "USER": "parent-user-must-not-leak",
+        "SIGNET_PARENT_SECRET": "must-not-leak",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    client = DownstreamClient(
+        "example",
+        _stdio_config(
+            command=(str(executable), str(environment_report)),
+            working_directory=tmp_path,
+            executable_sha256=_executable_digest(executable),
+            execution_snapshot_root=tmp_path / "snapshots",
+            test_only_allow_script=True,
+        ),
+        _store(),
+    )
+    async with client:
+        assert client.is_running
+
+    report = json.loads(environment_report.read_text(encoding="utf-8"))
+    assert report == {
+        "environment": {
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+            "SIGNET_DOWNSTREAM_EXAMPLE_CREDENTIAL": SECRET,
+        },
+        "helper": None,
+    }
+    assert list((tmp_path / "snapshots").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_official_stdio_launcher_rejects_symlinked_executable(tmp_path: Path) -> None:
+    executable = tmp_path / "provider-mcp-real"
+    _write_fake_stdio_server(executable)
+    symlink = tmp_path / "provider-mcp"
+    symlink.symlink_to(executable)
+    client = DownstreamClient(
+        "example",
+        _stdio_config(
+            command=(str(symlink), str(tmp_path / "unused.json")),
+            working_directory=tmp_path,
+            executable_sha256=_executable_digest(executable),
+            execution_snapshot_root=tmp_path / "snapshots",
+            test_only_allow_script=True,
+        ),
+        _store(),
+    )
+    with pytest.raises(DownstreamConnectionError, match="initialization failed"):
+        await client.start()
+    await client.close()
 
 
 @pytest.mark.asyncio
@@ -497,6 +609,19 @@ def test_stdio_configuration_rejects_shells_relative_paths_and_unbounded_argv() 
     ):
         with pytest.raises(DownstreamConfigurationError):
             DownstreamClient("example", _stdio_config(command=command), _store())
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"executable_sha256": None},
+        {"execution_snapshot_root": None},
+        {"execution_snapshot_root": Path("relative")},
+    ],
+)
+def test_stdio_configuration_requires_reviewed_executable_inputs(changes: dict[str, Any]) -> None:
+    with pytest.raises(DownstreamConfigurationError, match="stdio downstream"):
+        DownstreamClient("example", _stdio_config(**changes), _store())
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import re
+import signal
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import (
     AbstractAsyncContextManager,
@@ -20,11 +21,13 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
+import anyio
 import httpx
 import mcp.types as types
+from anyio.streams.text import TextReceiveStream
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.message import SessionMessage
 
 from signet.adapters.base import AdapterProtocolError, copy_json_object
 from signet.config import DownstreamConfig
@@ -36,6 +39,7 @@ from signet.mcp_mirror import (
 from signet.mcp_mirror import (
     discover_all_tools as _discover_all_tools,
 )
+from signet.reviewed_process import descriptor_path, open_verified_executable
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _MAX_TOOL_NAME_LENGTH = 256
@@ -101,6 +105,14 @@ class RedactedStdioServerParameters(StdioServerParameters):
         return repr(self)
 
 
+class ReviewedStdioServerParameters(RedactedStdioServerParameters):
+    """Pinned local process inputs consumed only by Signet's exact-env launcher."""
+
+    expected_sha256: str
+    execution_snapshot_root: Path
+    test_only_allow_script: bool = False
+
+
 class _Lifecycle(StrEnum):
     NEW = "new"
     STARTING = "starting"
@@ -114,7 +126,9 @@ TransportStreams = tuple[Any, Any] | tuple[Any, Any, Callable[[], str | None]]
 HTTPConnector = Callable[
     [str, Mapping[str, str], float], AbstractAsyncContextManager[TransportStreams]
 ]
-StdioConnector = Callable[[StdioServerParameters], AbstractAsyncContextManager[TransportStreams]]
+StdioConnector = Callable[
+    [ReviewedStdioServerParameters], AbstractAsyncContextManager[TransportStreams]
+]
 
 
 class DownstreamSession(Protocol):
@@ -148,11 +162,110 @@ async def _official_http_connector(
 
 @asynccontextmanager
 async def _official_stdio_connector(
-    parameters: StdioServerParameters,
+    parameters: ReviewedStdioServerParameters,
 ) -> AsyncIterator[TransportStreams]:
-    with Path(os.devnull).open("w", encoding="utf-8") as error_sink:
-        async with stdio_client(parameters, errlog=error_sink) as streams:
-            yield cast(TransportStreams, streams)
+    executable_descriptor = open_verified_executable(
+        Path(parameters.command),
+        expected_sha256=parameters.expected_sha256,
+        snapshot_root=parameters.execution_snapshot_root,
+        test_only_allow_script=parameters.test_only_allow_script,
+    )
+    try:
+        executable = descriptor_path(executable_descriptor)
+        with Path(os.devnull).open("w", encoding="utf-8") as error_sink:
+            process = await anyio.open_process(
+                [executable, *parameters.args],
+                env=dict(parameters.env or {}),
+                stderr=error_sink,
+                cwd=parameters.cwd,
+                start_new_session=True,
+                pass_fds=(executable_descriptor,),
+                umask=0o077,
+            )
+    finally:
+        os.close(executable_descriptor)
+
+    read_sender, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](0)
+    write_stream, write_receiver = anyio.create_memory_object_stream[SessionMessage](0)
+
+    async def stdout_reader() -> None:
+        assert process.stdout is not None
+        buffer = ""
+        try:
+            async with read_sender:
+                async for chunk in TextReceiveStream(
+                    process.stdout,
+                    encoding=parameters.encoding,
+                    errors=parameters.encoding_error_handler,
+                ):
+                    lines = (buffer + chunk).split("\n")
+                    buffer = lines.pop()
+                    for line in lines:
+                        try:
+                            message = types.JSONRPCMessage.model_validate_json(line)
+                        except Exception:
+                            await read_sender.send(
+                                DownstreamProtocolError("downstream emitted invalid JSON-RPC")
+                            )
+                            continue
+                        await read_sender.send(SessionMessage(message))
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async def stdin_writer() -> None:
+        assert process.stdin is not None
+        try:
+            async with write_receiver:
+                async for session_message in write_receiver:
+                    encoded = session_message.message.model_dump_json(
+                        by_alias=True, exclude_none=True
+                    )
+                    await process.stdin.send(
+                        (encoded + "\n").encode(
+                            encoding=parameters.encoding,
+                            errors=parameters.encoding_error_handler,
+                        )
+                    )
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async with anyio.create_task_group() as task_group, process:
+        task_group.start_soon(stdout_reader)
+        task_group.start_soon(stdin_writer)
+        try:
+            yield cast(TransportStreams, (read_stream, write_stream))
+        finally:
+            if process.stdin is not None:
+                with suppress(Exception):
+                    await process.stdin.aclose()
+            try:
+                with anyio.fail_after(2):
+                    await process.wait()
+            except TimeoutError:
+                await _terminate_stdio_process(process)
+            except ProcessLookupError:
+                pass
+            await read_stream.aclose()
+            await write_stream.aclose()
+            await read_sender.aclose()
+            await write_receiver.aclose()
+
+
+async def _terminate_stdio_process(process: Any) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    with anyio.move_on_after(2) as termination_scope:
+        await process.wait()
+    if not termination_scope.cancel_called:
+        return
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    with suppress(ProcessLookupError):
+        await process.wait()
 
 
 def _official_session_factory(
@@ -548,11 +661,21 @@ class DownstreamClient:
             raise DownstreamConfigurationError(
                 "downstream credentials may not appear in process arguments"
             )
-        parameters = RedactedStdioServerParameters(
+        assert self._config.executable_sha256 is not None
+        assert self._config.execution_snapshot_root is not None
+        parameters = ReviewedStdioServerParameters(
             command=executable,
             args=list(arguments),
-            env={_credential_environment_name(self._alias): revealed},
+            env={
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+                _credential_environment_name(self._alias): revealed,
+            },
             cwd=self._config.working_directory,
+            expected_sha256=self._config.executable_sha256,
+            execution_snapshot_root=self._config.execution_snapshot_root,
+            test_only_allow_script=self._config.test_only_allow_script,
         )
         return await stack.enter_async_context(self._stdio_connector(parameters))
 
@@ -592,7 +715,14 @@ class DownstreamClient:
             raise DownstreamConfigurationError("downstream configuration is invalid")
 
         if config.transport == "http":
-            if config.url is None or config.command or config.working_directory is not None:
+            if (
+                config.url is None
+                or config.command
+                or config.working_directory is not None
+                or config.executable_sha256 is not None
+                or config.execution_snapshot_root is not None
+                or config.test_only_allow_script
+            ):
                 raise DownstreamConfigurationError("HTTP downstream configuration is invalid")
             parsed = urlsplit(config.url)
             try:
@@ -623,7 +753,13 @@ class DownstreamClient:
                 )
             return
 
-        if config.url is not None or not config.command:
+        if (
+            config.url is not None
+            or not config.command
+            or config.executable_sha256 is None
+            or config.execution_snapshot_root is None
+            or not config.execution_snapshot_root.is_absolute()
+        ):
             raise DownstreamConfigurationError("stdio downstream configuration is invalid")
         executable, *arguments = config.command
         executable_path = Path(executable)
