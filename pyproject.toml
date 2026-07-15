@@ -24,8 +24,8 @@ dependencies = [
   "jinja2>=3.1,<4",
   "jsonschema>=4.23,<5",
   "keyring>=25.6,<27",
-  "mcp>=1.28.1,<2",
-  "pydantic>=2.10,<3",
+  "mcp==1.28.1",
+  "pydantic==2.13.4",
   "pydantic-settings>=2.7,<3",
   "pyotp>=2.9,<3",
   "python-multipart>=0.0.20,<1",
@@ -46,6 +46,7 @@ dev = [
   "pytest-asyncio>=0.25,<2",
   "pytest-cov>=6,<8",
   "ruff>=0.9,<1",
+  "types-jsonschema>=4.23,<5",
 ]
 
 [tool.hatch.build.targets.wheel]
