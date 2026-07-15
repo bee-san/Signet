@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 
 import pytest
@@ -57,6 +58,22 @@ def test_session_cookie_is_signed_opaque_and_has_host_cookie_controls() -> None:
     replacement = "A" if token[-1] != "A" else "B"
     with pytest.raises(InvalidSession, match="invalid or expired"):
         manager.authenticate(f"{token[:-1]}{replacement}", now=1_001)
+
+    version, session_id, signature = token.split(".")
+    raw_signature = base64.urlsafe_b64decode(signature + "=")
+    aliases = [
+        candidate
+        for candidate in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        if candidate != signature[-1]
+        and base64.urlsafe_b64decode(f"{signature[:-1]}{candidate}=") == raw_signature
+    ]
+    assert aliases
+    for alias in aliases:
+        with pytest.raises(InvalidSession, match="invalid or expired"):
+            manager.authenticate(
+                f"{version}.{session_id}.{signature[:-1]}{alias}",
+                now=1_001,
+            )
 
     settings = SessionCookieSettings()
     assert settings.name.startswith("__Host-")

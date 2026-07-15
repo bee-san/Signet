@@ -1004,7 +1004,10 @@ def _base64url_decode(value: str) -> bytes:
     if not value or any(character not in alphabet for character in value):
         raise ValueError("invalid base64url")
     padding = "=" * (-len(value) % 4)
-    return base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    if _base64url_encode(decoded) != value:
+        raise ValueError("non-canonical base64url")
+    return decoded
 
 
 def hmac_compare(left: bytes, right: bytes) -> bool:
