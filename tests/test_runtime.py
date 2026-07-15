@@ -108,6 +108,8 @@ def alias_surface(
         [str, str, dict[str, Any], str],
         Any,
     ],
+    *,
+    tracked_session_limit: int = 1_024,
 ) -> AliasToolSurface:
     policy = parse_policy(
         {
@@ -158,7 +160,12 @@ def alias_surface(
             return cast(dict[str, Any], await result)
         return cast(dict[str, Any], result)
 
-    return AliasToolSurface(alias="fastmail", mirror=mirror, call_handler=invoke)
+    return AliasToolSurface(
+        alias="fastmail",
+        mirror=mirror,
+        call_handler=invoke,
+        tracked_session_limit=tracked_session_limit,
+    )
 
 
 def make_runtime(
@@ -166,6 +173,7 @@ def make_runtime(
     *,
     handler: Callable[[str, str, dict[str, Any], str], Any] | None = None,
     json_response: bool = False,
+    session_limit: int = 1_024,
 ) -> RuntimeHarness:
     calls: list[tuple[str, str, dict[str, Any], str]] = []
 
@@ -189,7 +197,7 @@ def make_runtime(
         tools=cast(Any, gateway_tools),
         principal_provider=gateway_principal_provider("human:one"),
     )
-    surface = alias_surface(selected_handler)
+    surface = alias_surface(selected_handler, tracked_session_limit=session_limit)
     runtime = assemble_mcp_runtime(
         aliases={"fastmail": surface},
         approvals=approvals,
@@ -394,6 +402,45 @@ async def test_stateful_session_is_bound_to_token_and_delete_cancels_it(
         assert cancelled.status_code == 200
         assert session_id not in harness.runtime.managers["fastmail"]._server_instances
         assert harness.alias_surface.tracked_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stateful_transport_session_admission_is_atomic_and_bounded(
+    auth: AuthFixture,
+) -> None:
+    harness = make_runtime(auth, json_response=True, session_limit=1)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    async with http_client(harness.runtime, auth.all_aliases) as client:
+        responses = await asyncio.gather(
+            *(
+                client.post(
+                    "/mcp/fastmail",
+                    headers=headers,
+                    json=initialize_message(),
+                )
+                for _ in range(8)
+            )
+        )
+        assert [response.status_code for response in responses].count(200) == 1
+        assert [response.status_code for response in responses].count(429) == 7
+        assert len(harness.runtime.managers["fastmail"]._server_instances) == 1
+        accepted = next(response for response in responses if response.status_code == 200)
+        session_id = accepted.headers["mcp-session-id"]
+
+        retired = await client.delete(
+            "/mcp/fastmail",
+            headers={"Mcp-Session-Id": session_id},
+        )
+        assert retired.status_code == 200
+        replacement = await client.post(
+            "/mcp/fastmail",
+            headers=headers,
+            json=initialize_message(),
+        )
+        assert replacement.status_code == 200
 
 
 @pytest.mark.asyncio

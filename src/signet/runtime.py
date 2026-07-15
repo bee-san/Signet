@@ -163,13 +163,35 @@ class _ManagerEndpoint:
         manager: StreamableHTTPSessionManager,
         *,
         on_session_closed: Callable[[str], object] | None = None,
+        session_limit: int | None = None,
     ) -> None:
         self._manager = manager
         self._on_session_closed = on_session_closed
+        self._session_limit = session_limit
+        self._session_admission_lock = anyio.Lock()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         session_id = _header(scope, b"mcp-session-id")
-        await self._manager.handle_request(scope, receive, send)
+        if session_id is None and self._session_limit is not None:
+            async with self._session_admission_lock:
+                if len(self._manager._server_instances) >= self._session_limit:
+                    response = JSONResponse(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": "server-error",
+                            "error": {
+                                "code": -32600,
+                                "message": "The Signet MCP session limit is reached.",
+                            },
+                        },
+                        status_code=429,
+                        headers={"Cache-Control": "no-store"},
+                    )
+                    await response(scope, receive, send)
+                    return
+                await self._manager.handle_request(scope, receive, send)
+        else:
+            await self._manager.handle_request(scope, receive, send)
         if scope.get("method") == "DELETE" and session_id is not None:
             transport = self._manager._server_instances.get(session_id)
             if transport is not None and transport.is_terminated:
@@ -262,6 +284,9 @@ def assemble_mcp_runtime(
             manager,
             on_session_closed=(
                 bound_surface.retire_session if bound_surface is not None else None
+            ),
+            session_limit=(
+                bound_surface.tracked_session_limit if bound_surface is not None else None
             ),
         )
         endpoint = RequireAuthMiddleware(endpoint, required_scopes=[_alias_scope(alias)])

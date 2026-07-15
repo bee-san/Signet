@@ -630,6 +630,10 @@ class AliasToolSurface:
     def session_tracking_ttl_seconds(self) -> float:
         return self._tracked_session_ttl_seconds
 
+    @property
+    def tracked_session_limit(self) -> int:
+        return self._tracked_session_limit
+
     def _admit_session(self, session: Any, now: float) -> None:
         self._prune_sessions(now)
         if session not in self._sessions and len(self._sessions) >= self._tracked_session_limit:
