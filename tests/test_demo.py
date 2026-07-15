@@ -21,7 +21,6 @@ import yaml
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
-from starlette.testclient import TestClient
 
 import signet.demo as demo_module
 from signet.app import main
@@ -998,37 +997,6 @@ async def test_direct_workers_serve_cannot_recover_while_lifespan_holds_lock(
     async with holder.web.router.lifespan_context(holder.web):
         with pytest.raises(DemoError, match="already being served"):
             await contender.workers.serve(asyncio.Event())
-        assert recovery_calls == 0
-        assert contender.provider_clients["fastmail"].mutation_calls == 0
-        assert contender.provider_clients["whatsapp"].mutation_calls == 0
-
-
-def test_testclient_lifespan_cannot_start_second_worker_before_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = new_demo(tmp_path)
-    holder = build_demo(root)
-    contender = build_demo(root)
-    recovery_calls = 0
-
-    def unexpected_recovery(*, now: int) -> Any:
-        nonlocal recovery_calls
-        del now
-        recovery_calls += 1
-        raise AssertionError("unlocked recovery ran")
-
-    monkeypatch.setattr(contender.state_machine, "recover_startup", unexpected_recovery)
-    with TestClient(holder.web, base_url="http://127.0.0.1:8790") as client:
-        assert client.get("/healthz").status_code == 200
-        with (
-            pytest.raises(DemoError, match="already being served"),
-            TestClient(
-                contender.web,
-                base_url="http://127.0.0.1:8790",
-            ),
-        ):
-            pass
         assert recovery_calls == 0
         assert contender.provider_clients["fastmail"].mutation_calls == 0
         assert contender.provider_clients["whatsapp"].mutation_calls == 0

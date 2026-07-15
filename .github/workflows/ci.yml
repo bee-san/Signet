@@ -38,7 +38,9 @@ jobs:
       - name: Type check
         run: uv run mypy
       - name: Test
-        run: uv run pytest -q
+        run: >-
+          uv run pytest -q --cov=signet --cov-report=term-missing
+          --cov-fail-under=85
       - name: Build distributions
         run: uv build --no-sources
       - name: Smoke-test the isolated wheel
