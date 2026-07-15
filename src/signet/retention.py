@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -153,16 +154,15 @@ class BackupPins:
             ).fetchall()
             request_ids = [str(row["request_id"]) for row in rows]
             if request_ids:
-                placeholders = ",".join("?" for _ in request_ids)
                 conflict = connection.execute(
-                    f"""
+                    """
                     SELECT 1 FROM purge_jobs
-                    WHERE request_id IN ({placeholders})
+                    WHERE request_id IN (SELECT value FROM json_each(?))
                       AND intent != 'backup_pin'
                       AND started_at IS NOT NULL AND completed_at IS NULL
                     LIMIT 1
                     """,
-                    tuple(request_ids),
+                    (json.dumps(request_ids, separators=(",", ":")),),
                 ).fetchone()
                 if conflict is not None:
                     raise BackupPinConflict("attachment purge is already in progress")
@@ -190,15 +190,14 @@ class BackupPins:
         _validate_time(now, "backup pin release time")
         if not lease.purge_job_ids:
             return
-        placeholders = ",".join("?" for _ in lease.purge_job_ids)
         with self.database.transaction() as connection:
             updated = connection.execute(
-                f"""
+                """
                 UPDATE purge_jobs SET completed_at = ?, last_error = NULL
-                WHERE purge_job_id IN ({placeholders})
+                WHERE purge_job_id IN (SELECT value FROM json_each(?))
                   AND intent = 'backup_pin' AND completed_at IS NULL
                 """,
-                (now, *lease.purge_job_ids),
+                (now, json.dumps(lease.purge_job_ids, separators=(",", ":"))),
             ).rowcount
         if updated != len(lease.purge_job_ids):
             raise RetentionError("backup pin release was incomplete")
@@ -322,18 +321,15 @@ class RetentionManager:
                         connection,
                         request_id=request_id,
                         intent=PurgeIntent.ATTACHMENTS,
-                        due_at=completed_at + self._required_delay(
-                            PurgeIntent.ATTACHMENTS, state
-                        ),
+                        due_at=completed_at + self._required_delay(PurgeIntent.ATTACHMENTS, state),
                     )
                 if self._has_sensitive_rows(connection, request_id):
                     inserted += self._schedule_intent(
                         connection,
                         request_id=request_id,
                         intent=PurgeIntent.SENSITIVE_ROWS,
-                        due_at=completed_at + self._required_delay(
-                            PurgeIntent.SENSITIVE_ROWS, state
-                        ),
+                        due_at=completed_at
+                        + self._required_delay(PurgeIntent.SENSITIVE_ROWS, state),
                     )
                 if self.mode is RetentionMode.ISOLATED_PER_REQUEST_KEY and (
                     self._has_undestroyed_keys(connection, request_id)
@@ -342,9 +338,8 @@ class RetentionManager:
                         connection,
                         request_id=request_id,
                         intent=PurgeIntent.ENCRYPTION_KEY,
-                        due_at=completed_at + self._required_delay(
-                            PurgeIntent.ENCRYPTION_KEY, state
-                        ),
+                        due_at=completed_at
+                        + self._required_delay(PurgeIntent.ENCRYPTION_KEY, state),
                     )
         return inserted
 
@@ -554,9 +549,7 @@ class RetentionManager:
             self._fault("key_destroy_confirmed")
         with self.database.transaction() as connection:
             self._ensure_claim(connection, claim)
-            current_references = self._verified_isolated_references(
-                connection, claim.request_id
-            )
+            current_references = self._verified_isolated_references(connection, claim.request_id)
             if current_references != key_references:
                 raise _JobFailure("key_reference_changed")
             connection.execute(
@@ -588,9 +581,7 @@ class RetentionManager:
             self._tombstone_idempotency(connection, claim.request_id, now=now)
             self._complete_claim(connection, claim, now=now)
 
-    def _verified_isolated_references(
-        self, connection: Any, request_id: str
-    ) -> tuple[str, ...]:
+    def _verified_isolated_references(self, connection: Any, request_id: str) -> tuple[str, ...]:
         rows = connection.execute(
             """
             SELECT encryption_key_ref FROM payload_versions

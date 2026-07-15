@@ -9,7 +9,7 @@ import secrets
 import shutil
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from typing import Any, Literal
 
 from .admission import QueueAdmissionLimits, ReviewedToolLimits
 from .auth import (
@@ -1409,21 +1409,27 @@ class ApprovalStateMachine:
             attempt = self._attempt_for_fence(connection, lease, now=now)
             if attempt["phase"] == ExecutionPhase.PREPARING.value:
                 next_phase = ExecutionPhase.DISPATCH_STARTED
-                timestamp_column = "dispatch_started_at"
+                update_query = """
+                    UPDATE execution_attempts
+                    SET phase = ?, dispatch_started_at = ?
+                    WHERE attempt_id = ? AND fencing_token = ?
+                      AND worker_generation = ? AND phase = ?
+                      AND lease_expires_at > ?
+                """
             elif attempt["phase"] == ExecutionPhase.REDISPATCH_PREPARING.value:
                 next_phase = ExecutionPhase.REDISPATCH_STARTED
-                timestamp_column = "redispatch_started_at"
+                update_query = """
+                    UPDATE execution_attempts
+                    SET phase = ?, redispatch_started_at = ?
+                    WHERE attempt_id = ? AND fencing_token = ?
+                      AND worker_generation = ? AND phase = ?
+                      AND lease_expires_at > ?
+                """
             else:
                 raise FenceRejected("attempt is not at a dispatch boundary")
 
             updated = connection.execute(
-                f"""
-                UPDATE execution_attempts
-                SET phase = ?, {timestamp_column} = ?
-                WHERE attempt_id = ? AND fencing_token = ?
-                  AND worker_generation = ? AND phase = ?
-                  AND lease_expires_at > ?
-                """,
+                update_query,
                 (
                     next_phase.value,
                     now,
@@ -2361,16 +2367,16 @@ class ApprovalStateMachine:
 
         if self._pending_limit_reached(
             connection,
-            where_sql="",
-            where_parameters=(),
+            scope="global",
+            scope_parameters=(),
             now=request.created_at,
             limit=limits.queue_limit,
         ):
             raise AdmissionRejected("queue_capacity")
         if self._pending_limit_reached(
             connection,
-            where_sql="AND origin_namespace = ?",
-            where_parameters=(request.origin_namespace,),
+            scope="origin",
+            scope_parameters=(request.origin_namespace,),
             now=request.created_at,
             limit=limits.origin_pending_limit,
         ):
@@ -2380,8 +2386,8 @@ class ApprovalStateMachine:
             tool_pending_limit = min(tool_pending_limit, reviewed_limits.pending_requests)
         if self._pending_limit_reached(
             connection,
-            where_sql="AND downstream_alias = ? AND tool_name = ?",
-            where_parameters=(request.downstream_alias, request.tool_name),
+            scope="tool",
+            scope_parameters=(request.downstream_alias, request.tool_name),
             now=request.created_at,
             limit=tool_pending_limit,
         ):
@@ -2404,21 +2410,48 @@ class ApprovalStateMachine:
     def _pending_limit_reached(
         connection: Any,
         *,
-        where_sql: str,
-        where_parameters: tuple[str, ...],
+        scope: Literal["global", "origin", "tool"],
+        scope_parameters: tuple[str, ...],
         now: int,
         limit: int,
     ) -> bool:
+        if scope == "global":
+            if scope_parameters:
+                raise ValueError("global pending scope does not accept parameters")
+            query = """
+                SELECT COUNT(*) FROM (
+                    SELECT 1 FROM approval_requests
+                    WHERE state = 'pending_approval' AND expires_at > ?
+                    LIMIT ?
+                )
+            """
+        elif scope == "origin":
+            if len(scope_parameters) != 1:
+                raise ValueError("origin pending scope requires one parameter")
+            query = """
+                SELECT COUNT(*) FROM (
+                    SELECT 1 FROM approval_requests
+                    WHERE state = 'pending_approval' AND expires_at > ?
+                      AND origin_namespace = ?
+                    LIMIT ?
+                )
+            """
+        elif scope == "tool":
+            if len(scope_parameters) != 2:
+                raise ValueError("tool pending scope requires two parameters")
+            query = """
+                SELECT COUNT(*) FROM (
+                    SELECT 1 FROM approval_requests
+                    WHERE state = 'pending_approval' AND expires_at > ?
+                      AND downstream_alias = ? AND tool_name = ?
+                    LIMIT ?
+                )
+            """
+        else:
+            raise ValueError("unknown pending scope")
         count = connection.execute(
-            f"""
-            SELECT COUNT(*) FROM (
-                SELECT 1 FROM approval_requests
-                WHERE state = 'pending_approval' AND expires_at > ?
-                {where_sql}
-                LIMIT ?
-            )
-            """,
-            (now, *where_parameters, limit),
+            query,
+            (now, *scope_parameters, limit),
         ).fetchone()[0]
         return int(count) >= limit
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import yaml
@@ -96,9 +96,7 @@ _TOOL_FIELDS = frozenset(
         "reviewed_classification",
     }
 )
-_SCHEMA_REVIEW_FIELDS = frozenset(
-    {"source", "fixture_status", "fail_closed_on_digest_change"}
-)
+_SCHEMA_REVIEW_FIELDS = frozenset({"source", "fixture_status", "fail_closed_on_digest_change"})
 _WRAPPER_CONTRACT_FIELDS = frozenset(
     {
         "id",
@@ -300,9 +298,7 @@ def _schema_review(value: Any, label: str) -> SchemaReviewPolicy | None:
     if set(value) != _SCHEMA_REVIEW_FIELDS:
         raise PolicyError(f"{label} must declare every schema review field")
     source = _nonempty_string(value["source"], f"{label}.source")
-    fixture_status = _nonempty_string(
-        value["fixture_status"], f"{label}.fixture_status"
-    )
+    fixture_status = _nonempty_string(value["fixture_status"], f"{label}.fixture_status")
     fail_closed = value["fail_closed_on_digest_change"]
     if fail_closed is not True:
         raise PolicyError(f"{label}.fail_closed_on_digest_change must be true")
@@ -338,9 +334,7 @@ def _wrapper_contract(value: Any, label: str) -> WrapperContract | None:
         ),
         output="json_only",
         shell_interpolation="forbidden",
-        fixture_source=_nonempty_string(
-            value["fixture_source"], f"{label}.fixture_source"
-        ),
+        fixture_source=_nonempty_string(value["fixture_source"], f"{label}.fixture_source"),
     )
 
 
@@ -461,9 +455,7 @@ def parse_policy(data: Any) -> PolicySnapshot:
             communication_send = raw_tool.get("communication_send", False)
             if not isinstance(reviewed_read_only, bool) or not isinstance(communication_send, bool):
                 raise PolicyError(f"classification flags for {alias}/{name} must be booleans")
-            if mode is PolicyMode.PASSTHROUGH and (
-                communication_send or not reviewed_read_only
-            ):
+            if mode is PolicyMode.PASSTHROUGH and (communication_send or not reviewed_read_only):
                 raise PolicyError(
                     f"passthrough requires reviewed read-only classification for {alias}/{name}"
                 )
@@ -572,9 +564,13 @@ def load_policy(path: Path) -> PolicySnapshot:
 def parse_policy_yaml(document: bytes) -> PolicySnapshot:
     if not isinstance(document, bytes) or not document:
         raise PolicyError("policy YAML must be non-empty bytes")
-    return parse_policy(
-        yaml.load(document.decode("utf-8", errors="strict"), Loader=_UniqueKeySafeLoader)
-    )
+    loader = _UniqueKeySafeLoader(document.decode("utf-8", errors="strict"))
+    dispose = cast(Callable[[], None], loader.dispose)
+    try:
+        value = loader.get_single_data()
+    finally:
+        dispose()
+    return parse_policy(value)
 
 
 def policy_document(snapshot: PolicySnapshot) -> dict[str, Any]:

@@ -310,15 +310,19 @@ class DurableSchemaRegistry:
 
             removed = set(old_rows) - set(encoded)
             if removed:
-                placeholders = ",".join("?" for _ in removed)
                 connection.execute(
-                    f"""
+                    """
                     UPDATE schema_cache
                     SET present = 0, review_state = 'disabled_drift', reviewed_at = NULL,
                         discovered_at = ?
-                    WHERE downstream_alias = ? AND tool_name IN ({placeholders})
+                    WHERE downstream_alias = ?
+                      AND tool_name IN (SELECT value FROM json_each(?))
                     """,
-                    (discovered_at, alias, *sorted(removed)),
+                    (
+                        discovered_at,
+                        alias,
+                        json.dumps(sorted(removed), separators=(",", ":")),
+                    ),
                 )
                 changed.update(removed)
 

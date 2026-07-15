@@ -688,12 +688,15 @@ class WebBackend:
                 """,
                 (self._passkey_login_window_seconds, now, now),
             )
-            placeholders = ",".join("?" for _ in scopes)
+            scope_keys = tuple(scope for scope, _limit in scopes)
             rows = {
                 str(row["scope_key"]): row
                 for row in connection.execute(
-                    f"SELECT * FROM auth_attempts WHERE scope_key IN ({placeholders})",
-                    tuple(scope for scope, _limit in scopes),
+                    """
+                    SELECT * FROM auth_attempts
+                    WHERE scope_key IN (SELECT value FROM json_each(?))
+                    """,
+                    (json.dumps(scope_keys, separators=(",", ":")),),
                 ).fetchall()
             }
             for scope, _limit in scopes:

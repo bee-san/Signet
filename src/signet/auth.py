@@ -27,9 +27,7 @@ from signet.db import Database, IntegrityError
 PASSWORD_PROOF_DOMAIN = "signet.password-authenticated.v1"
 TOTP_PROOF_DOMAIN = "signet.totp-verified.v1"
 WEBAUTHN_PROOF_DOMAIN = "signet.webauthn-verified.v1"
-_PROOF_DOMAINS = frozenset(
-    {PASSWORD_PROOF_DOMAIN, TOTP_PROOF_DOMAIN, WEBAUTHN_PROOF_DOMAIN}
-)
+_PROOF_DOMAINS = frozenset({PASSWORD_PROOF_DOMAIN, TOTP_PROOF_DOMAIN, WEBAUTHN_PROOF_DOMAIN})
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,9 +523,11 @@ class SessionManager:
         """
 
         user_id = canonical_user_id(user_id)
-        if not auth_method or len(auth_method.encode("ascii", errors="ignore")) != len(
-            auth_method
-        ) or len(auth_method) > 64:
+        if (
+            not auth_method
+            or len(auth_method.encode("ascii", errors="ignore")) != len(auth_method)
+            or len(auth_method) > 64
+        ):
             raise ValueError("a bounded user and authentication method are required")
         if previous_token is not None:
             self.logout(previous_token, now=now)
@@ -768,8 +768,7 @@ class InMemoryAttemptLimiter:
                 (
                     state.locked_until - now
                     for scope in scopes
-                    if (state := self._states.get(scope, AttemptState())).locked_until
-                    is not None
+                    if (state := self._states.get(scope, AttemptState())).locked_until is not None
                     and now < state.locked_until
                 ),
                 default=0,
@@ -902,12 +901,14 @@ class SQLiteAttemptLimiter:
                 """,
                 (max(0, now - self._scope_retention_seconds), now),
             )
-            placeholders = ",".join("?" for _ in scopes)
             rows = {
                 str(row["scope_key"]): row
                 for row in connection.execute(
-                    f"SELECT * FROM auth_attempts WHERE scope_key IN ({placeholders})",
-                    scopes,
+                    """
+                    SELECT * FROM auth_attempts
+                    WHERE scope_key IN (SELECT value FROM json_each(?))
+                    """,
+                    (json.dumps(scopes, separators=(",", ":")),),
                 ).fetchall()
             }
             missing = sum(scope not in rows for scope in scopes)
@@ -973,9 +974,7 @@ class SQLiteAttemptLimiter:
             return AttemptState()
         return AttemptState(
             failures=int(row["failures"]),
-            locked_until=(
-                int(row["locked_until"]) if row["locked_until"] is not None else None
-            ),
+            locked_until=(int(row["locked_until"]) if row["locked_until"] is not None else None),
             last_attempt_id=str(row["last_attempt_id"]),
         )
 
@@ -1347,18 +1346,11 @@ class PasswordAuthenticator:
         credential = self._repository.find_password(user_id)
         encoded = (
             credential.verifier
-            if credential is not None
-            and credential.user_id == user_id
-            and not credential.disabled
+            if credential is not None and credential.user_id == user_id and not credential.disabled
             else self._dummy_verifier
         )
         valid = self._verifier.verify(password, encoded)
-        if (
-            not valid
-            or credential is None
-            or credential.user_id != user_id
-            or credential.disabled
-        ):
+        if not valid or credential is None or credential.user_id != user_id or credential.disabled:
             self._limiter.record_failure(reservation, now=now)
             raise InvalidCredentials("invalid credentials")
         self._limiter.record_success(reservation, now=now)
@@ -1400,8 +1392,11 @@ def canonical_user_id(user_id: str) -> str:
         encoded = normalized.encode("utf-8")
     except UnicodeError:
         raise InvalidCredentials("invalid credentials") from None
-    if normalized != user_id or not encoded or len(encoded) > 256 or any(
-        unicodedata.category(character).startswith("C") for character in normalized
+    if (
+        normalized != user_id
+        or not encoded
+        or len(encoded) > 256
+        or any(unicodedata.category(character).startswith("C") for character in normalized)
     ):
         raise InvalidCredentials("invalid credentials")
     return normalized
@@ -1590,8 +1585,7 @@ def _proof_capability_payload(domain: str, claims: Mapping[str, object]) -> byte
             raise ValueError("invalid proof capability claim")
         if isinstance(value, list):
             if len(value) > 16 or not all(
-                isinstance(item, str) and len(item.encode("utf-8")) <= 256
-                for item in value
+                isinstance(item, str) and len(item.encode("utf-8")) <= 256 for item in value
             ):
                 raise ValueError("invalid proof capability claim")
             normalized[key] = list(value)
@@ -1627,9 +1621,7 @@ def _base64url_decode(value: str) -> bytes:
     return decoded
 
 
-_BASE64URL_ALPHABET = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-)
+_BASE64URL_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 
 
 def _is_sha256(value: str) -> bool:
