@@ -19,6 +19,7 @@ from signet.web import (
     LoginOptions,
     PushSubscriptionInput,
     QueueItem,
+    RequestAttachment,
     RequestDetail,
     WebConflict,
     WebSettings,
@@ -128,10 +129,52 @@ class FakeBackend:
             payload_hash=HASH,
             detail_blocks=(
                 DetailBlock("Message", "plain_text", hostile),
-                DetailBlock("Recipients", "json", {"to": ["person@example.test"]}),
+                DetailBlock(
+                    "Recipients",
+                    "json",
+                    {
+                        "to": ["person@example.test"],
+                        "cc": ["copy@example.test"],
+                        "bcc": ["blind@example.test"],
+                    },
+                ),
+                DetailBlock("Reason", "plain_text", "Requested for the Tuesday release"),
             ),
-            events=({"occurred_at": NOW, "action": "queued", "actor": "caller:test"},),
+            events=(
+                {
+                    "occurred_at": NOW,
+                    "action": "queued",
+                    "actor": "caller:test",
+                    "version": 1,
+                    "payload_hash": HASH,
+                    "details_json": '{\n  "classification": "reviewed"\n}',
+                },
+            ),
             editable_arguments_json='{"body":"exact"}',
+            warnings=("Recipient list changed during drafting.",),
+            reviewed_arguments_json=(
+                '{\n  "bcc": ["blind@example.test"],\n  "body": "exact",\n'
+                '  "reason": "Requested for the Tuesday release"\n}'
+            ),
+            attachments=(
+                RequestAttachment(
+                    "stg_test",
+                    "agenda<script>.pdf",
+                    "application/pdf",
+                    1234,
+                    "b" * 64,
+                    False,
+                ),
+            ),
+            staged_file_hashes=("b" * 64,),
+            downstream_alias="fastmail",
+            tool_name="send_email",
+            account_context="primary-account",
+            policy_mode="approval",
+            policy_version="3",
+            adapter_version="7",
+            schema_version="schema-reviewed-1",
+            origin_namespace="profile:web-test",
         )
 
     def list_audit(self, principal: SessionPrincipal) -> tuple[AuditEntry, ...]:
@@ -298,8 +341,19 @@ def test_authenticated_queue_has_security_headers_and_no_sensitive_title(
     authenticate(client)
     response = client.get("/")
     assert response.status_code == 200
-    assert "masked@example.test" in response.text
-    assert "Viewing on Tuesday" not in response.text
+    assert '<details class="request-expander">' in response.text
+    collapsed_summary = response.text.split("<summary>", 1)[1].split("</summary>", 1)[0]
+    assert "person@example.test" not in collapsed_summary
+    assert "Viewing on Tuesday" not in collapsed_summary
+    assert "blind@example.test" not in collapsed_summary
+    assert "Viewing on Tuesday" in response.text
+    assert "blind@example.test" in response.text
+    assert "Requested for the Tuesday release" in response.text
+    assert "Frozen execution arguments" in response.text
+    assert "schema-reviewed-1" in response.text
+    assert "profile:web-test" in response.text
+    assert "agenda&lt;script&gt;.pdf" in response.text
+    assert "b" * 64 in response.text
     assert "no-store" in response.headers["cache-control"]
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
     assert "form-action 'self'" in response.headers["content-security-policy"]
@@ -457,6 +511,9 @@ def test_pwa_assets_install_without_offline_approval(client: TestClient) -> None
     assert "backgroundsync" not in worker.text.lower()
     assert "caches." not in worker.text
     assert 'addEventListener("fetch"' not in worker.text
+    assert "event.data" not in worker.text
+    assert 'body: "Approval queue updated"' in worker.text
+    assert 'data: { url: "/" }' in worker.text
     assert worker.headers["service-worker-allowed"] == "/"
 
     icon = ROOT / "src/signet/static/icons/signet-1254.png"

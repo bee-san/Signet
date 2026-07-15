@@ -83,6 +83,16 @@ class DetailBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class RequestAttachment:
+    attachment_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    sha256: str
+    purged: bool
+
+
+@dataclass(frozen=True, slots=True)
 class RequestDetail:
     request_id: str
     service: str
@@ -98,6 +108,26 @@ class RequestDetail:
     events: tuple[Mapping[str, Any], ...] = ()
     editable_arguments_json: str | None = None
     gateway_internal: bool = False
+    warnings: tuple[str, ...] = ()
+    reviewed_arguments_json: str = "{}"
+    attachments: tuple[RequestAttachment, ...] = ()
+    staged_file_hashes: tuple[str, ...] = ()
+    downstream_alias: str = ""
+    tool_name: str = ""
+    account_context: str | None = None
+    policy_mode: str = ""
+    policy_version: str = ""
+    adapter_version: str = ""
+    schema_version: str = ""
+    origin_namespace: str = ""
+    retry_of_request_id: str | None = None
+    approved_at: int | None = None
+    execution_started_at: int | None = None
+    completed_at: int | None = None
+    safe_outcome_json: str | None = None
+    failure_reason: str | None = None
+    manual_retry_allowed: bool = False
+    duplicate_warning_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,6 +566,16 @@ def create_web_app(
     async def queue(request: Request) -> Response:
         selected = principal(request)
         items = backend.list_queue(selected, now=now_fn())
+        reviews = tuple(
+            {
+                "item": backend.get_detail(selected, item.request_id),
+                "csrf_token": csrf.session_token(
+                    selected.session_id,
+                    f"request:{item.request_id}",
+                ),
+            }
+            for item in items
+        )
         return cast(
             Response,
             templates.TemplateResponse(
@@ -543,7 +583,7 @@ def create_web_app(
                 "queue.html",
                 {
                     **context(request, selected),
-                    "items": items,
+                    "reviews": reviews,
                     "now": now_fn(),
                     "logout_csrf": csrf.session_token(selected.session_id, "logout"),
                     "push_csrf": csrf.session_token(selected.session_id, "push"),

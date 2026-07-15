@@ -83,11 +83,15 @@ document.querySelectorAll("[data-passkey-action]").forEach((button) => {
   button.addEventListener("click", async () => {
     const root = button.closest("[data-request-id]");
     try {
+      if (!root) throw new Error("Request context is unavailable");
       const action = button.dataset.passkeyAction;
       const requestId = root.dataset.requestId;
-      const payloadHash = document.querySelector("input[name='expected_payload_hash']").value;
-      const expectedVersion = Number(document.querySelector("input[name='expected_version']").value);
-      const editArguments = action === "edit" ? document.querySelector("#edit-json")?.value : null;
+      const payloadHash = root.querySelector("input[name='expected_payload_hash']")?.value;
+      const expectedVersion = Number(root.querySelector("input[name='expected_version']")?.value);
+      const editArguments = action === "edit" ? root.querySelector("[data-edit-json]")?.value : null;
+      if (!payloadHash || !Number.isInteger(expectedVersion)) {
+        throw new Error("Request binding is unavailable");
+      }
       const options = await postJson(`/requests/${requestId}/actions/passkey/options`, {
         action,
         expected_version: expectedVersion,

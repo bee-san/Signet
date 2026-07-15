@@ -61,6 +61,7 @@ from signet.web import (
     LoginOptions,
     PushSubscriptionInput,
     QueueItem,
+    RequestAttachment,
     RequestDetail,
     WebConflict,
     WebForbidden,
@@ -868,15 +869,29 @@ class WebBackend:
             events = self._state_machine.list_events(request_id)
         except (RequestNotFound, WebPayloadError):
             raise WebConflict("request details are unavailable") from None
+        arguments_json = json.dumps(
+            dict(reviewed.arguments),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            indent=2,
+        )
         editable = None
         if request["state"] == "pending_approval":
-            editable = json.dumps(
-                dict(reviewed.arguments),
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-                indent=2,
-            )
+            editable = arguments_json
+        with self._database.read() as connection:
+            attachment_rows = connection.execute(
+                """
+                SELECT attachment_id, filename, mime_type, size_bytes, sha256, purged_at
+                FROM attachments
+                WHERE request_id = ? AND version = ?
+                ORDER BY attachment_id
+                """,
+                (request_id, int(request["current_version"])),
+            ).fetchall()
+        account = getattr(reviewed.adapter, "account", None)
+        if not isinstance(account, str) or not account:
+            account = None
         return RequestDetail(
             request_id=request_id,
             service=reviewed.summary.service,
@@ -899,11 +914,50 @@ class WebBackend:
                     "action": str(event["action"]),
                     "version": int(event["version"]),
                     "payload_hash": str(event["payload_hash"]),
+                    "details_json": _event_details_json(event["safe_details_json"]),
                 }
                 for event in events
             ),
             editable_arguments_json=editable,
             gateway_internal=bool(request["gateway_internal"]),
+            warnings=reviewed.summary.warnings,
+            reviewed_arguments_json=arguments_json,
+            attachments=tuple(
+                RequestAttachment(
+                    attachment_id=str(row["attachment_id"]),
+                    filename=str(row["filename"]),
+                    mime_type=str(row["mime_type"]),
+                    size_bytes=int(row["size_bytes"]),
+                    sha256=str(row["sha256"]),
+                    purged=row["purged_at"] is not None,
+                )
+                for row in attachment_rows
+            ),
+            staged_file_hashes=reviewed.staged_file_hashes,
+            downstream_alias=str(request["downstream_alias"]),
+            tool_name=str(request["tool_name"]),
+            account_context=account,
+            policy_mode=str(request["policy_mode"]),
+            policy_version=str(reviewed.policy_version),
+            adapter_version=reviewed.adapter_version,
+            schema_version=reviewed.schema_version,
+            origin_namespace=str(request["origin_namespace"]),
+            retry_of_request_id=(
+                str(request["retry_of_request_id"])
+                if request["retry_of_request_id"] is not None
+                else None
+            ),
+            approved_at=_optional_int(request["approved_at"]),
+            execution_started_at=_optional_int(request["execution_started_at"]),
+            completed_at=_optional_int(request["completed_at"]),
+            safe_outcome_json=_stored_json_for_display(request["safe_outcome_json"]),
+            failure_reason=(
+                str(request["failure_reason"])
+                if request["failure_reason"] is not None
+                else None
+            ),
+            manual_retry_allowed=bool(request["manual_retry_allowed"]),
+            duplicate_warning_required=bool(request["duplicate_warning_required"]),
         )
 
     def list_audit(self, principal: SessionPrincipal) -> tuple[AuditEntry, ...]:
@@ -1313,6 +1367,50 @@ class WebBackend:
             )
             return "pending_approval"
         raise InvalidConfirmation("action draft does not match its confirmation")
+
+
+def _event_details_json(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise WebConflict("request event details are unavailable")
+    try:
+        details = _strict_json_object(value)
+    except WebPayloadError:
+        raise WebConflict("request event details are unavailable") from None
+    return json.dumps(
+        details,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        indent=2,
+    )
+
+
+def _stored_json_for_display(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise WebConflict("request outcome details are unavailable")
+    try:
+        details = _strict_json_object(value)
+    except WebPayloadError:
+        raise WebConflict("request outcome details are unavailable") from None
+    return json.dumps(
+        details,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        indent=2,
+    )
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise WebConflict("request timestamps are unavailable")
+    return value
 
 
 def _confirmation_action(action: HumanAction) -> ConfirmationAction:

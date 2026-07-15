@@ -1,28 +1,33 @@
 {% extends "base.html" %}
+{% from "_request_review.html" import request_review %}
 {% block content %}
 <section class="queue-heading">
   <div>
     <p class="eyebrow">Approval queue</p>
-    <h1>{{ items|length }} waiting</h1>
+    <h1>{{ reviews|length }} waiting</h1>
   </div>
   <button class="button button-quiet" type="button" data-enable-push data-csrf="{{ push_csrf }}">Enable alerts</button>
 </section>
-{% if items %}
+{% if reviews %}
 <ol class="request-list">
-  {% for item in items %}
+  {% for review in reviews %}
   <li>
-    <a class="request-card" href="/requests/{{ item.request_id }}">
-      <div class="request-card-main">
-        <span class="service-label">{{ item.service }}</span>
-        <strong>{{ item.action }}</strong>
-        <span class="destination">{{ item.destination_summary }}</span>
+    <details class="request-expander">
+      <summary>
+        <span class="request-summary-main">
+          <span class="service-label">{{ review.item.service }}</span>
+          <strong>{{ review.item.action }}</strong>
+        </span>
+        <span class="request-summary-meta">
+          <span class="state state-{{ review.item.state }}">{{ review.item.state|replace('_', ' ') }}</span>
+          <span>v{{ review.item.version }}</span>
+          <time datetime="{{ review.item.expires_at }}">Expires in {{ [review.item.expires_at - now, 0]|max }}s</time>
+        </span>
+      </summary>
+      <div class="request-expansion">
+        {{ request_review(review.item, review.csrf_token, 'queue-' ~ loop.index, true) }}
       </div>
-      <div class="request-card-meta">
-        <span class="state state-{{ item.state }}">{{ item.state|replace('_', ' ') }}</span>
-        <span>v{{ item.version }} / {{ item.payload_hash[:12] }}</span>
-        <time datetime="{{ item.expires_at }}">Expires in {{ [item.expires_at - now, 0]|max }}s</time>
-      </div>
-    </a>
+    </details>
   </li>
   {% endfor %}
 </ol>
