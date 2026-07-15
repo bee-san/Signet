@@ -571,8 +571,14 @@ def create_web_app(
         )
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok", "service": "signet-web"}
+    async def healthz() -> Response:
+        probe = getattr(app.state, "signet_health_probe", None)
+        if probe is not None and (not callable(probe) or probe() is not True):
+            return JSONResponse(
+                {"status": "unavailable", "service": "signet-web"},
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return JSONResponse({"status": "ok", "service": "signet-web"})
 
     @app.get("/manifest.webmanifest", include_in_schema=False)
     async def manifest() -> Response:

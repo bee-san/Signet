@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import copy
+import fcntl
 import hashlib
 import http.client
 import json
@@ -15,7 +16,7 @@ import shutil
 import signal
 import stat
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,6 +130,7 @@ _STATE_FILE = "demo-state.json"
 _SECRETS_FILE = "demo-secrets.json"
 _POLICY_FILE = "policy.yaml"
 _DATABASE_FILE = "approvals.sqlite3"
+_SERVE_LOCK_FILE = ".serve.lock"
 _ATTACHMENTS_DIRECTORY = "attachments"
 _IMPORTS_DIRECTORY = "imports"
 _KEY_REFERENCE = "keychain://Signet/demo-payload-fake-only"
@@ -235,16 +237,20 @@ class FakeOnlyProviderClient:
             raise DemoError("fake provider alias is invalid")
         self.alias = alias
         self._mutation_calls = 0
+        self._sent_emails: dict[str, dict[str, str]] = {}
 
     @property
     def mutation_calls(self) -> int:
         return self._mutation_calls
 
     async def call_tool_raw(self, tool_name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        if arguments:
+        value: dict[str, Any]
+        if self.alias == "fastmail" and tool_name == "search_email":
+            value = self._search_email(arguments)
+        elif arguments:
             raise DemoError("fake read tools accept no arguments")
-        if self.alias == "fastmail" and tool_name == "list_identities":
-            value: dict[str, Any] = {
+        elif self.alias == "fastmail" and tool_name == "list_identities":
+            value = {
                 "identities": [
                     {
                         "id": "fake:identity:primary",
@@ -272,6 +278,8 @@ class FakeOnlyProviderClient:
         }
 
     async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if self.alias == "fastmail" and tool_name == "search_email":
+            return self._search_email(arguments)
         detached = copy_json_object(arguments)
         digest = hashlib.sha256(
             json.dumps(
@@ -283,12 +291,15 @@ class FakeOnlyProviderClient:
         ).hexdigest()[:24]
         if self.alias == "fastmail" and tool_name == "send_email":
             self._mutation_calls += 1
-            return {
+            result = {
                 "messageId": f"fake:message:{digest}",
                 "submissionId": f"fake:submission:{digest}",
                 "threadId": f"fake:thread:{digest}",
                 "status": "sent",
             }
+            self._sent_emails[result["messageId"]] = result
+            self._sent_emails[result["submissionId"]] = result
+            return result
         if self.alias == "fastmail" and tool_name == "upload_attachment":
             self._mutation_calls += 1
             return {"attachmentId": f"fake:attachment:{digest}"}
@@ -296,6 +307,17 @@ class FakeOnlyProviderClient:
             self._mutation_calls += 1
             return {"sent": True, "message_id": f"fake:chat-message:{digest}"}
         raise DemoError("fake provider refused an unreviewed mutation")
+
+    def _search_email(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if (
+            set(arguments) != {"query", "folder", "limit"}
+            or not isinstance(arguments.get("query"), str)
+            or arguments.get("folder") != "Sent"
+            or arguments.get("limit") != 10
+        ):
+            raise DemoError("fake provider refused an invalid sent-mail lookup")
+        selected = self._sent_emails.get(cast(str, arguments["query"]))
+        return {"messages": [copy_json_object(selected)] if selected is not None else []}
 
     def __repr__(self) -> str:
         return f"FakeOnlyProviderClient(alias={self.alias!r})"
@@ -385,12 +407,15 @@ class DemoWorkers:
         notifications: NotificationOutboxWorker,
         *,
         interval_seconds: float = 0.25,
+        maintenance_interval_seconds: int = 60,
         delivery_batch: int = 16,
         notification_batch: int = 32,
     ) -> None:
         if (
             interval_seconds < 0.05
             or interval_seconds > 60
+            or maintenance_interval_seconds < 5
+            or maintenance_interval_seconds > 60 * 60
             or delivery_batch < 1
             or delivery_batch > 100
             or notification_batch < 1
@@ -404,8 +429,12 @@ class DemoWorkers:
         self.retention = retention
         self.notifications = notifications
         self.interval_seconds = interval_seconds
+        self.maintenance_interval_seconds = maintenance_interval_seconds
         self.delivery_batch = delivery_batch
         self.notification_batch = notification_batch
+        self._next_maintenance_at = 0
+        self._consecutive_failures = 0
+        self._stopped = False
         self.expiry = ExpirySweeper(
             state_machine,
             batch_limit=100,
@@ -416,16 +445,36 @@ class DemoWorkers:
         if not isinstance(stop, asyncio.Event):
             raise TypeError("demo workers require an asyncio stop event")
         expiry_task = asyncio.create_task(self.expiry.serve(stop), name="demo-expiry")
+        self._stopped = False
         try:
             while not stop.is_set():
-                await self.run_once()
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=self.interval_seconds)
+                    await self.run_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Retry fake-only maintenance, but expose a persistent
+                    # failure through the otherwise static health endpoint.
+                    self._consecutive_failures += 1
+                else:
+                    self._consecutive_failures = 0
+                try:
+                    backoff = min(
+                        5.0,
+                        self.interval_seconds * (2 ** min(self._consecutive_failures, 4)),
+                    )
+                    await asyncio.wait_for(stop.wait(), timeout=backoff)
                 except TimeoutError:
                     continue
         finally:
+            self._stopped = True
             stop.set()
             await expiry_task
+
+    def healthy(self) -> bool:
+        """Return coarse readiness without exposing request or maintenance data."""
+
+        return not self._stopped and self._consecutive_failures < 3
 
     async def run_once(self, *, now: int | None = None) -> tuple[int, int]:
         selected_now = int(time.time()) if now is None else now
@@ -461,11 +510,12 @@ class DemoWorkers:
             )
         delivered = 0
         for request_id in request_ids:
+            dispatch_now = max(selected_now, int(time.time()))
             try:
                 await self.delivery.dispatch(
                     request_id,
                     worker_id="fake:demo-delivery",
-                    now=selected_now,
+                    now=dispatch_now,
                     lease_seconds=30,
                 )
             except (DeliveryError, InvalidTransition):
@@ -477,20 +527,24 @@ class DemoWorkers:
             now=selected_now,
             limit=self.delivery_batch,
         )
-        self.notifications.outbox.schedule_approaching_expiry(
-            user_id=DEMO_USER_ID,
-            now=selected_now,
-            limit=1_000,
-        )
-        self.notifications.outbox.schedule_daily_digest(
-            user_id=DEMO_USER_ID,
-            now=selected_now,
-        )
-        self.retention.run_due(now=selected_now, limit=100)
+        maintenance_due = selected_now >= self._next_maintenance_at
+        if maintenance_due:
+            self.notifications.outbox.schedule_approaching_expiry(
+                user_id=DEMO_USER_ID,
+                now=selected_now,
+                limit=1_000,
+            )
+            self.notifications.outbox.schedule_daily_digest(
+                user_id=DEMO_USER_ID,
+                now=selected_now,
+            )
         report = await self.notifications.run_due(
             now=selected_now,
             limit=self.notification_batch,
         )
+        if maintenance_due:
+            await asyncio.to_thread(self.retention.run_due, now=selected_now, limit=100)
+            self._next_maintenance_at = selected_now + self.maintenance_interval_seconds
         return delivered, report.delivered
 
 
@@ -771,7 +825,9 @@ def build_demo(
         loader,
         delivery,
         cast(Mapping[str, MCPClient], downstream_clients),
-        reviewed_tools={},
+        reviewed_tools={
+            ("fastmail", "send_email"): frozenset({"search_email"}),
+        },
     )
     retention_delays: dict[RequestState, int | None] = dict.fromkeys(RequestState)
     retention_delays.update(
@@ -812,6 +868,7 @@ def build_demo(
         retention,
         notification_worker,
     )
+    web.state.signet_health_probe = workers.healthy
     _attach_worker_lifespan(web, workers)
     return DemoAssembly(
         root=demo_root,
@@ -961,6 +1018,17 @@ async def serve_demo(
     *,
     mcp_port: int = DEFAULT_MCP_PORT,
     web_port: int = DEFAULT_WEB_PORT,
+) -> None:
+    demo_root, _state, _secrets = _load_demo(root)
+    with _demo_server_lock(demo_root):
+        await _serve_demo_locked(demo_root, mcp_port=mcp_port, web_port=web_port)
+
+
+async def _serve_demo_locked(
+    root: Path,
+    *,
+    mcp_port: int,
+    web_port: int,
 ) -> None:
     assembly = build_demo(root, mcp_port=mcp_port, web_port=web_port)
     servers = (
@@ -1457,6 +1525,10 @@ def _demo_policy_document() -> dict[str, Any]:
                         "mode": "passthrough",
                         "reviewed_read_only": True,
                     },
+                    "search_email": {
+                        "mode": "passthrough",
+                        "reviewed_read_only": True,
+                    },
                     "send_email": {
                         "mode": "approval",
                         "adapter": "fastmail.send",
@@ -1553,6 +1625,42 @@ def _captured_tools() -> dict[str, list[dict[str, Any]]]:
                                     "id": {"type": "string"},
                                     "email": {"type": "string"},
                                     "name": {"type": "string"},
+                                },
+                            },
+                        }
+                    },
+                },
+            },
+            {
+                "name": "search_email",
+                "description": "Search deterministic fake-only sent-mail identifiers.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["query", "folder", "limit"],
+                    "properties": {
+                        "query": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "folder": {"const": "Sent"},
+                        "limit": {"const": 10},
+                    },
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["messages"],
+                    "properties": {
+                        "messages": {
+                            "type": "array",
+                            "maxItems": 1,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["messageId", "submissionId", "threadId", "status"],
+                                "properties": {
+                                    "messageId": {"type": "string"},
+                                    "submissionId": {"type": "string"},
+                                    "threadId": {"type": "string"},
+                                    "status": {"const": "sent"},
                                 },
                             },
                         }
@@ -1736,6 +1844,35 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+@contextmanager
+def _demo_server_lock(root: Path) -> Iterator[None]:
+    path = root / _SERVE_LOCK_FILE
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+        ):
+            raise DemoError("demo serve lock is unavailable or unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise DemoError("this demo data directory is already being served") from None
+        yield
+    except OSError as exc:
+        raise DemoError("demo serve lock is unavailable or unsafe") from exc
+    finally:
+        if "descriptor" in locals():
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _require_private_parent(path: Path) -> None:

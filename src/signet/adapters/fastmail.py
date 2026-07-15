@@ -67,6 +67,7 @@ _FASTMAIL_RESULT_FIELDS = frozenset(
     {"messageId", "submissionId", "threadId", "status", "isError"}
 )
 _FASTMAIL_PROVIDER_STATUSES = frozenset({"sent", "submitted"})
+_FASTMAIL_AMBIGUOUS_STATUSES = frozenset({"ambiguous", "pending", "queued", "unknown"})
 FASTMAIL_SEND_SCHEMA: Mapping[str, Any] = MappingProxyType(
     {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -231,12 +232,32 @@ def _reviewed_send_result(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return payload
 
 
+def _candidate_send_metadata(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Keep only bounded provider IDs from an otherwise ambiguous send result."""
+
+    payload = _one_level_result_payload(value)
+    if payload is None or not set(payload) <= _FASTMAIL_RESULT_FIELDS:
+        return None
+    if not ({"messageId", "submissionId"} & set(payload)):
+        return None
+    if "isError" in payload and not isinstance(payload["isError"], bool):
+        return None
+    if "status" in payload and payload["status"] not in (
+        _FASTMAIL_PROVIDER_STATUSES | _FASTMAIL_AMBIGUOUS_STATUSES
+    ):
+        return None
+    for field in ("messageId", "submissionId", "threadId"):
+        if field in payload and _opaque_provider_id(payload[field]) is None:
+            return None
+    return payload
+
+
 def _candidate_send_identity(value: Mapping[str, Any] | None) -> str | None:
     """Read a bounded provider identity from one read-only search candidate."""
 
     if value is None:
         return None
-    for key in ("messageId", "submissionId"):
+    for key in ("messageId", "submissionId", "message_id", "submission_id"):
         candidate = _opaque_provider_id(value.get(key))
         if candidate is not None:
             return candidate
@@ -568,7 +589,8 @@ class FastmailAdapter:
         return Reconciliation.INCONCLUSIVE
 
     def safe_result_metadata(self, downstream_result: Mapping[str, Any]) -> dict[str, Any]:
-        payload = _reviewed_send_result(downstream_result)
+        reviewed = _reviewed_send_result(downstream_result)
+        payload = reviewed or _candidate_send_metadata(downstream_result)
         if payload is None:
             return {}
         safe: dict[str, Any] = {}
@@ -578,6 +600,6 @@ class FastmailAdapter:
             safe["submission_id"] = payload["submissionId"]
         if "threadId" in payload:
             safe["thread_id"] = payload["threadId"]
-        if "status" in payload:
+        if reviewed is not None and "status" in payload:
             safe["provider_status"] = payload["status"]
         return safe

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -255,6 +256,7 @@ async def test_mcp_fake_read_approval_deny_and_web_only_approval_surface(
             listed = await session.list_tools()
             assert [tool.name for tool in listed.tools] == [
                 "list_identities",
+                "search_email",
                 "send_email",
                 "delete_email",
             ]
@@ -388,9 +390,9 @@ async def test_workers_reclaim_only_pre_dispatch_and_reconcile_abandoned_dispatc
         )
         unknown_id = await enqueue(
             client,
-            "fastmail",
-            "send_email",
-            {**FASTMAIL_ARGUMENTS, "subject": "Recover after fake dispatch boundary"},
+            "whatsapp",
+            "send_text",
+            {**WHATSAPP_ARGUMENTS, "message": "Recover after fake dispatch boundary"},
         )
     assert (await web_action(assembly, reclaimable_id, "approve")).status_code == 303
     assert (await web_action(assembly, unknown_id, "approve")).status_code == 303
@@ -415,6 +417,7 @@ async def test_workers_reclaim_only_pre_dispatch_and_reconcile_abandoned_dispatc
     assert request_state(assembly, reclaimable_id) == "succeeded"
     assert request_state(assembly, unknown_id) == "outcome_unknown"
     assert assembly.provider_clients["fastmail"].mutation_calls == 1
+    assert assembly.provider_clients["whatsapp"].mutation_calls == 0
     with assembly.database.read() as connection:
         reclaimed = connection.execute(
             "SELECT worker_generation, phase FROM execution_attempts WHERE request_id = ?",
@@ -447,6 +450,55 @@ async def test_workers_reclaim_only_pre_dispatch_and_reconcile_abandoned_dispatc
     assert unknown["reconciliation_attempt_count"] == 5
     assert unknown["reconciliation_next_at"] is None
     assert assembly.provider_clients["fastmail"].mutation_calls == 1
+    assert assembly.provider_clients["whatsapp"].mutation_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fake_fastmail_ambiguous_result_is_resolved_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assembly = build_demo(new_demo(tmp_path))
+    async with mcp_client(assembly) as client:
+        request_id = await enqueue(
+            client,
+            "fastmail",
+            "send_email",
+            {**FASTMAIL_ARGUMENTS, "subject": "Reconcile this fake send"},
+        )
+    assert (await web_action(assembly, request_id, "approve")).status_code == 303
+
+    provider = assembly.provider_clients["fastmail"]
+    original_call = provider.call_tool
+
+    async def ambiguous_result(
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = await original_call(tool_name, arguments)
+        if tool_name == "send_email":
+            result["status"] = "ambiguous"
+        return result
+
+    monkeypatch.setattr(provider, "call_tool", ambiguous_result)
+    now = int(time.time())
+    delivered, _notifications = await assembly.workers.run_once(now=now)
+    assert delivered == 1
+    assert request_state(assembly, request_id) == "outcome_unknown"
+    assert provider.mutation_calls == 1
+
+    await assembly.workers.run_once(now=now + 60)
+    assert request_state(assembly, request_id) == "succeeded"
+    assert provider.mutation_calls == 1
+    with assembly.database.read() as connection:
+        attempt = connection.execute(
+            """
+            SELECT reconciliation_attempt_count, reconciliation_resolution
+            FROM execution_attempts WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+    assert tuple(attempt) == (1, "confirmed_effect")
 
 
 @pytest.mark.asyncio
@@ -492,6 +544,48 @@ async def test_workers_schedule_private_notifications_and_retention_once(
     assert payload["encrypted_payload"] is not None
     assert payload["purged_at"] is None
     assert [tuple(row) for row in retention] == [("sensitive_rows", None)]
+
+
+@pytest.mark.asyncio
+async def test_worker_supervision_retries_and_health_reports_persistent_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assembly = build_demo(new_demo(tmp_path))
+    stop = asyncio.Event()
+    third_failure = asyncio.Event()
+    calls = 0
+
+    async def flaky_run_once(*, now: int | None = None) -> tuple[int, int]:
+        nonlocal calls
+        del now
+        calls += 1
+        if calls <= 3:
+            if calls == 3:
+                third_failure.set()
+            raise RuntimeError("private fake maintenance failure")
+        stop.set()
+        return 0, 0
+
+    assembly.workers.interval_seconds = 0.05
+    monkeypatch.setattr(assembly.workers, "run_once", flaky_run_once)
+    task = asyncio.create_task(assembly.workers.serve(stop))
+    await asyncio.wait_for(third_failure.wait(), timeout=2)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=assembly.web),
+        base_url="http://127.0.0.1:8790",
+    ) as client:
+        for _ in range(20):
+            health = await client.get("/healthz")
+            if health.status_code == 503:
+                break
+            await asyncio.sleep(0.01)
+    assert health.status_code == 503
+    assert health.json() == {"status": "unavailable", "service": "signet-web"}
+
+    await asyncio.wait_for(task, timeout=2)
+    assert calls == 4
 
 
 @pytest.mark.asyncio
@@ -680,6 +774,30 @@ def test_demo_serve_stops_both_listeners_within_bound(
             "mode": "fake-only",
             "services": ["mcp", "web"],
         }
+        contender_ports = _available_ports()
+        contender = subprocess.run(  # noqa: S603 - fixed interpreter and entry point
+            [
+                sys.executable,
+                "-c",
+                "from signet.app import main; main()",
+                "demo",
+                "serve",
+                "--data-dir",
+                str(root),
+                "--mcp-port",
+                str(contender_ports[0]),
+                "--web-port",
+                str(contender_ports[1]),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert contender.returncode != 0
+        assert "already being served" in contender.stderr
+        assert "Traceback" not in contender.stderr
+        assert stat.S_IMODE((root / ".serve.lock").stat().st_mode) == 0o600
         started_shutdown = time.monotonic()
         process.send_signal(stop_signal)
         stdout, stderr = process.communicate(timeout=DEMO_GRACEFUL_SHUTDOWN_SECONDS + 5)
