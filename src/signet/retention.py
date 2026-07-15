@@ -301,42 +301,37 @@ class RetentionManager:
         _validate_time(now, "purge scheduling time")
         inserted = 0
         with self.database.transaction() as connection:
-            retained_predicates = [
+            requests = connection.execute(
                 """
+                SELECT request_id, state, completed_at FROM approval_requests
+                WHERE state IN ('succeeded', 'failed', 'denied', 'expired', 'cancelled')
+                  AND (
                 EXISTS (
                     SELECT 1 FROM payload_versions AS payload
                     WHERE payload.request_id = approval_requests.request_id
                       AND payload.encrypted_payload IS NOT NULL
                       AND payload.purged_at IS NULL
                 )
-                """,
-                """
+                OR
                 EXISTS (
                     SELECT 1 FROM attachments AS attachment
                     WHERE attachment.request_id = approval_requests.request_id
                       AND attachment.storage_path IS NOT NULL
                       AND attachment.purged_at IS NULL
                 )
-                """,
-            ]
-            if self.mode is RetentionMode.ISOLATED_PER_REQUEST_KEY:
-                retained_predicates.append(
-                    """
+                OR
+                (? = 1 AND
                     EXISTS (
                         SELECT 1 FROM payload_versions AS payload_key
                         WHERE payload_key.request_id = approval_requests.request_id
                           AND payload_key.encryption_key_ref IS NOT NULL
                           AND payload_key.key_destroyed_at IS NULL
                     )
-                    """
                 )
-            requests = connection.execute(
-                f"""
-                SELECT request_id, state, completed_at FROM approval_requests
-                WHERE state IN ('succeeded', 'failed', 'denied', 'expired', 'cancelled')
-                  AND ({" OR ".join(retained_predicates)})
+                  )
                 ORDER BY request_id
-                """
+                """,
+                (int(self.mode is RetentionMode.ISOLATED_PER_REQUEST_KEY),),
             ).fetchall()
             for request in requests:
                 try:
