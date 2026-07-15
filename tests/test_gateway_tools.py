@@ -95,7 +95,7 @@ class FakeSummaries:
         *,
         service: str = "Fastmail",
         tool: str = "send_email",
-        destination: str = "a***@example.test",
+        destination: str = "a*** at example.test",
     ) -> None:
         self.values[request_id] = SafeRequestSummary(service, tool, destination)
 
@@ -460,7 +460,7 @@ async def test_list_pending_is_caller_scoped_masked_and_omits_expired(
                 "request_id": "req_Own",
                 "service": "Fastmail",
                 "tool": "send_email",
-                "destination_summary": "a***@example.test",
+                "destination_summary": "a*** at example.test",
                 "summary_available": True,
                 "age_seconds": 10,
                 "expires_at": "2027-01-15T08:10:00Z",
@@ -539,8 +539,8 @@ async def test_list_pending_isolates_corrupt_or_unmasked_private_summaries(
     for request_id in ("req_Corrupt", "req_Good", "req_Unmasked"):
         machine.enqueue(enqueue_request(request_id, payload=request_id))
     harness.summaries.failures.add("req_Corrupt")
-    harness.summaries.add("req_Good", destination="g***@example.test")
-    raw_destination = "private-recipient@example.test"
+    harness.summaries.add("req_Good", destination="g*** at example.test")
+    raw_destination = "a***@example.test"
     harness.summaries.add("req_Unmasked", destination=raw_destination)
 
     result = structured(
@@ -550,7 +550,7 @@ async def test_list_pending_isolates_corrupt_or_unmasked_private_summaries(
     )
 
     by_id = {item["request_id"]: item for item in result["requests"]}
-    assert by_id["req_Good"]["destination_summary"] == "g***@example.test"
+    assert by_id["req_Good"]["destination_summary"] == "g*** at example.test"
     assert by_id["req_Good"]["summary_available"] is True
     for request_id in ("req_Corrupt", "req_Unmasked"):
         assert by_id[request_id]["summary_available"] is False
@@ -629,7 +629,7 @@ async def test_check_status_returns_authoritative_safe_outcome_metadata(
     assert result["status"] == "succeeded"
     assert result["service"] == "Fastmail"
     assert result["tool"] == "send_email"
-    assert result["destination_summary"] == "a***@example.test"
+    assert result["destination_summary"] == "a*** at example.test"
     assert result["summary_available"] is True
     assert result["version"] == 1
     assert result["safe_result_metadata"] == {
@@ -670,7 +670,7 @@ async def test_approve_binds_exact_revision_consumes_once_and_returns_safe_recei
         "status": "approved",
         "request_id": "req_Approve",
         "tool": "send_email",
-        "destination_summary": "a***@example.test",
+        "destination_summary": "a*** at example.test",
         "version": 1,
         "version_hash_prefix": digest("body-one")[:12],
         "approval_notification_queued": True,
@@ -709,7 +709,7 @@ async def test_approval_fails_closed_when_summary_is_corrupt_or_unmasked(
         else:
             harness.summaries.add(
                 request_id,
-                destination="private-recipient@example.test",
+                destination="a***@example.test",
             )
 
         result = await harness.tools.call_tool(
@@ -723,7 +723,7 @@ async def test_approval_fails_closed_when_summary_is_corrupt_or_unmasked(
         )
 
         assert error_code(result) == "private_summary_unavailable"
-        assert "private-recipient@example.test" not in json.dumps(result)
+        assert "a***@example.test" not in json.dumps(result)
         assert machine.get_request(request_id)["state"] == "pending_approval"
         assert harness.totp.consumed_successes == []
 

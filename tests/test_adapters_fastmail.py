@@ -83,7 +83,7 @@ def test_fastmail_fixture_validates_and_private_summary_is_complete() -> None:
     masked = adapter.masked_destination_summary(arguments)
 
     assert summary.destination_summary == "recipient@example.test"
-    assert masked == "r***@example.test"
+    assert masked == "r*** at example.test"
     assert summary.destination_summary not in masked
     assert any(block.value == arguments["body"] for block in summary.detail_blocks)
     audit = repr(adapter.redact_for_audit(arguments))
@@ -107,7 +107,10 @@ def test_fastmail_agent_summary_is_deterministic_bounded_and_never_full() -> Non
     second = adapter.masked_destination_summary(arguments)
 
     assert first == second
-    assert first == "o***@example.test, t***@elsewhere.test, t***@example.test, (+1 more)"
+    assert first == (
+        "o*** at example.test, t*** at elsewhere.test, "
+        "t*** at example.test, (+1 more)"
+    )
     assert all(recipient not in first for recipient in raw_recipients)
 
 

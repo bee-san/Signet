@@ -191,8 +191,10 @@ page size. A corrupt or purged row remains visible with `summary_available=false
 without suppressing healthy rows, and cannot be approved through MCP.
 
 Fastmail recipient hints retain only one local-part character and the normalized
-domain, for example `a***@example.test`, and show at most three recipients plus a
-count. WhatsApp hints retain only the final four digits and JID class, for example
+domain, for example `a*** at example.test`, and show at most three recipients plus
+a count. The non-email ` at ` separator ensures that even an address whose real
+local part contains stars cannot equal its mask. WhatsApp hints retain only the
+final four digits and JID class, for example
 `*******0123@s.whatsapp.net`. Complete addresses and JIDs are web-only.
 
 The version hash prefix is the review binding for chat approval. An edit creates a
@@ -260,7 +262,7 @@ code and must never be fabricated, logged, saved, guessed, or replayed.
 1. Human: "What is waiting for my approval?"
 2. AI calls `list_pending_approvals({})`.
 3. Tool result includes `req_01J000...`, `send_email`, masked destination
-   `a***@example.test`, and version hash prefix `4f82c119a0d3`.
+   `a*** at example.test`, and version hash prefix `4f82c119a0d3`.
 4. AI repeats that masked summary and hash prefix. It does not request approval for
    a different request or claim that a send already happened.
 5. Human: "Approve `req_01J000...`, hash `4f82c119a0d3`. My current code is

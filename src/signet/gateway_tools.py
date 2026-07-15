@@ -983,14 +983,15 @@ def _is_masked_email_summary(value: str) -> bool:
     if not parts or len(parts) > 3:
         return False
     for mailbox in parts:
-        local, separator, domain = mailbox.partition("@")
+        local, separator, domain = mailbox.partition(" at ")
         if (
-            separator != "@"
+            separator != " at "
             or re.fullmatch(r"[A-Za-z0-9]\*{3}", local) is None
             or not domain
             or len(domain) > 253
             or any(character.isspace() or ord(character) < 33 for character in domain)
             or any(character in domain for character in "@,")
+            or "@" in mailbox
         ):
             return False
     return True

@@ -169,7 +169,7 @@ def _masked_mailbox(value: str) -> str:
     hint = address.username[0]
     if not hint.isascii() or not hint.isalnum():
         hint = "x"
-    return f"{hint}***@{domain}"
+    return f"{hint}*** at {domain}"
 
 
 def _normalize_header(value: str, *, name: str) -> str:

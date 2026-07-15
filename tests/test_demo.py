@@ -306,7 +306,7 @@ async def test_mcp_fake_read_approval_deny_and_web_only_approval_surface(
                 str(item["request_id"]): str(item["destination_summary"])
                 for item in pending.structuredContent["requests"]
             }
-            assert summaries[fastmail_request_id] == "f***@demo.invalid"
+            assert summaries[fastmail_request_id] == "f*** at demo.invalid"
             assert summaries[whatsapp_request_id] == "*******0123@s.whatsapp.net"
             for request_id, raw_destination in (
                 (fastmail_request_id, FASTMAIL_ARGUMENTS["to"][0]),
