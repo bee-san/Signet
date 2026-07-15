@@ -11,10 +11,51 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import yaml
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
 
 
 class PolicyError(ValueError):
     pass
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that refuses ambiguous duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found a duplicate mapping key",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 class PolicyMode(StrEnum):
@@ -273,7 +314,7 @@ def parse_policy(data: Any) -> PolicySnapshot:
 def load_policy(path: Path) -> PolicySnapshot:
     try:
         with path.open("r", encoding="utf-8") as handle:
-            return parse_policy(yaml.safe_load(handle))
+            return parse_policy(yaml.load(handle, Loader=_UniqueKeySafeLoader))
     except yaml.YAMLError as exc:
         raise PolicyError(f"invalid YAML in {path}") from exc
 

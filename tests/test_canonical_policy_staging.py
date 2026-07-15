@@ -130,6 +130,31 @@ def test_policy_rejects_unknown_or_mistyped_security_fields() -> None:
         parse_policy(policy)
 
 
+@pytest.mark.parametrize(
+    "document",
+    [
+        "version: 1\nversion: 2\ndefault_mode: deny\ndownstreams: {}\n",
+        (
+            "version: 1\ndefault_mode: deny\ndownstreams:\n"
+            "  mail:\n"
+            "    transport: http\n"
+            "    url: https://provider.example.test/mcp\n"
+            "    tools:\n"
+            "      search:\n"
+            "        mode: deny\n"
+            "        mode: passthrough\n"
+            "        reviewed_read_only: true\n"
+        ),
+    ],
+)
+def test_policy_yaml_rejects_duplicate_mapping_keys(tmp_path: Path, document: str) -> None:
+    path = tmp_path / "duplicate-policy.yaml"
+    path.write_text(document, encoding="utf-8")
+
+    with pytest.raises(PolicyError, match="invalid YAML"):
+        load_policy(path)
+
+
 def test_communication_send_cannot_be_passthrough() -> None:
     policy = _policy()
     policy["downstreams"]["mail"]["tools"]["send"] = {
