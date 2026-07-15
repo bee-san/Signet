@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -289,7 +290,7 @@ async def test_success_commits_boundary_before_one_call_and_stores_only_safe_ali
     assert client.calls[0][2] == "dispatch_started"
     assert client.calls[0][1]["idempotency_key"].startswith("sgd_")
     assert result.safe_metadata == {
-        "message_id": "real-message",
+        "message_id": "sgref_54f5be45b98a2fff53aa64e9a9dced0a",
         "provider_status": "sent",
     }
     request = machine.get_request("success")
@@ -300,6 +301,30 @@ async def test_success_commits_boundary_before_one_call_and_stores_only_safe_ali
             "SELECT account_namespace, identifier_kind, downstream_identifier FROM result_aliases"
         ).fetchall()
     assert [tuple(row) for row in aliases] == [("primary", "message_id", "real-message")]
+    assert "real-message" not in request["safe_outcome_json"]
+
+
+@pytest.mark.asyncio
+async def test_provider_identifier_cannot_echo_private_content_to_status_metadata(
+    machine: ApprovalStateMachine,
+) -> None:
+    enqueue_approved(machine, "covert-id")
+    adapter = FakeAdapter(supports_idempotency=True)
+    echoed = "cHJpdmF0ZSByZXF1ZXN0IGNvbnRlbnQ="
+    client = FakeClient(machine, [{"status": "sent", "id": echoed}])
+
+    result = await dispatcher(machine, adapter, client).dispatch(
+        "covert-id", worker_id="worker", now=NOW + 2
+    )
+
+    assert result.safe_metadata["message_id"].startswith("sgref_")
+    assert echoed not in json.dumps(dict(result.safe_metadata))
+    assert echoed not in machine.get_request("covert-id")["safe_outcome_json"]
+    with machine.database.read() as connection:
+        internal = connection.execute(
+            "SELECT downstream_identifier FROM result_aliases WHERE request_id = 'covert-id'"
+        ).fetchone()
+    assert internal is not None and internal[0] == echoed
 
 
 @pytest.mark.asyncio

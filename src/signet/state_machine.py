@@ -52,6 +52,7 @@ from .models import (
 )
 from .notification_outbox import enqueue_notification
 from .notifications import NotificationKind, PushMessage
+from .safe_metadata import public_safe_metadata
 
 FaultInjector = Callable[[str], None]
 TokenFactory = Callable[[], str]
@@ -1453,6 +1454,9 @@ class ApprovalStateMachine:
         result_aliases: tuple[ResultAlias, ...] = (),
     ) -> None:
         safe_json = self._safe_outcome_json(safe_outcome)
+        public_safe_json = self._safe_outcome_json(
+            public_safe_metadata(safe_outcome) if safe_outcome is not None else None
+        )
         with self.database.transaction() as connection:
             attempt = self._attempt_for_fence(connection, lease)
             if attempt["phase"] not in {
@@ -1496,7 +1500,7 @@ class ApprovalStateMachine:
                 (
                     request_state.value,
                     now if request_state != RequestState.OUTCOME_UNKNOWN else None,
-                    safe_json,
+                    public_safe_json,
                     failure_reason,
                     manual_retry,
                     duplicate_warning,
@@ -1580,6 +1584,9 @@ class ApprovalStateMachine:
         result_aliases: tuple[ResultAlias, ...] = (),
     ) -> ReconciliationResult:
         safe_json = self._safe_outcome_json(safe_outcome)
+        public_safe_json = self._safe_outcome_json(
+            public_safe_metadata(safe_outcome) if safe_outcome is not None else None
+        )
         with self.database.transaction() as connection:
             request = self._request_for_update(connection, request_id)
             if request["state"] != RequestState.OUTCOME_UNKNOWN.value:
@@ -1613,7 +1620,7 @@ class ApprovalStateMachine:
                         duplicate_warning_required = 0, revision = revision + 1
                     WHERE request_id = ? AND state = 'outcome_unknown'
                     """,
-                    (now, safe_json, request_id),
+                    (now, public_safe_json, request_id),
                 )
                 connection.execute(
                     """

@@ -536,7 +536,7 @@ async def test_check_status_returns_authoritative_safe_outcome_metadata(
     assert result["status"] == "succeeded"
     assert result["version"] == 1
     assert result["safe_result_metadata"] == {
-        "message_id": "provider-message-1",
+        "message_id": "sgref_07055ac0b625e7c7fb975c3f283ef742",
         "status": "sent",
     }
 

@@ -22,6 +22,7 @@ from typing import Any, Protocol, cast
 from signet.adapters.base import AdapterRequest, ApprovalAdapter, MCPClient, Outcome
 from signet.canonical import CanonicalizationError, canonical_json
 from signet.models import ExecutionLease, ExecutionPhase, OutcomeClassification, ResultAlias
+from signet.safe_metadata import public_safe_metadata
 from signet.state_machine import ApprovalStateMachine
 
 
@@ -307,21 +308,24 @@ class DeliveryDispatcher:
             result_or_error = exc
 
         outcome = _classify(loaded.adapter, result_or_error)
-        metadata = (
+        internal_metadata = (
             standardize_safe_metadata(loaded.adapter, result_or_error)
             if isinstance(result_or_error, Mapping)
             else MappingProxyType({})
         )
         aliases = (
-            result_aliases_from_metadata(metadata, account_namespace=loaded.request.account)
+            result_aliases_from_metadata(
+                internal_metadata, account_namespace=loaded.request.account
+            )
             if outcome is Outcome.SUCCEEDED
             else ()
         )
+        metadata = MappingProxyType(public_safe_metadata(internal_metadata))
         classification = _state_classification(outcome)
         kwargs: dict[str, Any] = {
             "classification": classification,
             "now": now,
-            "safe_outcome": metadata,
+            "safe_outcome": internal_metadata,
             "result_aliases": aliases,
         }
         if classification is OutcomeClassification.DEFINITE_FAILURE:
