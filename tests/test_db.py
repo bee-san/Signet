@@ -122,7 +122,7 @@ def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Pat
             "SELECT * FROM schema_meta ORDER BY migration_id"
         ).fetchall()
     assert tables >= CORE_TABLES
-    assert [migration["migration_id"] for migration in migrations] == [1, 2, 3]
+    assert [migration["migration_id"] for migration in migrations] == [1, 2, 3, 4]
     assert all(len(migration["checksum"]) == 64 for migration in migrations)
 
 
@@ -240,6 +240,35 @@ def test_every_initial_migration_statement_is_failure_injected_and_restartable(
             database.initialize(fault_injector=fail)
         database.initialize()
         assert database.integrity_check() == ("ok", ())
+
+
+def test_retention_trigger_migration_is_atomic_and_restartable(tmp_path: Path) -> None:
+    database = Database(tmp_path / "retention-migration" / "approvals.sqlite3")
+
+    def fail_after_trigger_replacement(stage: str) -> None:
+        if stage == "migration:4:statement:2":
+            raise RuntimeError("injected retention migration crash")
+
+    with pytest.raises(RuntimeError, match="retention migration"):
+        database.initialize(fault_injector=fail_after_trigger_replacement)
+    with database.read() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+    backed_up_versions: list[int] = []
+    database.initialize(
+        pre_migration_backup=lambda _database, version: backed_up_versions.append(version)
+    )
+    assert backed_up_versions == [3]
+    with database.read() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        trigger = connection.execute(
+            """
+            SELECT sql FROM sqlite_schema
+            WHERE type = 'trigger' AND name = 'payload_versions_immutable_fields'
+            """
+        ).fetchone()[0]
+    assert "NEW.purged_at IS NOT NULL" in trigger
+    assert "NEW.key_destroyed_at IS NOT NULL" in trigger
 
 
 def test_upgrade_requires_and_runs_a_verified_pre_migration_backup(

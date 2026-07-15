@@ -758,6 +758,98 @@ class StagingStore:
                 os.close(metadata_fd)
                 os.close(root_fd)
 
+    def purge_verified(
+        self,
+        opaque_id: str,
+        *,
+        expected_path: Path,
+        expected_size: int,
+        expected_sha256: str,
+        missing_ok: bool = False,
+    ) -> None:
+        """Unlink one DB-owned object and sidecar after confined integrity checks.
+
+        ``missing_ok`` exists for the narrow crash-recovery case where filesystem
+        unlink completed before the owning SQLite transaction committed.
+        """
+
+        if not _OPAQUE_ID_RE.fullmatch(opaque_id):
+            raise StagingError("staged object identifier is invalid")
+        candidate = Path(expected_path)
+        if not candidate.is_absolute() or candidate != self.root / opaque_id:
+            raise StagingError("staged object path is outside the private root")
+        if (
+            isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+            or expected_size < 0
+            or expected_size > self.max_file_bytes
+            or not isinstance(expected_sha256, str)
+            or _SHA256_RE.fullmatch(expected_sha256) is None
+            or not isinstance(missing_ok, bool)
+        ):
+            raise ValueError("staged object purge expectation is invalid")
+
+        with self._locked():
+            root_fd = self._open_root()
+            metadata_fd = self._open_metadata_root()
+            content_fd: int | None = None
+            content_present = False
+            metadata_present = False
+            try:
+                try:
+                    content_fd = os.open(opaque_id, _readonly_flags(), dir_fd=root_fd)
+                except FileNotFoundError:
+                    if not missing_ok:
+                        raise StagingError("staged object is unavailable") from None
+                except OSError as exc:
+                    raise StagingError("staged object is unsafe") from exc
+                else:
+                    content_present = True
+                    opened = os.fstat(content_fd)
+                    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                        raise StagingError("staged object is unsafe")
+                    size, digest = hash_verified_descriptor(
+                        content_fd,
+                        maximum_bytes=self.max_file_bytes,
+                    )
+                    if size != expected_size or digest != expected_sha256:
+                        raise StagingError("staged object failed purge integrity verification")
+                    named = os.stat(opaque_id, dir_fd=root_fd, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(named.st_mode)
+                        or named.st_nlink != 1
+                        or _identity(named) != _identity(opened)
+                    ):
+                        raise StagingError("staged object changed before purge")
+
+                metadata_name = f"{opaque_id}.json"
+                try:
+                    metadata = os.stat(
+                        metadata_name,
+                        dir_fd=metadata_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise StagingError("staged object metadata is unsafe") from exc
+                else:
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise StagingError("staged object metadata is unsafe")
+                    metadata_present = True
+
+                if content_present:
+                    os.unlink(opaque_id, dir_fd=root_fd)
+                if metadata_present:
+                    os.unlink(metadata_name, dir_fd=metadata_fd)
+                os.fsync(root_fd)
+                os.fsync(metadata_fd)
+            finally:
+                if content_fd is not None:
+                    os.close(content_fd)
+                os.close(metadata_fd)
+                os.close(root_fd)
+
     def sweep_orphans(
         self,
         *,

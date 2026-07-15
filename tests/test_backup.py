@@ -6,7 +6,9 @@ import pytest
 
 from signet.backup import BackupBundleManager, BackupError
 from signet.db import Database
-from signet.models import AttachmentReference, EnqueueRequest
+from signet.models import AttachmentReference, EnqueueRequest, RequestState
+from signet.retention import RetentionManager, RetentionMatrix
+from signet.staging import StagingStore
 from signet.state_machine import ApprovalStateMachine
 
 
@@ -76,8 +78,22 @@ def test_encrypted_bundle_restores_database_attachments_and_key_manifest(
         restored_path = connection.execute(
             "SELECT storage_path FROM attachments WHERE attachment_id = 'stg_backup'"
         ).fetchone()[0]
+        restored_active_pins = connection.execute(
+            """
+            SELECT count(*) FROM purge_jobs
+            WHERE intent = 'backup_pin' AND completed_at IS NULL
+            """
+        ).fetchone()[0]
+    with database.read() as connection:
+        live_pins = connection.execute(
+            "SELECT started_at, completed_at FROM purge_jobs WHERE intent = 'backup_pin'"
+        ).fetchall()
     assert restored_path == str(restored.attachments_root / "00000000.bin")
     assert restored_path != str(attachment)
+    assert restored_active_pins == 0
+    assert len(live_pins) == 1
+    assert live_pins[0]["started_at"] is not None
+    assert live_pins[0]["completed_at"] is not None
 
 
 def test_bundle_tamper_and_wrong_key_fail_before_restore(tmp_path: Path) -> None:
@@ -120,6 +136,11 @@ def test_backup_rejects_changed_attachment(tmp_path: Path) -> None:
     manager = BackupBundleManager(database, staging_root=staging, encryption_key=b"k" * 32)
     with pytest.raises(BackupError, match="integrity"):
         manager.create(tmp_path / "backup.signet")
+    with database.read() as connection:
+        pins = connection.execute(
+            "SELECT completed_at FROM purge_jobs WHERE intent = 'backup_pin'"
+        ).fetchall()
+    assert len(pins) == 1 and pins[0]["completed_at"] is not None
 
 
 def test_manager_repr_redacts_key(tmp_path: Path) -> None:
@@ -189,3 +210,111 @@ def test_backup_rejects_symlink_replacement_of_snapshot_attachment(tmp_path: Pat
 
     with pytest.raises(BackupError, match="unsafe"):
         manager.create(tmp_path / "backup.signet")
+
+
+def test_backup_pin_prevents_purge_between_snapshot_and_attachment_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "fake.txt"
+    source.write_bytes(b"fake consistently backed up bytes")
+    staging = StagingStore(
+        tmp_path / "staging",
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    staged = staging.stage_path(
+        source,
+        adapter="fake-adapter",
+        account="fake-account",
+        filename="fake.txt",
+        declared_mime="text/plain",
+    )
+    database = Database(tmp_path / "live" / "approvals.sqlite3")
+    database.initialize()
+    digest = "d" * 64
+    ApprovalStateMachine(database).enqueue(
+        EnqueueRequest(
+            request_id="backup-pin-race",
+            downstream_alias="fake-service",
+            tool_name="fake_write",
+            policy_mode="approval",
+            origin_namespace="profile:fake",
+            encrypted_payload=b"fake encrypted payload",
+            payload_hash=digest,
+            payload_fingerprint="fake-backup-race-fingerprint",
+            pending_result=b'{"status":"pending_approval"}',
+            created_at=10,
+            expires_at=10_000,
+            policy_version="policy-fake",
+            adapter_version="adapter-fake",
+            schema_version="schema-fake",
+            editor_actor="caller:profile:fake",
+            attachments=(
+                AttachmentReference(
+                    staged.opaque_id,
+                    staged.filename,
+                    staged.declared_mime,
+                    staged.size,
+                    staged.sha256,
+                    str(staged.path),
+                ),
+            ),
+        )
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE approval_requests SET state = 'denied', completed_at = 100
+            WHERE request_id = 'backup-pin-race'
+            """
+        )
+    attachments: dict[RequestState, int | None] = dict.fromkeys(RequestState)
+    attachments.update(
+        {
+            RequestState.SUCCEEDED: 0,
+            RequestState.FAILED: 2 * 24 * 60 * 60,
+            RequestState.DENIED: 0,
+            RequestState.EXPIRED: 24 * 60 * 60,
+            RequestState.CANCELLED: 24 * 60 * 60,
+        }
+    )
+    payloads: dict[RequestState, int | None] = dict.fromkeys(RequestState)
+    payloads.update(
+        {
+            RequestState.SUCCEEDED: 24 * 60 * 60,
+            RequestState.FAILED: 24 * 60 * 60,
+            RequestState.DENIED: 24 * 60 * 60,
+            RequestState.EXPIRED: 24 * 60 * 60,
+            RequestState.CANCELLED: 24 * 60 * 60,
+        }
+    )
+    retention = RetentionManager(
+        database,
+        staging,
+        matrix=RetentionMatrix(attachments, payloads),
+    )
+    manager = BackupBundleManager(
+        database,
+        staging_root=staging.root,
+        encryption_key=b"k" * 32,
+    )
+    copy_attachments = manager._copy_attachments
+
+    def copy_while_purge_is_due(snapshot: Path, destination: Path) -> list[dict[str, object]]:
+        report = retention.run_due(now=100)
+        assert report.claimed == 0
+        assert staged.path.exists()
+        return copy_attachments(snapshot, destination)
+
+    monkeypatch.setattr(manager, "_copy_attachments", copy_while_purge_is_due)
+    bundle = manager.create(tmp_path / "backup.signet", created_at=100)
+    assert staged.path.exists()
+
+    assert retention.run_due(now=100).completed == 1
+    assert not staged.path.exists()
+    restored = manager.restore(bundle, tmp_path / "restored-race")
+    assert (restored.attachments_root / "00000000.bin").read_bytes() == (
+        b"fake consistently backed up bytes"
+    )

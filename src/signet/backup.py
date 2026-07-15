@@ -23,6 +23,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from signet.db import Database
+from signet.retention import BackupPins, RetentionError
 from signet.staging import (
     StagingError,
     hash_verified_descriptor,
@@ -55,6 +56,7 @@ class BackupBundleManager:
         staging_root: Path,
         encryption_key: bytes,
         max_bundle_bytes: int = 512 * 1024 * 1024,
+        backup_pins: BackupPins | None = None,
     ) -> None:
         if len(encryption_key) != 32:
             raise ValueError("backup encryption key must be exactly 32 bytes")
@@ -73,6 +75,7 @@ class BackupBundleManager:
             self._staging_root_identity = (metadata.st_dev, metadata.st_ino)
         self._encryption_key = bytes(encryption_key)
         self.max_bundle_bytes = max_bundle_bytes
+        self._backup_pins = backup_pins or BackupPins(database)
 
     def __repr__(self) -> str:
         return f"BackupBundleManager(database={self.database.path!s}, encryption_key=<redacted>)"
@@ -85,57 +88,80 @@ class BackupBundleManager:
             raise BackupError("backup destination already exists")
         workspace = Path(tempfile.mkdtemp(prefix=".signet-backup-", dir=destination.parent))
         os.chmod(workspace, 0o700)
+        pin_time = int(time.time())
         try:
-            snapshot = self.database.create_snapshot(workspace / "approvals.sqlite3")
-            attachments_dir = workspace / "attachments"
-            attachments_dir.mkdir(mode=0o700)
-            attachment_manifest = self._copy_attachments(snapshot, attachments_dir)
-            with _snapshot_connection(snapshot) as connection:
-                schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-                key_references = sorted(
-                    {
-                        row[0]
-                        for row in connection.execute(
-                            """
-                            SELECT encryption_key_ref FROM payload_versions
-                            WHERE encryption_key_ref IS NOT NULL
-                            """
-                        )
-                    }
-                )
-            manifest = {
-                "format": 1,
-                "schema_version": schema_version,
-                "created_at": created_at if created_at is not None else int(time.time()),
-                "database_sha256": _file_hash(snapshot),
-                "attachments": attachment_manifest,
-                "key_references": key_references,
-            }
-            manifest_path = workspace / "manifest.json"
-            manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            os.chmod(manifest_path, 0o600)
-            archive = _archive_workspace(workspace, manifest)
-            nonce = secrets.token_bytes(12)
-            ciphertext = AESGCM(self._encryption_key).encrypt(nonce, archive, MAGIC)
-            if len(ciphertext) + len(MAGIC) + len(nonce) > self.max_bundle_bytes:
-                raise BackupError("encrypted backup exceeds the configured size limit")
-            temporary = destination.with_name(f".{destination.name}.partial")
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
-                _write_all(descriptor, MAGIC + nonce + ciphertext)
-                os.fsync(descriptor)
-            except BaseException:
-                os.close(descriptor)
-                temporary.unlink(missing_ok=True)
-                raise
-            else:
-                os.close(descriptor)
-            os.replace(temporary, destination)
-            _fsync_directory(destination.parent)
-            return destination
+                pins = self._backup_pins.acquire(now=pin_time)
+            except RetentionError as exc:
+                raise BackupError("backup could not acquire consistent attachment pins") from exc
+            try:
+                snapshot = self.database.create_snapshot(workspace / "approvals.sqlite3")
+                try:
+                    self._backup_pins.release_snapshot_pins(snapshot, now=pin_time)
+                except (OSError, sqlite3.Error) as exc:
+                    raise BackupError("backup snapshot pins could not be finalized") from exc
+                attachments_dir = workspace / "attachments"
+                attachments_dir.mkdir(mode=0o700)
+                attachment_manifest = self._copy_attachments(snapshot, attachments_dir)
+                with _snapshot_connection(snapshot) as connection:
+                    schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                    key_references = sorted(
+                        {
+                            row[0]
+                            for row in connection.execute(
+                                """
+                                SELECT encryption_key_ref FROM payload_versions
+                                WHERE encryption_key_ref IS NOT NULL
+                                """
+                            )
+                        }
+                    )
+                manifest = {
+                    "format": 1,
+                    "schema_version": schema_version,
+                    "created_at": created_at if created_at is not None else int(time.time()),
+                    "database_sha256": _file_hash(snapshot),
+                    "attachments": attachment_manifest,
+                    "key_references": key_references,
+                }
+                manifest_path = workspace / "manifest.json"
+                manifest_path.write_text(
+                    json.dumps(
+                        manifest,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+                os.chmod(manifest_path, 0o600)
+                archive = _archive_workspace(workspace, manifest)
+                nonce = secrets.token_bytes(12)
+                ciphertext = AESGCM(self._encryption_key).encrypt(nonce, archive, MAGIC)
+                if len(ciphertext) + len(MAGIC) + len(nonce) > self.max_bundle_bytes:
+                    raise BackupError("encrypted backup exceeds the configured size limit")
+                temporary = destination.with_name(f".{destination.name}.partial")
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    _write_all(descriptor, MAGIC + nonce + ciphertext)
+                    os.fsync(descriptor)
+                except BaseException:
+                    os.close(descriptor)
+                    temporary.unlink(missing_ok=True)
+                    raise
+                else:
+                    os.close(descriptor)
+                os.replace(temporary, destination)
+                _fsync_directory(destination.parent)
+                return destination
+            finally:
+                try:
+                    self._backup_pins.release(
+                        pins,
+                        now=max(pin_time, int(time.time())),
+                    )
+                except RetentionError as exc:
+                    raise BackupError("backup attachment pins could not be released") from exc
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
 
