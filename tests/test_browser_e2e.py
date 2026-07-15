@@ -547,9 +547,9 @@ def _assert_layout(page: Page) -> None:
           const horizontalOverflow =
             root.scrollWidth > root.clientWidth + 1 || body.scrollWidth > body.clientWidth + 1;
           const controls = document.querySelectorAll(
-            "button, input:not([type='hidden']), textarea, summary, a[href]"
+            "button, input:not([type='hidden']), select, textarea, summary, a[href]"
           );
-          const undersized = Array.from(controls).filter((element) => {
+          const undersized = Array.from(controls).flatMap((element) => {
             const style = getComputedStyle(element);
             const rect = element.getBoundingClientRect();
             const visible =
@@ -557,14 +557,38 @@ def _assert_layout(page: Page) -> None:
               style.visibility !== "hidden" &&
               rect.width > 0 &&
               rect.height > 0;
-            return visible && (rect.width < 43.5 || rect.height < 43.5);
-          }).length;
-          return { horizontalOverflow, undersized };
+            if (!visible || (rect.width >= 43.5 && rect.height >= 43.5)) {
+              return [];
+            }
+            return [{
+              tag: element.tagName.toLowerCase(),
+              id: element.id,
+              className: typeof element.className === "string" ? element.className : "",
+              label: (element.getAttribute("aria-label") || element.textContent || "")
+                .trim()
+                .replace(/\\s+/g, " ")
+                .slice(0, 120),
+              width: rect.width,
+              height: rect.height,
+            }];
+          });
+          return {
+            horizontalOverflow,
+            rootClientWidth: root.clientWidth,
+            rootScrollWidth: root.scrollWidth,
+            bodyClientWidth: body.clientWidth,
+            bodyScrollWidth: body.scrollWidth,
+            undersized,
+          };
         }
         """
     )
-    if metrics != {"horizontalOverflow": False, "undersized": 0}:
-        pytest.fail("browser layout overflowed or exposed an undersized control", pytrace=False)
+    if metrics["horizontalOverflow"] or metrics["undersized"]:
+        pytest.fail(
+            "browser layout overflowed or exposed an undersized control: "
+            f"{json.dumps(metrics, sort_keys=True)}",
+            pytrace=False,
+        )
 
 
 def _login(page: Page, demo: LiveDemo) -> None:

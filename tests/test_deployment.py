@@ -553,13 +553,14 @@ def test_init_preserves_state_if_database_inode_changes_before_cleanup(
     config_path = tmp_path / "config.json"
     data_dir = tmp_path / "data"
     database_path = data_dir / "signet.sqlite3"
+    replacement_path = data_dir / "replacement.sqlite3"
     replacement = b"replacement requiring manual review\n"
 
     def replace_database_then_fail(self: Database, **kwargs: Any) -> None:
         del kwargs
-        self.path.unlink()
-        self.path.write_bytes(replacement)
-        os.chmod(self.path, 0o600)
+        replacement_path.write_bytes(replacement)
+        os.chmod(replacement_path, 0o600)
+        replacement_path.replace(self.path)
         raise DatabaseError("injected database replacement")
 
     monkeypatch.setattr(Database, "initialize", replace_database_then_fail)

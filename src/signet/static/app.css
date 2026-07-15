@@ -164,6 +164,7 @@ h4 { font-size: .86rem; line-height: 1.35; }
 .attachment-band h4 { margin: 20px 0 8px; }
 .attachments-table { min-width: 820px; }
 .attachments-table .hash-value { overflow-wrap: anywhere; }
+.attachments-table a { align-items: center; display: inline-flex; min-height: 44px; }
 .hash-list { list-style: none; margin: 0; padding: 0; }
 .hash-list li { overflow-wrap: anywhere; padding: 5px 0; }
 .muted-value { color: var(--muted); margin-bottom: 0; }
