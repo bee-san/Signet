@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
 import json
@@ -406,30 +407,91 @@ def _advertises_task_support(raw: Mapping[str, Any]) -> bool:
     return task_support not in (None, "forbidden")
 
 
-async def discover_all_tools(session: Any) -> list[dict[str, Any]]:
+async def discover_all_tools(
+    session: Any,
+    *,
+    max_pages: int = 32,
+    max_tools: int = 512,
+    max_aggregate_bytes: int = 8 * 1024 * 1024,
+    timeout_seconds: float = 30.0,
+) -> list[dict[str, Any]]:
     """Exhaust tools/list pagination while detecting loops and duplicates."""
 
+    if (
+        max_pages < 1
+        or max_pages > 256
+        or max_tools < 1
+        or max_tools > 10_000
+        or max_aggregate_bytes < 1
+        or max_aggregate_bytes > 64 * 1024 * 1024
+        or timeout_seconds <= 0
+        or timeout_seconds > 120
+    ):
+        raise ValueError("downstream discovery bounds are invalid")
     cursor: str | None = None
     cursors: set[str] = set()
     names: set[str] = set()
     tools: list[dict[str, Any]] = []
-    while True:
-        params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
-        page = await session.list_tools(params=params)
-        for model in page.tools:
-            raw = validate_lossless_tool(raw_model(model))
-            name = raw["name"]
-            if name in names:
-                raise MirrorError(f"duplicate downstream tool name: {name}")
-            names.add(name)
-            tools.append(raw)
-        next_cursor = page.nextCursor
-        if next_cursor is None:
-            return tools
-        if next_cursor in cursors:
-            raise MirrorError("downstream tools/list pagination cursor repeated")
-        cursors.add(next_cursor)
-        cursor = next_cursor
+    aggregate_bytes = 0
+    page_count = 0
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            while True:
+                if page_count >= max_pages:
+                    raise MirrorError("downstream tools/list exceeded the page limit")
+                page_count += 1
+                params = (
+                    types.PaginatedRequestParams(cursor=cursor)
+                    if cursor is not None
+                    else None
+                )
+                page = await session.list_tools(params=params)
+                if len(tools) + len(page.tools) > max_tools:
+                    raise MirrorError("downstream tools/list exceeded the tool limit")
+                for model in page.tools:
+                    raw = validate_lossless_tool(raw_model(model))
+                    name = raw["name"]
+                    if name in names:
+                        raise MirrorError(f"duplicate downstream tool name: {name}")
+                    try:
+                        encoded_size = len(
+                            json.dumps(
+                                raw,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        )
+                    except (TypeError, ValueError):
+                        raise MirrorError(
+                            "downstream tools/list contained invalid JSON"
+                        ) from None
+                    aggregate_bytes += encoded_size
+                    if aggregate_bytes > max_aggregate_bytes:
+                        raise MirrorError(
+                            "downstream tools/list exceeded the aggregate byte limit"
+                        )
+                    names.add(name)
+                    tools.append(raw)
+                next_cursor = page.nextCursor
+                if next_cursor is None:
+                    return tools
+                if not isinstance(next_cursor, str) or not next_cursor:
+                    raise MirrorError("downstream tools/list returned an invalid cursor")
+                cursor_size = len(next_cursor.encode("utf-8"))
+                if cursor_size > 1_024:
+                    raise MirrorError("downstream tools/list cursor exceeded its limit")
+                aggregate_bytes += cursor_size
+                if aggregate_bytes > max_aggregate_bytes:
+                    raise MirrorError(
+                        "downstream tools/list exceeded the aggregate byte limit"
+                    )
+                if next_cursor in cursors:
+                    raise MirrorError("downstream tools/list pagination cursor repeated")
+                cursors.add(next_cursor)
+                cursor = next_cursor
+    except TimeoutError:
+        raise MirrorError("downstream tools/list discovery timed out") from None
 
 
 ToolCallHandler = Callable[

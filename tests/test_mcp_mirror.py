@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from pathlib import Path
@@ -204,6 +205,41 @@ async def test_discovery_rejects_repeated_cursor() -> None:
 
     with pytest.raises(MirrorError, match="cursor repeated"):
         await discover_all_tools(Repeating())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_pages": 1}, "page limit"),
+        ({"max_tools": 1}, "tool limit"),
+        ({"max_aggregate_bytes": 100}, "aggregate byte limit"),
+    ],
+)
+async def test_discovery_enforces_incremental_resource_bounds(
+    kwargs: dict[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises(MirrorError, match=message):
+        await discover_all_tools(_PagedSession(), **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_discovery_bounds_cursor_and_elapsed_time() -> None:
+    class LongCursor:
+        async def list_tools(self, *, params: Any) -> Any:
+            del params
+            return SimpleNamespace(tools=[], nextCursor="x" * 1_025)
+
+    class NeverReturns:
+        async def list_tools(self, *, params: Any) -> Any:
+            del params
+            await asyncio.Event().wait()
+
+    with pytest.raises(MirrorError, match="cursor exceeded"):
+        await discover_all_tools(LongCursor())
+    with pytest.raises(MirrorError, match="timed out"):
+        await discover_all_tools(NeverReturns(), timeout_seconds=0.01)
 
 
 def test_raw_server_result_uses_exact_raw_serializer() -> None:
