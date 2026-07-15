@@ -7,7 +7,7 @@
   },
   "tool": "send_text",
   "arguments": {
-    "to": "15550102030",
+    "to": "+15550102030",
     "message": "This is inert Signet fixture data and must never be delivered."
   }
 }

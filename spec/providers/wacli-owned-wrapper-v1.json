@@ -1,0 +1,120 @@
+{
+  "fixture_kind": "owned_provider_wrapper_contract",
+  "source": "https://github.com/openclaw/wacli/blob/main/docs/send.md",
+  "reviewed_on": "2026-07-15",
+  "must_not_dispatch": true,
+  "runtime_activation_default": "disabled",
+  "contract": "signet.wacli.v1",
+  "executable": {
+    "path": "/opt/homebrew/bin/wacli",
+    "version": "0.12.0",
+    "version_preflight_required": true,
+    "shell": false,
+    "stdin": "closed",
+    "environment": "minimal_allowlist",
+    "output": "single_json_object",
+    "timeout_bounded": true,
+    "output_bounded": true
+  },
+  "global_argv": [
+    "--account",
+    "ACCOUNT",
+    "--json",
+    "--timeout",
+    "15s"
+  ],
+  "tools": {
+    "send_text": {
+      "argv": [
+        "send",
+        "text",
+        "--to",
+        "DESTINATION",
+        "--message",
+        "MESSAGE",
+        "--no-preview"
+      ],
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://signet.local/schemas/wacli-send-text-v1.json",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["to", "message"],
+        "properties": {
+          "to": {"type": "string", "minLength": 7, "maxLength": 64},
+          "reply_to": {"type": "string", "minLength": 1, "maxLength": 512},
+          "reply_to_sender": {"type": "string", "minLength": 7, "maxLength": 64},
+          "message": {"type": "string", "minLength": 1, "maxLength": 65536}
+        }
+      }
+    },
+    "send_file": {
+      "argv": [
+        "send",
+        "file",
+        "--to",
+        "DESTINATION",
+        "--file",
+        "INHERITED_APPROVED_FILE_DESCRIPTOR",
+        "--filename",
+        "FILENAME",
+        "--mime",
+        "MIME_TYPE"
+      ],
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://signet.local/schemas/wacli-send-file-v1.json",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["to", "media"],
+        "properties": {
+          "to": {"type": "string", "minLength": 7, "maxLength": 64},
+          "reply_to": {"type": "string", "minLength": 1, "maxLength": 512},
+          "reply_to_sender": {"type": "string", "minLength": 7, "maxLength": 64},
+          "caption": {"type": "string", "maxLength": 65536},
+          "media": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "staged_id",
+              "filename",
+              "mime_type",
+              "detected_mime",
+              "size",
+              "sha256"
+            ],
+            "properties": {
+              "staged_id": {
+                "type": "string",
+                "pattern": "^stg_[A-Za-z0-9_]+$"
+              },
+              "filename": {"type": "string", "minLength": 1, "maxLength": 255},
+              "mime_type": {"type": "string", "minLength": 3, "maxLength": 255},
+              "detected_mime": {"type": "string", "minLength": 3, "maxLength": 255},
+              "size": {"type": "integer", "minimum": 0, "maximum": 52428800},
+              "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+            }
+          }
+        }
+      }
+    }
+  },
+  "result": {
+    "success_marker": {"sent": true},
+    "message_id_required_for_safe_success_metadata": true,
+    "recipient_delivery_confirmation": false
+  },
+  "media_boundary": {
+    "source": "confined_staging_root",
+    "open_flags": ["O_RDONLY", "O_NOFOLLOW"],
+    "regular_single_link_required": true,
+    "size_and_sha256_reverified_after_open": true,
+    "child_receives": "/dev/fd/<inherited-fd>"
+  },
+  "reconciliation": {
+    "read_only_tools": [],
+    "provider_idempotency_key": null,
+    "decision": "inconclusive",
+    "reason": "local history cannot uniquely identify an ambiguous repeated send"
+  }
+}

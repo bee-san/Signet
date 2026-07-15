@@ -1,0 +1,80 @@
+{
+  "fixture_kind": "signet_adapter_schema",
+  "source": "synthetic Fastmail adapter contract pending redacted live tools/list capture",
+  "schema_status": "live_tools_list_capture_required_before_enablement",
+  "must_not_dispatch": true,
+  "runtime_activation_default": "disabled",
+  "adapter": {
+    "id": "fastmail.send",
+    "version": "1",
+    "downstream_alias": "fastmail",
+    "tool": "send_email",
+    "communication_send": true,
+    "supports_idempotency": false,
+    "reconciliation_tools": ["search_email"],
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "subject", "body"],
+      "properties": {
+        "from": {"type": "string", "minLength": 3, "maxLength": 998},
+        "to": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 3, "maxLength": 998},
+          "maxItems": 100
+        },
+        "cc": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 3, "maxLength": 998},
+          "maxItems": 100
+        },
+        "bcc": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 3, "maxLength": 998},
+          "maxItems": 100
+        },
+        "subject": {"type": "string", "maxLength": 998},
+        "body": {"type": "string", "maxLength": 2000000},
+        "attachments": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "staged_id",
+              "filename",
+              "mime_type",
+              "detected_mime",
+              "size",
+              "sha256"
+            ],
+            "properties": {
+              "staged_id": {
+                "type": "string",
+                "pattern": "^stg_[A-Za-z0-9_]+$"
+              },
+              "filename": {"type": "string", "minLength": 1, "maxLength": 255},
+              "mime_type": {"type": "string", "minLength": 3, "maxLength": 255},
+              "detected_mime": {"type": "string", "minLength": 3, "maxLength": 255},
+              "size": {"type": "integer", "minimum": 0, "maximum": 26214400},
+              "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+            }
+          }
+        }
+      }
+    }
+  },
+  "execution": {
+    "attachments": "opaque local staging references uploaded only after approval",
+    "send_calls_per_execution": 1,
+    "provider_idempotency_key": null
+  },
+  "reconciliation": {
+    "lookup": "search_email",
+    "confirmation": "exact captured provider message or submission identifier",
+    "empty_result": "inconclusive",
+    "confirmed_no_effect_supported": false
+  }
+}
