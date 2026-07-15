@@ -45,7 +45,13 @@ from signet.totp import (
     TotpCredential,
     TotpVerifier,
 )
-from signet.web import PushSubscriptionInput, WebConflict, WebForbidden, WebUnauthorized
+from signet.web import (
+    PushSubscriptionInput,
+    WebConflict,
+    WebForbidden,
+    WebRateLimited,
+    WebUnauthorized,
+)
 from signet.web_backend import (
     ActionDraftRepository,
     EncryptedPayloadReviewer,
@@ -477,6 +483,87 @@ def test_failed_passkey_login_revokes_its_durable_preauth_session(
             (challenge.session_id,),
         ).fetchone()
     assert row is not None and row["revoked_at"] == NOW + 1
+
+
+def test_unknown_passkey_accounts_create_no_users_sessions_or_challenges(
+    bundle: BackendBundle,
+) -> None:
+    with bundle.database.read() as connection:
+        before = tuple(
+            int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            for table in ("auth_users", "web_sessions", "auth_challenges")
+        )
+
+    outcomes: list[type[Exception]] = []
+    for index in range(25):
+        try:
+            bundle.backend.begin_passkey_login(
+                f"unknown-{index}",
+                source="one-untrusted-source",
+                http_method="POST",
+                now=NOW + index,
+            )
+        except (WebUnauthorized, WebRateLimited) as exc:
+            outcomes.append(type(exc))
+
+    assert outcomes[:20] == [WebUnauthorized] * 20
+    assert outcomes[20:] == [WebRateLimited] * 5
+    with bundle.database.read() as connection:
+        after = tuple(
+            int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            for table in ("auth_users", "web_sessions", "auth_challenges")
+        )
+        limiter_rows = int(
+            connection.execute(
+                """
+                SELECT count(*) FROM auth_attempts
+                WHERE scope_key LIKE 'passkey-login:%'
+                """
+            ).fetchone()[0]
+        )
+    assert after == before
+    assert limiter_rows == 2
+
+
+def test_passkey_challenge_cap_is_checked_before_creating_an_extra_session(
+    bundle: BackendBundle,
+) -> None:
+    for offset in range(5):
+        bundle.backend.begin_passkey_login(
+            USER_ID,
+            source="known-account-source",
+            http_method="POST",
+            now=NOW + offset,
+        )
+
+    with pytest.raises(WebRateLimited, match="active passkey"):
+        bundle.backend.begin_passkey_login(
+            USER_ID,
+            source="known-account-source",
+            http_method="POST",
+            now=NOW + 5,
+        )
+
+    with bundle.database.read() as connection:
+        challenges = int(
+            connection.execute(
+                """
+                SELECT count(*) FROM auth_challenges
+                WHERE user_id = ? AND action = 'login'
+                """,
+                (USER_ID,),
+            ).fetchone()[0]
+        )
+        sessions = int(
+            connection.execute(
+                """
+                SELECT count(*) FROM web_sessions
+                WHERE user_id = ? AND auth_method = 'preauth:webauthn'
+                """,
+                (USER_ID,),
+            ).fetchone()[0]
+        )
+    assert (challenges, sessions) == (5, 5)
 
 
 def test_queue_detail_and_audit_only_expose_authenticated_private_review(

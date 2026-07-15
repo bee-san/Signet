@@ -27,6 +27,7 @@ from signet.auth import (
     SQLiteAuthenticationTransactions,
     TotpLoginProof,
     WebAuthnLoginProof,
+    canonical_user_id,
 )
 from signet.canonical import CanonicalizationError, canonical_json
 from signet.db import Database
@@ -437,9 +438,24 @@ class WebBackend:
         policy_promotions: PolicyPromotionBoundary,
         pushes: PushRepository,
         max_audit_entries: int = 1_000,
+        passkey_login_window_seconds: int = 10 * 60,
+        passkey_login_source_limit: int = 20,
+        passkey_login_account_limit: int = 10,
+        passkey_login_global_limit: int = 200,
     ) -> None:
         if max_audit_entries <= 0 or max_audit_entries > 10_000:
             raise ValueError("audit read limit is invalid")
+        if (
+            passkey_login_window_seconds < 60
+            or passkey_login_window_seconds > 60 * 60
+            or passkey_login_source_limit < 1
+            or passkey_login_source_limit > 1_000
+            or passkey_login_account_limit < 1
+            or passkey_login_account_limit > passkey_login_source_limit
+            or passkey_login_global_limit < passkey_login_source_limit
+            or passkey_login_global_limit > 100_000
+        ):
+            raise ValueError("passkey login issuance limits are invalid")
         self._database = database
         self._sessions = sessions
         self._passwords = passwords
@@ -454,6 +470,10 @@ class WebBackend:
         self._policy_promotions = policy_promotions
         self._pushes = pushes
         self.max_audit_entries = max_audit_entries
+        self._passkey_login_window_seconds = passkey_login_window_seconds
+        self._passkey_login_source_limit = passkey_login_source_limit
+        self._passkey_login_account_limit = passkey_login_account_limit
+        self._passkey_login_global_limit = passkey_login_global_limit
 
     def authenticate(self, token: str | None, *, now: int) -> SessionPrincipal:
         principal = self._sessions.authenticate(token, now=now)
@@ -518,16 +538,47 @@ class WebBackend:
     ) -> LoginOptions:
         if not source or len(source) > 256:
             raise WebUnauthorized("invalid credentials")
+        try:
+            canonical_user = canonical_user_id(user_id)
+            credentials = self._webauthn_repository.credentials_for_user(canonical_user)
+        except (TypeError, ValueError, WebAuthnError):
+            canonical_user = None
+            credentials = ()
+        try:
+            self._reserve_passkey_login(
+                source,
+                account=canonical_user if credentials else None,
+                now=now,
+            )
+        except AuthenticationRateLimited as exc:
+            raise WebRateLimited(str(exc)) from None
+        self._prune_login_ephemera(now=now)
+        if canonical_user is None or not credentials:
+            raise WebUnauthorized("invalid credentials")
+        with self._database.read() as connection:
+            active = int(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM auth_challenges
+                    WHERE user_id = ? AND action = 'login'
+                      AND consumed_at IS NULL AND invalidated_at IS NULL
+                      AND expires_at > ?
+                    """,
+                    (canonical_user, now),
+                ).fetchone()[0]
+            )
+        if active >= self._webauthn_issuer.max_active_per_user:
+            raise WebRateLimited("too many active passkey challenges")
         preauth_token: str | None = None
         try:
             preauth_token = self._sessions.create_session(
-                user_id,
+                canonical_user,
                 auth_method="preauth:webauthn",
                 now=now,
             )
             preauth = self._sessions.authenticate(preauth_token, now=now)
             issued = self._webauthn_issuer.issue(
-                user_id,
+                canonical_user,
                 ActionBinding("login"),
                 session_id=preauth.session_id,
                 http_method=http_method,
@@ -545,6 +596,158 @@ class WebBackend:
             if preauth_token is not None:
                 self._sessions.logout(preauth_token, now=now)
             raise WebUnauthorized("invalid credentials") from None
+
+    def _reserve_passkey_login(
+        self,
+        source: str,
+        *,
+        account: str | None,
+        now: int,
+    ) -> None:
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise WebUnauthorized("invalid credentials")
+        scopes = [
+            ("passkey-login:global", self._passkey_login_global_limit),
+            (
+                "passkey-login:source:"
+                + hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                self._passkey_login_source_limit,
+            ),
+        ]
+        if account is not None:
+            scopes.append(
+                (
+                    "passkey-login:account:"
+                    + hashlib.sha256(account.encode("utf-8")).hexdigest(),
+                    self._passkey_login_account_limit,
+                )
+            )
+        blocked_until: int | None = None
+        with self._database.transaction() as connection:
+            placeholders = ",".join("?" for _ in scopes)
+            rows = {
+                str(row["scope_key"]): row
+                for row in connection.execute(
+                    f"SELECT * FROM auth_attempts WHERE scope_key IN ({placeholders})",
+                    tuple(scope for scope, _limit in scopes),
+                ).fetchall()
+            }
+            for scope, _limit in scopes:
+                row = rows.get(scope)
+                if row is not None and row["locked_until"] is not None:
+                    locked_until = int(row["locked_until"])
+                    if now < locked_until:
+                        blocked_until = max(blocked_until or 0, locked_until)
+            if blocked_until is None:
+                for scope, limit in scopes:
+                    row = rows.get(scope)
+                    window_start = int(row["updated_at"]) if row is not None else now
+                    count = int(row["failures"]) if row is not None else 0
+                    if (
+                        now < window_start
+                        or now >= window_start + self._passkey_login_window_seconds
+                    ):
+                        window_start = now
+                        count = 0
+                    new_count = count + 1
+                    next_lock = (
+                        window_start + self._passkey_login_window_seconds
+                        if new_count >= limit
+                        else None
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO auth_attempts(
+                            scope_key, failures, locked_until, last_attempt_id, updated_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(scope_key) DO UPDATE SET
+                            failures = excluded.failures,
+                            locked_until = excluded.locked_until,
+                            last_attempt_id = excluded.last_attempt_id,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            scope,
+                            new_count,
+                            next_lock,
+                            secrets.token_urlsafe(18),
+                            window_start,
+                        ),
+                    )
+        if blocked_until is not None:
+            raise AuthenticationRateLimited(max(1, blocked_until - now))
+
+    def _prune_login_ephemera(self, *, now: int) -> None:
+        cutoff = max(0, now - 7 * 24 * 60 * 60)
+        proof_cutoff = max(0, now - 30 * 24 * 60 * 60)
+        with self._database.transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM auth_login_consumptions WHERE rowid IN (
+                    SELECT rowid FROM auth_login_consumptions
+                    WHERE consumed_at <= ? ORDER BY consumed_at LIMIT 500
+                )
+                """,
+                (proof_cutoff,),
+            )
+            connection.execute(
+                """
+                DELETE FROM auth_proof_consumptions WHERE rowid IN (
+                    SELECT rowid FROM auth_proof_consumptions
+                    WHERE purpose = 'login' AND consumed_at <= ?
+                    ORDER BY consumed_at LIMIT 500
+                )
+                """,
+                (proof_cutoff,),
+            )
+            connection.execute(
+                """
+                DELETE FROM auth_challenges WHERE rowid IN (
+                    SELECT rowid FROM auth_challenges
+                    WHERE action = 'login' AND expires_at <= ?
+                    ORDER BY expires_at LIMIT 500
+                )
+                """,
+                (cutoff,),
+            )
+            connection.execute(
+                """
+                DELETE FROM web_sessions WHERE rowid IN (
+                    SELECT session.rowid FROM web_sessions AS session
+                    WHERE (session.revoked_at <= ? OR session.absolute_expires_at <= ?)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM auth_challenges AS challenge
+                          WHERE challenge.session_id = session.session_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM auth_login_consumptions AS consumption
+                          WHERE consumption.session_id = session.session_id
+                      )
+                    ORDER BY session.absolute_expires_at LIMIT 500
+                )
+                """,
+                (cutoff, cutoff),
+            )
+            connection.execute(
+                """
+                DELETE FROM auth_users WHERE rowid IN (
+                    SELECT user.rowid FROM auth_users AS user
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM auth_credentials AS credential
+                        WHERE credential.user_id = user.user_id
+                    )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM web_sessions AS session
+                          WHERE session.user_id = user.user_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM auth_challenges AS challenge
+                          WHERE challenge.user_id = user.user_id
+                      )
+                    LIMIT 500
+                )
+                """
+            )
 
     def complete_passkey_login(
         self,
