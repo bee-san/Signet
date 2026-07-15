@@ -6,12 +6,14 @@ import asyncio
 import copy
 import inspect
 import json
+import math
 import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal, cast
 
 import mcp.types as types
@@ -43,6 +45,24 @@ _EXPLICIT_INVOCATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _MAX_IDENTITY_COMPONENT_BYTES = 512
 _SCHEMA_REFERENCE_KEYS = frozenset({"$dynamicRef", "$recursiveRef", "$ref"})
+_SCHEMA_COMBINATOR_KEYS = frozenset({"allOf", "anyOf", "oneOf"})
+_MAX_SCHEMA_NODES = 4_096
+_MAX_SCHEMA_DEPTH = 32
+_MAX_SCHEMA_BYTES = 256 * 1024
+_MAX_SCHEMA_SCALAR_BYTES = 16 * 1024
+_MAX_SCHEMA_COMBINATOR_BRANCHES = 16
+_MAX_SCHEMA_COMBINATOR_BRANCHES_TOTAL = 64
+_MAX_SCHEMA_REFERENCES = 32
+_MAX_SCHEMA_PATTERNS = 16
+_MAX_PATTERN_BYTES = 1_024
+_MAX_PATTERN_EXPANDED_ATOMS = 4_096
+_MAX_JSON_INTEGER_BITS = 4_096
+_MAX_UNIQUE_ITEMS = 256
+_MAX_INSTANCE_NODES = 20_000
+_MAX_INSTANCE_DEPTH = 64
+_MAX_INSTANCE_KEY_BYTES = 4 * 1024
+_MAX_INSTANCE_SCALAR_BYTES = 8 * 1024 * 1024
+_MAX_INSTANCE_SCALAR_BYTES_TOTAL = 16 * 1024 * 1024
 
 
 class MirrorError(RuntimeError):
@@ -58,6 +78,10 @@ class InvocationIdentityError(MirrorError):
 
 
 class ListChangedNotificationError(MirrorError):
+    pass
+
+
+class _ValidationComplexityError(MirrorError):
     pass
 
 
@@ -120,27 +144,371 @@ _CLOSED_SCHEMA_REGISTRY: Registry[Any] = Registry(  # type: ignore[call-arg]
 
 
 def _closed_schema_validator(schema: Mapping[str, Any]) -> Draft202012Validator:
-    _reject_external_schema_references(schema)
+    _validate_schema_complexity(schema)
+    try:
+        encoded = canonical_json(dict(schema))
+    except Exception:
+        raise SchemaDriftError("the reviewed JSON schema is invalid") from None
+    if len(encoded) > _MAX_SCHEMA_BYTES:
+        raise SchemaDriftError("the reviewed JSON schema exceeds its byte limit")
+    return _compile_closed_schema(encoded)
+
+
+@lru_cache(maxsize=64)
+def _compile_closed_schema(encoded: bytes) -> Draft202012Validator:
+    schema = json.loads(encoded)
     try:
         Draft202012Validator.check_schema(schema)
     except Exception:
         raise SchemaDriftError("the reviewed JSON schema is invalid") from None
-    return Draft202012Validator(dict(schema), registry=_CLOSED_SCHEMA_REGISTRY)
+    return Draft202012Validator(schema, registry=_CLOSED_SCHEMA_REGISTRY)
 
 
-def _reject_external_schema_references(value: Any) -> None:
-    if isinstance(value, Mapping):
-        for key, child in value.items():
-            if key in _SCHEMA_REFERENCE_KEYS and (
-                not isinstance(child, str) or not child.startswith("#")
-            ):
-                raise SchemaDriftError(
-                    "reviewed JSON schemas may only use in-document references"
-                )
-            _reject_external_schema_references(child)
-    elif isinstance(value, list):
-        for child in value:
-            _reject_external_schema_references(child)
+def _validate_schema_complexity(schema: Mapping[str, Any]) -> None:
+    nodes = 0
+    combinator_branches = 0
+    patterns = 0
+    references: list[str] = []
+    active_containers: set[int] = set()
+    stack: list[tuple[Any, int, bool]] = [(schema, 0, False)]
+
+    while stack:
+        value, depth, exiting = stack.pop()
+        if exiting:
+            active_containers.remove(id(value))
+            continue
+        nodes += 1
+        if nodes > _MAX_SCHEMA_NODES or depth > _MAX_SCHEMA_DEPTH:
+            raise SchemaDriftError("the reviewed JSON schema exceeds structural limits")
+
+        if isinstance(value, Mapping):
+            container_id = id(value)
+            if container_id in active_containers:
+                raise SchemaDriftError("the reviewed JSON schema contains a cycle")
+            active_containers.add(container_id)
+            stack.append((value, depth, True))
+            nodes += len(value)
+            if nodes > _MAX_SCHEMA_NODES:
+                raise SchemaDriftError("the reviewed JSON schema exceeds structural limits")
+
+            if value.get("uniqueItems") is True:
+                max_items = value.get("maxItems")
+                if (
+                    isinstance(max_items, bool)
+                    or not isinstance(max_items, int)
+                    or max_items < 0
+                    or max_items > _MAX_UNIQUE_ITEMS
+                ):
+                    raise SchemaDriftError(
+                        "reviewed uniqueItems schemas require a bounded maxItems"
+                    )
+
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    raise SchemaDriftError("the reviewed JSON schema is invalid")
+                _bounded_schema_text(key)
+                if key in {"$dynamicRef", "$recursiveRef"}:
+                    raise SchemaDriftError(
+                        "reviewed JSON schemas do not support dynamic references"
+                    )
+                if key == "$id" and depth != 0:
+                    raise SchemaDriftError(
+                        "reviewed JSON schemas do not support nested identifiers"
+                    )
+                if key == "$ref":
+                    if not isinstance(child, str) or not child.startswith("#/"):
+                        raise SchemaDriftError(
+                            "reviewed JSON schemas may only use in-document references"
+                        )
+                    references.append(child)
+                    if len(references) > _MAX_SCHEMA_REFERENCES:
+                        raise SchemaDriftError(
+                            "the reviewed JSON schema exceeds its reference limit"
+                        )
+                elif key == "pattern":
+                    if not isinstance(child, str):
+                        raise SchemaDriftError("the reviewed JSON schema is invalid")
+                    patterns += 1
+                    if patterns > _MAX_SCHEMA_PATTERNS:
+                        raise SchemaDriftError(
+                            "the reviewed JSON schema exceeds its pattern limit"
+                        )
+                    _validate_linear_pattern(child)
+                elif key == "patternProperties":
+                    if not isinstance(child, Mapping):
+                        raise SchemaDriftError("the reviewed JSON schema is invalid")
+                    patterns += len(child)
+                    if patterns > _MAX_SCHEMA_PATTERNS:
+                        raise SchemaDriftError(
+                            "the reviewed JSON schema exceeds its pattern limit"
+                        )
+                    for pattern in child:
+                        if not isinstance(pattern, str):
+                            raise SchemaDriftError("the reviewed JSON schema is invalid")
+                        _validate_linear_pattern(pattern)
+                elif key in _SCHEMA_COMBINATOR_KEYS:
+                    if not isinstance(child, list):
+                        raise SchemaDriftError("the reviewed JSON schema is invalid")
+                    if len(child) > _MAX_SCHEMA_COMBINATOR_BRANCHES:
+                        raise SchemaDriftError(
+                            "the reviewed JSON schema exceeds its combinator limit"
+                        )
+                    combinator_branches += len(child)
+                    if combinator_branches > _MAX_SCHEMA_COMBINATOR_BRANCHES_TOTAL:
+                        raise SchemaDriftError(
+                            "the reviewed JSON schema exceeds its combinator limit"
+                        )
+                stack.append((child, depth + 1, False))
+        elif isinstance(value, list):
+            container_id = id(value)
+            if container_id in active_containers:
+                raise SchemaDriftError("the reviewed JSON schema contains a cycle")
+            active_containers.add(container_id)
+            stack.append((value, depth, True))
+            stack.extend((child, depth + 1, False) for child in reversed(value))
+        elif isinstance(value, str):
+            _bounded_schema_text(value)
+        elif isinstance(value, bool) or value is None:
+            continue
+        elif isinstance(value, int):
+            if value.bit_length() > _MAX_JSON_INTEGER_BITS:
+                raise SchemaDriftError("the reviewed JSON schema exceeds scalar limits")
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
+        else:
+            raise SchemaDriftError("the reviewed JSON schema is invalid")
+
+    for reference in references:
+        target = _resolve_schema_reference(schema, reference)
+        if _contains_schema_reference(target):
+            raise SchemaDriftError(
+                "reviewed in-document references may not be recursive or chained"
+            )
+
+
+def _bounded_schema_text(value: str) -> None:
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeError:
+        raise SchemaDriftError("the reviewed JSON schema is invalid") from None
+    if size > _MAX_SCHEMA_SCALAR_BYTES:
+        raise SchemaDriftError("the reviewed JSON schema exceeds scalar limits")
+
+
+def _resolve_schema_reference(schema: Mapping[str, Any], reference: str) -> Any:
+    if "%" in reference:
+        raise SchemaDriftError("reviewed in-document references must use JSON Pointer syntax")
+    target: Any = schema
+    for encoded_token in reference[2:].split("/"):
+        if re.search(r"~(?![01])", encoded_token):
+            raise SchemaDriftError("reviewed in-document references must use JSON Pointer syntax")
+        token = encoded_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(target, Mapping) and token in target:
+            target = target[token]
+        elif isinstance(target, list) and token.isascii() and token.isdecimal():
+            if len(token) > 6 or (len(token) > 1 and token.startswith("0")):
+                raise SchemaDriftError("reviewed JSON schema reference does not resolve")
+            index = int(token)
+            if index >= len(target):
+                raise SchemaDriftError("reviewed JSON schema reference does not resolve")
+            target = target[index]
+        else:
+            raise SchemaDriftError("reviewed JSON schema reference does not resolve")
+    return target
+
+
+def _contains_schema_reference(value: Any) -> bool:
+    remaining = _MAX_SCHEMA_NODES
+    stack = [value]
+    while stack:
+        remaining -= 1
+        if remaining < 0:
+            raise SchemaDriftError("the reviewed JSON schema exceeds structural limits")
+        child = stack.pop()
+        if isinstance(child, Mapping):
+            if any(key in _SCHEMA_REFERENCE_KEYS for key in child):
+                return True
+            stack.extend(child.values())
+        elif isinstance(child, list):
+            stack.extend(child)
+    return False
+
+
+def _validate_linear_pattern(pattern: str) -> None:
+    try:
+        if len(pattern.encode("utf-8")) > _MAX_PATTERN_BYTES:
+            raise SchemaDriftError("reviewed JSON schema pattern exceeds its byte limit")
+    except UnicodeError:
+        raise SchemaDriftError("the reviewed JSON schema pattern is invalid") from None
+
+    index = 0
+    variable_repeats = 0
+    variable_repeat_end: int | None = None
+    expanded_atoms = 0
+    can_quantify = False
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\":
+            index = _consume_safe_pattern_escape(pattern, index)
+            expanded_atoms += 1
+            can_quantify = pattern[index - 1] not in "AbBZ"
+            continue
+        if character == "[":
+            index = _consume_safe_character_class(pattern, index)
+            expanded_atoms += 1
+            can_quantify = True
+            continue
+        if character in "()|":
+            raise SchemaDriftError("reviewed JSON schema pattern is outside the linear-time subset")
+        if character in "*+?":
+            if not can_quantify:
+                raise SchemaDriftError("the reviewed JSON schema pattern is invalid")
+            variable_repeats += 1
+            can_quantify = False
+            index += 1
+            variable_repeat_end = index
+        elif character == "{":
+            if not can_quantify:
+                raise SchemaDriftError("the reviewed JSON schema pattern is invalid")
+            repeat = re.match(r"\{([0-9]+)(?:,([0-9]*))?\}", pattern[index:])
+            if repeat is None:
+                raise SchemaDriftError("the reviewed JSON schema pattern is invalid")
+            minimum_text, maximum_text = repeat.groups()
+            minimum = int(minimum_text)
+            maximum = (
+                minimum if maximum_text is None else (int(maximum_text) if maximum_text else None)
+            )
+            if maximum is not None and maximum < minimum:
+                raise SchemaDriftError("the reviewed JSON schema pattern is invalid")
+            variable = maximum is None or maximum != minimum
+            if variable:
+                variable_repeats += 1
+            expanded_atoms += (maximum if maximum is not None else minimum) - 1
+            can_quantify = False
+            index += repeat.end()
+            if variable:
+                variable_repeat_end = index
+        elif character == "^":
+            if index != 0:
+                raise SchemaDriftError("the reviewed JSON schema pattern is invalid")
+            can_quantify = False
+            index += 1
+        elif character == "$":
+            if index != len(pattern) - 1:
+                raise SchemaDriftError("the reviewed JSON schema pattern is invalid")
+            can_quantify = False
+            index += 1
+        else:
+            expanded_atoms += 1
+            can_quantify = True
+            index += 1
+
+        if variable_repeats > 1 or expanded_atoms > _MAX_PATTERN_EXPANDED_ATOMS:
+            raise SchemaDriftError("reviewed JSON schema pattern is outside the linear-time subset")
+
+    try:
+        re.compile(pattern)
+    except re.error:
+        raise SchemaDriftError("the reviewed JSON schema pattern is invalid") from None
+    if pattern and not (pattern.startswith("^") or pattern.startswith(r"\A")):
+        raise SchemaDriftError("reviewed JSON schema pattern is outside the linear-time subset")
+    if variable_repeat_end is not None and pattern[variable_repeat_end:] not in {
+        "",
+        "$",
+        r"\Z",
+    }:
+        raise SchemaDriftError("reviewed JSON schema pattern is outside the linear-time subset")
+
+
+def _consume_safe_pattern_escape(pattern: str, index: int) -> int:
+    if index + 1 >= len(pattern):
+        raise SchemaDriftError("the reviewed JSON schema pattern is invalid")
+    escaped = pattern[index + 1]
+    if escaped.isalnum() and escaped not in "AbBdDsSwWZ":
+        raise SchemaDriftError("reviewed JSON schema pattern is outside the linear-time subset")
+    return index + 2
+
+
+def _consume_safe_character_class(pattern: str, index: int) -> int:
+    cursor = index + 1
+    if cursor < len(pattern) and pattern[cursor] == "^":
+        cursor += 1
+    has_content = False
+    while cursor < len(pattern):
+        character = pattern[cursor]
+        if character == "]" and has_content:
+            return cursor + 1
+        if character == "[":
+            raise SchemaDriftError("reviewed JSON schema pattern is outside the linear-time subset")
+        if character == "\\":
+            cursor = _consume_safe_pattern_escape(pattern, cursor)
+        else:
+            cursor += 1
+        has_content = True
+    raise SchemaDriftError("the reviewed JSON schema pattern is invalid")
+
+
+def _validate_instance_complexity(value: Any) -> None:
+    nodes = 0
+    scalar_bytes = 0
+    active_containers: set[int] = set()
+    stack: list[tuple[Any, int, bool]] = [(value, 0, False)]
+    while stack:
+        child, depth, exiting = stack.pop()
+        if exiting:
+            active_containers.remove(id(child))
+            continue
+        nodes += 1
+        if nodes > _MAX_INSTANCE_NODES or depth > _MAX_INSTANCE_DEPTH:
+            raise _ValidationComplexityError("JSON value exceeds validation complexity limits")
+        if isinstance(child, Mapping):
+            container_id = id(child)
+            if container_id in active_containers:
+                raise _ValidationComplexityError("JSON value contains a cycle")
+            active_containers.add(container_id)
+            stack.append((child, depth, True))
+            nodes += len(child)
+            if nodes > _MAX_INSTANCE_NODES:
+                raise _ValidationComplexityError("JSON value exceeds validation complexity limits")
+            for key, nested in child.items():
+                if not isinstance(key, str):
+                    raise _ValidationComplexityError("JSON object key is invalid")
+                try:
+                    key_bytes = len(key.encode("utf-8"))
+                except UnicodeError:
+                    raise _ValidationComplexityError("JSON object key is invalid") from None
+                if key_bytes > _MAX_INSTANCE_KEY_BYTES:
+                    raise _ValidationComplexityError("JSON object key exceeds its byte limit")
+                scalar_bytes += key_bytes
+                stack.append((nested, depth + 1, False))
+        elif isinstance(child, list):
+            container_id = id(child)
+            if container_id in active_containers:
+                raise _ValidationComplexityError("JSON value contains a cycle")
+            active_containers.add(container_id)
+            stack.append((child, depth, True))
+            stack.extend((nested, depth + 1, False) for nested in reversed(child))
+        elif isinstance(child, str):
+            try:
+                size = len(child.encode("utf-8"))
+            except UnicodeError:
+                raise _ValidationComplexityError("JSON string is invalid") from None
+            if size > _MAX_INSTANCE_SCALAR_BYTES:
+                raise _ValidationComplexityError("JSON string exceeds its byte limit")
+            scalar_bytes += size
+        elif isinstance(child, bool) or child is None:
+            continue
+        elif isinstance(child, int):
+            if child.bit_length() > _MAX_JSON_INTEGER_BITS:
+                raise _ValidationComplexityError("JSON integer exceeds its size limit")
+        elif isinstance(child, float):
+            if not math.isfinite(child):
+                raise _ValidationComplexityError("JSON number is invalid")
+        else:
+            raise _ValidationComplexityError("value is outside the JSON data model")
+        if scalar_bytes > _MAX_INSTANCE_SCALAR_BYTES_TOTAL:
+            raise _ValidationComplexityError("JSON value exceeds its scalar byte limit")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -294,6 +662,8 @@ class CapturedTool:
     name: str
     raw: dict[str, Any]
     digest: str
+    input_validator: Draft202012Validator
+    output_validator: Draft202012Validator | None
 
 
 class SchemaMirror:
@@ -323,14 +693,20 @@ class SchemaMirror:
         seen: set[str] = set()
         changed: set[str] = set()
         for tool in tools:
-            raw = raw_model(tool) if isinstance(tool, types.Tool) else dict(tool)
-            raw = validate_lossless_tool(raw)
-            for schema_field in ("inputSchema", "outputSchema"):
-                schema = raw.get(schema_field)
-                if schema is not None:
-                    if not isinstance(schema, Mapping):
-                        raise SchemaDriftError("the reviewed JSON schema is invalid")
-                    _closed_schema_validator(schema)
+            candidate = raw_model(tool) if isinstance(tool, types.Tool) else dict(tool)
+            input_schema = candidate.get("inputSchema")
+            if not isinstance(input_schema, Mapping):
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
+            input_validator = _closed_schema_validator(input_schema)
+            output_schema = candidate.get("outputSchema")
+            if output_schema is not None and not isinstance(output_schema, Mapping):
+                raise SchemaDriftError("the reviewed JSON schema is invalid")
+            output_validator = (
+                _closed_schema_validator(output_schema)
+                if isinstance(output_schema, Mapping)
+                else None
+            )
+            raw = validate_lossless_tool(candidate)
             name = raw.get("name")
             if not isinstance(name, str) or not name or name in seen:
                 raise MirrorError("downstream tools/list contained a missing or duplicate name")
@@ -338,7 +714,14 @@ class SchemaMirror:
             digest = tool_schema_digest(raw)
             key = (alias, name)
             previous = self._captured.get(key)
-            self._captured[key] = CapturedTool(alias=alias, name=name, raw=raw, digest=digest)
+            self._captured[key] = CapturedTool(
+                alias=alias,
+                name=name,
+                raw=raw,
+                digest=digest,
+                input_validator=input_validator,
+                output_validator=output_validator,
+            )
             reviewed = self._reviewed_digests.get(key)
             if reviewed is not None and reviewed != digest:
                 self._drifted.add(key)
@@ -436,15 +819,14 @@ class SchemaMirror:
                 "schema_unreviewed",
                 "The tool is disabled until its current schema has been reviewed.",
             )
-        schema = captured.raw.get("inputSchema")
-        if not isinstance(schema, dict):
-            raise DomainToolError(
-                "schema_invalid",
-                "The reviewed downstream input schema is invalid.",
-            )
         try:
-            validator = _closed_schema_validator(schema)
-            valid = validator.is_valid(copy.deepcopy(dict(arguments)))
+            _validate_instance_complexity(arguments)
+            valid = captured.input_validator.is_valid(copy.deepcopy(dict(arguments)))
+        except _ValidationComplexityError:
+            raise DomainToolError(
+                "invalid_arguments",
+                "Tool arguments exceed reviewed validation limits.",
+            ) from None
         except Exception:
             raise DomainToolError(
                 "schema_invalid",
@@ -457,10 +839,10 @@ class SchemaMirror:
             )
 
     def validate_virtual_result(self, alias: str, tool: str, result: Any) -> None:
-        raw = self._captured[(alias, tool)].raw
-        schema = raw.get("outputSchema")
-        if isinstance(schema, dict):
-            _closed_schema_validator(schema).validate(result)
+        validator = self._captured[(alias, tool)].output_validator
+        if validator is not None:
+            _validate_instance_complexity(result)
+            validator.validate(copy.deepcopy(result))
 
     def validate_downstream_result(
         self,
@@ -472,17 +854,14 @@ class SchemaMirror:
 
         if result.get("isError", False) is True:
             return
-        raw = self._captured[(alias, tool)].raw
-        schema = raw.get("outputSchema")
-        if schema is None:
+        validator = self._captured[(alias, tool)].output_validator
+        if validator is None:
             return
-        if not isinstance(schema, dict):
-            raise SchemaDriftError("the reviewed output schema is invalid")
         structured = result.get("structuredContent")
         if not isinstance(structured, Mapping):
             raise SchemaDriftError("a successful result omitted structured content")
         try:
-            validator = _closed_schema_validator(schema)
+            _validate_instance_complexity(structured)
             validator.validate(copy.deepcopy(dict(structured)))
         except Exception:
             raise SchemaDriftError(

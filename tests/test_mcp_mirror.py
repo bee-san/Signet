@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,6 +16,7 @@ from jsonschema.exceptions import ValidationError
 from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
 
+import signet.mcp_mirror as mcp_mirror_module
 from signet.mcp_mirror import (
     PENDING_RESULT_SCHEMA,
     SIGNET_INVOCATION_ID_META,
@@ -23,6 +25,7 @@ from signet.mcp_mirror import (
     InvocationIdentity,
     MirrorError,
     RawServerResult,
+    SchemaDriftError,
     SchemaMirror,
     _stable_session_scope,
     derive_invocation_identity,
@@ -211,6 +214,154 @@ def test_schema_validation_permits_only_closed_in_document_refs() -> None:
     mirror.validate_input("example", "read", {"query": "local"})
     with pytest.raises(DomainToolError, match="arguments"):
         mirror.validate_input("example", "read", {"query": "too-long-query"})
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {
+            "type": "object",
+            "properties": {f"field_{index}": {"type": "string"} for index in range(1_400)},
+        },
+        {"anyOf": [{} for _ in range(17)]},
+        {
+            "type": "object",
+            "patternProperties": {f"^field_{index}$": {} for index in range(17)},
+        },
+        {"description": "x" * (16 * 1024 + 1)},
+        {"type": "array", "uniqueItems": True},
+    ],
+)
+def test_schema_capture_rejects_expensive_structures(schema: dict[str, Any]) -> None:
+    raw = _raw_tool("read")
+    raw["inputSchema"] = schema
+    with pytest.raises(SchemaDriftError):
+        SchemaMirror(_policy()).capture("example", [raw])
+
+
+def test_schema_capture_rejects_excessive_depth() -> None:
+    schema: dict[str, Any] = {"type": "string"}
+    for _ in range(2_000):
+        schema = {"not": schema}
+    raw = _raw_tool("read")
+    raw["inputSchema"] = schema
+    with pytest.raises(SchemaDriftError, match="structural limits"):
+        SchemaMirror(_policy()).capture("example", [raw])
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "^(a+)+$",
+        "^(a|aa)+$",
+        "^(?=a)a+$",
+        r"^(a)\1$",
+        "^a+a+$",
+        "a+$",
+        "^a+b$",
+    ],
+)
+def test_schema_capture_rejects_backtracking_regex_features(pattern: str) -> None:
+    raw = _raw_tool("read")
+    raw["inputSchema"] = {
+        "type": "object",
+        "properties": {"value": {"type": "string", "pattern": pattern}},
+    }
+    with pytest.raises(SchemaDriftError, match="linear-time subset"):
+        SchemaMirror(_policy()).capture("example", [raw])
+
+
+def test_schema_capture_accepts_bounded_linear_regex_subset() -> None:
+    raw = _raw_tool("read")
+    raw["inputSchema"] = {
+        "type": "object",
+        "properties": {
+            "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
+            "digest": {"type": "string", "pattern": "^[a-f0-9]{8,64}$"},
+        },
+        "required": ["request_id", "digest"],
+    }
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [raw])
+    mirror.validate_input(
+        "example",
+        "read",
+        {"request_id": "req_123", "digest": "01234567abcdef"},
+    )
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"$dynamicRef": "#/$defs/value", "$defs": {"value": {"type": "string"}}},
+        {"$ref": "#"},
+        {
+            "$defs": {
+                "nested": {
+                    "$id": "https://example.test/nested.json",
+                    "type": "string",
+                }
+            },
+            "$ref": "#/$defs/nested",
+        },
+        {
+            "$defs": {
+                "leaf": {"type": "string"},
+                "alias": {"$ref": "#/$defs/leaf"},
+            },
+            "$ref": "#/$defs/alias",
+        },
+        {"$defs": {"node": {"$ref": "#/$defs/node"}}, "$ref": "#/$defs/node"},
+    ],
+)
+def test_schema_capture_rejects_dynamic_recursive_or_chained_refs(
+    schema: dict[str, Any],
+) -> None:
+    raw = _raw_tool("read")
+    raw["inputSchema"] = schema
+    with pytest.raises(SchemaDriftError):
+        SchemaMirror(_policy()).capture("example", [raw])
+
+
+def test_runtime_validation_uses_cached_captured_validators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [_raw_tool("read"), _raw_tool("stage")])
+
+    def unexpected_compile(schema: Mapping[str, Any]) -> Any:
+        del schema
+        raise AssertionError("runtime validation recompiled a captured schema")
+
+    monkeypatch.setattr(mcp_mirror_module, "_closed_schema_validator", unexpected_compile)
+    mirror.validate_input("example", "read", {})
+    mirror.validate_virtual_result("example", "stage", {"id": "stg_123"})
+    mirror.validate_downstream_result(
+        "example",
+        "read",
+        {"isError": False, "structuredContent": {"id": "remote_123"}},
+    )
+
+
+def test_runtime_validation_rejects_oversized_instances_before_jsonschema() -> None:
+    raw = _raw_tool("read")
+    raw["inputSchema"] = {"type": "object"}
+    raw["outputSchema"] = {"type": "object"}
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [raw])
+    oversized = {"items": [None] * 20_000}
+
+    with pytest.raises(DomainToolError) as input_error:
+        mirror.validate_input("example", "read", oversized)
+    assert input_error.value.code == "invalid_arguments"
+    with pytest.raises(MirrorError, match="complexity"):
+        mirror.validate_virtual_result("example", "read", oversized)
+    with pytest.raises(SchemaDriftError, match="does not match"):
+        mirror.validate_downstream_result(
+            "example",
+            "read",
+            {"isError": False, "structuredContent": oversized},
+        )
 
 
 class _PagedSession:
