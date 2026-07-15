@@ -52,6 +52,38 @@ def test_access_request_factory_freezes_exact_gateway_internal_proposal() -> Non
     assert b"Need reviewed read access" not in request.encrypted_payload
 
 
+def test_denied_event_is_private_argument_free_and_deduplicated_by_policy_scope() -> None:
+    selected = factory()
+    first = selected.freeze_denied_event(
+        origin_namespace="profile:one",
+        alias="fastmail",
+        tool="delete_email",
+        actor="mcp:profile:one",
+        created_at=NOW,
+    )
+    replay = selected.freeze_denied_event(
+        origin_namespace="profile:one",
+        alias="fastmail",
+        tool="delete_email",
+        actor="mcp:profile:one",
+        created_at=NOW + 1,
+    )
+    other = selected.freeze_denied_event(
+        origin_namespace="profile:one",
+        alias="fastmail",
+        tool="delete_mailbox",
+        actor="mcp:profile:one",
+        created_at=NOW,
+    )
+
+    assert first.gateway_internal is True
+    assert first.idempotency_key == replay.idempotency_key
+    assert first.payload_fingerprint == replay.payload_fingerprint
+    assert first.idempotency_key != other.idempotency_key
+    assert first.retry_of_request_id is None
+    assert b"delete_email" not in first.encrypted_payload
+
+
 def test_tool_access_adapter_is_reviewable_but_structurally_non_dispatchable() -> None:
     adapter = ToolAccessAdapter()
     proposal = {
