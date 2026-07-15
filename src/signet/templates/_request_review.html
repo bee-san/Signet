@@ -118,19 +118,21 @@
       <input type="hidden" name="expected_version" value="{{ item.version }}">
       <input type="hidden" name="expected_payload_hash" value="{{ item.payload_hash }}">
     </div>
+    {% if not fake_only_ui %}
     <div class="passkey-actions">
       <button class="button button-primary" type="button" data-passkey-action="approve">Approve</button>
       <button class="button button-danger" type="button" data-passkey-action="deny">Deny</button>
       <button class="button button-quiet" type="button" data-passkey-action="cancel">Cancel</button>
     </div>
-    <details class="authenticator-fallback">
-      <summary>Use authenticator code</summary>
+    {% endif %}
+    <details class="authenticator-fallback"{% if fake_only_ui %} open{% endif %}>
+      <summary>{{ 'Use fake action proof' if fake_only_ui else 'Use authenticator code' }}</summary>
       <form class="totp-action" action="/requests/{{ item.request_id }}/actions/totp" method="post">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="expected_version" value="{{ item.version }}">
         <input type="hidden" name="expected_payload_hash" value="{{ item.payload_hash }}">
-        <label for="totp-proof-{{ id_suffix }}">Authenticator code</label>
-        <input id="totp-proof-{{ id_suffix }}" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" required>
+        <label for="totp-proof-{{ id_suffix }}">{{ 'Fake action proof' if fake_only_ui else 'Authenticator code' }}</label>
+        <input id="totp-proof-{{ id_suffix }}" name="totp_proof" inputmode="{{ 'text' if fake_only_ui else 'numeric' }}" autocomplete="{{ 'off' if fake_only_ui else 'one-time-code' }}" maxlength="128" required>
         <div class="button-row">
           <button class="button button-primary" name="action" value="approve" type="submit">Approve</button>
           <button class="button button-danger" name="action" value="deny" type="submit">Deny</button>
@@ -150,17 +152,19 @@
       <input type="hidden" name="action" value="edit">
       <label for="edit-json-{{ id_suffix }}">Arguments</label>
       <textarea id="edit-json-{{ id_suffix }}" data-edit-json name="prospective_arguments_json" rows="14" maxlength="4000000" required>{{ item.editable_arguments_json }}</textarea>
-      <label for="edit-totp-{{ id_suffix }}">Authenticator code</label>
-      <input id="edit-totp-{{ id_suffix }}" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" required>
+      <label for="edit-totp-{{ id_suffix }}">{{ 'Fake action proof' if fake_only_ui else 'Authenticator code' }}</label>
+      <input id="edit-totp-{{ id_suffix }}" name="totp_proof" inputmode="{{ 'text' if fake_only_ui else 'numeric' }}" autocomplete="{{ 'off' if fake_only_ui else 'one-time-code' }}" maxlength="128" required>
       <div class="button-row">
         <button class="button button-primary" type="submit">Confirm edit</button>
+        {% if not fake_only_ui %}
         <button class="button button-quiet" type="button" data-passkey-action="edit">Use passkey</button>
+        {% endif %}
       </div>
     </form>
   </section>
   {% endif %}
 
-  {% if not item.gateway_internal %}
+  {% if not item.gateway_internal and not fake_only_ui %}
   <section class="policy-band" aria-labelledby="policy-{{ id_suffix }}">
     <h3 id="policy-{{ id_suffix }}">Policy</h3>
     <div class="button-row">

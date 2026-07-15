@@ -41,6 +41,11 @@ reviewed. Nothing in the repository has:
 Those are deferred human-authorized cutover steps. Automated implementation and
 CI must remain fake-provider/downstream-disabled.
 
+For copy-pasteable fake-only startup, a disposable Hermes profile, command
+verification, troubleshooting, and a restore drill, use
+[`operator-runbook.md`](operator-runbook.md). Completing that runbook does not
+satisfy any live prerequisite in this guide.
+
 ## Platform requirements
 
 - macOS for the reference launchd/Keychain deployment;
@@ -109,8 +114,9 @@ the reviewed components. It must:
 8. assemble `ApprovalStateMachine`, transactional notification outbox, gateway
    tools, alias surfaces, delivery/reconciliation workers, and authenticated web
    backend with the same durable database and proof-capability boundary;
-9. provide and test a concrete durable policy-promotion coordinator before enabling
-   web policy actions; the core currently exposes only injected boundaries;
+9. wire and test `SQLitePolicyPromotionBoundary` against the deployment's exact
+   policy path, shared engine/mirror, and list-change callback before enabling web
+   policy actions, and call `DurableSchemaRegistry.restore()` before serving tools;
 10. return one MCP ASGI app from `create_mcp_app()` and one web ASGI app from
    `create_web_app()`;
 11. start bounded maintenance workers only inside ASGI lifespan and stop them on
@@ -321,9 +327,12 @@ and recovery procedures. Tailscale Funnel remains disabled.
 
 ## Backup and restore
 
-There is currently no `signet backup` shell command. Do not invent one in an ops
-script or copy a live WAL database with `cp`. Deployment assembly must call the
-tested `BackupBundleManager` API with a 32-byte key resolved outside argv/env.
+There is no general or live `signet backup` shell command. `signet demo backup` and
+`signet demo restore` are deliberately restricted to state marked by the shipped
+fake-only assembly; they are not deployment commands and must not be pointed at or
+adapted for live state. Do not invent a live wrapper in an ops script or copy a WAL
+database with `cp`. Deployment assembly must call the tested `BackupBundleManager`
+API with a 32-byte key resolved outside argv/env.
 
 `BackupBundleManager.create()`:
 
@@ -385,19 +394,40 @@ mcp_servers:
   fastmail:
     url: http://127.0.0.1:8789/mcp/fastmail
     headers:
-      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
+      Authorization: "Bearer ${SIGNET_MCP_CALLER_TOKEN}"
+    enabled: true
+    connect_timeout: 10
+    timeout: 120
+    supports_parallel_tool_calls: false
+    tools:
+      resources: false
+      prompts: false
     sampling:
       enabled: false
   whatsapp:
     url: http://127.0.0.1:8789/mcp/whatsapp
     headers:
-      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
+      Authorization: "Bearer ${SIGNET_MCP_CALLER_TOKEN}"
+    enabled: true
+    connect_timeout: 10
+    timeout: 120
+    supports_parallel_tool_calls: false
+    tools:
+      resources: false
+      prompts: false
     sampling:
       enabled: false
   signet_approvals:
     url: http://127.0.0.1:8789/mcp/approvals
     headers:
-      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
+      Authorization: "Bearer ${SIGNET_MCP_CALLER_TOKEN}"
+    enabled: true
+    connect_timeout: 10
+    timeout: 120
+    supports_parallel_tool_calls: false
+    tools:
+      resources: false
+      prompts: false
     sampling:
       enabled: false
 ```
@@ -408,6 +438,15 @@ profiles, check that active and disabled profiles have no alternate mutation pat
 provision the profile-scoped token through a reviewed secret mechanism, and prefer
 `/reload-mcp` or the client's supported MCP reload. A Hermes Gateway
 restart needs separate explicit approval.
+
+The token placeholder is resolved from the selected Hermes profile's mode-`0600`
+`.env`; it is not a literal value and must not be stored in `config.yaml`. Explicitly
+disabling parallel calls, resources, prompts, and sampling narrows the client side
+of the integration as well as the Signet server. Use `hermes -p PROFILE mcp test`
+for each alias before `/reload-mcp` inside a Hermes session. See the reviewed
+operator sequence in `deploy/hermes/README.md`. The checked-in structured merge
+helper accepts only the blank `signet-demo` profile and explicit fake credentials;
+it is not a live profile editor.
 
 Do not remove direct credentials before the local aliases, human authentication,
 live schema digests, fake providers, backup restore, and rollback packet pass. Do

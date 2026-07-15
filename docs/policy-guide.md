@@ -157,13 +157,20 @@ A tool is enabled only if:
 
 Removal or any definition change marks the tool drifted. Connected MCP sessions
 advertise `listChanged` capability, and `AliasToolSurface.notify_list_changed()` can
-notify currently tracked sessions. The repository does not yet ship the concrete
-durable coordinator that commits policy/schema state and invokes that primitive on
-every affected surface. Until a deployment supplies and tests that coordinator,
-runtime policy promotion and automatic drift notification remain disabled. The
-required production behavior is to send `notifications/tools/list_changed`, have
-clients fetch `tools/list` again, keep tools disabled on notification failure, and
-serve the current list to reconnecting clients.
+notify currently tracked sessions. `DurableSchemaRegistry` now joins the exact
+lossless capture, SQLite review state, the shared `SchemaMirror`, and each affected
+alias surface. A deployment must call `restore()` before serving traffic and route
+complete, bounded discovery results through `refresh()`; the core does not perform
+live discovery by itself.
+
+Refresh and manual review serialize against calls on the affected surface. The
+registry persists removals and changed definitions as disabled drift, restores only
+present integrity-checked schemas after restart, and sends
+`notifications/tools/list_changed` when the exposed list changes. If any connected
+session cannot receive a publication notification, a newly captured or reviewed
+tool remains disabled rather than being exposed inconsistently. Reconnecting clients
+receive the current list from durable state. This tested coordinator is a safety
+boundary, not evidence that any live provider schema has been captured or reviewed.
 
 Never update `schema_digest` mechanically just to clear drift. Review semantic
 changes, argument defaults, new union branches, open object properties, task
@@ -172,15 +179,24 @@ new digest.
 
 ## Policy changes
 
-Policy changes are durable capability changes, not ordinary sends. The database
-schema, in-memory `PolicyEngine` callback, web `PolicyPromotionBoundary`, and MCP
-list-change primitive exist, but this repository does not yet provide a production
-durable policy coordinator joining them. Therefore the following is a required
-deployment/implementation contract, not a claim that promotion is ready: each
+Policy changes are durable capability changes, not ordinary sends.
+`SQLitePolicyPromotionBoundary` now joins proof consumption, request state, policy
+version history, the exact serialized policy snapshot, atomic policy-file writeback,
+the in-memory `PolicyEngine`, and injected runtime publication callbacks. Each
 applied change records actor, timestamp, prior mode, new mode, originating event,
-and configuration hash in policy-version history. File state, in-memory state, and
-durable applied state must agree; startup and reload fail closed on invalid or
-ambiguous state.
+and configuration hash in the durable history. The boundary holds a private file
+lock, refuses concurrent or stale promotion, and preserves every strict policy field
+other than the reviewed mode/version change.
+
+SQLite and the policy file cannot share one physical transaction. The boundary
+therefore fsyncs an exact pending file, commits a pending ledger record with the
+single-use proof, atomically replaces the policy file, then marks file and runtime
+publication complete. On restart it completes only the byte-identical committed
+pending snapshot and replays an outstanding publication callback. A changed policy
+file, conflicting ledger hash, corrupt snapshot, or ambiguous pending artifact
+fails closed with policy mutation unavailable. A deployment must still wire this
+boundary to its exact policy path, shared engine/mirror, and list-change callback;
+its existence does not enroll a human proof or authorize a live policy change.
 
 There are two user flows:
 
@@ -190,8 +206,10 @@ There are two user flows:
   encrypted gateway-internal pending request. It never applies policy by itself.
 
 The MCP `approve_request` path rejects every gateway-internal policy request with
-`web_only`. The current web backend requires passkey confirmation for promotion.
-The policy engine also enforces these non-negotiable guards:
+`web_only`. The authenticated web backend can bind promotion to either a fresh
+passkey or TOTP confirmation. The visible "always" shortcut buttons currently use
+the passkey path; a gateway-internal request can also be confirmed through its web
+authenticator fallback. The policy engine enforces these non-negotiable guards:
 
 - only a discovered, reviewed exact tool can be promoted;
 - passthrough requires reviewed read-only classification;
@@ -200,9 +218,12 @@ The policy engine also enforces these non-negotiable guards:
 - a policy update and the approval event must share one durable boundary so a
   "successful" approval cannot exist without the applied policy version.
 
-Once that coordinator is implemented, rollback is another versioned policy change
-with its own actor and origin. Do not edit history or restore an older YAML file
-that diverges from the database.
+Rollback is another reviewed, versioned policy change with its own actor and origin.
+The current web actions promote an exact tool to `approval` or eligible
+`passthrough`; they are not a general policy editor. Do not hand-edit history,
+restore an older YAML file, or invent a downgrade path that diverges from the
+durable ledger. A deny/demotion workflow must use the same proof, version, file,
+ledger, and publication guarantees before it is exposed.
 
 ## Offline onboarding workflow
 

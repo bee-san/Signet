@@ -34,6 +34,17 @@ a { color: inherit; }
   z-index: 10;
 }
 
+.fake-only-banner {
+  background: #fff0bf;
+  border-bottom: 1px solid #d5a94c;
+  color: #573d08;
+  font-size: .82rem;
+  font-weight: 780;
+  padding: 7px 16px;
+  text-align: center;
+  text-transform: uppercase;
+}
+
 .brand { align-items: center; display: flex; font-size: 1.3rem; font-weight: 760; gap: 10px; text-decoration: none; }
 .brand img { border-radius: 6px; display: block; }
 nav { align-items: center; display: flex; gap: 18px; }

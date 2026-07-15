@@ -23,8 +23,9 @@ account. This document states those limits directly.
 5. Dispatch crosses a durable fencing boundary before network I/O. A crash after
    possible dispatch becomes `outcome_unknown`, never an assumed failure and never
    a blind retry.
-6. Policy grants are never approved over the MCP TOTP path. The current web backend
-   requires a passkey for promotion, and communication sends can never become
+6. Policy grants are never approved over the MCP TOTP path. The authenticated web
+   backend binds them to a fresh passkey or TOTP confirmation through the injected
+   durable promotion boundary, and communication sends can never become
    `passthrough`.
 7. Push, logs, health checks, queue summaries, and operational audits exclude full
    payloads, targets, filenames, credentials, TOTP values, WebAuthn challenges,

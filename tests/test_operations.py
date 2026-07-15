@@ -530,8 +530,11 @@ def test_homepage_template_is_one_normal_secret_free_signet_card() -> None:
 def test_hermes_forward_diff_authenticates_every_local_alias_without_a_raw_token() -> None:
     path = ROOT / "deploy" / "hermes" / "managed-routes.forward.diff.example"
     value = path.read_text(encoding="utf-8")
-    assert value.count("Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}") == 3
+    assert value.count('Authorization: "Bearer ${SIGNET_MCP_CALLER_TOKEN}"') == 3
     assert value.count("sampling:") == 3
+    assert value.count("supports_parallel_tool_calls: false") == 3
+    assert value.count("resources: false") == 3
+    assert value.count("prompts: false") == 3
     assert "sgt_" not in value
 
 

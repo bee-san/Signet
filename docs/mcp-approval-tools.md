@@ -282,8 +282,10 @@ fresh action confirmation.
 ## `request_tool_access`
 
 Creates a gateway-internal approval request for a durable policy change. Creating
-the request does not enable the tool. Approval is web-only, and the current web
-backend requires a passkey for promotion. A communication send or a tool without a
+the request does not enable the tool. Approval is web-only. The authenticated web
+backend accepts a fresh passkey or TOTP confirmation; the visible "always" shortcut
+buttons currently start the passkey flow, while the request's authenticator fallback
+can approve the bound proposal with TOTP. A communication send or a tool without a
 reviewed read-only classification can never be promoted to `passthrough`.
 
 ```json
@@ -321,12 +323,13 @@ Example flow:
    reason="Read the next appointment")`.
 2. Signet returns an honest pending result with `approval_channel="web_only"`.
 3. The user opens the private queue, inspects the captured schema and proposed
-   mode, and confirms the exact policy change with a passkey.
-4. A production durable policy coordinator must atomically record the policy
-   version and notify connected affected MCP sessions with
-   `notifications/tools/list_changed`. The current repository exposes injected
-   promotion and notification boundaries but does not ship that concrete
-   coordinator, so deployments must keep policy approval disabled until it exists.
+   mode, and confirms the exact policy change with a fresh web passkey or TOTP proof.
+4. The shipped `SQLitePolicyPromotionBoundary`, when explicitly injected with the
+   deployment's policy path, shared engine/mirror, and publication callback,
+   durably records the policy version and publishes
+   `notifications/tools/list_changed` to affected MCP sessions. A deployment must
+   keep policy approval disabled until that exact wiring and its human proof paths
+   are reviewed; the class existing in the repository is not deployment readiness.
 5. The client calls `tools/list` again. The tool appears only if its current schema
    digest is still reviewed and the applied policy permits exposure.
 

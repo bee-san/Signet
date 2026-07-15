@@ -1,0 +1,45 @@
+# Merge these entries only into a disposable Hermes profile created for the
+# Signet no-live demo. SIGNET_DEMO_MCP_CALLER_TOKEN belongs in that profile's
+# mode-0600 .env and must be the explicitly fake value printed by the demo CLI.
+mcp_servers:
+  signet_demo_fastmail:
+    url: "http://127.0.0.1:8789/mcp/fastmail"
+    headers:
+      Authorization: "Bearer ${SIGNET_DEMO_MCP_CALLER_TOKEN}"
+    enabled: true
+    connect_timeout: 10
+    timeout: 120
+    supports_parallel_tool_calls: false
+    tools:
+      resources: false
+      prompts: false
+    sampling:
+      enabled: false
+
+  signet_demo_whatsapp:
+    url: "http://127.0.0.1:8789/mcp/whatsapp"
+    headers:
+      Authorization: "Bearer ${SIGNET_DEMO_MCP_CALLER_TOKEN}"
+    enabled: true
+    connect_timeout: 10
+    timeout: 120
+    supports_parallel_tool_calls: false
+    tools:
+      resources: false
+      prompts: false
+    sampling:
+      enabled: false
+
+  signet_demo_approvals:
+    url: "http://127.0.0.1:8789/mcp/approvals"
+    headers:
+      Authorization: "Bearer ${SIGNET_DEMO_MCP_CALLER_TOKEN}"
+    enabled: true
+    connect_timeout: 10
+    timeout: 120
+    supports_parallel_tool_calls: false
+    tools:
+      resources: false
+      prompts: false
+    sampling:
+      enabled: false

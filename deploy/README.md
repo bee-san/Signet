@@ -8,9 +8,12 @@ running until an operator reviews and replaces them during an authorized cutover
 - `launchd/` contains separate user-agent templates for the MCP and web listeners.
 - `homepage/` contains one ordinary Signet service card and no widget credential.
 - `tailscale/` documents a merge-safe tailnet-only Serve route and exact removal.
-- `hermes/` contains redacted forward and reverse route-diff examples.
+- `hermes/` contains a validated disposable-profile configurator and fragment plus
+  redacted forward and reverse live route-diff examples.
 - `operations/` contains fail-closed inventory and human-evidence skeletons.
 
-Follow `docs/deployment.md`. Do not apply a template merely because it parses.
+Start with `docs/operator-runbook.md` for fake-only local verification, then use
+`docs/deployment.md` for the deferred deployment review. Do not apply a template
+merely because it parses.
 Credential enrollment, proxy changes, service startup, live discovery, route
 replacement, and provider calls require a separate human-authorized cutover.

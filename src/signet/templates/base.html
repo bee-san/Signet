@@ -27,6 +27,9 @@
     </nav>
     {% endif %}
   </header>
+  {% if fake_only_ui %}
+  <div class="fake-only-banner" role="status">Fake-only demo</div>
+  {% endif %}
   <main class="app-main">
     {% block content %}{% endblock %}
   </main>

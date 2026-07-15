@@ -1,2 +1,2 @@
-{% from "_request_review.html" import request_review %}
+{% from "_request_review.html" import request_review with context %}
 {{ request_review(item, csrf_token, id_suffix, true) }}

@@ -1,5 +1,7 @@
 # Signet
 
+[![CI](https://github.com/bee-san/Signet/actions/workflows/ci.yml/badge.svg)](https://github.com/bee-san/Signet/actions/workflows/ci.yml)
+
 Signet is a provider-neutral MCP human approval gateway. A configured write call
 returns an honest `pending_approval` result only after the exact executable
 payload, expiry, origin namespace, and byte-identical acknowledgement are durable.
@@ -74,6 +76,30 @@ Those example factories are deployment responsibilities, not modules shipped by
 this repository. The MCP command rejects a non-loopback numeric host. Do not point
 an ad hoc factory at live credentials.
 
+## Fake-only operator path
+
+[`docs/operator-runbook.md`](docs/operator-runbook.md) is the start-to-finish path
+for a disposable local demo, Hermes profile wiring, verification, troubleshooting,
+backup/restore drills, and rollback. The demo uses explicit fake identities and
+network-disabled providers; it is not evidence of passkey/TOTP enrollment, live
+schema review, provider readiness, or cutover authorization.
+
+From the repository root, the minimal fake-only path is:
+
+```console
+export SIGNET_DEMO_DIR="$PWD/var/operator-demo"
+test ! -e "$SIGNET_DEMO_DIR"
+uv run signet demo init --data-dir "$SIGNET_DEMO_DIR"
+uv run signet demo smoke --data-dir "$SIGNET_DEMO_DIR"
+uv run signet demo serve --data-dir "$SIGNET_DEMO_DIR"
+```
+
+`demo init` refuses every existing path, `smoke` is offline unless `--live` is explicit,
+and `serve` binds both demo apps to numeric loopback. The generic `serve-*` factory
+interface remains deployment-owned. Hermes templates stay inert; the runbook uses a
+new blank profile and a validated structured merge instead of editing an existing
+profile.
+
 ## Offline onboarding
 
 Operational helpers are available without adding another console entry point:
@@ -109,6 +135,7 @@ The readiness report is advisory: it always keeps `ready` and
 - [Security model](docs/security-model.md)
 - [Policy and adapter onboarding](docs/policy-guide.md)
 - [Deployment, backup, restore, and rollback](docs/deployment.md)
+- [No-live operator and Hermes runbook](docs/operator-runbook.md)
 
 The implementation contract and deferred human-only ceremony are recorded in
 [`2026-07-14-signet-approval-gateway-plan.md`](2026-07-14-signet-approval-gateway-plan.md).

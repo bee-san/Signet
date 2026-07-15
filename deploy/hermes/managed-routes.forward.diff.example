@@ -7,20 +7,41 @@
 -    credential_ref: REDACTED_DIRECT_REFERENCE
 +    url: http://127.0.0.1:8789/mcp/fastmail
 +    headers:
-+      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
++      Authorization: "Bearer ${SIGNET_MCP_CALLER_TOKEN}"
++    enabled: true
++    connect_timeout: 10
++    timeout: 120
++    supports_parallel_tool_calls: false
++    tools:
++      resources: false
++      prompts: false
 +    sampling:
 +      enabled: false
    whatsapp:
 -    command_ref: REDACTED_DIRECT_WHATSAPP_LAUNCHER
 +    url: http://127.0.0.1:8789/mcp/whatsapp
 +    headers:
-+      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
++      Authorization: "Bearer ${SIGNET_MCP_CALLER_TOKEN}"
++    enabled: true
++    connect_timeout: 10
++    timeout: 120
++    supports_parallel_tool_calls: false
++    tools:
++      resources: false
++      prompts: false
 +    sampling:
 +      enabled: false
 +  signet_approvals:
 +    url: http://127.0.0.1:8789/mcp/approvals
 +    headers:
-+      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
++      Authorization: "Bearer ${SIGNET_MCP_CALLER_TOKEN}"
++    enabled: true
++    connect_timeout: 10
++    timeout: 120
++    supports_parallel_tool_calls: false
++    tools:
++      resources: false
++      prompts: false
 +    sampling:
 +      enabled: false
 
