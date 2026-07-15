@@ -59,6 +59,13 @@ class DeploymentError(RuntimeError):
     """Raised when disabled deployment state is missing, unsafe, or inconsistent."""
 
 
+class _CreatedFileError(DeploymentError):
+    def __init__(self, message: str, *, path: Path, identity: tuple[int, int]) -> None:
+        super().__init__(message)
+        self.path = path
+        self.identity = identity
+
+
 class ListenerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -480,37 +487,66 @@ def _initialize_command(args: argparse.Namespace) -> None:
         raise DeploymentError("the config path collides with reserved database state")
     if config_path.exists() or config_path.is_symlink():
         raise DeploymentError("the config destination must be a new nonsymlink path")
-    if config.database_path.exists() or config.database_path.is_symlink():
-        raise DeploymentError("deployment init requires a new database path")
+    if any(path.exists() or path.is_symlink() for path in _reserved_database_paths(config)):
+        raise DeploymentError("deployment init requires new database state paths")
     created_directories = {
         path
         for path in (config.data_dir, config_path.parent)
         if not path.exists() and not path.is_symlink()
     }
-    config_created = False
+    config_identity: tuple[int, int] | None = None
+    database_identity: tuple[int, int] | None = None
     try:
         resolved_data = ensure_private_directory(config.data_dir)
         if resolved_data != config.data_dir:
             raise DeploymentError("the deployment data directory must not use symbolic links")
-        _write_private_config(config_path, config)
-        config_created = True
+        config_identity = _write_private_config(config_path, config)
+        database_identity = _create_private_database(config.database_path)
         Database(config.database_path).initialize()
+    except _CreatedFileError as exc:
+        if exc.path == config_path:
+            config_identity = exc.identity
+        elif exc.path == config.database_path:
+            database_identity = exc.identity
+        else:  # pragma: no cover - creation helpers receive only these exact paths
+            raise DeploymentError("initialization failed at an unexpected state path") from exc
+        _require_safe_init_rollback(
+            config_path=config_path,
+            config_identity=config_identity,
+            config=config,
+            database_identity=database_identity,
+            cause=exc,
+        )
+        _remove_empty_directories(created_directories)
+        raise
     except PrivatePathError as exc:
-        if config_created:
-            with suppress(OSError):
-                config_path.unlink()
+        _require_safe_init_rollback(
+            config_path=config_path,
+            config_identity=config_identity,
+            config=config,
+            database_identity=database_identity,
+            cause=exc,
+        )
         _remove_empty_directories(created_directories)
         raise DeploymentError("the deployment data directory must be owned mode 0700") from exc
-    except (DatabaseError, DeploymentError):
-        if config_created:
-            with suppress(OSError):
-                config_path.unlink()
+    except (DatabaseError, DeploymentError) as exc:
+        _require_safe_init_rollback(
+            config_path=config_path,
+            config_identity=config_identity,
+            config=config,
+            database_identity=database_identity,
+            cause=exc,
+        )
         _remove_empty_directories(created_directories)
         raise
     except Exception as exc:
-        if config_created:
-            with suppress(OSError):
-                config_path.unlink()
+        _require_safe_init_rollback(
+            config_path=config_path,
+            config_identity=config_identity,
+            config=config,
+            database_identity=database_identity,
+            cause=exc,
+        )
         _remove_empty_directories(created_directories)
         raise DeploymentError("the disabled deployment database could not be initialized") from exc
     _print_json(
@@ -699,7 +735,7 @@ def _read_private_config(path: Path) -> str:
             os.close(descriptor)
 
 
-def _write_private_config(path: Path, config: DisabledDeploymentConfig) -> None:
+def _write_private_config(path: Path, config: DisabledDeploymentConfig) -> tuple[int, int]:
     try:
         parent = ensure_private_directory(path.parent)
     except PrivatePathError as exc:
@@ -710,6 +746,7 @@ def _write_private_config(path: Path, config: DisabledDeploymentConfig) -> None:
         "utf-8"
     )
     descriptor: int | None = None
+    identity: tuple[int, int] | None = None
     try:
         descriptor = os.open(
             path,
@@ -721,6 +758,10 @@ def _write_private_config(path: Path, config: DisabledDeploymentConfig) -> None:
             0o600,
         )
         os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        if not _private_regular_file(metadata):
+            raise OSError("unsafe config file")
+        identity = (metadata.st_dev, metadata.st_ino)
         view = memoryview(encoded)
         while view:
             written = os.write(descriptor, view)
@@ -728,24 +769,185 @@ def _write_private_config(path: Path, config: DisabledDeploymentConfig) -> None:
                 raise OSError("short config write")
             view = view[written:]
         os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        _fsync_directory(parent)
     except OSError as exc:
-        if descriptor is not None:
-            with suppress(OSError):
-                path.unlink()
+        if identity is not None:
+            raise _CreatedFileError(
+                "the deployment config could not be created safely",
+                path=path,
+                identity=identity,
+            ) from exc
         raise DeploymentError("the deployment config could not be created safely") from exc
     finally:
         if descriptor is not None:
-            os.close(descriptor)
+            with suppress(OSError):
+                os.close(descriptor)
+    if identity is None:  # pragma: no cover - a successful descriptor always has metadata
+        raise DeploymentError("the deployment config identity could not be verified")
+    return identity
+
+
+def _create_private_database(path: Path) -> tuple[int, int]:
+    descriptor: int | None = None
+    identity: tuple[int, int] | None = None
     try:
-        directory = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        descriptor = os.open(
+            path,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        if not _private_regular_file(metadata):
+            raise OSError("unsafe database placeholder")
+        identity = (metadata.st_dev, metadata.st_ino)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        _fsync_directory(path.parent)
     except OSError as exc:
-        with suppress(OSError):
-            path.unlink()
-        raise DeploymentError("the deployment config could not be committed safely") from exc
+        if identity is not None:
+            raise _CreatedFileError(
+                "the deployment database could not be created safely",
+                path=path,
+                identity=identity,
+            ) from exc
+        raise DeploymentError("the deployment database could not be created safely") from exc
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+    if identity is None:  # pragma: no cover - a successful descriptor always has metadata
+        raise DeploymentError("the deployment database identity could not be verified")
+    return identity
+
+
+def _require_safe_init_rollback(
+    *,
+    config_path: Path,
+    config_identity: tuple[int, int] | None,
+    config: DisabledDeploymentConfig,
+    database_identity: tuple[int, int] | None,
+    cause: Exception,
+) -> None:
+    database_removed = database_identity is None or _remove_created_database_state(
+        config, database_identity
+    )
+    config_removed = config_identity is None
+    if database_removed and config_identity is not None:
+        config_removed = _unlink_verified_private_file(config_path, config_identity)
+    if not database_removed or not config_removed:
+        raise DeploymentError(
+            "initialization failed and created state changed before verified cleanup; "
+            "preserved it for manual review"
+        ) from cause
+
+
+def _remove_created_database_state(
+    config: DisabledDeploymentConfig, database_identity: tuple[int, int]
+) -> bool:
+    database = config.database_path
+    if not _private_file_has_identity(database, database_identity):
+        return False
+    paths = sorted(
+        _reserved_database_paths(config),
+        key=lambda path: (path == database, path.name),
+    )
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            if path == database:
+                return False
+            continue
+        except OSError:
+            return False
+        identity = (metadata.st_dev, metadata.st_ino)
+        if path == database and identity != database_identity:
+            return False
+        if not _unlink_verified_private_file(path, identity):
+            return False
+    try:
+        _fsync_directory(config.data_dir)
+    except OSError:
+        return False
+    return True
+
+
+def _unlink_verified_private_file(path: Path, expected_identity: tuple[int, int]) -> bool:
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino)
+        if (
+            identity != expected_identity
+            or (before.st_dev, before.st_ino) != identity
+            or not _private_regular_file(opened)
+        ):
+            return False
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != identity:
+            return False
+        path.unlink()
+        return True
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _private_file_has_identity(path: Path, expected_identity: tuple[int, int]) -> bool:
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        return (
+            (before.st_dev, before.st_ino) == expected_identity
+            and (opened.st_dev, opened.st_ino) == expected_identity
+            and _private_regular_file(opened)
+        )
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _private_regular_file(metadata: os.stat_result) -> bool:
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == current_uid
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+    )
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _unique_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:

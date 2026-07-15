@@ -21,7 +21,7 @@ from mcp.client.streamable_http import streamable_http_client
 import signet.db as db_module
 from signet.app import main
 from signet.credential_broker import CredentialError, SQLiteTokenRegistry
-from signet.db import Database, IntegrityError
+from signet.db import Database, DatabaseError, IntegrityError
 from signet.deployment import (
     DISABLED_CONFIG_ENV,
     DeploymentError,
@@ -486,6 +486,97 @@ def test_init_reports_unsafe_data_directory_without_deleting_existing_state(
     assert marker.read_text(encoding="utf-8") == "operator-owned\n"
     assert not config_path.exists()
     assert "Traceback" not in capsys.readouterr().err
+
+
+def test_init_partial_database_failure_rolls_back_and_same_command_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "config.json"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(mode=0o700)
+    marker = data_dir / "operator-owned.txt"
+    marker.write_text("keep\n", encoding="utf-8")
+    arguments = [
+        "deployment",
+        "init",
+        "--config",
+        str(config_path),
+        "--data-dir",
+        str(data_dir),
+        "--namespace",
+        "profile:retry",
+    ]
+    original_initialize = Database.initialize
+    injected = False
+
+    def fail_first_initialization(self: Database, **kwargs: Any) -> None:
+        nonlocal injected
+        if not injected:
+            injected = True
+
+            def fail_after_partial_creation(stage: str) -> None:
+                if stage == "migration:1:statement:8":
+                    raise RuntimeError("injected deployment init failure")
+
+            original_initialize(self, fault_injector=fail_after_partial_creation)
+            return
+        original_initialize(self, **kwargs)
+
+    monkeypatch.setattr(Database, "initialize", fail_first_initialization)
+    with pytest.raises(SystemExit):
+        main(arguments)
+    failed = capsys.readouterr()
+    assert "could not be initialized" in failed.err
+    assert "Traceback" not in failed.err
+    assert not config_path.exists()
+    assert {path.name for path in data_dir.iterdir()} == {marker.name}
+    assert marker.read_text(encoding="utf-8") == "keep\n"
+
+    main(arguments)
+    initialized = json.loads(capsys.readouterr().out)
+    assert initialized["database_initialized"] is True
+    assert load_disabled_config(config_path).database_path.exists()
+    assert marker.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_init_preserves_state_if_database_inode_changes_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "config.json"
+    data_dir = tmp_path / "data"
+    database_path = data_dir / "signet.sqlite3"
+    replacement = b"replacement requiring manual review\n"
+
+    def replace_database_then_fail(self: Database, **kwargs: Any) -> None:
+        del kwargs
+        self.path.unlink()
+        self.path.write_bytes(replacement)
+        os.chmod(self.path, 0o600)
+        raise DatabaseError("injected database replacement")
+
+    monkeypatch.setattr(Database, "initialize", replace_database_then_fail)
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "deployment",
+                "init",
+                "--config",
+                str(config_path),
+                "--data-dir",
+                str(data_dir),
+                "--namespace",
+                "profile:changed-inode",
+            ]
+        )
+    error = capsys.readouterr().err
+    assert "preserved it for manual review" in error
+    assert "Traceback" not in error
+    assert config_path.exists()
+    assert database_path.read_bytes() == replacement
 
 
 def test_auth_status_is_metadata_only_and_context_validation_is_honest(
