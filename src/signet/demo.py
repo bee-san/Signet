@@ -90,7 +90,8 @@ from signet.policy_persistence import (
     SQLitePolicyPromotionBoundary,
 )
 from signet.reconcile import ReconciliationCoordinator
-from signet.retention import RetentionManager, RetentionMatrix
+from signet.retention import PurgeIntent, RetentionError, RetentionManager, RetentionMatrix
+from signet.retention_contract import fake_unknown_purge_job_key
 from signet.runtime import (
     APPROVALS_ALIAS,
     MCPRuntime,
@@ -882,6 +883,7 @@ def build_demo(
         database,
         staging,
         matrix=RetentionMatrix(attachment_delays, retention_delays),
+        allow_fake_only_unknown_purge=True,
     )
     pushes = SQLitePushRepository(database)
     notification_dispatcher = NotificationDispatcher(pushes, FakePushTransport())
@@ -998,6 +1000,74 @@ def restore_demo(source_root: Path, bundle: Path, destination: Path) -> Restored
         shutil.rmtree(destination_path, ignore_errors=True)
         raise
     return restored
+
+
+def purge_fake_unknown_content(
+    root: Path,
+    *,
+    request_id: str,
+    expected_version: int,
+    expected_payload_hash: str,
+    acknowledge_possible_delivery: bool,
+    now: int | None = None,
+) -> dict[str, int | str | bool]:
+    """Redact one durably exhausted fake-only unknown while preserving uncertainty."""
+
+    demo_root, _state, _secrets = _load_demo(root)
+    selected_now = int(time.time()) if now is None else now
+    with _demo_server_lock(demo_root):
+        assembly = build_demo(demo_root)
+        retention = assembly.workers.retention
+        try:
+            scheduled = retention.authorize_fake_only_exhausted_unknown_purge(
+                request_id=request_id,
+                expected_version=expected_version,
+                expected_payload_hash=expected_payload_hash,
+                acknowledge_possible_external_effect=acknowledge_possible_delivery,
+                now=selected_now,
+            )
+        except RetentionError as exc:
+            raise DemoError(str(exc)) from None
+
+        claimed = completed = failed = 0
+        for _ in range(2):
+            claim = retention.claim_due(now=selected_now, request_id=request_id)
+            if claim is None:
+                break
+            claimed += 1
+            if retention.process(claim, now=selected_now):
+                completed += 1
+            else:
+                failed += 1
+
+        keys = tuple(
+            fake_unknown_purge_job_key(
+                request_id=request_id,
+                version=expected_version,
+                payload_hash=expected_payload_hash,
+                intent=intent.value,
+            )
+            for intent in (PurgeIntent.ATTACHMENTS, PurgeIntent.SENSITIVE_ROWS)
+        )
+        with assembly.database.read() as connection:
+            remaining = connection.execute(
+                """
+                SELECT count(*) FROM purge_jobs
+                WHERE idempotency_key IN (?, ?) AND completed_at IS NULL
+                """,
+                keys,
+            ).fetchone()[0]
+        if remaining or failed:
+            raise DemoError("fake-only unknown-content purge is incomplete; retry safely")
+    return {
+        "claimed": claimed,
+        "completed": completed,
+        "failed": failed,
+        "scheduled": scheduled,
+        "state": RequestState.OUTCOME_UNKNOWN.value,
+        "status": "fake_only_content_purged",
+        "uncertainty_preserved": True,
+    }
 
 
 def offline_smoke(root: Path) -> dict[str, Any]:
@@ -1220,6 +1290,40 @@ def add_demo_parser(subcommands: Any) -> None:
     _data_dir_argument(backup)
     backup.add_argument("--output", type=Path, required=True)
 
+    purge_unknown = commands.add_parser(
+        "purge-unknown",
+        help="redact content from one exhausted fake-only unknown outcome",
+        description=(
+            "FAKE-ONLY destructive logical redaction for a durably exhausted unknown "
+            "outcome. Stop the demo server first. This preserves outcome_unknown and "
+            "does not erase SQLite free pages, snapshots, swap, or prior backups."
+        ),
+    )
+    _data_dir_argument(purge_unknown)
+    purge_unknown.add_argument(
+        "--request-id",
+        required=True,
+        help="exact request ID recorded from the authenticated expanded review",
+    )
+    purge_unknown.add_argument(
+        "--expected-version",
+        type=_positive_version_type,
+        required=True,
+        help="exact current version recorded before stopping the demo server",
+    )
+    purge_unknown.add_argument(
+        "--expected-payload-hash",
+        type=_payload_hash_type,
+        required=True,
+        help="exact full lowercase SHA-256 payload hash from the expanded review",
+    )
+    purge_unknown.add_argument(
+        "--acknowledge-possible-delivery",
+        action="store_true",
+        required=True,
+        help="confirm that delivery remains possible and uncertainty must be preserved",
+    )
+
     restore = commands.add_parser("restore", help="restore into a new rotated demo directory")
     _data_dir_argument(restore)
     restore.add_argument("--bundle", type=Path, required=True)
@@ -1238,6 +1342,7 @@ def run_demo_command(args: argparse.Namespace) -> None:
         OSError,
         PolicyError,
         PolicyPersistenceError,
+        RetentionError,
         StagingError,
     ):
         raise DemoError(f"demo {args.demo_command} failed safely") from None
@@ -1280,6 +1385,16 @@ def _run_demo_command(args: argparse.Namespace) -> None:
         created = backup_demo(args.data_dir, args.output)
         print(f"Created encrypted fake-only demo backup at {created}")
         return
+    if command == "purge-unknown":
+        result = purge_fake_unknown_content(
+            args.data_dir,
+            request_id=args.request_id,
+            expected_version=args.expected_version,
+            expected_payload_hash=args.expected_payload_hash,
+            acknowledge_possible_delivery=args.acknowledge_possible_delivery,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return
     if command == "restore":
         restored = restore_demo(args.data_dir, args.bundle, args.destination)
         print(f"Restored Signet fake-only demo at {restored.root}")
@@ -1303,6 +1418,26 @@ def _port_type(value: str) -> int:
     except (TypeError, ValueError):
         raise argparse.ArgumentTypeError("port must be between 1024 and 65535") from None
     return port
+
+
+def _positive_version_type(value: str) -> int:
+    try:
+        version = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("version must be a positive integer") from None
+    if version <= 0:
+        raise argparse.ArgumentTypeError("version must be a positive integer")
+    return version
+
+
+def _payload_hash_type(value: str) -> str:
+    if len(value) != 64 or value.lower() != value:
+        raise argparse.ArgumentTypeError("payload hash must be lowercase SHA-256 hex")
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("payload hash must be lowercase SHA-256 hex") from None
+    return value
 
 
 def _validate_port(port: int) -> None:

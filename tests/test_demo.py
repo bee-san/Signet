@@ -43,6 +43,7 @@ from signet.demo import (
     offline_smoke,
     restore_demo,
 )
+from signet.retention import BackupPins
 
 FASTMAIL_ARGUMENTS = {
     "from": "fake-sender@demo.invalid",
@@ -107,6 +108,51 @@ async def enqueue(
     assert result.structuredContent is not None
     assert result.structuredContent["status"] == "pending_approval"
     return str(result.structuredContent["request_id"])
+
+
+def exhausted_fake_unknown(root: Path) -> tuple[DemoAssembly, str, str]:
+    assembly = build_demo(root)
+
+    async def create_request() -> str:
+        async with mcp_client(assembly) as client:
+            return await enqueue(client, "fastmail", "send_email", FASTMAIL_ARGUMENTS)
+
+    request_id = asyncio.run(create_request())
+    request = assembly.state_machine.get_request(request_id)
+    payload_hash = str(request["current_payload_hash"])
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE approval_requests
+            SET state = 'outcome_unknown', safe_outcome_json = ?
+            WHERE request_id = ?
+            """,
+            ('{"provider_candidate":"fake:private"}', request_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO execution_attempts(
+                attempt_id, request_id, version, payload_hash, fencing_token,
+                worker_id, worker_generation, phase, claimed_at,
+                dispatch_started_at, reconciliation_attempt_count,
+                reconciliation_resolution, reconciliation_exhausted_at,
+                reconciliation_notification_required, safe_completion_json,
+                outcome_classification
+            ) VALUES (?, ?, 1, ?, ?, 'fake:worker', 1, 'outcome_unknown', ?,
+                      ?, 2, 'exhausted', ?, 1, ?, 'outcome_unknown')
+            """,
+            (
+                f"attempt:{request_id}",
+                request_id,
+                payload_hash,
+                f"fence:{request_id}",
+                int(request["created_at"]),
+                int(request["created_at"]) + 1,
+                int(request["created_at"]) + 2,
+                '{"provider_candidate":"fake:private"}',
+            ),
+        )
+    return assembly, request_id, payload_hash
 
 
 def hidden_values(document: str, name: str) -> list[str]:
@@ -209,6 +255,216 @@ def test_cli_initializes_private_state_and_prints_only_selected_credentials(
     with pytest.raises(SystemExit):
         main(["demo", "init", "--data-dir", str(root)])
     assert offline_smoke(root)["network_provider_calls"] == 0
+
+
+def test_cli_fake_unknown_purge_preserves_uncertainty_and_redacts_content(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = new_demo(tmp_path, "unknown-purge")
+    assembly, request_id, payload_hash = exhausted_fake_unknown(root)
+
+    main(
+        [
+            "demo",
+            "purge-unknown",
+            "--data-dir",
+            str(root),
+            "--request-id",
+            request_id,
+            "--expected-version",
+            "1",
+            "--expected-payload-hash",
+            payload_hash,
+            "--acknowledge-possible-delivery",
+        ]
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
+        "claimed": 2,
+        "completed": 2,
+        "failed": 0,
+        "scheduled": 2,
+        "state": "outcome_unknown",
+        "status": "fake_only_content_purged",
+        "uncertainty_preserved": True,
+    }
+    main(
+        [
+            "demo",
+            "purge-unknown",
+            "--data-dir",
+            str(root),
+            "--request-id",
+            request_id,
+            "--expected-version",
+            "1",
+            "--expected-payload-hash",
+            payload_hash,
+            "--acknowledge-possible-delivery",
+        ]
+    )
+    replay = json.loads(capsys.readouterr().out)
+    assert replay["scheduled"] == replay["claimed"] == replay["completed"] == 0
+    assert replay["failed"] == 0
+    assert replay["state"] == "outcome_unknown"
+    restarted = build_demo(root)
+    with restarted.database.read() as connection:
+        stored = connection.execute(
+            """
+            SELECT request.state, request.safe_outcome_json,
+                   payload.encrypted_payload, payload.payload_hash, payload.purge_reason,
+                   attempt.safe_completion_json, attempt.reconciliation_resolution
+            FROM approval_requests AS request
+            JOIN payload_versions AS payload
+              ON payload.request_id = request.request_id
+             AND payload.version = request.current_version
+            JOIN execution_attempts AS attempt
+              ON attempt.request_id = request.request_id
+             AND attempt.version = request.current_version
+            WHERE request.request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        actions = connection.execute(
+            """
+            SELECT action FROM request_events
+            WHERE request_id = ? AND action LIKE 'fake_only_unknown_content_purge_%'
+            ORDER BY event_id
+            """,
+            (request_id,),
+        ).fetchall()
+    assert tuple(stored) == (
+        "outcome_unknown",
+        None,
+        None,
+        payload_hash,
+        "fake_only_unknown_content",
+        None,
+        "exhausted",
+    )
+    assert [row["action"] for row in actions] == [
+        "fake_only_unknown_content_purge_authorized",
+        "fake_only_unknown_content_purge_completed",
+    ]
+    assert assembly.provider_clients["fastmail"].mutation_calls == 0
+
+
+def test_fake_unknown_purge_cli_help_and_required_acknowledgement(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as help_exit:
+        main(["demo", "purge-unknown", "--help"])
+    assert help_exit.value.code == 0
+    help_output = capsys.readouterr()
+    assert help_output.err == ""
+    normalized_help = " ".join(help_output.out.split())
+    for phrase in (
+        "FAKE-ONLY destructive logical redaction",
+        "Stop the demo server first",
+        "does not erase SQLite free pages",
+        "authenticated expanded review",
+        "full lowercase SHA-256 payload hash",
+        "delivery remains possible",
+    ):
+        assert phrase in normalized_help
+
+    with pytest.raises(SystemExit) as missing_ack:
+        main(
+            [
+                "demo",
+                "purge-unknown",
+                "--data-dir",
+                "/private/path-marker",
+                "--request-id",
+                "request-secret-marker",
+                "--expected-version",
+                "1",
+                "--expected-payload-hash",
+                "a" * 64,
+            ]
+        )
+    assert missing_ack.value.code == 2
+    failure = capsys.readouterr()
+    assert "--acknowledge-possible-delivery" in failure.err
+    assert "request-secret-marker" not in failure.err
+    assert "/private/path-marker" not in failure.err
+    assert "Traceback" not in failure.err
+
+
+def test_fake_unknown_purge_cli_pin_lock_and_stale_binding_fail_without_authorizing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = new_demo(tmp_path, "unknown-purge-guards")
+    assembly, request_id, payload_hash = exhausted_fake_unknown(root)
+    args = [
+        "demo",
+        "purge-unknown",
+        "--data-dir",
+        str(root),
+        "--request-id",
+        request_id,
+        "--expected-version",
+        "1",
+        "--expected-payload-hash",
+        payload_hash,
+        "--acknowledge-possible-delivery",
+    ]
+
+    pins = BackupPins(assembly.database)
+    lease = pins.acquire(now=1_800_000_100)
+    with pytest.raises(SystemExit) as pinned_exit:
+        main(args)
+    assert pinned_exit.value.code == 2
+    pinned = capsys.readouterr()
+    assert "backup is active" in pinned.err
+    assert request_id not in pinned.err
+    assert payload_hash not in pinned.err
+    assert str(root) not in pinned.err
+    assert "Traceback" not in pinned.err
+    with assembly.database.read() as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT count(*) FROM request_events
+                WHERE request_id = ?
+                  AND action = 'fake_only_unknown_content_purge_authorized'
+                """,
+                (request_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT count(*) FROM purge_jobs
+                WHERE request_id = ? AND intent != 'backup_pin'
+                """,
+                (request_id,),
+            ).fetchone()[0]
+            == 0
+        )
+    pins.release(lease, now=1_800_000_101)
+
+    stale_args = list(args)
+    stale_args[stale_args.index(payload_hash)] = "b" * 64
+    with pytest.raises(SystemExit) as stale_exit:
+        main(stale_args)
+    assert stale_exit.value.code == 2
+    stale = capsys.readouterr()
+    assert "revision is not the current unknown outcome" in stale.err
+    assert request_id not in stale.err
+    assert payload_hash not in stale.err
+    assert "b" * 64 not in stale.err
+    assert "Traceback" not in stale.err
+
+    with demo_module._demo_server_lock(root), pytest.raises(SystemExit) as locked_exit:
+        main(args)
+    assert locked_exit.value.code == 2
+    locked = capsys.readouterr()
+    assert "already being served" in locked.err
+    assert request_id not in locked.err
+    assert payload_hash not in locked.err
+    assert "Traceback" not in locked.err
 
 
 def test_marker_permissions_policy_and_production_shaped_tokens_fail_closed(
@@ -765,9 +1021,12 @@ def test_testclient_lifespan_cannot_start_second_worker_before_lock(
     monkeypatch.setattr(contender.state_machine, "recover_startup", unexpected_recovery)
     with TestClient(holder.web, base_url="http://127.0.0.1:8790") as client:
         assert client.get("/healthz").status_code == 200
-        with pytest.raises(DemoError, match="already being served"), TestClient(
-            contender.web,
-            base_url="http://127.0.0.1:8790",
+        with (
+            pytest.raises(DemoError, match="already being served"),
+            TestClient(
+                contender.web,
+                base_url="http://127.0.0.1:8790",
+            ),
         ):
             pass
         assert recovery_calls == 0

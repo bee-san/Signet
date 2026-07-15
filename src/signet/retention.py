@@ -19,6 +19,12 @@ from typing import Any, Protocol
 
 from signet.db import Database
 from signet.models import RequestState
+from signet.retention_contract import (
+    FAKE_UNKNOWN_PURGE_AUTHORIZED_ACTION,
+    FAKE_UNKNOWN_PURGE_AUTHORIZED_DETAILS,
+    FAKE_UNKNOWN_PURGE_COMPLETED_ACTION,
+    fake_unknown_purge_job_key,
+)
 from signet.staging import StagingError, StagingStore
 
 _MICROSECONDS = 1_000_000
@@ -26,6 +32,7 @@ _MAX_UNIX_SECONDS = 9_000_000_000_000
 _ONE_DAY = 24 * 60 * 60
 _DEFAULT_SCHEDULE_PAGE_SIZE = 256
 _SAFE_ERROR_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,255}$")
 
 _NONTERMINAL_STATES = frozenset(
     {
@@ -149,8 +156,11 @@ class BackupPins:
         with self.database.transaction() as connection:
             rows = connection.execute(
                 """
-                SELECT DISTINCT request_id FROM attachments
+                SELECT request_id FROM attachments
                 WHERE storage_path IS NOT NULL AND purged_at IS NULL
+                UNION
+                SELECT request_id FROM payload_versions
+                WHERE encrypted_payload IS NOT NULL AND purged_at IS NULL
                 ORDER BY request_id
                 """
             ).fetchall()
@@ -161,7 +171,11 @@ class BackupPins:
                     SELECT 1 FROM purge_jobs
                     WHERE request_id IN (SELECT value FROM json_each(?))
                       AND intent != 'backup_pin'
-                      AND started_at IS NOT NULL AND completed_at IS NULL
+                      AND completed_at IS NULL
+                      AND (
+                          started_at IS NOT NULL
+                          OR idempotency_key LIKE 'fake\\_unknown:%' ESCAPE '\\'
+                      )
                     LIMIT 1
                     """,
                     (json.dumps(request_ids, separators=(",", ":")),),
@@ -276,6 +290,7 @@ class RetentionManager:
         key_destroyer: KeyDestroyer | None = None,
         claim_lease_seconds: int = 5 * 60,
         retry_delay_seconds: int = 60,
+        allow_fake_only_unknown_purge: bool = False,
         fault_injector: Callable[[str], None] | None = None,
     ) -> None:
         if claim_lease_seconds <= 0 or claim_lease_seconds > _ONE_DAY:
@@ -290,6 +305,8 @@ class RetentionManager:
             raise ValueError("logical retention must not receive a key destroyer")
         if mode is RetentionMode.ISOLATED_PER_REQUEST_KEY and key_destroyer is None:
             raise ValueError("isolated-key retention requires a key destroyer")
+        if not isinstance(allow_fake_only_unknown_purge, bool):
+            raise TypeError("fake-only unknown purge setting must be boolean")
         self.database = database
         self.staging = staging
         self.matrix = matrix
@@ -297,6 +314,7 @@ class RetentionManager:
         self.key_destroyer = key_destroyer
         self.claim_lease_seconds = claim_lease_seconds
         self.retry_delay_seconds = retry_delay_seconds
+        self.allow_fake_only_unknown_purge = allow_fake_only_unknown_purge
         self._fault_injector = fault_injector
         self._schedule_cursor: str | None = None
         self._schedule_lock = Lock()
@@ -361,6 +379,128 @@ class RetentionManager:
             )
         return inserted
 
+    def authorize_fake_only_exhausted_unknown_purge(
+        self,
+        *,
+        request_id: str,
+        expected_version: int,
+        expected_payload_hash: str,
+        acknowledge_possible_external_effect: bool,
+        now: int,
+    ) -> int:
+        """Authorize fake-data redaction for an exact exhausted unknown outcome.
+
+        The request remains ``outcome_unknown`` after redaction. This operation must
+        never be enabled by a live/provider-capable assembly.
+        """
+
+        if not self.allow_fake_only_unknown_purge:
+            raise RetentionError("unknown-content purge is unavailable outside fake-only mode")
+        _validate_fake_unknown_inputs(
+            request_id=request_id,
+            expected_version=expected_version,
+            expected_payload_hash=expected_payload_hash,
+            acknowledge_possible_external_effect=acknowledge_possible_external_effect,
+            now=now,
+        )
+        scheduled = 0
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT request.state, request.current_version,
+                       request.current_payload_hash,
+                       attempt.phase, attempt.reconciliation_next_at,
+                       attempt.reconciliation_resolution,
+                       attempt.reconciliation_exhausted_at,
+                       attempt.reconciliation_notification_required
+                FROM approval_requests AS request
+                LEFT JOIN execution_attempts AS attempt
+                  ON attempt.request_id = request.request_id
+                 AND attempt.version = request.current_version
+                 AND attempt.payload_hash = request.current_payload_hash
+                WHERE request.request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                raise RetentionError("fake-only purge request was not found")
+            if (
+                row["state"] != RequestState.OUTCOME_UNKNOWN.value
+                or row["current_version"] != expected_version
+                or row["current_payload_hash"] != expected_payload_hash
+            ):
+                raise RetentionError("fake-only purge revision is not the current unknown outcome")
+            if (
+                row["phase"] != RequestState.OUTCOME_UNKNOWN.value
+                or row["reconciliation_next_at"] is not None
+                or row["reconciliation_resolution"] != "exhausted"
+                or not isinstance(row["reconciliation_exhausted_at"], int)
+                or row["reconciliation_notification_required"] != 1
+            ):
+                raise RetentionError("fake-only purge requires exhausted reconciliation")
+            if self._active_pin(connection, request_id):
+                raise RetentionError("fake-only purge cannot start while a backup is active")
+
+            existing_event = connection.execute(
+                """
+                SELECT 1 FROM request_events
+                WHERE request_id = ? AND action = ? AND version = ?
+                  AND payload_hash = ? AND safe_details_json = ?
+                LIMIT 1
+                """,
+                (
+                    request_id,
+                    FAKE_UNKNOWN_PURGE_AUTHORIZED_ACTION,
+                    expected_version,
+                    expected_payload_hash,
+                    FAKE_UNKNOWN_PURGE_AUTHORIZED_DETAILS,
+                ),
+            ).fetchone()
+            authorization_preexisting = existing_event is not None
+            if existing_event is None:
+                connection.execute(
+                    """
+                    INSERT INTO request_events(
+                        request_id, actor, action, occurred_at,
+                        version, payload_hash, safe_details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request_id,
+                        "fake:operator",
+                        FAKE_UNKNOWN_PURGE_AUTHORIZED_ACTION,
+                        now,
+                        expected_version,
+                        expected_payload_hash,
+                        FAKE_UNKNOWN_PURGE_AUTHORIZED_DETAILS,
+                    ),
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE approval_requests SET revision = revision + 1
+                    WHERE request_id = ? AND state = 'outcome_unknown'
+                      AND current_version = ? AND current_payload_hash = ?
+                    """,
+                    (request_id, expected_version, expected_payload_hash),
+                ).rowcount
+                if updated != 1:
+                    raise RetentionError("fake-only purge lost the current request revision")
+
+            intents = [PurgeIntent.ATTACHMENTS, PurgeIntent.SENSITIVE_ROWS]
+            if self.mode is RetentionMode.ISOLATED_PER_REQUEST_KEY:
+                intents.append(PurgeIntent.ENCRYPTION_KEY)
+            for intent in intents:
+                scheduled += self._schedule_fake_unknown_intent(
+                    connection,
+                    request_id=request_id,
+                    version=expected_version,
+                    payload_hash=expected_payload_hash,
+                    intent=intent,
+                    now=now,
+                    allow_existing=authorization_preexisting,
+                )
+        return scheduled
+
     def _schedule_page(
         self,
         connection: Any,
@@ -413,18 +553,23 @@ class RetentionManager:
         ).fetchall()
         return rows
 
-    def claim_due(self, *, now: int) -> PurgeClaim | None:
+    def claim_due(self, *, now: int, request_id: str | None = None) -> PurgeClaim | None:
         _validate_time(now, "purge claim time")
+        if request_id is not None and _SAFE_REQUEST_ID_RE.fullmatch(request_id) is None:
+            raise ValueError("purge request ID is invalid")
         stale_before = max(0, now - self.claim_lease_seconds) * _MICROSECONDS
         with self.database.transaction() as connection:
             rows = connection.execute(
                 """
-                SELECT job.*, request.state, request.completed_at AS request_completed_at
+                SELECT job.*, request.state,
+                       request.current_version, request.current_payload_hash,
+                       request.completed_at AS request_completed_at
                 FROM purge_jobs AS job
                 JOIN approval_requests AS request USING(request_id)
                 WHERE job.intent != 'backup_pin' AND job.completed_at IS NULL
                   AND job.created_at <= ?
                   AND (job.started_at IS NULL OR job.started_at < ?)
+                  AND (? IS NULL OR job.request_id = ?)
                 ORDER BY job.created_at,
                          CASE job.intent
                              WHEN 'attachments' THEN 0
@@ -435,7 +580,7 @@ class RetentionManager:
                          job.purge_job_id
                 LIMIT 256
                 """,
-                (now, stale_before),
+                (now, stale_before, request_id, request_id),
             ).fetchall()
             for row in rows:
                 try:
@@ -444,16 +589,46 @@ class RetentionManager:
                 except ValueError as exc:
                     raise RetentionError("stored purge job is invalid") from exc
                 completed_at = row["request_completed_at"]
-                if state not in _PURGEABLE_STATES or not isinstance(completed_at, int):
+                fake_unknown = (
+                    self.allow_fake_only_unknown_purge
+                    and (state is RequestState.OUTCOME_UNKNOWN)
+                    and (
+                        self._fake_unknown_job_authorized(
+                            connection,
+                            request_id=str(row["request_id"]),
+                            intent=intent,
+                            idempotency_key=str(row["idempotency_key"]),
+                        )
+                    )
+                )
+                if not fake_unknown and (
+                    state not in _PURGEABLE_STATES or not isinstance(completed_at, int)
+                ):
                     continue
                 if intent is PurgeIntent.ENCRYPTION_KEY and (
                     self.mode is not RetentionMode.ISOLATED_PER_REQUEST_KEY
                 ):
                     continue
-                delay = self.matrix.delay(intent, state)
-                if delay is None or completed_at + delay > now:
+                if intent is PurgeIntent.ENCRYPTION_KEY and self._earlier_purge_incomplete(
+                    connection,
+                    request_id=str(row["request_id"]),
+                    state=state,
+                    version=int(row["current_version"]),
+                    payload_hash=str(row["current_payload_hash"]),
+                ):
                     continue
+                if not fake_unknown:
+                    delay = self.matrix.delay(intent, state)
+                    if delay is None or completed_at + delay > now:
+                        continue
                 if self._active_pin(connection, str(row["request_id"])):
+                    continue
+                if self._active_purge_claim(
+                    connection,
+                    request_id=str(row["request_id"]),
+                    stale_before=stale_before,
+                    excluding_job_id=str(row["purge_job_id"]),
+                ):
                     continue
                 marker = now * _MICROSECONDS + secrets.randbelow(_MICROSECONDS)
                 updated = connection.execute(
@@ -466,8 +641,17 @@ class RetentionManager:
                           WHERE pin.request_id = purge_jobs.request_id
                             AND pin.intent = 'backup_pin' AND pin.completed_at IS NULL
                       )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM purge_jobs AS active
+                          WHERE active.request_id = purge_jobs.request_id
+                            AND active.purge_job_id != purge_jobs.purge_job_id
+                            AND active.intent != 'backup_pin'
+                            AND active.started_at IS NOT NULL
+                            AND active.started_at >= ?
+                            AND active.completed_at IS NULL
+                      )
                     """,
-                    (marker, row["purge_job_id"], stale_before),
+                    (marker, row["purge_job_id"], stale_before, stale_before),
                 ).rowcount
                 if updated == 1:
                     return PurgeClaim(
@@ -583,9 +767,10 @@ class RetentionManager:
                 WHERE request_id = ? AND encrypted_payload IS NOT NULL
                   AND purged_at IS NULL
                 """,
-                (now, f"retention_{claim.state.value}", claim.request_id),
+                (now, self._purge_reason(claim), claim.request_id),
             )
             self._tombstone_idempotency(connection, claim.request_id, now=now)
+            self._clear_fake_unknown_metadata(connection, claim)
             self._complete_claim(connection, claim, now=now)
 
     def _destroy_isolated_key(self, claim: PurgeClaim, *, now: int) -> None:
@@ -634,7 +819,7 @@ class RetentionManager:
                 (
                     now,
                     now,
-                    f"retention_{claim.state.value}",
+                    self._purge_reason(claim),
                     claim.request_id,
                 ),
             )
@@ -649,6 +834,7 @@ class RetentionManager:
                 (now, claim.request_id),
             )
             self._tombstone_idempotency(connection, claim.request_id, now=now)
+            self._clear_fake_unknown_metadata(connection, claim)
             self._complete_claim(connection, claim, now=now)
 
     def _verified_isolated_references(self, connection: Any, request_id: str) -> tuple[str, ...]:
@@ -689,7 +875,7 @@ class RetentionManager:
         row = connection.execute(
             """
             SELECT job.started_at, job.completed_at AS job_completed_at,
-                   request.state,
+                   job.idempotency_key, request.state,
                    request.completed_at AS request_completed_at
             FROM purge_jobs AS job
             JOIN approval_requests AS request USING(request_id)
@@ -706,7 +892,20 @@ class RetentionManager:
         ):
             raise _JobFailure("claim_lost")
         request_completed_at = row["request_completed_at"]
-        if not isinstance(request_completed_at, int):
+        if claim.state in _PURGEABLE_STATES and isinstance(request_completed_at, int):
+            return
+        if (
+            self.allow_fake_only_unknown_purge
+            and claim.state is RequestState.OUTCOME_UNKNOWN
+            and self._fake_unknown_job_authorized(
+                connection,
+                request_id=claim.request_id,
+                intent=claim.intent,
+                idempotency_key=str(row["idempotency_key"]),
+            )
+        ):
+            return
+        if not isinstance(request_completed_at, int) or claim.state not in _PURGEABLE_STATES:
             raise _JobFailure("state_not_purgeable")
 
     @staticmethod
@@ -719,6 +918,65 @@ class RetentionManager:
                   AND completed_at IS NULL LIMIT 1
                 """,
                 (request_id,),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _active_purge_claim(
+        connection: Any,
+        *,
+        request_id: str,
+        stale_before: int,
+        excluding_job_id: str,
+    ) -> bool:
+        return (
+            connection.execute(
+                """
+                SELECT 1 FROM purge_jobs
+                WHERE request_id = ? AND purge_job_id != ?
+                  AND intent != 'backup_pin' AND started_at IS NOT NULL
+                  AND started_at >= ? AND completed_at IS NULL
+                LIMIT 1
+                """,
+                (request_id, excluding_job_id, stale_before),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _earlier_purge_incomplete(
+        connection: Any,
+        *,
+        request_id: str,
+        state: RequestState,
+        version: int,
+        payload_hash: str,
+    ) -> bool:
+        if state is RequestState.OUTCOME_UNKNOWN:
+            keys = tuple(
+                fake_unknown_purge_job_key(
+                    request_id=request_id,
+                    version=version,
+                    payload_hash=payload_hash,
+                    intent=intent.value,
+                )
+                for intent in (PurgeIntent.ATTACHMENTS, PurgeIntent.SENSITIVE_ROWS)
+            )
+        else:
+            keys = tuple(
+                f"retention:{intent.value}:{_digest(request_id)}"
+                for intent in (PurgeIntent.ATTACHMENTS, PurgeIntent.SENSITIVE_ROWS)
+            )
+        return (
+            connection.execute(
+                """
+                SELECT 1 FROM purge_jobs
+                WHERE request_id = ? AND idempotency_key IN (?, ?)
+                  AND completed_at IS NULL
+                LIMIT 1
+                """,
+                (request_id, *keys),
             ).fetchone()
             is not None
         )
@@ -799,6 +1057,148 @@ class RetentionManager:
             ).rowcount
         )
 
+    @staticmethod
+    def _schedule_fake_unknown_intent(
+        connection: Any,
+        *,
+        request_id: str,
+        version: int,
+        payload_hash: str,
+        intent: PurgeIntent,
+        now: int,
+        allow_existing: bool,
+    ) -> int:
+        idempotency_key = fake_unknown_purge_job_key(
+            request_id=request_id,
+            version=version,
+            payload_hash=payload_hash,
+            intent=intent.value,
+        )
+        inserted = int(
+            connection.execute(
+                """
+                INSERT INTO purge_jobs(
+                    purge_job_id, request_id, intent, idempotency_key, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (
+                    f"purge_{secrets.token_urlsafe(18)}",
+                    request_id,
+                    intent.value,
+                    idempotency_key,
+                    now,
+                ),
+            ).rowcount
+        )
+        if inserted == 0 and not allow_existing:
+            raise RetentionError("fake-only purge job predates its authorization")
+        row = connection.execute(
+            """
+            SELECT request_id, intent, started_at, completed_at
+            FROM purge_jobs WHERE idempotency_key = ?
+            """,
+            (idempotency_key,),
+        ).fetchone()
+        if row is None or row["request_id"] != request_id or row["intent"] != intent.value:
+            raise RetentionError("fake-only purge job identity conflicts with durable state")
+        if row["completed_at"] is None and row["started_at"] is None:
+            connection.execute(
+                """
+                UPDATE purge_jobs SET created_at = MIN(created_at, ?), last_error = NULL
+                WHERE idempotency_key = ? AND started_at IS NULL AND completed_at IS NULL
+                """,
+                (now, idempotency_key),
+            )
+        return inserted
+
+    @staticmethod
+    def _fake_unknown_job_authorized(
+        connection: Any,
+        *,
+        request_id: str,
+        intent: PurgeIntent,
+        idempotency_key: str,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT request.current_version, request.current_payload_hash,
+                   attempt.phase, attempt.reconciliation_next_at,
+                   attempt.reconciliation_resolution,
+                   attempt.reconciliation_exhausted_at,
+                   attempt.reconciliation_notification_required
+            FROM approval_requests AS request
+            JOIN execution_attempts AS attempt
+              ON attempt.request_id = request.request_id
+             AND attempt.version = request.current_version
+             AND attempt.payload_hash = request.current_payload_hash
+            WHERE request.request_id = ? AND request.state = 'outcome_unknown'
+            """,
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        version = row["current_version"]
+        payload_hash = row["current_payload_hash"]
+        if not isinstance(version, int) or not isinstance(payload_hash, str):
+            return False
+        if idempotency_key != fake_unknown_purge_job_key(
+            request_id=request_id,
+            version=version,
+            payload_hash=payload_hash,
+            intent=intent.value,
+        ):
+            return False
+        if (
+            row["phase"] != RequestState.OUTCOME_UNKNOWN.value
+            or row["reconciliation_next_at"] is not None
+            or row["reconciliation_resolution"] != "exhausted"
+            or not isinstance(row["reconciliation_exhausted_at"], int)
+            or row["reconciliation_notification_required"] != 1
+        ):
+            return False
+        event = connection.execute(
+            """
+            SELECT 1 FROM request_events
+            WHERE request_id = ? AND action = ? AND version = ?
+              AND payload_hash = ? AND safe_details_json = ?
+            LIMIT 1
+            """,
+            (
+                request_id,
+                FAKE_UNKNOWN_PURGE_AUTHORIZED_ACTION,
+                version,
+                payload_hash,
+                FAKE_UNKNOWN_PURGE_AUTHORIZED_DETAILS,
+            ),
+        ).fetchone()
+        return event is not None
+
+    @staticmethod
+    def _purge_reason(claim: PurgeClaim) -> str:
+        if claim.state is RequestState.OUTCOME_UNKNOWN:
+            return "fake_only_unknown_content"
+        return f"retention_{claim.state.value}"
+
+    @staticmethod
+    def _clear_fake_unknown_metadata(connection: Any, claim: PurgeClaim) -> None:
+        if claim.state is not RequestState.OUTCOME_UNKNOWN:
+            return
+        connection.execute(
+            """
+            UPDATE approval_requests SET safe_outcome_json = NULL
+            WHERE request_id = ? AND state = 'outcome_unknown'
+            """,
+            (claim.request_id,),
+        )
+        connection.execute(
+            """
+            UPDATE execution_attempts SET safe_completion_json = NULL
+            WHERE request_id = ? AND phase = 'outcome_unknown'
+            """,
+            (claim.request_id,),
+        )
+
     def _required_delay(self, intent: PurgeIntent, state: RequestState) -> int:
         delay = self.matrix.delay(intent, state)
         if delay is None:
@@ -815,8 +1215,7 @@ class RetentionManager:
             (now, request_id),
         )
 
-    @staticmethod
-    def _complete_claim(connection: Any, claim: PurgeClaim, *, now: int) -> None:
+    def _complete_claim(self, connection: Any, claim: PurgeClaim, *, now: int) -> None:
         updated = connection.execute(
             """
             UPDATE purge_jobs SET completed_at = ?, last_error = NULL
@@ -825,6 +1224,116 @@ class RetentionManager:
             (now, claim.purge_job_id, claim.claim_marker),
         ).rowcount
         if updated != 1:
+            raise _JobFailure("claim_lost")
+        if claim.state is RequestState.OUTCOME_UNKNOWN:
+            self._complete_fake_unknown_authorization(
+                connection,
+                request_id=claim.request_id,
+                now=now,
+            )
+
+    @staticmethod
+    def _complete_fake_unknown_authorization(
+        connection: Any,
+        *,
+        request_id: str,
+        now: int,
+    ) -> None:
+        request = connection.execute(
+            """
+            SELECT current_version, current_payload_hash
+            FROM approval_requests
+            WHERE request_id = ? AND state = 'outcome_unknown'
+            """,
+            (request_id,),
+        ).fetchone()
+        if request is None:
+            raise _JobFailure("state_not_purgeable")
+        version = int(request["current_version"])
+        payload_hash = str(request["current_payload_hash"])
+        required: list[tuple[PurgeIntent, str]] = []
+        for intent in (PurgeIntent.ATTACHMENTS, PurgeIntent.SENSITIVE_ROWS):
+            required.append(
+                (
+                    intent,
+                    fake_unknown_purge_job_key(
+                        request_id=request_id,
+                        version=version,
+                        payload_hash=payload_hash,
+                        intent=intent.value,
+                    ),
+                )
+            )
+        encryption_key = fake_unknown_purge_job_key(
+            request_id=request_id,
+            version=version,
+            payload_hash=payload_hash,
+            intent=PurgeIntent.ENCRYPTION_KEY.value,
+        )
+        encryption_job = connection.execute(
+            "SELECT completed_at FROM purge_jobs WHERE idempotency_key = ?",
+            (encryption_key,),
+        ).fetchone()
+        if encryption_job is not None:
+            required.append((PurgeIntent.ENCRYPTION_KEY, encryption_key))
+        for _intent, idempotency_key in required:
+            job = connection.execute(
+                "SELECT completed_at FROM purge_jobs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if job is None or job["completed_at"] is None:
+                return
+        if encryption_job is not None and RetentionManager._has_undestroyed_keys(
+            connection, request_id
+        ):
+            raise _JobFailure("key_destroy_incomplete")
+        details = json.dumps(
+            {"isolated_key_destruction": encryption_job is not None},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        existing = connection.execute(
+            """
+            SELECT 1 FROM request_events
+            WHERE request_id = ? AND action = ? AND version = ?
+              AND payload_hash = ? AND safe_details_json = ?
+            LIMIT 1
+            """,
+            (
+                request_id,
+                FAKE_UNKNOWN_PURGE_COMPLETED_ACTION,
+                version,
+                payload_hash,
+                details,
+            ),
+        ).fetchone()
+        if existing is not None:
+            return
+        connection.execute(
+            """
+            INSERT INTO request_events(
+                request_id, actor, action, occurred_at,
+                version, payload_hash, safe_details_json
+            ) VALUES (?, 'gateway:retention', ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                FAKE_UNKNOWN_PURGE_COMPLETED_ACTION,
+                now,
+                version,
+                payload_hash,
+                details,
+            ),
+        )
+        updated_request = connection.execute(
+            """
+            UPDATE approval_requests SET revision = revision + 1
+            WHERE request_id = ? AND state = 'outcome_unknown'
+              AND current_version = ? AND current_payload_hash = ?
+            """,
+            (request_id, version, payload_hash),
+        ).rowcount
+        if updated_request != 1:
             raise _JobFailure("claim_lost")
 
     def _record_failure(self, claim: PurgeClaim, *, now: int, error_code: str) -> None:
@@ -890,6 +1399,37 @@ def _validate_time(value: int, label: str) -> None:
         or value > _MAX_UNIX_SECONDS
     ):
         raise ValueError(f"{label} is invalid")
+
+
+def _validate_fake_unknown_inputs(
+    *,
+    request_id: str,
+    expected_version: int,
+    expected_payload_hash: str,
+    acknowledge_possible_external_effect: bool,
+    now: int,
+) -> None:
+    if _SAFE_REQUEST_ID_RE.fullmatch(request_id) is None:
+        raise ValueError("fake-only purge request ID is invalid")
+    if (
+        isinstance(expected_version, bool)
+        or not isinstance(expected_version, int)
+        or expected_version <= 0
+    ):
+        raise ValueError("fake-only purge version is invalid")
+    if (
+        not isinstance(expected_payload_hash, str)
+        or len(expected_payload_hash) != 64
+        or expected_payload_hash.lower() != expected_payload_hash
+    ):
+        raise ValueError("fake-only purge payload hash is invalid")
+    try:
+        bytes.fromhex(expected_payload_hash)
+    except ValueError:
+        raise ValueError("fake-only purge payload hash is invalid") from None
+    if acknowledge_possible_external_effect is not True:
+        raise RetentionError("fake-only purge requires explicit possible-effect acknowledgement")
+    _validate_time(now, "fake-only purge authorization time")
 
 
 def _digest(value: str) -> str:

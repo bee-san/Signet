@@ -53,6 +53,10 @@ from .models import (
 )
 from .notification_outbox import enqueue_notification
 from .notifications import NotificationKind, PushMessage
+from .retention_contract import (
+    FAKE_UNKNOWN_PURGE_AUTHORIZED_ACTION,
+    FAKE_UNKNOWN_PURGE_AUTHORIZED_DETAILS,
+)
 from .safe_metadata import public_safe_metadata
 
 FaultInjector = Callable[[str], None]
@@ -1687,6 +1691,24 @@ class ApprovalStateMachine:
             request = self._request_for_update(connection, request_id)
             if request["state"] != RequestState.OUTCOME_UNKNOWN.value:
                 raise ReconciliationRejected(f"request is not outcome_unknown: {request['state']}")
+            purge_authorized = connection.execute(
+                """
+                SELECT 1 FROM request_events
+                WHERE request_id = ?
+                  AND action = ? AND safe_details_json = ?
+                  AND version = ? AND payload_hash = ?
+                LIMIT 1
+                """,
+                (
+                    request_id,
+                    FAKE_UNKNOWN_PURGE_AUTHORIZED_ACTION,
+                    FAKE_UNKNOWN_PURGE_AUTHORIZED_DETAILS,
+                    request["current_version"],
+                    request["current_payload_hash"],
+                ),
+            ).fetchone()
+            if purge_authorized is not None:
+                raise ReconciliationRejected("unknown content purge was already authorized")
             attempt = connection.execute(
                 """
                 SELECT * FROM execution_attempts

@@ -7,15 +7,23 @@ from pathlib import Path
 import pytest
 
 from signet.db import Database, IntegrityError
-from signet.models import AttachmentReference, EnqueueRequest, RequestState
+from signet.models import (
+    AttachmentReference,
+    EnqueueRequest,
+    ReconciliationDecision,
+    ReconciliationRejected,
+    RequestState,
+)
 from signet.retention import (
     BackupPinConflict,
     BackupPins,
     PurgeIntent,
+    RetentionError,
     RetentionManager,
     RetentionMatrix,
     RetentionMode,
 )
+from signet.retention_contract import fake_unknown_purge_job_key
 from signet.staging import StagedFile, StagingStore
 from signet.state_machine import ApprovalStateMachine
 from tests.attachment_fixtures import FAKE_ATTACHMENT_KEY_REF, attachment_cipher
@@ -168,6 +176,56 @@ def _payload_rows(database: Database, request_id: str) -> list[dict[str, object]
         ]
 
 
+def _exhausted_unknown(
+    database: Database,
+    *,
+    request_id: str,
+    staged: StagedFile | None = None,
+    key_reference: str | None = None,
+) -> str:
+    _request(
+        database,
+        request_id=request_id,
+        state=RequestState.OUTCOME_UNKNOWN,
+        staged=staged,
+        key_reference=key_reference,
+    )
+    payload_hash = hashlib.sha256(request_id.encode()).hexdigest()
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE approval_requests
+            SET completed_at = NULL,
+                safe_outcome_json = '{"provider_candidate":"private-candidate"}'
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO execution_attempts(
+                attempt_id, request_id, version, payload_hash, fencing_token,
+                worker_id, worker_generation, phase, claimed_at,
+                dispatch_started_at, reconciliation_attempt_count,
+                reconciliation_next_at, reconciliation_resolution,
+                reconciliation_exhausted_at,
+                reconciliation_notification_required, safe_completion_json,
+                outcome_classification
+            ) VALUES (?, ?, 1, ?, ?, 'fake-worker', 1, 'outcome_unknown', 200,
+                      201, 2, NULL, 'exhausted', 300, 1,
+                      '{"provider_candidate":"private-candidate"}',
+                      'outcome_unknown')
+            """,
+            (
+                f"attempt-{request_id}",
+                request_id,
+                payload_hash,
+                f"fence-{request_id}",
+            ),
+        )
+    return payload_hash
+
+
 def test_matrix_is_explicit_for_every_state_and_validates_fixed_attachment_rules() -> None:
     matrix = _matrix()
     assert set(matrix.attachment_delays) == set(RequestState)
@@ -254,9 +312,7 @@ def test_scheduler_persists_exact_matrix_due_times_and_is_idempotent(
                 COMPLETED_AT + int(matrix.payload_delays[state] or 0),
             )
         )
-    assert {(row["request_id"], row["intent"], row["created_at"]) for row in rows} == (
-        expected
-    )
+    assert {(row["request_id"], row["intent"], row["created_at"]) for row in rows} == (expected)
 
 
 def test_scheduler_finds_untombstoned_idempotency_after_payload_was_purged(
@@ -277,7 +333,12 @@ def test_scheduler_finds_untombstoned_idempotency_after_payload_was_purged(
             """,
             (COMPLETED_AT, "partial-idempotency"),
         )
-    manager = RetentionManager(database, staging, matrix=_matrix())
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(),
+        allow_fake_only_unknown_purge=True,
+    )
 
     assert manager.schedule(now=COMPLETED_AT) == 1
     with database.read() as connection:
@@ -480,6 +541,526 @@ def test_outcome_unknown_is_protected_even_from_a_preexisting_due_job(
     assert _payload_rows(database, "unknown-protected")[0]["encrypted_payload"] is not None
 
 
+def test_fake_unknown_purge_requires_acknowledgement_exact_revision_and_exhaustion(
+    database: Database, staging: StagingStore
+) -> None:
+    payload_hash = _exhausted_unknown(database, request_id="unknown-guarded")
+    disabled = RetentionManager(database, staging, matrix=_matrix())
+    with pytest.raises(RetentionError, match="outside fake-only mode"):
+        disabled.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-guarded",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=True,
+            now=COMPLETED_AT,
+        )
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(),
+        allow_fake_only_unknown_purge=True,
+    )
+
+    with pytest.raises(RetentionError, match="explicit possible-effect acknowledgement"):
+        manager.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-guarded",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=False,
+            now=COMPLETED_AT,
+        )
+    with pytest.raises(RetentionError, match="current unknown outcome"):
+        manager.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-guarded",
+            expected_version=1,
+            expected_payload_hash="0" * 64,
+            acknowledge_possible_external_effect=True,
+            now=COMPLETED_AT,
+        )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE execution_attempts
+            SET reconciliation_resolution = 'inconclusive',
+                reconciliation_next_at = ?
+            WHERE request_id = 'unknown-guarded'
+            """,
+            (COMPLETED_AT + 10,),
+        )
+    with pytest.raises(RetentionError, match="exhausted reconciliation"):
+        manager.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-guarded",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=True,
+            now=COMPLETED_AT,
+        )
+    with database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM request_events WHERE action = ?",
+                ("fake_only_unknown_content_purge_authorized",),
+            ).fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT count(*) FROM purge_jobs").fetchone()[0] == 0
+
+
+def test_malformed_fake_purge_event_does_not_block_reconciliation(
+    database: Database, staging: StagingStore
+) -> None:
+    payload_hash = _exhausted_unknown(database, request_id="unknown-malformed-event")
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO request_events(
+                request_id, actor, action, occurred_at,
+                version, payload_hash, safe_details_json
+            ) VALUES (?, 'fake:forged', 'fake_only_unknown_content_purge_authorized',
+                      ?, 1, ?, '{}')
+            """,
+            ("unknown-malformed-event", COMPLETED_AT, payload_hash),
+        )
+
+    result = ApprovalStateMachine(database).reconcile(
+        "unknown-malformed-event",
+        expected_reconciliation_count=2,
+        decision=ReconciliationDecision.CONFIRMED_EFFECT,
+        worker_id="reconciler",
+        now=COMPLETED_AT + 1,
+    )
+    assert result.action.value == "succeeded"
+
+
+def test_fake_unknown_purge_rejects_a_job_that_predates_authorization(
+    database: Database, staging: StagingStore
+) -> None:
+    payload_hash = _exhausted_unknown(database, request_id="unknown-preexisting-job")
+    job_key = fake_unknown_purge_job_key(
+        request_id="unknown-preexisting-job",
+        version=1,
+        payload_hash=payload_hash,
+        intent=PurgeIntent.ATTACHMENTS.value,
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO purge_jobs(
+                purge_job_id, request_id, intent, idempotency_key, created_at
+            ) VALUES ('preexisting-exact-job', 'unknown-preexisting-job',
+                      'attachments', ?, 1)
+            """,
+            (job_key,),
+        )
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(),
+        allow_fake_only_unknown_purge=True,
+    )
+
+    with pytest.raises(RetentionError, match="predates its authorization"):
+        manager.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-preexisting-job",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=True,
+            now=COMPLETED_AT,
+        )
+    with database.read() as connection:
+        events = connection.execute(
+            """
+            SELECT count(*) FROM request_events
+            WHERE request_id = 'unknown-preexisting-job'
+              AND action = 'fake_only_unknown_content_purge_authorized'
+            """
+        ).fetchone()[0]
+    assert events == 0
+
+
+def test_fake_unknown_purge_is_audited_idempotent_and_preserves_uncertainty(
+    database: Database, staging: StagingStore
+) -> None:
+    staged = _stage(staging, "manual-unknown", b"private fake unknown attachment")
+    payload_hash = _exhausted_unknown(
+        database,
+        request_id="unknown-manual",
+        staged=staged,
+        key_reference="keychain://Signet/manual-unknown-logical",
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO purge_jobs(
+                purge_job_id, request_id, intent, idempotency_key, created_at
+            ) VALUES ('malicious-unknown-job', 'unknown-manual', 'sensitive_rows',
+                      'malicious:unknown', 1)
+            """
+        )
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(),
+        allow_fake_only_unknown_purge=True,
+    )
+
+    assert (
+        manager.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-manual",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=True,
+            now=COMPLETED_AT,
+        )
+        == 2
+    )
+    assert (
+        manager.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-manual",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=True,
+            now=COMPLETED_AT + 1,
+        )
+        == 0
+    )
+    with pytest.raises(ReconciliationRejected, match="purge was already authorized"):
+        ApprovalStateMachine(database).reconcile(
+            "unknown-manual",
+            expected_reconciliation_count=2,
+            decision=ReconciliationDecision.CONFIRMED_EFFECT,
+            worker_id="late-reconciler",
+            now=COMPLETED_AT + 1,
+        )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO request_events(
+                request_id, actor, action, occurred_at,
+                version, payload_hash, safe_details_json
+            ) VALUES ('unknown-manual', 'fake:forged',
+                      'fake_only_unknown_content_purge_completed', ?, 1, ?, '{}')
+            """,
+            (COMPLETED_AT, payload_hash),
+        )
+
+    completed = 0
+    while claim := manager.claim_due(now=COMPLETED_AT + 1, request_id="unknown-manual"):
+        assert claim.state is RequestState.OUTCOME_UNKNOWN
+        assert manager.process(claim, now=COMPLETED_AT + 1)
+        completed += 1
+    assert completed == 2
+    assert not staged.path.exists()
+
+    with database.read() as connection:
+        request = connection.execute(
+            """
+            SELECT state, current_version, current_payload_hash, safe_outcome_json,
+                   completed_at, revision
+            FROM approval_requests WHERE request_id = 'unknown-manual'
+            """
+        ).fetchone()
+        attempt = connection.execute(
+            """
+            SELECT phase, reconciliation_resolution, reconciliation_exhausted_at,
+                   safe_completion_json
+            FROM execution_attempts WHERE request_id = 'unknown-manual'
+            """
+        ).fetchone()
+        payload = connection.execute(
+            """
+            SELECT encrypted_payload, payload_hash, purged_at, purge_reason,
+                   encryption_key_ref, key_destroyed_at
+            FROM payload_versions WHERE request_id = 'unknown-manual'
+            """
+        ).fetchone()
+        attachment = connection.execute(
+            """
+            SELECT storage_path, purged_at FROM attachments
+            WHERE request_id = 'unknown-manual'
+            """
+        ).fetchone()
+        idempotency = connection.execute(
+            """
+            SELECT tombstoned_at FROM idempotency_records
+            WHERE request_id = 'unknown-manual'
+            """
+        ).fetchone()
+        events = connection.execute(
+            """
+            SELECT actor, action, version, payload_hash, safe_details_json
+            FROM request_events
+            WHERE request_id = 'unknown-manual'
+              AND action = 'fake_only_unknown_content_purge_authorized'
+            """
+        ).fetchall()
+        completion = connection.execute(
+            """
+            SELECT actor, safe_details_json FROM request_events
+            WHERE request_id = 'unknown-manual'
+              AND action = 'fake_only_unknown_content_purge_completed'
+            ORDER BY event_id
+            """
+        ).fetchall()
+        jobs = connection.execute(
+            """
+            SELECT idempotency_key, completed_at FROM purge_jobs
+            WHERE request_id = 'unknown-manual' ORDER BY idempotency_key
+            """
+        ).fetchall()
+    assert tuple(request) == (
+        "outcome_unknown",
+        1,
+        payload_hash,
+        None,
+        None,
+        3,
+    )
+    assert tuple(attempt) == ("outcome_unknown", "exhausted", 300, None)
+    assert tuple(payload) == (
+        None,
+        payload_hash,
+        COMPLETED_AT + 1,
+        "fake_only_unknown_content",
+        "keychain://Signet/manual-unknown-logical",
+        None,
+    )
+    assert tuple(attachment) == (None, COMPLETED_AT + 1)
+    assert idempotency["tombstoned_at"] == COMPLETED_AT + 1
+    assert [tuple(event) for event in events] == [
+        (
+            "fake:operator",
+            "fake_only_unknown_content_purge_authorized",
+            1,
+            payload_hash,
+            '{"acknowledged_possible_external_effect":true,"fake_only":true}',
+        )
+    ]
+    assert [tuple(event) for event in completion] == [
+        ("fake:forged", "{}"),
+        ("gateway:retention", '{"isolated_key_destruction":false}'),
+    ]
+    assert len(jobs) == 3
+    malicious = next(row for row in jobs if row["idempotency_key"] == "malicious:unknown")
+    assert malicious["completed_at"] is None
+    assert all(
+        row["completed_at"] == COMPLETED_AT + 1
+        for row in jobs
+        if row["idempotency_key"] != "malicious:unknown"
+    )
+
+
+def test_fake_unknown_purge_honors_backup_pins_and_recovers_after_unlink_crash(
+    database: Database, staging: StagingStore
+) -> None:
+    staged = _stage(staging, "manual-unknown-crash")
+    payload_hash = _exhausted_unknown(
+        database,
+        request_id="unknown-crash",
+        staged=staged,
+    )
+
+    def crash(stage: str) -> None:
+        if stage == "attachment_unlinked":
+            raise SimulatedCrash
+
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(),
+        claim_lease_seconds=10,
+        allow_fake_only_unknown_purge=True,
+        fault_injector=crash,
+    )
+    pins = BackupPins(database)
+    lease = pins.acquire(now=COMPLETED_AT)
+    with pytest.raises(RetentionError, match="backup is active"):
+        manager.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-crash",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=True,
+            now=COMPLETED_AT,
+        )
+    with database.read() as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT count(*) FROM request_events
+                WHERE request_id = 'unknown-crash'
+                  AND action = 'fake_only_unknown_content_purge_authorized'
+                """
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT count(*) FROM purge_jobs
+                WHERE request_id = 'unknown-crash' AND intent != 'backup_pin'
+                """
+            ).fetchone()[0]
+            == 0
+        )
+    pins.release(lease, now=COMPLETED_AT + 1)
+    manager.authorize_fake_only_exhausted_unknown_purge(
+        request_id="unknown-crash",
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+        acknowledge_possible_external_effect=True,
+        now=COMPLETED_AT + 1,
+    )
+    disabled = RetentionManager(database, staging, matrix=_matrix())
+    assert disabled.claim_due(now=COMPLETED_AT + 1, request_id="unknown-crash") is None
+    with pytest.raises(BackupPinConflict, match="in progress"):
+        pins.acquire(now=COMPLETED_AT + 1)
+
+    claim = manager.claim_due(now=COMPLETED_AT + 1, request_id="unknown-crash")
+    assert claim is not None and claim.intent is PurgeIntent.ATTACHMENTS
+    with pytest.raises(SimulatedCrash):
+        manager.process(claim, now=COMPLETED_AT + 1)
+    assert not staged.path.exists()
+
+    restarted = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(),
+        claim_lease_seconds=10,
+        allow_fake_only_unknown_purge=True,
+    )
+    recovered = restarted.claim_due(now=COMPLETED_AT + 12, request_id="unknown-crash")
+    assert recovered is not None and recovered.intent is PurgeIntent.ATTACHMENTS
+    assert restarted.process(recovered, now=COMPLETED_AT + 12)
+
+
+def test_payload_only_backup_pin_blocks_fake_unknown_purge_claim(
+    database: Database, staging: StagingStore
+) -> None:
+    payload_hash = _exhausted_unknown(database, request_id="unknown-payload-pin")
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(),
+        allow_fake_only_unknown_purge=True,
+    )
+    pins = BackupPins(database)
+    lease = pins.acquire(now=COMPLETED_AT)
+    assert lease.request_ids == ("unknown-payload-pin",)
+    with pytest.raises(RetentionError, match="backup is active"):
+        manager.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-payload-pin",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=True,
+            now=COMPLETED_AT,
+        )
+    pins.release(lease, now=COMPLETED_AT + 1)
+    manager.authorize_fake_only_exhausted_unknown_purge(
+        request_id="unknown-payload-pin",
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+        acknowledge_possible_external_effect=True,
+        now=COMPLETED_AT + 1,
+    )
+    assert manager.claim_due(now=COMPLETED_AT + 1, request_id="unknown-payload-pin") is not None
+
+
+def test_purge_claims_are_serialized_per_request(database: Database, staging: StagingStore) -> None:
+    staged = _stage(staging, "serialized-purge")
+    payload_hash = _exhausted_unknown(
+        database,
+        request_id="unknown-serialized",
+        staged=staged,
+    )
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(),
+        allow_fake_only_unknown_purge=True,
+    )
+    manager.authorize_fake_only_exhausted_unknown_purge(
+        request_id="unknown-serialized",
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+        acknowledge_possible_external_effect=True,
+        now=COMPLETED_AT,
+    )
+
+    first = manager.claim_due(now=COMPLETED_AT, request_id="unknown-serialized")
+    assert first is not None and first.intent is PurgeIntent.ATTACHMENTS
+    assert manager.claim_due(now=COMPLETED_AT, request_id="unknown-serialized") is None
+    assert manager.process(first, now=COMPLETED_AT)
+    second = manager.claim_due(now=COMPLETED_AT, request_id="unknown-serialized")
+    assert second is not None and second.intent is PurgeIntent.SENSITIVE_ROWS
+
+
+def test_fake_unknown_purge_destroys_isolated_request_keys(
+    database: Database, staging: StagingStore
+) -> None:
+    staged = _stage(staging, "manual-unknown-isolated")
+    payload_key = "keychain://Signet/manual-unknown-isolated"
+    payload_hash = _exhausted_unknown(
+        database,
+        request_id="unknown-isolated",
+        staged=staged,
+        key_reference=payload_key,
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO purge_jobs(
+                purge_job_id, request_id, intent, idempotency_key, created_at
+            ) VALUES ('unrelated-isolated-job', 'unknown-isolated', 'sensitive_rows',
+                      'malicious:isolated', 1)
+            """
+        )
+    destroyer = FakeKeyDestroyer()
+    manager = RetentionManager(
+        database,
+        staging,
+        matrix=_matrix(),
+        mode=RetentionMode.ISOLATED_PER_REQUEST_KEY,
+        key_destroyer=destroyer,
+        allow_fake_only_unknown_purge=True,
+    )
+
+    assert (
+        manager.authorize_fake_only_exhausted_unknown_purge(
+            request_id="unknown-isolated",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=True,
+            now=COMPLETED_AT,
+        )
+        == 3
+    )
+    intents: list[PurgeIntent] = []
+    while claim := manager.claim_due(now=COMPLETED_AT, request_id="unknown-isolated"):
+        assert manager.process(claim, now=COMPLETED_AT)
+        intents.append(claim.intent)
+    assert intents == [
+        PurgeIntent.ATTACHMENTS,
+        PurgeIntent.SENSITIVE_ROWS,
+        PurgeIntent.ENCRYPTION_KEY,
+    ]
+    assert {call[0] for call in destroyer.calls} == {payload_key, FAKE_ATTACHMENT_KEY_REF}
+    with database.read() as connection:
+        payload = connection.execute(
+            """
+            SELECT encrypted_payload, encryption_key_ref, purged_at,
+                   key_destroyed_at, purge_reason
+            FROM payload_versions WHERE request_id = 'unknown-isolated'
+            """
+        ).fetchone()
+    assert tuple(payload) == (
+        None,
+        None,
+        COMPLETED_AT,
+        COMPLETED_AT,
+        "fake_only_unknown_content",
+    )
+
+
 def test_logical_purge_clears_body_but_never_claims_key_destruction(
     database: Database, staging: StagingStore
 ) -> None:
@@ -489,9 +1070,7 @@ def test_logical_purge_clears_body_but_never_claims_key_destruction(
         state=RequestState.DENIED,
         key_reference="keychain://Signet/fake-logical",
     )
-    matrix = _matrix(
-        payload_delays={state: 0 for state in _PURGEABLE_FIXTURE_STATES}
-    )
+    matrix = _matrix(payload_delays={state: 0 for state in _PURGEABLE_FIXTURE_STATES})
     manager = RetentionManager(database, staging, matrix=matrix)
 
     report = manager.run_due(now=COMPLETED_AT)
@@ -816,14 +1395,15 @@ def test_abandoned_backup_pin_requires_explicit_release_after_restart(
     BackupPins(database).acquire(now=COMPLETED_AT)
 
     restarted_pins = BackupPins(Database(database.path))
-    restarted_manager = RetentionManager(
-        Database(database.path), staging, matrix=_matrix()
-    )
+    restarted_manager = RetentionManager(Database(database.path), staging, matrix=_matrix())
     assert restarted_manager.claim_due(now=COMPLETED_AT + 10_000) is None
-    assert restarted_pins.release_abandoned(
-        before=COMPLETED_AT,
-        now=COMPLETED_AT + 10_000,
-    ) == 1
+    assert (
+        restarted_pins.release_abandoned(
+            before=COMPLETED_AT,
+            now=COMPLETED_AT + 10_000,
+        )
+        == 1
+    )
     claim = restarted_manager.claim_due(now=COMPLETED_AT + 10_000)
     assert claim is not None
 

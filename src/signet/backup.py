@@ -117,7 +117,7 @@ class BackupBundleManager:
             try:
                 pins = self._backup_pins.acquire(now=pin_time)
             except RetentionError as exc:
-                raise BackupError("backup could not acquire consistent attachment pins") from exc
+                raise BackupError("backup could not acquire consistent retention pins") from exc
             try:
                 snapshot = self.database.create_snapshot(workspace / "approvals.sqlite3")
                 try:
@@ -191,7 +191,7 @@ class BackupBundleManager:
                         now=max(pin_time, int(time.time())),
                     )
                 except RetentionError as exc:
-                    raise BackupError("backup attachment pins could not be released") from exc
+                    raise BackupError("backup retention pins could not be released") from exc
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
 
