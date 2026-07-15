@@ -69,7 +69,7 @@ from signet.gateway_tools import (
     SafeRequestSummary,
 )
 from signet.mcp_mirror import AliasToolSurface, SchemaMirror
-from signet.models import InvalidTransition, RequestState
+from signet.models import AdmissionRejected, InvalidTransition, RequestState
 from signet.notification_outbox import NotificationOutboxWorker, SQLiteNotificationOutbox
 from signet.notifications import (
     NotificationDispatcher,
@@ -743,16 +743,32 @@ def build_demo(
         freezer=freezer,
         enqueuer=state_machine,
     )
+    access_requests = FrozenAccessRequestFactory(
+        freezer,
+        policy_version=lambda: engine.snapshot.version,
+    )
+
+    def record_denied_event(namespace: str, alias: str, tool: str) -> None:
+        event = access_requests.freeze_denied_event(
+            origin_namespace=namespace,
+            alias=alias,
+            tool=tool,
+            actor=f"mcp:{namespace}",
+            created_at=int(time.time()),
+        )
+        try:
+            state_machine.enqueue(event)
+        except AdmissionRejected:
+            # The policy denial remains authoritative when the review queue is full.
+            return
+
     for alias in ("fastmail", "whatsapp"):
         surfaces[alias] = AliasToolSurface(
             alias=alias,
             mirror=mirror,
             call_handler=pipeline.handle_call,
+            denied_event_handler=record_denied_event,
         )
-    access_requests = FrozenAccessRequestFactory(
-        freezer,
-        policy_version=lambda: engine.snapshot.version,
-    )
     gateway_tools = GatewayTools(
         state_machine=state_machine,
         totp_verifier=totp,

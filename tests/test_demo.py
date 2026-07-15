@@ -31,6 +31,7 @@ from signet.demo import (
     DEMO_ACTION_PROOF,
     DEMO_GRACEFUL_SHUTDOWN_SECONDS,
     DEMO_LOGIN_PROOF,
+    DEMO_NAMESPACE,
     DemoAssembly,
     DemoError,
     backup_demo,
@@ -278,6 +279,10 @@ async def test_mcp_fake_read_approval_deny_and_web_only_approval_surface(
             )
             assert denied.isError is True
             assert denied.structuredContent["error"]["code"] == "policy_denied"
+            denied_replay = await session.call_tool(
+                "delete_email", {"message_id": "fake:message:different-private-value"}
+            )
+            assert denied_replay.structuredContent["error"]["code"] == "policy_denied"
             pending_fastmail = await session.call_tool("send_email", FASTMAIL_ARGUMENTS)
             assert pending_fastmail.isError is False
             fastmail_request_id = str(pending_fastmail.structuredContent["request_id"])
@@ -334,6 +339,36 @@ async def test_mcp_fake_read_approval_deny_and_web_only_approval_surface(
                 )
     assert assembly.provider_clients["fastmail"].mutation_calls == 0
     assert assembly.provider_clients["whatsapp"].mutation_calls == 0
+    with assembly.database.read() as connection:
+        denied_events = connection.execute(
+            """
+            SELECT request.request_id, request.origin_namespace,
+                   payload.encrypted_payload
+            FROM approval_requests AS request
+            JOIN payload_versions AS payload
+              ON payload.request_id = request.request_id
+             AND payload.version = request.current_version
+            WHERE request.gateway_internal = 1
+              AND request.tool_name = 'request_tool_access'
+            ORDER BY request.request_id
+            """
+        ).fetchall()
+        denied_idempotency = connection.execute(
+            """
+            SELECT count(*) FROM idempotency_records AS idempotency
+            JOIN approval_requests AS request USING(request_id)
+            WHERE request.gateway_internal = 1
+              AND request.tool_name = 'request_tool_access'
+            """
+        ).fetchone()[0]
+    assert len(denied_events) == 2
+    assert denied_idempotency == 2
+    assert {row["origin_namespace"] for row in denied_events} == {DEMO_NAMESPACE}
+    for row in denied_events:
+        ciphertext = bytes(row["encrypted_payload"])
+        assert b"never-delete" not in ciphertext
+        assert b"different-private-value" not in ciphertext
+        assert b"15555550123" not in ciphertext
 
 
 @pytest.mark.asyncio
