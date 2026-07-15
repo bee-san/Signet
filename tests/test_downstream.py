@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import anyio
+import httpx
 import mcp.types as types
 import pytest
 from mcp import StdioServerParameters
@@ -27,6 +28,8 @@ from signet.downstream import (
     DownstreamConnectionError,
     DownstreamLifecycleError,
     DownstreamProtocolError,
+    _bounded_response_hook,
+    _BoundedHTTPResponseStream,
     structured_adapter_result,
     validate_call_tool_result,
 )
@@ -215,15 +218,19 @@ class FakeFactories:
     def __init__(self, session: FakeSession) -> None:
         self.session = session
         self.events = session.events
-        self.http_calls: list[tuple[str, dict[str, str], float]] = []
+        self.http_calls: list[tuple[str, dict[str, str], float, int]] = []
         self.stdio_parameters: list[StdioServerParameters] = []
         self.session_timeouts: list[timedelta] = []
 
     @asynccontextmanager
     async def http(
-        self, url: str, headers: Mapping[str, str], timeout: float
+        self,
+        url: str,
+        headers: Mapping[str, str],
+        timeout: float,
+        output_limit: int,
     ) -> AsyncIterator[tuple[Any, Any, Any]]:
-        self.http_calls.append((url, dict(headers), timeout))
+        self.http_calls.append((url, dict(headers), timeout, output_limit))
         self.events.append("transport-enter")
         try:
             yield object(), object(), lambda: "session-id"
@@ -279,6 +286,7 @@ async def test_http_lifecycle_initializes_once_discovers_pages_and_detaches_resu
                 "https://provider.test/mcp",
                 {"Authorization": f"Bearer {SECRET}"},
                 2.0,
+                1_048_576,
             )
         ]
         assert factories.session_timeouts == [timedelta(seconds=2)]
@@ -763,9 +771,12 @@ async def test_injected_memory_transport_uses_the_pinned_sdk_session_end_to_end(
 
     @asynccontextmanager
     async def memory_connector(
-        url: str, headers: Mapping[str, str], timeout: float
+        url: str,
+        headers: Mapping[str, str],
+        timeout: float,
+        output_limit: int,
     ) -> AsyncIterator[tuple[Any, Any, Any]]:
-        del url, timeout
+        del url, timeout, output_limit
         observed_headers.update(headers)
         low_level = server._mcp_server
         async with create_client_server_memory_streams() as (client_streams, server_streams):
@@ -796,3 +807,67 @@ async def test_injected_memory_transport_uses_the_pinned_sdk_session_end_to_end(
             "isError": False,
         }
     assert observed_headers == {"Authorization": f"Bearer {SECRET}"}
+
+
+class _ChunkStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: tuple[bytes, ...]) -> None:
+        self.chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_http_json_stream_is_bounded_before_body_buffering() -> None:
+    source = _ChunkStream((b'{"value":"', b"x" * 20, b'"}'))
+    bounded = _BoundedHTTPResponseStream(
+        source,
+        limit_bytes=16,
+        event_stream=False,
+    )
+    with pytest.raises(DownstreamProtocolError, match="HTTP response exceeds"):
+        async for _chunk in bounded:
+            pass
+    await bounded.aclose()
+    assert source.closed
+
+
+@pytest.mark.asyncio
+async def test_http_sse_stream_bounds_each_event_and_resets_on_delimiter() -> None:
+    valid_source = _ChunkStream((b"data: 1234\n\n", b"data: 5678\r\n\r\n"))
+    valid = _BoundedHTTPResponseStream(
+        valid_source,
+        limit_bytes=16,
+        event_stream=True,
+    )
+    assert b"".join([chunk async for chunk in valid]) == (
+        b"data: 1234\n\ndata: 5678\r\n\r\n"
+    )
+
+    oversized = _BoundedHTTPResponseStream(
+        _ChunkStream((b"data: ", b"x" * 20)),
+        limit_bytes=16,
+        event_stream=True,
+    )
+    with pytest.raises(DownstreamProtocolError, match="SSE event exceeds"):
+        async for _chunk in oversized:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_http_stream_rejects_compression_before_decompression() -> None:
+    source = _ChunkStream((b"compressed",))
+    response = httpx.Response(
+        200,
+        headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        stream=source,
+    )
+    hook = _bounded_response_hook(32)
+    with pytest.raises(DownstreamProtocolError, match="compressed"):
+        await hook(response)
+    assert source.closed

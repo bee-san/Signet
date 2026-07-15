@@ -124,7 +124,7 @@ class _Lifecycle(StrEnum):
 
 TransportStreams = tuple[Any, Any] | tuple[Any, Any, Callable[[], str | None]]
 HTTPConnector = Callable[
-    [str, Mapping[str, str], float], AbstractAsyncContextManager[TransportStreams]
+    [str, Mapping[str, str], float, int], AbstractAsyncContextManager[TransportStreams]
 ]
 StdioConnector = Callable[
     [ReviewedStdioServerParameters], AbstractAsyncContextManager[TransportStreams]
@@ -140,16 +140,95 @@ class DownstreamSession(Protocol):
 SessionFactory = Callable[[Any, Any, timedelta], AbstractAsyncContextManager[DownstreamSession]]
 
 
+class _BoundedHTTPResponseStream(httpx.AsyncByteStream):
+    """Reject oversized JSON bodies or individual SSE events before parsing."""
+
+    def __init__(
+        self,
+        stream: httpx.AsyncByteStream,
+        *,
+        limit_bytes: int,
+        event_stream: bool,
+    ) -> None:
+        self._stream = stream
+        self._limit_bytes = limit_bytes
+        self._event_stream = event_stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        consumed = 0
+        line_has_content = False
+        previous_was_cr = False
+        async for chunk in self._stream:
+            if not self._event_stream:
+                consumed += len(chunk)
+                if consumed > self._limit_bytes:
+                    raise DownstreamProtocolError(
+                        "downstream HTTP response exceeds its configured limit"
+                    )
+            else:
+                for byte in chunk:
+                    consumed += 1
+                    if consumed > self._limit_bytes:
+                        raise DownstreamProtocolError(
+                            "downstream SSE event exceeds its configured limit"
+                        )
+                    if byte == 13:
+                        if not line_has_content:
+                            consumed = 0
+                        line_has_content = False
+                        previous_was_cr = True
+                    elif byte == 10:
+                        if previous_was_cr:
+                            previous_was_cr = False
+                            continue
+                        if not line_has_content:
+                            consumed = 0
+                        line_has_content = False
+                    else:
+                        previous_was_cr = False
+                        line_has_content = True
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+
+def _bounded_response_hook(
+    limit_bytes: int,
+) -> Callable[[httpx.Response], Any]:
+    async def bound(response: httpx.Response) -> None:
+        if not isinstance(response.stream, httpx.AsyncByteStream):
+            raise DownstreamProtocolError("downstream HTTP response stream is invalid")
+        content_encoding = response.headers.get("content-encoding", "identity").lower()
+        if content_encoding != "identity":
+            await response.aclose()
+            raise DownstreamProtocolError(
+                "compressed downstream HTTP responses are not accepted"
+            )
+        media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        response.stream = _BoundedHTTPResponseStream(
+            response.stream,
+            limit_bytes=limit_bytes,
+            event_stream=media_type == "text/event-stream",
+        )
+
+    return bound
+
+
 @asynccontextmanager
 async def _official_http_connector(
-    url: str, headers: Mapping[str, str], timeout_seconds: float
+    url: str,
+    headers: Mapping[str, str],
+    timeout_seconds: float,
+    output_limit_bytes: int,
 ) -> AsyncIterator[TransportStreams]:
     timeout = httpx.Timeout(timeout_seconds)
     async with (
         httpx.AsyncClient(
-            headers=dict(headers),
+            headers={**dict(headers), "Accept-Encoding": "identity"},
             timeout=timeout,
             trust_env=False,
+            event_hooks={"response": [_bounded_response_hook(output_limit_bytes)]},
         ) as http_client,
         streamable_http_client(
             url,
@@ -675,6 +754,7 @@ class DownstreamClient:
                 self._config.url,
                 {"Authorization": f"Bearer {revealed}"},
                 self._config.timeout_seconds,
+                self._config.output_limit_bytes,
             )
             return await stack.enter_async_context(context)
 
