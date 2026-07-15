@@ -329,6 +329,39 @@ def test_sqlite_rate_limit_reservations_are_atomic_and_durable(database: Databas
     assert limiter.state("source:success").failures == 0
 
 
+def test_sqlite_rate_limiter_bounds_distributed_scope_storage(database: Database) -> None:
+    limiter = SQLiteAttemptLimiter(
+        database,
+        lock_schedule=((10, 60),),
+        global_window_seconds=60,
+        global_attempt_limit=20,
+        scope_retention_seconds=60,
+        maximum_scope_rows=50,
+    )
+    for window in range(12):
+        now = 1_000 + window * 60
+        for index in range(20):
+            limiter.reserve(
+                f"account:{window}:{index}",
+                source_key=f"source:{window}:{index}",
+                now=now,
+            )
+        with pytest.raises(AuthenticationRateLimited):
+            limiter.reserve(
+                f"account:{window}:blocked",
+                source_key=f"source:{window}:blocked",
+                now=now,
+            )
+
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM auth_attempts").fetchone()[0] <= 40
+        global_row = connection.execute(
+            "SELECT attempts, blocked_until FROM auth_rate_windows WHERE scope_key = 'auth:global'"
+        ).fetchone()
+    assert global_row is not None
+    assert tuple(global_row) == (20, 1_720)
+
+
 def test_persistent_webauthn_challenge_binds_session_method_action_and_offered_set(
     database: Database,
 ) -> None:

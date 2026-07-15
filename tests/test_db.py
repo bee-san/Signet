@@ -45,6 +45,7 @@ CORE_TABLES = {
     "policy_versions",
     "push_subscriptions",
     "auth_credentials",
+    "auth_rate_windows",
     "caller_tokens",
     "schema_cache",
     "purge_jobs",

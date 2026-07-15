@@ -811,10 +811,29 @@ class SQLiteAttemptLimiter:
             (7, 5 * 60),
             (10, 60 * 60),
         ),
+        global_window_seconds: int = 10 * 60,
+        global_attempt_limit: int = 200,
+        scope_retention_seconds: int = 10 * 60,
+        maximum_scope_rows: int = 1_000,
     ) -> None:
         _validate_lock_schedule(lock_schedule)
+        if (
+            global_window_seconds < 60
+            or global_window_seconds > 60 * 60
+            or global_attempt_limit < 1
+            or global_attempt_limit > 100_000
+            or scope_retention_seconds < global_window_seconds
+            or scope_retention_seconds > 30 * 24 * 60 * 60
+            or maximum_scope_rows < global_attempt_limit * 2 + 1
+            or maximum_scope_rows > 1_000_000
+        ):
+            raise ValueError("durable rate-limiter bounds are invalid")
         self.database = database
         self._schedule = lock_schedule
+        self._global_window_seconds = global_window_seconds
+        self._global_attempt_limit = global_attempt_limit
+        self._scope_retention_seconds = scope_retention_seconds
+        self._maximum_scope_rows = maximum_scope_rows
 
     def reserve(
         self,
@@ -828,6 +847,53 @@ class SQLiteAttemptLimiter:
             _bounded_identifier(scope, name="rate-limit scope", maximum=128)
         attempt_id = secrets.token_urlsafe(18)
         with self.database.transaction() as connection:
+            global_row = connection.execute(
+                "SELECT * FROM auth_rate_windows WHERE scope_key = 'auth:global'"
+            ).fetchone()
+            if global_row is not None and now < int(global_row["window_start"]):
+                raise AuthenticationRateLimited(self._global_window_seconds)
+            window_start = int(global_row["window_start"]) if global_row is not None else now
+            attempts = int(global_row["attempts"]) if global_row is not None else 0
+            if now >= window_start + self._global_window_seconds:
+                window_start = now
+                attempts = 0
+            blocked_until = (
+                int(global_row["blocked_until"])
+                if global_row is not None and global_row["blocked_until"] is not None
+                else None
+            )
+            if blocked_until is not None and now < blocked_until:
+                raise AuthenticationRateLimited(max(1, blocked_until - now))
+            attempts += 1
+            next_block = (
+                window_start + self._global_window_seconds
+                if attempts >= self._global_attempt_limit
+                else None
+            )
+            connection.execute(
+                """
+                INSERT INTO auth_rate_windows(
+                    scope_key, window_start, attempts, blocked_until, updated_at
+                ) VALUES ('auth:global', ?, ?, ?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    window_start = excluded.window_start,
+                    attempts = excluded.attempts,
+                    blocked_until = excluded.blocked_until,
+                    updated_at = excluded.updated_at
+                """,
+                (window_start, attempts, next_block, now),
+            )
+            connection.execute(
+                """
+                DELETE FROM auth_attempts WHERE rowid IN (
+                    SELECT rowid FROM auth_attempts
+                    WHERE updated_at <= ?
+                      AND (locked_until IS NULL OR locked_until <= ?)
+                    ORDER BY updated_at LIMIT 500
+                )
+                """,
+                (max(0, now - self._scope_retention_seconds), now),
+            )
             placeholders = ",".join("?" for _ in scopes)
             rows = {
                 str(row["scope_key"]): row
@@ -836,6 +902,10 @@ class SQLiteAttemptLimiter:
                     scopes,
                 ).fetchall()
             }
+            missing = sum(scope not in rows for scope in scopes)
+            stored = int(connection.execute("SELECT count(*) FROM auth_attempts").fetchone()[0])
+            if stored + missing > self._maximum_scope_rows:
+                raise AuthenticationRateLimited(self._global_window_seconds)
             retry_after = max(
                 (
                     int(row["locked_until"]) - now
