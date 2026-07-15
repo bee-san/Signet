@@ -133,7 +133,8 @@ jobs:
       - name: Render and lint inactive launchd plists without installing them
         shell: bash
         run: |
-          root="$(mktemp -d)"
+          temporary_root="$(mktemp -d)"
+          root="$(cd "$temporary_root" && pwd -P)"
           trap 'chmod -R u+rwX "$root"; rm -rf "$root"' EXIT
           chmod 700 "$root"
           install -d -m 0700 "$root/logs" "$root/output"
