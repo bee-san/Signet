@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="login-shell" aria-labelledby="login-heading">
+  <img class="login-mark" src="/static/icons/signet-1254.png" width="112" height="112" alt="">
+  <h1 id="login-heading">Signet</h1>
+  <form class="login-form" data-passkey-login data-csrf="{{ login_csrf }}">
+    <label for="passkey-user">Account</label>
+    <input id="passkey-user" name="user_id" autocomplete="username webauthn" maxlength="256" required>
+    <button class="button button-primary" type="submit">Use passkey</button>
+  </form>
+  <details class="fallback-login">
+    <summary>Password and authenticator</summary>
+    <form class="login-form" action="/login/password" method="post">
+      <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
+      <label for="fallback-user">Account</label>
+      <input id="fallback-user" name="user_id" autocomplete="username" maxlength="256" required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required>
+      <label for="totp-proof">Authenticator code</label>
+      <input id="totp-proof" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" required>
+      <button class="button button-primary" type="submit">Sign in</button>
+    </form>
+  </details>
+</section>
+{% endblock %}

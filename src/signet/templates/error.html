@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="error-state">
+  <p class="eyebrow">{{ status_code }}</p>
+  <h1>Request not completed</h1>
+  <p>{{ message }}</p>
+  <a class="button button-primary" href="/">Return to queue</a>
+</section>
+{% endblock %}

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="audit-view">
+  <p class="eyebrow">Append-only events</p>
+  <h1>Audit</h1>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Request</th><th>Hash</th></tr></thead>
+      <tbody>
+      {% for entry in entries %}
+        <tr>
+          <td>{{ entry.occurred_at }}</td>
+          <td>{{ entry.actor }}</td>
+          <td>{{ entry.action }}</td>
+          <td>{{ entry.request_id or '' }}</td>
+          <td>{{ entry.payload_hash_prefix or '' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

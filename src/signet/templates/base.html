@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#123b2d">
+  <title>Signet</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/static/icons/signet-1254.png" type="image/png">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body data-vapid-public-key="{{ vapid_public_key|default('') }}">
+  <header class="app-header">
+    <a class="brand" href="/" aria-label="Signet queue">
+      <img src="/static/icons/signet-1254.png" width="42" height="42" alt="">
+      <span>Signet</span>
+    </a>
+    {% if principal %}
+    <nav aria-label="Primary">
+      <a href="/">Queue</a>
+      <a href="/audit">Audit</a>
+      <form action="/logout" method="post">
+        <input type="hidden" name="csrf_token" value="{{ logout_csrf }}">
+        <button class="button button-quiet" type="submit">Sign out</button>
+      </form>
+    </nav>
+    {% endif %}
+  </header>
+  <main class="app-main">
+    {% block content %}{% endblock %}
+  </main>
+  <div class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

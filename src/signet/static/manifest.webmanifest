@@ -1,0 +1,19 @@
+{
+  "name": "Signet",
+  "short_name": "Signet",
+  "description": "Private human approval queue",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f8f5",
+  "theme_color": "#123b2d",
+  "icons": [
+    {
+      "src": "/static/icons/signet-1254.png",
+      "sizes": "1254x1254",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
