@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 import secrets
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -11,8 +12,6 @@ from typing import Protocol
 from urllib.parse import urlparse
 
 import keyring
-from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
 
 class CredentialError(RuntimeError):
@@ -113,35 +112,25 @@ class TokenRecord:
 
 
 class TokenRegistry:
-    """Small Argon2-backed registry; raw bearer tokens are returned only once."""
+    """Registry for high-entropy machine tokens returned only once."""
 
-    def __init__(
-        self,
-        records: Iterable[TokenRecord] = (),
-        *,
-        password_hasher: PasswordHasher | None = None,
-    ) -> None:
+    def __init__(self, records: Iterable[TokenRecord] = ()) -> None:
         self._records = {record.token_id: record for record in records}
-        self._hasher = password_hasher or PasswordHasher(
-            time_cost=2,
-            memory_cost=19_456,
-            parallelism=1,
-            hash_len=32,
-            salt_len=16,
-        )
 
     def issue(self, namespace: str, allowed_aliases: Iterable[str]) -> IssuedToken:
         aliases = frozenset(allowed_aliases)
         if not namespace or not aliases or any(not alias for alias in aliases):
             raise CredentialError("namespace and at least one alias are required")
         token_id = secrets.token_urlsafe(12)
+        while token_id in self._records:
+            token_id = secrets.token_urlsafe(12)
         raw_secret = secrets.token_urlsafe(32)
         raw_token = f"sgt_{token_id}.{raw_secret}"
         self._records[token_id] = TokenRecord(
             token_id=token_id,
             namespace=namespace,
             allowed_aliases=aliases,
-            verifier=self._hasher.hash(raw_token),
+            verifier=_encode_machine_token_verifier(raw_token),
         )
         return IssuedToken(token_id=token_id, token=raw_token)
 
@@ -152,18 +141,21 @@ class TokenRegistry:
         if not authorization or not authorization.startswith("Bearer "):
             raise CredentialError("bearer authentication is required")
         raw_token = authorization.removeprefix("Bearer ")
-        if not raw_token.startswith("sgt_") or "." not in raw_token:
+        match = _MACHINE_TOKEN_PATTERN.fullmatch(raw_token)
+        if match is None:
             raise CredentialError("invalid bearer token")
-        token_id = raw_token[4:].split(".", 1)[0]
+        token_id = match.group("token_id")
         record = self._records.get(token_id)
-        if record is None or record.revoked or alias not in record.allowed_aliases:
-            # Keep a fixed-cost digest in the cheap rejection path.
-            hmac.compare_digest(hashlib.sha256(raw_token.encode()).digest(), bytes(32))
+        actual = hashlib.sha256(raw_token.encode("ascii")).digest()
+        expected = _decode_machine_token_verifier(record.verifier if record is not None else "")
+        secret_matches = hmac.compare_digest(actual, expected)
+        if (
+            record is None
+            or record.revoked
+            or alias not in record.allowed_aliases
+            or not secret_matches
+        ):
             raise CredentialError("invalid bearer token")
-        try:
-            self._hasher.verify(record.verifier, raw_token)
-        except (VerifyMismatchError, InvalidHashError):
-            raise CredentialError("invalid bearer token") from None
         return CallerPrincipal(
             namespace=record.namespace,
             allowed_aliases=record.allowed_aliases,
@@ -181,3 +173,23 @@ class TokenRegistry:
             verifier=record.verifier,
             revoked=True,
         )
+
+
+_MACHINE_TOKEN_PATTERN = re.compile(r"^sgt_(?P<token_id>[A-Za-z0-9_-]{16})\.[A-Za-z0-9_-]{43}$")
+_MACHINE_TOKEN_VERIFIER_PREFIX = "sha256$"
+
+
+def _encode_machine_token_verifier(raw_token: str) -> str:
+    return _MACHINE_TOKEN_VERIFIER_PREFIX + hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+
+
+def _decode_machine_token_verifier(verifier: str) -> bytes:
+    if not verifier.startswith(_MACHINE_TOKEN_VERIFIER_PREFIX):
+        return bytes(hashlib.sha256().digest_size)
+    encoded = verifier.removeprefix(_MACHINE_TOKEN_VERIFIER_PREFIX)
+    if len(encoded) != hashlib.sha256().digest_size * 2:
+        return bytes(hashlib.sha256().digest_size)
+    try:
+        return bytes.fromhex(encoded)
+    except ValueError:
+        return bytes(hashlib.sha256().digest_size)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -9,6 +10,7 @@ from signet.credential_broker import (
     CredentialError,
     MemorySecretStore,
     SecretReference,
+    TokenRecord,
     TokenRegistry,
 )
 
@@ -57,6 +59,8 @@ def test_raw_tokens_are_never_exported_or_represented() -> None:
     assert issued.token not in str(issued)
     assert issued.token not in exported
     assert issued.token.startswith("sgt_")
+    assert registry.export_records()[0].verifier.startswith("sha256$")
+    assert "$argon2" not in registry.export_records()[0].verifier
 
 
 def test_revoked_and_missing_tokens_fail_closed() -> None:
@@ -67,3 +71,56 @@ def test_revoked_and_missing_tokens_fail_closed() -> None:
         registry.authenticate(f"Bearer {issued.token}", alias="approvals")
     with pytest.raises(CredentialError, match="required"):
         registry.authenticate(None, alias="approvals")
+
+
+def test_machine_token_authentication_has_bounded_parallel_cost() -> None:
+    registry = TokenRegistry()
+    issued = registry.issue("profile:test", {"approvals"})
+    token_id = issued.token.removeprefix("sgt_").split(".", 1)[0]
+    wrong = f"sgt_{token_id}.{'A' * 43}"
+
+    def reject(_: int) -> bool:
+        try:
+            registry.authenticate(f"Bearer {wrong}", alias="approvals")
+        except CredentialError:
+            return True
+        return False
+
+    with ThreadPoolExecutor(max_workers=64) as executor:
+        assert all(executor.map(reject, range(2_048)))
+    assert (
+        registry.authenticate(f"Bearer {issued.token}", alias="approvals").namespace
+        == "profile:test"
+    )
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "sgt_short.secret",
+        f"sgt_{'a' * 16}.{'b' * 42}",
+        f"sgt_{'a' * 16}.{'b' * 44}",
+        f"sgt_{'a' * 15}!.{'b' * 43}",
+        f"sgt_{'a' * 16}.{'b' * 42}!",
+    ],
+)
+def test_machine_token_format_is_exact(token: str) -> None:
+    registry = TokenRegistry()
+    with pytest.raises(CredentialError, match="invalid"):
+        registry.authenticate(f"Bearer {token}", alias="approvals")
+
+
+def test_legacy_password_hash_token_records_fail_closed_without_verification() -> None:
+    registry = TokenRegistry(
+        [
+            TokenRecord(
+                token_id="abcdefghijklmnop",
+                namespace="profile:test",
+                allowed_aliases=frozenset({"approvals"}),
+                verifier="$argon2id$v=19$m=1073741824,t=99,p=99$invalid$invalid",
+            )
+        ]
+    )
+    token = f"sgt_abcdefghijklmnop.{'A' * 43}"
+    with pytest.raises(CredentialError, match="invalid"):
+        registry.authenticate(f"Bearer {token}", alias="approvals")

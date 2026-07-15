@@ -10,9 +10,10 @@ from typing import Any, cast
 import httpx
 import mcp.types as types
 import pytest
-from argon2 import PasswordHasher
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
 from starlette.testclient import TestClient
 
 from signet.app import main
@@ -23,6 +24,8 @@ from signet.policy import parse_policy
 from signet.runtime import (
     APPROVALS_ALIAS,
     MCPRuntime,
+    PrincipalConcurrencyLimiter,
+    PrincipalConcurrencyLimitMiddleware,
     RegistryTokenVerifier,
     RuntimeAssemblyError,
     assemble_mcp_runtime,
@@ -83,21 +86,11 @@ class RuntimeHarness:
 
 @pytest.fixture(scope="module")
 def auth() -> AuthFixture:
-    registry = TokenRegistry(
-        password_hasher=PasswordHasher(
-            time_cost=1,
-            memory_cost=32,
-            parallelism=1,
-            hash_len=16,
-            salt_len=8,
-        )
-    )
+    registry = TokenRegistry()
     return AuthFixture(
         registry=registry,
         all_aliases=registry.issue("profile:one", {"fastmail", APPROVALS_ALIAS}),
-        same_profile_second_token=registry.issue(
-            "profile:one", {"fastmail", APPROVALS_ALIAS}
-        ),
+        same_profile_second_token=registry.issue("profile:one", {"fastmail", APPROVALS_ALIAS}),
         approvals_only=registry.issue("profile:one", {APPROVALS_ALIAS}),
         fastmail_only=registry.issue("profile:one", {"fastmail"}),
     )
@@ -213,11 +206,14 @@ async def http_client(
     token: IssuedToken | None = None,
 ) -> AsyncIterator[httpx.AsyncClient]:
     headers = {"Authorization": f"Bearer {token.token}"} if token is not None else {}
-    async with runtime.app.router.lifespan_context(runtime.app), httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=runtime.app),
-        base_url="http://localhost:8789",
-        headers=headers,
-    ) as client:
+    async with (
+        runtime.app.router.lifespan_context(runtime.app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=runtime.app),
+            base_url="http://localhost:8789",
+            headers=headers,
+        ) as client,
+    ):
         yield client
 
 
@@ -301,9 +297,7 @@ async def test_bearer_auth_alias_scope_and_transport_security(auth: AuthFixture)
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
-        missing = await client.post(
-            "/mcp/fastmail", headers=headers, json=initialize_message()
-        )
+        missing = await client.post("/mcp/fastmail", headers=headers, json=initialize_message())
         assert missing.status_code == 401
         assert missing.headers["www-authenticate"].startswith("Bearer")
 
@@ -341,13 +335,80 @@ async def test_bearer_auth_alias_scope_and_transport_security(auth: AuthFixture)
 
 
 @pytest.mark.asyncio
+async def test_authenticated_token_concurrency_is_bounded_before_body_read() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        del scope, receive
+        entered.set()
+        await release.wait()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    middleware = PrincipalConcurrencyLimitMiddleware(
+        app,
+        limiter=PrincipalConcurrencyLimiter(1),
+    )
+    access = AccessToken(
+        token="<redacted>",
+        client_id="token-one",
+        subject="profile:one",
+        scopes=["signet:mcp:fastmail"],
+        claims={"token_id": "token-one"},
+    )
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp/fastmail",
+        "headers": [],
+        "user": AuthenticatedUser(access),
+    }
+    reads = 0
+    first_sent: list[dict[str, Any]] = []
+    second_sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal reads
+        reads += 1
+        return {"type": "http.request", "body": b"large", "more_body": False}
+
+    async def first_send(message: dict[str, Any]) -> None:
+        first_sent.append(message)
+
+    async def second_send(message: dict[str, Any]) -> None:
+        second_sent.append(message)
+
+    first = asyncio.create_task(middleware(scope, receive, first_send))  # type: ignore[arg-type]
+    await entered.wait()
+    await middleware(scope, receive, second_send)  # type: ignore[arg-type]
+    release.set()
+    await first
+
+    assert first_sent[0]["status"] == 204
+    assert second_sent[0]["status"] == 429
+    assert second_sent[1]["body"]
+    assert reads == 0
+
+    after_release: list[dict[str, Any]] = []
+
+    async def after_send(message: dict[str, Any]) -> None:
+        after_release.append(message)
+
+    await middleware(scope, receive, after_send)  # type: ignore[arg-type]
+    assert after_release[0]["status"] == 204
+
+
+@pytest.mark.asyncio
 async def test_stateful_alias_preserves_exact_profile_namespace(auth: AuthFixture) -> None:
     harness = make_runtime(auth)
     async with (
         http_client(harness.runtime, auth.all_aliases) as client,
-        streamable_http_client(
-            "http://localhost:8789/mcp/fastmail", http_client=client
-        ) as (read_stream, write_stream, get_session_id),
+        streamable_http_client("http://localhost:8789/mcp/fastmail", http_client=client) as (
+            read_stream,
+            write_stream,
+            get_session_id,
+        ),
         ClientSession(read_stream, write_stream) as session,
     ):
         initialized = await session.initialize()
@@ -362,9 +423,7 @@ async def test_stateful_alias_preserves_exact_profile_namespace(auth: AuthFixtur
             "namespace": "profile:one",
         }
 
-    assert harness.alias_calls == [
-        ("fastmail", "read_mail", {}, "profile:one")
-    ]
+    assert harness.alias_calls == [("fastmail", "read_mail", {}, "profile:one")]
 
 
 @pytest.mark.asyncio
@@ -476,9 +535,7 @@ async def test_client_cancellation_reaches_in_flight_tool_handler(auth: AuthFixt
         await asyncio.wait_for(started.wait(), timeout=2)
         session_id = get_session_id()
         assert session_id is not None
-        response = await client.delete(
-            "/mcp/fastmail", headers={"Mcp-Session-Id": session_id}
-        )
+        response = await client.delete("/mcp/fastmail", headers={"Mcp-Session-Id": session_id})
         assert response.status_code == 200
         await asyncio.wait_for(cancelled.wait(), timeout=2)
         task.cancel()
@@ -491,9 +548,11 @@ async def test_approvals_surface_is_stateless_and_uses_active_profile(auth: Auth
     harness = make_runtime(auth)
     async with (
         http_client(harness.runtime, auth.approvals_only) as client,
-        streamable_http_client(
-            "http://localhost:8789/mcp/approvals", http_client=client
-        ) as (read_stream, write_stream, get_session_id),
+        streamable_http_client("http://localhost:8789/mcp/approvals", http_client=client) as (
+            read_stream,
+            write_stream,
+            get_session_id,
+        ),
         ClientSession(read_stream, write_stream) as session,
     ):
         await session.initialize()
@@ -519,17 +578,13 @@ async def test_json_mode_and_default_sse_mode_are_both_supported(auth: AuthFixtu
     }
     sse_harness = make_runtime(auth)
     async with http_client(sse_harness.runtime, auth.all_aliases) as client:
-        response = await client.post(
-            "/mcp/fastmail", headers=headers, json=initialize_message()
-        )
+        response = await client.post("/mcp/fastmail", headers=headers, json=initialize_message())
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
 
     json_harness = make_runtime(auth, json_response=True)
     async with http_client(json_harness.runtime, auth.all_aliases) as client:
-        response = await client.post(
-            "/mcp/fastmail", headers=headers, json=initialize_message()
-        )
+        response = await client.post("/mcp/fastmail", headers=headers, json=initialize_message())
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("application/json")
         assert response.headers.get("mcp-session-id")
@@ -548,9 +603,12 @@ async def test_registry_verifier_redacts_raw_token_and_enforces_alias(auth: Auth
         "token_id": auth.all_aliases.token_id,
     }
     assert auth.all_aliases.token not in repr(verified)
-    assert await RegistryTokenVerifier(
-        auth.registry, alias="fastmail"
-    ).verify_token(auth.approvals_only.token) is None
+    assert (
+        await RegistryTokenVerifier(auth.registry, alias="fastmail").verify_token(
+            auth.approvals_only.token
+        )
+        is None
+    )
 
 
 def test_cli_requires_explicit_factory_and_mcp_loopback() -> None:
@@ -595,6 +653,7 @@ def test_cli_runs_only_the_explicit_factory(command: str, default_port: int) -> 
                 "host": "127.0.0.1",
                 "port": default_port,
                 "server_header": False,
+                "limit_concurrency": 64,
             },
         )
     ]

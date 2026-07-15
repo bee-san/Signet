@@ -38,7 +38,10 @@ from signet.credential_broker import (
     TokenRegistry,
 )
 from signet.gateway_tools import GatewayPrincipal, GatewayToolSurface
-from signet.http_security import RequestBodyLimitMiddleware
+from signet.http_security import (
+    RequestBodyLimitMiddleware,
+    RequestConcurrencyLimitMiddleware,
+)
 from signet.mcp_mirror import AliasToolSurface
 
 APPROVALS_ALIAS = "approvals"
@@ -71,9 +74,7 @@ class RegistryTokenVerifier:
 
     async def verify_token(self, token: str) -> AccessToken | None:
         try:
-            principal = await anyio.to_thread.run_sync(
-                lambda: self._registry.authenticate(f"Bearer {token}", alias=self._alias)
-            )
+            principal = self._registry.authenticate(f"Bearer {token}", alias=self._alias)
         except CredentialError:
             return None
         return AccessToken(
@@ -155,6 +156,63 @@ class CallerContextMiddleware:
             _current_caller.reset(context_token)
 
 
+class PrincipalConcurrencyLimiter:
+    """Bound concurrent parsed MCP work for each authenticated token."""
+
+    def __init__(self, maximum: int) -> None:
+        if maximum < 1 or maximum > 64:
+            raise RuntimeAssemblyError("per-token concurrency limit must be 1 to 64")
+        self._maximum = maximum
+        self._semaphores: dict[str, anyio.Semaphore] = {}
+
+    async def run(
+        self,
+        app: ASGIApp,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        user = scope.get("user")
+        token_id = (
+            (user.access_token.claims or {}).get("token_id")
+            if isinstance(user, AuthenticatedUser)
+            else None
+        )
+        if not isinstance(token_id, str):
+            await app(scope, receive, send)
+            return
+        semaphore = self._semaphores.setdefault(token_id, anyio.Semaphore(self._maximum))
+        try:
+            semaphore.acquire_nowait()
+        except anyio.WouldBlock:
+            response = JSONResponse(
+                {
+                    "error": "rate_limited",
+                    "error_description": "Too many concurrent requests for this token",
+                },
+                status_code=429,
+                headers={"Cache-Control": "no-store", "Retry-After": "1"},
+            )
+            await response(scope, receive, send)
+            return
+        try:
+            await app(scope, receive, send)
+        finally:
+            semaphore.release()
+
+
+class PrincipalConcurrencyLimitMiddleware:
+    def __init__(self, app: ASGIApp, *, limiter: PrincipalConcurrencyLimiter) -> None:
+        self._app = app
+        self._limiter = limiter
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        await self._limiter.run(self._app, scope, receive, send)
+
+
 class _ManagerEndpoint:
     """Call the SDK manager and retire explicitly terminated stateful sessions."""
 
@@ -231,6 +289,8 @@ def assemble_mcp_runtime(
     bind_port: int = 8789,
     session_idle_timeout: float = 30 * 60,
     json_response: bool = False,
+    request_concurrency_limit: int = 32,
+    per_token_concurrency_limit: int = 8,
 ) -> MCPRuntime:
     """Assemble a local MCP ASGI app without contacting downstream providers."""
 
@@ -239,6 +299,8 @@ def assemble_mcp_runtime(
         raise RuntimeAssemblyError("the MCP port must be between 1024 and 65535")
     if session_idle_timeout < 60 or session_idle_timeout > 30 * 60:
         raise RuntimeAssemblyError("the MCP session idle timeout must be 60 to 1800 seconds")
+    if request_concurrency_limit < 1 or request_concurrency_limit > 256:
+        raise RuntimeAssemblyError("request concurrency limit must be 1 to 256")
     if APPROVALS_ALIAS in aliases:
         raise RuntimeAssemblyError("the approvals alias is reserved for gateway-owned tools")
 
@@ -278,18 +340,21 @@ def assemble_mcp_runtime(
     )
 
     routes: list[Route] = []
+    principal_limiter = PrincipalConcurrencyLimiter(per_token_concurrency_limit)
     for alias, manager in managers.items():
         bound_surface = aliases.get(alias)
         endpoint: ASGIApp = _ManagerEndpoint(
             manager,
-            on_session_closed=(
-                bound_surface.retire_session if bound_surface is not None else None
-            ),
+            on_session_closed=(bound_surface.retire_session if bound_surface is not None else None),
             session_limit=(
                 bound_surface.tracked_session_limit if bound_surface is not None else None
             ),
         )
         endpoint = RequireAuthMiddleware(endpoint, required_scopes=[_alias_scope(alias)])
+        endpoint = PrincipalConcurrencyLimitMiddleware(
+            endpoint,
+            limiter=principal_limiter,
+        )
         endpoint = CallerContextMiddleware(endpoint, alias=alias)
         endpoint = AuthenticationMiddleware(
             endpoint,
@@ -326,6 +391,11 @@ def assemble_mcp_runtime(
         debug=False,
         routes=routes,
         middleware=[
+            Middleware(
+                RequestConcurrencyLimitMiddleware,
+                maximum=request_concurrency_limit,
+                exempt_paths=frozenset({"/healthz"}),
+            ),
             Middleware(RequestBodyLimitMiddleware, default_limit=16 * 1024 * 1024),
             Middleware(LoopbackHostMiddleware, allowed_hosts=allowed_hosts),
         ],

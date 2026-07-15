@@ -4,12 +4,51 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import anyio
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
 class _BodyTooLarge(Exception):
     pass
+
+
+class RequestConcurrencyLimitMiddleware:
+    """Reject excess in-flight requests before their bodies are consumed."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        maximum: int,
+        exempt_paths: frozenset[str] = frozenset(),
+    ) -> None:
+        if maximum < 1 or maximum > 256:
+            raise ValueError("request concurrency limit is invalid")
+        if any(not path.startswith("/") for path in exempt_paths):
+            raise ValueError("request concurrency exemptions are invalid")
+        self._app = app
+        self._semaphore = anyio.Semaphore(maximum)
+        self._exempt_paths = exempt_paths
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") in self._exempt_paths:
+            await self._app(scope, receive, send)
+            return
+        try:
+            self._semaphore.acquire_nowait()
+        except anyio.WouldBlock:
+            response = Response(
+                "Too Many Requests",
+                status_code=429,
+                headers={"Cache-Control": "no-store", "Retry-After": "1"},
+            )
+            await response(scope, receive, send)
+            return
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            self._semaphore.release()
 
 
 class RequestBodyLimitMiddleware:
@@ -26,10 +65,7 @@ class RequestBodyLimitMiddleware:
             raise ValueError("default request body limit is invalid")
         selected = dict(route_limits or {})
         if any(
-            not method
-            or not path.startswith("/")
-            or limit <= 0
-            or limit > 64 * 1024 * 1024
+            not method or not path.startswith("/") or limit <= 0 or limit > 64 * 1024 * 1024
             for (method, path), limit in selected.items()
         ):
             raise ValueError("route request body limits are invalid")

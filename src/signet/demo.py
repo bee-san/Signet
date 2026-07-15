@@ -886,6 +886,7 @@ async def serve_demo(
                 port=mcp_port,
                 server_header=False,
                 timeout_graceful_shutdown=DEMO_GRACEFUL_SHUTDOWN_SECONDS,
+                limit_concurrency=64,
                 access_log=False,
                 log_level="critical",
             )
@@ -897,6 +898,7 @@ async def serve_demo(
                 port=web_port,
                 server_header=False,
                 timeout_graceful_shutdown=DEMO_GRACEFUL_SHUTDOWN_SECONDS,
+                limit_concurrency=64,
                 access_log=False,
                 log_level="critical",
             )

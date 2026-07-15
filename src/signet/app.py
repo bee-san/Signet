@@ -47,6 +47,7 @@ def main(
         host=args.host,
         port=args.port,
         server_header=False,
+        limit_concurrency=args.limit_concurrency,
     )
 
 
@@ -76,3 +77,10 @@ def _factory_arguments(
     )
     parser.add_argument("--host", default=default_host)
     parser.add_argument("--port", type=int, choices=range(1024, 65536), default=default_port)
+    parser.add_argument(
+        "--limit-concurrency",
+        type=int,
+        choices=range(1, 257),
+        default=64,
+        help="maximum concurrent server tasks before admission is refused",
+    )

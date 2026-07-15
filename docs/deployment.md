@@ -104,7 +104,7 @@ the reviewed components. It must:
 3. initialize the database with a verified pre-migration backup callback;
 4. resolve high-entropy session, proof-capability, payload, TOTP, VAPID, downstream,
    and backup secrets at their narrow use sites without printing them;
-5. persist the Argon2 verifier records for profile-scoped MCP caller tokens and
+5. persist the SHA-256 verifier records for random profile-scoped MCP caller tokens and
    load them into `TokenRegistry`; the raw token is returned once and belongs only
    in Hermes' reviewed secret mechanism;
 6. load the exact policy and captured schema digests, leaving drifted/unreviewed
@@ -123,6 +123,12 @@ the reviewed components. It must:
    shutdown;
 12. default to disabled/fake downstreams until the explicit cutover flag and every
     readiness prerequisite are independently satisfied.
+
+MCP caller-token verifiers created before the SHA-256 machine-token format are
+rejected without running their legacy password hash. Rotate and reissue those
+random bearer tokens during the upgrade, then update Hermes' secret value before
+retiring the old record. Human password verifiers remain Argon2id and are not
+affected.
 
 Do not retrieve secrets at import time, store them in global reprs, add them to
 launchd `EnvironmentVariables`, or pass them in process arguments. Ordinary
