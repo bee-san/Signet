@@ -108,6 +108,13 @@ jobs:
           not wacli_wrapper_rehashes_open_descriptor and
           not wacli_wrapper_rejects_media_outside and
           not wacli_wrapper_rejects_symlinked_media'
+      - name: Check demo backup lock boundaries
+        run: >-
+          uv run pytest -q
+          tests/test_demo.py::test_demo_serve_lock_rejects_links_and_reuses_stale_regular_file
+          tests/test_demo.py::test_demo_backup_maintenance_lock_is_marker_guarded_safe_and_reusable
+          tests/test_demo.py::test_active_backup_lock_blocks_abandoned_pin_release_atomically
+          tests/test_demo.py::test_offline_operations_under_serve_lock_never_recover_execution
       - name: Render and lint inactive launchd plists without installing them
         shell: bash
         run: |
