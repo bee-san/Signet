@@ -13,8 +13,10 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 
 import yaml
+from yaml.composer import ComposerError
 from yaml.constructor import ConstructorError
-from yaml.nodes import MappingNode
+from yaml.events import AliasEvent, ScalarEvent
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from signet.canonical import canonical_json
 
@@ -24,7 +26,129 @@ class PolicyError(ValueError):
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
-    """Safe YAML loader that refuses ambiguous duplicate mapping keys."""
+    """Safe YAML loader with bounded composition and unique mapping keys."""
+
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream)
+        self._policy_alias_count = 0
+        self._policy_node_count = 0
+        self._policy_compose_depth = 0
+
+    def compose_node(self, parent: Node | None, index: Any) -> Node:
+        peek_event: Callable[[], Any] = self.peek_event
+        check_event = cast(Callable[[type[Any]], bool], self.check_event)
+        event = peek_event()
+        alias = check_event(AliasEvent)
+        self._policy_compose_depth += 1
+        try:
+            if self._policy_compose_depth > _MAX_POLICY_YAML_DEPTH:
+                raise _policy_yaml_composer_error(
+                    "policy YAML exceeds its nesting-depth limit",
+                    event,
+                )
+            anchor = getattr(event, "anchor", None)
+            if isinstance(anchor, str) and len(anchor) > _MAX_POLICY_ANCHOR_LENGTH:
+                raise _policy_yaml_composer_error(
+                    "policy YAML exceeds its anchor-name limit",
+                    event,
+                )
+            if alias:
+                self._policy_alias_count += 1
+                if self._policy_alias_count > _MAX_POLICY_YAML_ALIASES:
+                    raise _policy_yaml_composer_error(
+                        "policy YAML exceeds its alias limit",
+                        event,
+                    )
+            else:
+                self._policy_node_count += 1
+                if self._policy_node_count > _MAX_POLICY_YAML_NODES:
+                    raise _policy_yaml_composer_error(
+                        "policy YAML exceeds its node limit",
+                        event,
+                    )
+                if isinstance(event, ScalarEvent) and len(event.value) > _MAX_POLICY_SCALAR_LENGTH:
+                    raise _policy_yaml_composer_error(
+                        "policy YAML exceeds its scalar-length limit",
+                        event,
+                    )
+            return cast(Node, super().compose_node(parent, index))
+        finally:
+            self._policy_compose_depth -= 1
+
+    def get_single_data(self) -> Any:
+        node = self.get_single_node()
+        if node is None:
+            return None
+        _validate_policy_node_graph(node)
+        construct_document = cast(Callable[[Node], Any], self.construct_document)
+        return construct_document(node)
+
+
+_MAX_POLICY_YAML_BYTES = 4 * 1024 * 1024
+_MAX_POLICY_YAML_ALIASES = 128
+_MAX_POLICY_YAML_NODES = 50_000
+_MAX_POLICY_YAML_EXPANDED_NODES = 100_000
+_MAX_POLICY_SCALAR_LENGTH = 16 * 1024
+_MAX_POLICY_ANCHOR_LENGTH = 256
+_MAX_POLICY_YAML_DEPTH = 32
+
+
+def _policy_yaml_composer_error(problem: str, event: Any) -> ComposerError:
+    mark = getattr(event, "start_mark", None)
+    return ComposerError("while composing policy YAML", mark, problem, mark)
+
+
+def _validate_policy_node_graph(root: Node) -> None:
+    expanded_nodes = 0
+    active: set[int] = set()
+
+    def visit(node: Node, depth: int) -> None:
+        nonlocal expanded_nodes
+        if depth > _MAX_POLICY_YAML_DEPTH:
+            raise ComposerError(
+                "while reviewing policy YAML aliases",
+                node.start_mark,
+                "policy YAML aliases exceed the nesting-depth limit",
+                node.start_mark,
+            )
+        identity = id(node)
+        if identity in active:
+            raise ComposerError(
+                "while reviewing policy YAML aliases",
+                node.start_mark,
+                "recursive policy YAML aliases are forbidden",
+                node.start_mark,
+            )
+        expanded_nodes += 1
+        if expanded_nodes > _MAX_POLICY_YAML_EXPANDED_NODES:
+            raise ComposerError(
+                "while reviewing policy YAML aliases",
+                node.start_mark,
+                "policy YAML alias expansion exceeds its node limit",
+                node.start_mark,
+            )
+        if isinstance(node, ScalarNode):
+            return
+        active.add(identity)
+        try:
+            if isinstance(node, SequenceNode):
+                for child in node.value:
+                    visit(child, depth + 1)
+            elif isinstance(node, MappingNode):
+                for key, value in node.value:
+                    visit(key, depth + 1)
+                    visit(value, depth + 1)
+            else:  # pragma: no cover - SafeLoader composes only these node types
+                raise ComposerError(
+                    "while reviewing policy YAML",
+                    node.start_mark,
+                    "policy YAML contains an unsupported node type",
+                    node.start_mark,
+                )
+        finally:
+            active.remove(identity)
+
+    visit(root, 1)
 
 
 def _construct_unique_mapping(
@@ -557,7 +681,9 @@ def parse_policy(data: Any) -> PolicySnapshot:
 
 def load_policy(path: Path) -> PolicySnapshot:
     try:
-        return parse_policy_yaml(path.read_bytes())
+        with path.open("rb") as stream:
+            document = stream.read(_MAX_POLICY_YAML_BYTES + 1)
+        return parse_policy_yaml(document)
     except UnicodeDecodeError as exc:
         raise PolicyError(f"invalid UTF-8 YAML in {path}") from exc
     except yaml.YAMLError as exc:
@@ -567,6 +693,8 @@ def load_policy(path: Path) -> PolicySnapshot:
 def parse_policy_yaml(document: bytes) -> PolicySnapshot:
     if not isinstance(document, bytes) or not document:
         raise PolicyError("policy YAML must be non-empty bytes")
+    if len(document) > _MAX_POLICY_YAML_BYTES:
+        raise PolicyError("policy YAML exceeds its byte limit")
     loader = _UniqueKeySafeLoader(document.decode("utf-8", errors="strict"))
     dispose = cast(Callable[[], None], loader.dispose)
     try:
