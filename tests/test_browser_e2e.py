@@ -645,6 +645,9 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
             page.evaluate("document.documentElement.style.zoom = '2'")
             _assert_layout(page)
             page.evaluate("document.documentElement.style.zoom = ''")
+            page.emulate_media(forced_colors="active")
+            _assert_layout(page)
+            page.emulate_media(forced_colors="none")
             page.set_viewport_size({"width": 1440, "height": 900})
 
             _submit_decision(
