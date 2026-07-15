@@ -514,9 +514,12 @@ def parse_policy(data: Any) -> PolicySnapshot:
                 if classification_value is not None
                 else None
             )
-            if reviewed_classification is not None and mode is not PolicyMode.DENY:
+            if reviewed_classification is not None and mode not in {
+                PolicyMode.DENY,
+                PolicyMode.APPROVAL,
+            }:
                 raise PolicyError(
-                    f"reviewed classification is only valid for denied tool {alias}/{name}"
+                    f"reviewed classification is invalid for {mode.value} tool {alias}/{name}"
                 )
             if mode is PolicyMode.VIRTUALIZE_LOCAL and tool_account_ref is None:
                 raise PolicyError(f"virtualize_local requires account_ref for {alias}/{name}")
@@ -725,7 +728,9 @@ class PolicyEngine:
             current.reviewed_read_only if reviewed_read_only is None else reviewed_read_only
         )
         if mode is PolicyMode.PASSTHROUGH and (
-            current.communication_send or not effective_read_only
+            current.communication_send
+            or not effective_read_only
+            or current.reviewed_classification is not None
         ):
             raise PolicyError("passthrough is limited to reviewed read-only tools")
         if mode in {PolicyMode.APPROVAL, PolicyMode.VIRTUALIZE_LOCAL} and not current.adapter:

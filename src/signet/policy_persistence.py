@@ -617,7 +617,9 @@ class SQLitePolicyPromotionBoundary:
                 raise PolicyError("only a discovered, reviewed tool can be promoted")
             mode = (
                 PolicyMode.PASSTHROUGH
-                if current.reviewed_read_only and not current.communication_send
+                if current.reviewed_read_only
+                and not current.communication_send
+                and current.reviewed_classification is None
                 else PolicyMode.APPROVAL
             )
             origin = "request_tool_access"
@@ -645,6 +647,19 @@ class SQLitePolicyPromotionBoundary:
         except PolicyError as exc:
             raise PolicyPersistenceError("reviewed policy promotion was refused") from exc
         serialized = dump_policy(snapshot)
+        try:
+            serialized_snapshot = _parse_snapshot(serialized)
+        except PolicyDivergenceError as exc:
+            raise PolicyPersistenceError(
+                "reviewed policy promotion cannot be serialized safely"
+            ) from exc
+        if serialized_snapshot != snapshot or not _same_text(
+            policy_config_hash(serialized_snapshot),
+            policy_config_hash(snapshot),
+        ):
+            raise PolicyPersistenceError(
+                "reviewed policy promotion changed during strict serialization"
+            )
         with self.database.read() as connection:
             self._require_history_capacity(
                 connection,

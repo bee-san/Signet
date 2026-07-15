@@ -21,6 +21,7 @@ from signet.mcp_mirror import SchemaMirror
 from signet.models import InvalidConfirmation
 from signet.policy import (
     PolicyEngine,
+    PolicyError,
     PolicyMode,
     PolicySnapshot,
     dump_policy,
@@ -818,6 +819,66 @@ def test_writeback_preserves_every_strict_security_field(
         key: value for key, value in before_tool.items() if key != "mode"
     }
     assert policy_config_hash(after_snapshot) != policy_config_hash(_snapshot())
+
+
+def test_destructive_review_context_survives_approval_promotion_and_restart(
+    tmp_path: Path,
+) -> None:
+    bundle = _assemble_enrolled(Database(tmp_path / "classified.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    document = policy_document(_snapshot())
+    document["downstreams"]["fake-service"]["tools"]["create_item"]["reviewed_classification"] = (
+        "destructive"
+    )
+    initial = parse_policy(document)
+    _write_policy(policy_path, initial)
+    _install(bundle, policy_path)
+    request_id = bundle.enqueue()
+    token, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "promote_approval",
+            "fake:799",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+        == "policy_updated"
+    )
+    promoted = load_policy(policy_path).configured("fake-service", "create_item")
+    assert promoted is not None
+    assert promoted.mode is PolicyMode.APPROVAL
+    assert promoted.reviewed_classification == "destructive"
+
+    restarted = assemble(Database(bundle.database.path), adapter=bundle.adapter)
+    restarted.backend.authenticate(token, now=NOW + 2)
+    recovered = _install(restarted, policy_path)
+    assert recovered.boundary.ready
+    restored = recovered.engine.snapshot.configured("fake-service", "create_item")
+    assert restored is not None and restored.reviewed_classification == "destructive"
+
+
+def test_denial_classification_cannot_be_carried_into_passthrough() -> None:
+    document = policy_document(_snapshot())
+    tool = document["downstreams"]["fake-service"]["tools"]["create_item"]
+    tool["reviewed_classification"] = "destructive"
+    engine = PolicyEngine(parse_policy(document))
+
+    with pytest.raises(PolicyError, match="reviewed read-only"):
+        engine.preview_promotion(
+            "fake-service",
+            "create_item",
+            PolicyMode.PASSTHROUGH,
+        )
+
+    tool["mode"] = "passthrough"
+    with pytest.raises(PolicyError, match="reviewed classification"):
+        parse_policy(document)
 
 
 def test_policy_lock_hardlink_is_rejected_without_chmodding_target(tmp_path: Path) -> None:
