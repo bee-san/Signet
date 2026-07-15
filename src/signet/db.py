@@ -12,11 +12,18 @@ import fcntl
 import hashlib
 import os
 import re
+import stat
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from signet.private_paths import (
+    PrivatePathError,
+    ensure_owned_directory,
+    ensure_private_directory,
+)
 
 try:  # pragma: no cover - selection depends on the runtime build
     import pysqlite3 as sqlite3  # type: ignore[import-not-found]
@@ -67,7 +74,7 @@ class Database:
     ):
         if timeout < 0.1 or timeout > 60:
             raise ValueError("SQLite timeout must be between 0.1 and 60 seconds")
-        self.path = Path(path)
+        self.path = Path(path).expanduser().absolute()
         self.timeout = timeout
 
     @property
@@ -87,15 +94,27 @@ class Database:
         partially understood state machine.
         """
 
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.path.parent, 0o700)
+        try:
+            parent = ensure_private_directory(self.path.parent)
+        except PrivatePathError as exc:
+            raise DatabaseError("the database parent must be an owned mode-0700 directory") from exc
+        self.path = parent / self.path.name
         _require_local_filesystem(self.path.parent)
         if self.path.is_symlink():
             raise DatabaseError("the approval database may not be a symbolic link")
         if not self.path.exists():
-            descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            descriptor = os.open(
+                self.path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            os.fchmod(descriptor, 0o600)
             os.close(descriptor)
-        os.chmod(self.path, 0o600)
+        _require_private_file(self.path, label="approval database")
 
         with self._maintenance_lock():
             self._initialize_locked(
@@ -103,7 +122,7 @@ class Database:
                 pre_migration_backup=pre_migration_backup,
             )
 
-        os.chmod(self.path, 0o600)
+        _require_private_file(self.path, label="approval database")
 
     def _initialize_locked(
         self,
@@ -162,9 +181,14 @@ class Database:
     @contextmanager
     def _maintenance_lock(self) -> Iterator[None]:
         lock_path = self.path.with_name(f".{self.path.name}.maintenance.lock")
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        os.chmod(lock_path, 0o600)
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
         try:
+            if not _private_file_metadata(os.fstat(descriptor)):
+                raise DatabaseError("the database maintenance lock is unsafe")
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             yield
         finally:
@@ -226,17 +250,30 @@ class Database:
         deployment backup.
         """
 
-        destination_path = Path(destination)
+        destination_path = Path(destination).expanduser().absolute()
         if destination_path.resolve() == self.path.resolve():
             raise DatabaseError("a backup snapshot must use a separate path")
-        destination_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(destination_path.parent, 0o700)
+        try:
+            ensure_owned_directory(destination_path.parent)
+        except PrivatePathError as exc:
+            raise DatabaseError(
+                "backup snapshot parent must be owned and not writable by others"
+            ) from exc
         if destination_path.exists() or destination_path.is_symlink():
             raise DatabaseError("backup snapshot destination already exists")
         temporary = destination_path.with_name(f".{destination_path.name}.partial")
         if temporary.exists() or temporary.is_symlink():
             raise DatabaseError("backup snapshot temporary path already exists")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        os.fchmod(descriptor, 0o600)
         os.close(descriptor)
 
         source = self._connect()
@@ -257,7 +294,7 @@ class Database:
         finally:
             source.close()
 
-        os.chmod(temporary, 0o600)
+        _require_private_file(temporary, label="backup snapshot")
         descriptor = os.open(temporary, os.O_RDONLY)
         try:
             os.fsync(descriptor)
@@ -415,6 +452,31 @@ class Database:
                 raise MigrationIntegrityError(
                     f"migration {version} checksum does not match the database"
                 )
+
+
+def _require_private_file(path: Path, *, label: str) -> None:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise DatabaseError(f"the {label} is unavailable or unsafe") from exc
+    try:
+        if not _private_file_metadata(os.fstat(descriptor)):
+            raise DatabaseError(f"the {label} must be an owned mode-0600 regular file")
+    finally:
+        os.close(descriptor)
+
+
+def _private_file_metadata(metadata: os.stat_result) -> bool:
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == current_uid
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+    )
 
 
 def _sql_statements(script: str) -> Iterator[str]:

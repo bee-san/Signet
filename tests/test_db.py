@@ -133,6 +133,47 @@ def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Pat
     assert all(len(migration["checksum"]) == 64 for migration in migrations)
 
 
+def test_database_refuses_unsafe_existing_parent_without_changing_mode(
+    tmp_path: Path,
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o1777)
+
+    with pytest.raises(DatabaseError, match="mode-0700"):
+        Database(shared / "approvals.sqlite3").initialize()
+
+    assert os.stat(shared).st_mode & 0o7777 == 0o1777
+    assert not (shared / "approvals.sqlite3").exists()
+
+
+def test_database_refuses_unsafe_existing_file_without_changing_mode(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "data"
+    parent.mkdir(mode=0o700)
+    path = parent / "approvals.sqlite3"
+    path.write_bytes(b"not a private database")
+    path.chmod(0o640)
+
+    with pytest.raises(DatabaseError, match="mode-0600"):
+        Database(path).initialize()
+
+    assert os.stat(path).st_mode & 0o777 == 0o640
+
+
+def test_database_refuses_symlinked_parent(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(DatabaseError, match="mode-0700"):
+        Database(linked / "approvals.sqlite3").initialize()
+
+    assert not (target / "approvals.sqlite3").exists()
+
+
 def test_runtime_refuses_an_unverified_sqlite_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -190,7 +231,7 @@ def test_backup_snapshot_restores_into_a_separate_verified_path(tmp_path: Path) 
     Database.verify_snapshot(snapshot)
 
     restored = Database(tmp_path / "restored" / "approvals.sqlite3")
-    restored.path.parent.mkdir(parents=True)
+    restored.path.parent.mkdir(parents=True, mode=0o700)
     snapshot.replace(restored.path)
     restored.initialize()
     assert ApprovalStateMachine(restored).get_request("backup-fixture")["state"] == (
@@ -267,10 +308,7 @@ def test_retention_trigger_migration_is_atomic_and_restartable(tmp_path: Path) -
     )
     assert backed_up_versions == [3]
     with database.read() as connection:
-        assert (
-            connection.execute("PRAGMA user_version").fetchone()[0]
-            == LATEST_SCHEMA_VERSION
-        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
         trigger = connection.execute(
             """
             SELECT sql FROM sqlite_schema
@@ -322,9 +360,12 @@ def test_upgrade_requires_and_runs_a_verified_pre_migration_backup(
     assert snapshots
     with upgrading.read() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-        assert connection.execute(
-            "SELECT count(*) FROM sqlite_schema WHERE name = 'upgrade_marker'"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'upgrade_marker'"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_newer_schema_is_refused_before_application_work(tmp_path: Path) -> None:
@@ -421,9 +462,7 @@ def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None
         )
     )
     with database.transaction() as connection:
-        connection.execute(
-            "INSERT INTO auth_users(user_id, created_at) VALUES ('owner', 100)"
-        )
+        connection.execute("INSERT INTO auth_users(user_id, created_at) VALUES ('owner', 100)")
         connection.execute(
             """
             INSERT INTO auth_credentials(
@@ -576,9 +615,7 @@ def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None
     with database.read() as connection:
         states = {
             row["request_id"]: row["state"]
-            for row in connection.execute(
-                "SELECT request_id, state FROM approval_requests"
-            )
+            for row in connection.execute("SELECT request_id, state FROM approval_requests")
         }
         assert connection.execute("SELECT count(*) FROM execution_attempts").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM result_aliases").fetchone()[0] == 1
