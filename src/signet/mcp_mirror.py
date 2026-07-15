@@ -5,9 +5,11 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import re
+import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import mcp.types as types
 from jsonschema import Draft202012Validator
@@ -31,6 +33,10 @@ PENDING_RESULT_SCHEMA: dict[str, Any] = {
         "message": {"type": "string", "minLength": 1},
     },
 }
+SIGNET_INVOCATION_ID_META = "io.signet/invocation-id"
+_EXPLICIT_INVOCATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+_MAX_IDENTITY_COMPONENT_BYTES = 512
 
 
 class MirrorError(RuntimeError):
@@ -41,12 +47,98 @@ class SchemaDriftError(MirrorError):
     pass
 
 
+class InvocationIdentityError(MirrorError):
+    pass
+
+
 class DomainToolError(MirrorError):
     def __init__(self, code: str, message: str, *, details: Mapping[str, Any] | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.details = dict(details or {})
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class InvocationIdentity:
+    """A one-way, caller/tool-scoped key suitable for durable idempotency."""
+
+    invocation_key: str
+    source: Literal["explicit", "session_request"]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.invocation_key, str)
+            or not _SHA256_RE.fullmatch(self.invocation_key)
+            or not isinstance(self.source, str)
+            or self.source not in {"explicit", "session_request"}
+        ):
+            raise InvocationIdentityError("invocation identity is invalid")
+
+    def __repr__(self) -> str:
+        return f"InvocationIdentity(source={self.source!r}, invocation_key=<redacted>)"
+
+
+def derive_invocation_identity(
+    *,
+    namespace: str,
+    alias: str,
+    tool: str,
+    explicit_id: object | None,
+    explicit_id_present: bool,
+    session_scope: str,
+    request_id: str | int,
+) -> InvocationIdentity:
+    """Validate identity inputs and return only their domain-separated digest."""
+
+    for value in (namespace, alias, tool):
+        if not _bounded_identity_text(value):
+            raise InvocationIdentityError("invocation scope is invalid")
+    if explicit_id_present:
+        if not isinstance(explicit_id, str) or not _EXPLICIT_INVOCATION_ID_RE.fullmatch(
+            explicit_id
+        ):
+            raise InvocationIdentityError("explicit invocation ID is invalid")
+        source: Literal["explicit", "session_request"] = "explicit"
+        source_value: object = explicit_id
+    else:
+        if not _bounded_identity_text(session_scope):
+            raise InvocationIdentityError("session invocation scope is invalid")
+        if isinstance(request_id, bool) or not isinstance(request_id, str | int):
+            raise InvocationIdentityError("JSON-RPC request ID is invalid")
+        if isinstance(request_id, str):
+            if not _bounded_identity_text(request_id):
+                raise InvocationIdentityError("JSON-RPC request ID is invalid")
+            normalized_request_id: object = {"kind": "string", "value": request_id}
+        else:
+            if request_id < -(2**63) or request_id > 2**63 - 1:
+                raise InvocationIdentityError("JSON-RPC request ID is invalid")
+            normalized_request_id = {"kind": "integer", "value": request_id}
+        source = "session_request"
+        source_value = {
+            "session_scope": session_scope,
+            "request_id": normalized_request_id,
+        }
+    material = canonical_json(
+        {
+            "domain": "signet/invocation-identity/v1",
+            "namespace": namespace,
+            "alias": alias,
+            "tool": tool,
+            "source": source,
+            "value": source_value,
+        }
+    )
+    return InvocationIdentity(invocation_key=sha256_hex(material), source=source)
+
+
+def _bounded_identity_text(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= _MAX_IDENTITY_COMPONENT_BYTES
+    except UnicodeError:
+        return False
 
 
 class RawServerResult(types.ServerResult):
@@ -240,11 +332,69 @@ class SchemaMirror:
             )
         return configured.mode
 
+    def validate_input(self, alias: str, tool: str, arguments: Mapping[str, Any]) -> None:
+        """Validate exact call arguments against the captured reviewed input schema."""
+
+        captured = self._captured.get((alias, tool))
+        if captured is None:
+            raise DomainToolError(
+                "schema_unreviewed",
+                "The tool is disabled until its current schema has been reviewed.",
+            )
+        schema = captured.raw.get("inputSchema")
+        if not isinstance(schema, dict):
+            raise DomainToolError(
+                "schema_invalid",
+                "The reviewed downstream input schema is invalid.",
+            )
+        try:
+            validator = Draft202012Validator(schema)
+            validator.check_schema(schema)
+            valid = validator.is_valid(copy.deepcopy(dict(arguments)))
+        except Exception:
+            raise DomainToolError(
+                "schema_invalid",
+                "The reviewed downstream input schema is invalid.",
+            ) from None
+        if not valid:
+            raise DomainToolError(
+                "invalid_arguments",
+                "Tool arguments do not match the reviewed input schema.",
+            )
+
     def validate_virtual_result(self, alias: str, tool: str, result: Any) -> None:
         raw = self._captured[(alias, tool)].raw
         schema = raw.get("outputSchema")
         if isinstance(schema, dict):
             Draft202012Validator(schema).validate(result)
+
+    def validate_downstream_result(
+        self,
+        alias: str,
+        tool: str,
+        result: Mapping[str, Any],
+    ) -> None:
+        """Enforce a reviewed output schema for successful passthrough results."""
+
+        if result.get("isError", False) is True:
+            return
+        raw = self._captured[(alias, tool)].raw
+        schema = raw.get("outputSchema")
+        if schema is None:
+            return
+        if not isinstance(schema, dict):
+            raise SchemaDriftError("the reviewed output schema is invalid")
+        structured = result.get("structuredContent")
+        if not isinstance(structured, Mapping):
+            raise SchemaDriftError("a successful result omitted structured content")
+        try:
+            validator = Draft202012Validator(schema)
+            validator.check_schema(schema)
+            validator.validate(copy.deepcopy(dict(structured)))
+        except Exception:
+            raise SchemaDriftError(
+                "the downstream result does not match the reviewed output schema"
+            ) from None
 
 
 def _advertises_task_support(raw: Mapping[str, Any]) -> bool:
@@ -281,7 +431,10 @@ async def discover_all_tools(session: Any) -> list[dict[str, Any]]:
         cursor = next_cursor
 
 
-ToolCallHandler = Callable[[str, str, Mapping[str, Any], str], Awaitable[dict[str, Any]]]
+ToolCallHandler = Callable[
+    [str, str, Mapping[str, Any], str, InvocationIdentity],
+    Awaitable[dict[str, Any]],
+]
 DeniedEventHandler = Callable[[str, str, str], Awaitable[None] | None]
 NamespaceProvider = Callable[[], tuple[str, set[str] | frozenset[str]]]
 
@@ -321,6 +474,7 @@ class AliasToolSurface:
         self.namespace_provider = namespace_provider
         self.server: LosslessToolServer = LosslessToolServer("Signet", version="0.1.0")
         self._sessions: set[Any] = set()
+        self._session_invocation_scopes: dict[Any, str] = {}
         self.server.request_handlers[types.ListToolsRequest] = self._list_tools
         self.server.request_handlers[types.CallToolRequest] = self._call_tool
 
@@ -341,7 +495,36 @@ class AliasToolSurface:
         return raw_namespace
 
     def _remember_session(self) -> None:
-        self._sessions.add(self.server.request_context.session)
+        session = self.server.request_context.session
+        self._sessions.add(session)
+        self._session_invocation_scopes.setdefault(session, secrets.token_urlsafe(24))
+
+    def _invocation_identity(self, namespace: str, tool: str) -> InvocationIdentity:
+        context = self.server.request_context
+        meta = (
+            context.meta.model_dump(mode="json", by_alias=True, exclude_unset=True)
+            if context.meta is not None
+            else {}
+        )
+        explicit_present = SIGNET_INVOCATION_ID_META in meta
+        session_scope = self._session_invocation_scopes[context.session]
+        try:
+            return derive_invocation_identity(
+                namespace=namespace,
+                alias=self.alias,
+                tool=tool,
+                explicit_id=meta.get(SIGNET_INVOCATION_ID_META),
+                explicit_id_present=explicit_present,
+                session_scope=session_scope,
+                request_id=context.request_id,
+            )
+        except InvocationIdentityError:
+            raise McpError(
+                types.ErrorData(
+                    code=types.INVALID_PARAMS,
+                    message="Invalid Signet invocation identity",
+                )
+            ) from None
 
     async def _list_tools(self, request: types.ListToolsRequest) -> types.ServerResult:
         del request
@@ -356,6 +539,13 @@ class AliasToolSurface:
         arguments = request.params.arguments or {}
         try:
             mode = self.mirror.require_callable(self.alias, name)
+            if request.params.task is not None:
+                raise DomainToolError(
+                    "task_execution_unsupported",
+                    "Task-augmented tool execution is not supported.",
+                )
+            invocation_identity = self._invocation_identity(namespace, name)
+            self.mirror.validate_input(self.alias, name, arguments)
             if mode is PolicyMode.DENY:
                 if self.denied_event_handler:
                     result = self.denied_event_handler(namespace, self.alias, name)
@@ -367,7 +557,13 @@ class AliasToolSurface:
                         "This reviewed tool is denied by Signet policy.",
                     )
                 )
-            raw_result = await self.call_handler(self.alias, name, arguments, namespace)
+            raw_result = await self.call_handler(
+                self.alias,
+                name,
+                arguments,
+                namespace,
+                invocation_identity,
+            )
             types.CallToolResult.model_validate(raw_result)
             return RawServerResult(raw_result)
         except DomainToolError as exc:
@@ -384,4 +580,5 @@ class AliasToolSurface:
                 stale.append(session)
         for session in stale:
             self._sessions.discard(session)
+            self._session_invocation_scopes.pop(session, None)
         return sent

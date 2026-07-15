@@ -14,10 +14,13 @@ from mcp.shared.memory import create_connected_server_and_client_session
 
 from signet.mcp_mirror import (
     PENDING_RESULT_SCHEMA,
+    SIGNET_INVOCATION_ID_META,
     AliasToolSurface,
+    InvocationIdentity,
     MirrorError,
     RawServerResult,
     SchemaMirror,
+    derive_invocation_identity,
     discover_all_tools,
     domain_error_result,
     pending_call_result,
@@ -204,6 +207,27 @@ def test_raw_server_result_uses_exact_raw_serializer() -> None:
     assert result.model_dump(mode="json", by_alias=True, exclude_none=True) == raw
 
 
+def test_invocation_identity_digest_is_scoped_by_caller_alias_and_tool() -> None:
+    def derive(namespace: str, alias: str, tool: str) -> InvocationIdentity:
+        return derive_invocation_identity(
+            namespace=namespace,
+            alias=alias,
+            tool=tool,
+            explicit_id="same-explicit-id",
+            explicit_id_present=True,
+            session_scope="unused",
+            request_id=1,
+        )
+
+    identities = {
+        derive("profile:one", "example", "read").invocation_key,
+        derive("profile:two", "example", "read").invocation_key,
+        derive("profile:one", "other", "read").invocation_key,
+        derive("profile:one", "example", "other").invocation_key,
+    }
+    assert len(identities) == 4
+
+
 @pytest.mark.asyncio
 async def test_low_level_server_preserves_raw_list_and_error_channels() -> None:
     mirror = SchemaMirror(_policy())
@@ -215,8 +239,14 @@ async def test_low_level_server_preserves_raw_list_and_error_channels() -> None:
     _review_all(mirror)
     downstream_calls: list[str] = []
 
-    async def call_handler(alias: str, name: str, arguments: Any, namespace: str) -> Any:
-        del alias, arguments, namespace
+    async def call_handler(
+        alias: str,
+        name: str,
+        arguments: Any,
+        namespace: str,
+        identity: InvocationIdentity,
+    ) -> Any:
+        del alias, arguments, namespace, identity
         downstream_calls.append(name)
         return {
             "content": [{"type": "text", "text": "ok"}],
@@ -247,3 +277,88 @@ async def test_low_level_server_preserves_raw_list_and_error_channels() -> None:
         assert result.isError is False
         assert raw_model(result)["x-result-extension"] is None
     assert downstream_calls == ["read"]
+
+
+@pytest.mark.asyncio
+async def test_surface_passes_hashed_explicit_and_session_request_invocation_identities() -> None:
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [_raw_tool("read")])
+    mirror.approve_schema("example", "read", mirror.captured_digest("example", "read"))
+    identities: list[InvocationIdentity] = []
+
+    async def call_handler(
+        alias: str,
+        name: str,
+        arguments: Any,
+        namespace: str,
+        identity: InvocationIdentity,
+    ) -> dict[str, Any]:
+        del alias, name, arguments, namespace
+        identities.append(identity)
+        return {
+            "content": [{"type": "text", "text": "ok"}],
+            "structuredContent": {"id": "real-id"},
+            "isError": False,
+        }
+
+    surface = AliasToolSurface(
+        alias="example",
+        mirror=mirror,
+        call_handler=call_handler,
+        namespace_provider=lambda: ("profile:test", {"example"}),
+    )
+    async with create_connected_server_and_client_session(surface.server) as client:
+        await client.call_tool(
+            "read",
+            {},
+            meta={SIGNET_INVOCATION_ID_META: "invocation-001"},
+        )
+        await client.call_tool(
+            "read",
+            {},
+            meta={SIGNET_INVOCATION_ID_META: "invocation-001"},
+        )
+        await client.call_tool("read", {})
+        await client.call_tool("read", {})
+
+    assert identities[0].source == identities[1].source == "explicit"
+    assert identities[0].invocation_key == identities[1].invocation_key
+    assert "invocation-001" not in repr(identities[0])
+    assert identities[2].source == identities[3].source == "session_request"
+    assert identities[2].invocation_key != identities[3].invocation_key
+
+
+@pytest.mark.asyncio
+async def test_surface_rejects_malformed_explicit_invocation_id_before_handler() -> None:
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [_raw_tool("read")])
+    mirror.approve_schema("example", "read", mirror.captured_digest("example", "read"))
+    calls = 0
+
+    async def call_handler(
+        alias: str,
+        name: str,
+        arguments: Any,
+        namespace: str,
+        identity: InvocationIdentity,
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del alias, name, arguments, namespace, identity
+        calls += 1
+        return {"content": [], "structuredContent": {}, "isError": False}
+
+    surface = AliasToolSurface(
+        alias="example",
+        mirror=mirror,
+        call_handler=call_handler,
+        namespace_provider=lambda: ("profile:test", {"example"}),
+    )
+    async with create_connected_server_and_client_session(surface.server) as client:
+        with pytest.raises(McpError) as captured:
+            await client.call_tool(
+                "read",
+                {},
+                meta={SIGNET_INVOCATION_ID_META: "contains spaces"},
+            )
+    assert captured.value.error.code == types.INVALID_PARAMS
+    assert calls == 0

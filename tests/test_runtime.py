@@ -18,7 +18,7 @@ from starlette.testclient import TestClient
 from signet.app import main
 from signet.credential_broker import IssuedToken, TokenRegistry
 from signet.gateway_tools import GatewayPrincipal, GatewayToolSurface
-from signet.mcp_mirror import AliasToolSurface, SchemaMirror
+from signet.mcp_mirror import AliasToolSurface, InvocationIdentity, SchemaMirror
 from signet.policy import parse_policy
 from signet.runtime import (
     APPROVALS_ALIAS,
@@ -149,7 +149,9 @@ def alias_surface(
         tool: str,
         arguments: Any,
         namespace: str,
+        identity: InvocationIdentity,
     ) -> dict[str, Any]:
+        del identity
         result = call_handler(alias, tool, dict(arguments), namespace)
         if asyncio.iscoroutine(result):
             return cast(dict[str, Any], await result)
