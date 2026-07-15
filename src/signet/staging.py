@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -11,12 +12,21 @@ import re
 import secrets
 import shutil
 import stat
+import tempfile
 import time
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any
+
+from signet.attachment_crypto import (
+    ATTACHMENT_ENVELOPE_FORMAT,
+    AttachmentCipher,
+    AttachmentContext,
+    AttachmentEnvelopeError,
+)
+from signet.db import Database, IntegrityError
 
 
 class StagingPathError(ValueError):
@@ -63,6 +73,10 @@ class StagedFile:
     sha256: str
     path: Path
     created_at: int = 0
+    envelope_format: str = ATTACHMENT_ENVELOPE_FORMAT
+    envelope_size: int = 0
+    envelope_sha256: str = ""
+    encryption_key_ref: str = ""
 
 
 _OPAQUE_ID_RE = re.compile(r"stg_[A-Za-z0-9_]{20,64}\Z")
@@ -78,6 +92,10 @@ _METADATA_KEYS = {
     "size",
     "sha256",
     "created_at",
+    "envelope_format",
+    "envelope_size",
+    "envelope_sha256",
+    "encryption_key_ref",
 }
 _CHUNK_SIZE = 1024 * 1024
 _METADATA_LIMIT = 64 * 1024
@@ -213,9 +231,22 @@ def open_confined_readonly(
 
 def hash_verified_descriptor(descriptor: int, *, maximum_bytes: int) -> tuple[int, str]:
     """Hash an open regular file and reject mutation during the read."""
+    return _hash_stable_descriptor(
+        descriptor,
+        maximum_bytes=maximum_bytes,
+        allowed_link_counts=frozenset({1}),
+    )
+
+
+def _hash_stable_descriptor(
+    descriptor: int,
+    *,
+    maximum_bytes: int,
+    allowed_link_counts: Collection[int],
+) -> tuple[int, str]:
     before = os.fstat(descriptor)
-    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-        raise StagingError("file is not a single-link regular file")
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink not in allowed_link_counts:
+        raise StagingError("file is not a regular file with the expected link state")
     if before.st_size < 0 or before.st_size > maximum_bytes:
         raise StagingError("file exceeds the configured size limit")
     os.lseek(descriptor, 0, os.SEEK_SET)
@@ -262,13 +293,23 @@ class StagingStore:
         self,
         root: Path,
         *,
+        database: Database,
+        cipher: AttachmentCipher,
         allowed_source_roots: tuple[Path, ...] = (),
         max_file_bytes: int = 25 * 1024 * 1024,
         max_total_bytes: int = 50 * 1024 * 1024,
         minimum_free_bytes: int = 100 * 1024 * 1024,
     ) -> None:
+        if not isinstance(database, Database):
+            raise TypeError("staging database is required")
+        if not isinstance(cipher, AttachmentCipher):
+            raise TypeError("staging attachment cipher is required")
         if max_file_bytes < 0 or max_total_bytes < 0 or minimum_free_bytes < 0:
             raise ValueError("staging capacity limits must be non-negative")
+        if max_file_bytes > cipher.max_plaintext_bytes:
+            raise ValueError("staging file limit exceeds the attachment cipher limit")
+        self.database = database
+        self._cipher = cipher
         requested_root = Path(root).absolute()
         if requested_root.is_symlink():
             raise StagingError("staging root must not be a symbolic link")
@@ -429,15 +470,16 @@ class StagingStore:
     def _check_capacity(self, incoming: int) -> None:
         if incoming < 0 or incoming > self.max_file_bytes:
             raise StagingError("file exceeds the configured size limit")
-        if self._durable_content_bytes() + incoming > self.max_total_bytes:
+        envelope_size = self._cipher.envelope_size(incoming)
+        if self._durable_content_bytes() + envelope_size > self.max_total_bytes:
             raise StagingError("staging total exceeds the configured limit")
-        if shutil.disk_usage(self.root).free - incoming < self.minimum_free_bytes:
+        if shutil.disk_usage(self.root).free - envelope_size < self.minimum_free_bytes:
             raise StagingError("insufficient disk headroom")
 
     @staticmethod
     def _metadata_document(record: StagedFile) -> bytes:
         document = {
-            "format": 1,
+            "format": 2,
             "opaque_id": record.opaque_id,
             "adapter": record.adapter,
             "account": record.account,
@@ -447,6 +489,10 @@ class StagingStore:
             "size": record.size,
             "sha256": record.sha256,
             "created_at": record.created_at,
+            "envelope_format": record.envelope_format,
+            "envelope_size": record.envelope_size,
+            "envelope_sha256": record.envelope_sha256,
+            "encryption_key_ref": record.encryption_key_ref,
         }
         encoded = json.dumps(
             document,
@@ -498,6 +544,93 @@ class StagingStore:
         finally:
             os.close(metadata_fd)
 
+    def _insert_catalog(self, record: StagedFile) -> None:
+        try:
+            with self.database.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO staged_objects(
+                        attachment_id, adapter, account, filename, declared_mime,
+                        detected_mime, size_bytes, sha256, storage_path,
+                        envelope_format, envelope_size, envelope_sha256,
+                        encryption_key_ref, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.opaque_id,
+                        record.adapter,
+                        record.account,
+                        record.filename,
+                        record.declared_mime,
+                        record.detected_mime,
+                        record.size,
+                        record.sha256,
+                        str(record.path),
+                        record.envelope_format,
+                        record.envelope_size,
+                        record.envelope_sha256,
+                        record.encryption_key_ref,
+                        record.created_at,
+                    ),
+                )
+        except IntegrityError as exc:
+            raise StagingError("staged object catalog registration failed") from exc
+
+    def _catalog_record(self, opaque_id: str) -> StagedFile:
+        with self.database.read() as connection:
+            row = connection.execute(
+                """
+                SELECT attachment_id, adapter, account, filename, declared_mime,
+                       detected_mime, size_bytes, sha256, storage_path,
+                       envelope_format, envelope_size, envelope_sha256,
+                       encryption_key_ref, created_at, purged_at, key_destroyed_at
+                FROM staged_objects WHERE attachment_id = ?
+                """,
+                (opaque_id,),
+            ).fetchone()
+        if (
+            row is None
+            or row["storage_path"] is None
+            or row["purged_at"] is not None
+            or row["key_destroyed_at"] is not None
+            or not isinstance(row["encryption_key_ref"], str)
+        ):
+            raise StagingError("staged object was not found in this scope")
+        return StagedFile(
+            opaque_id=str(row["attachment_id"]),
+            adapter=str(row["adapter"]),
+            account=str(row["account"]),
+            filename=str(row["filename"]),
+            declared_mime=str(row["declared_mime"]),
+            detected_mime=str(row["detected_mime"]),
+            size=int(row["size_bytes"]),
+            sha256=str(row["sha256"]),
+            path=Path(str(row["storage_path"])),
+            created_at=int(row["created_at"]),
+            envelope_format=str(row["envelope_format"]),
+            envelope_size=int(row["envelope_size"]),
+            envelope_sha256=str(row["envelope_sha256"]),
+            encryption_key_ref=str(row["encryption_key_ref"]),
+        )
+
+    @staticmethod
+    def _same_record(left: StagedFile, right: StagedFile) -> bool:
+        return left == right
+
+    @staticmethod
+    def _context(record: StagedFile) -> AttachmentContext:
+        return AttachmentContext(
+            opaque_id=record.opaque_id,
+            adapter=record.adapter,
+            account=record.account,
+            filename=record.filename,
+            declared_mime=record.declared_mime,
+            detected_mime=record.detected_mime,
+            size=record.size,
+            sha256=record.sha256,
+            created_at=record.created_at,
+        )
+
     def stage_path(
         self,
         source: Path,
@@ -521,12 +654,38 @@ class StagingStore:
         temporary_created = False
         published = False
         metadata_published = False
+        catalog_published = False
         try:
             source_metadata = os.fstat(source_fd)
             if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1:
                 raise StagingError("source must be a single-link regular file")
             with self._locked():
                 self._check_capacity(source_metadata.st_size)
+                plaintext = read_verified_descriptor(
+                    source_fd,
+                    maximum_bytes=self.max_file_bytes,
+                )
+                plaintext_hash = hashlib.sha256(plaintext).hexdigest()
+                detected = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                created_at = int(time.time())
+                context = AttachmentContext(
+                    opaque_id=opaque_id,
+                    adapter=adapter,
+                    account=account,
+                    filename=filename,
+                    declared_mime=declared_mime,
+                    detected_mime=detected,
+                    size=len(plaintext),
+                    sha256=plaintext_hash,
+                    created_at=created_at,
+                )
+                try:
+                    envelope = self._cipher.encrypt(plaintext, context=context)
+                except AttachmentEnvelopeError as exc:
+                    raise StagingError("staged object encryption failed") from exc
+                finally:
+                    del plaintext
+                envelope_hash = hashlib.sha256(envelope).hexdigest()
                 root_fd = self._open_root()
                 metadata_fd = self._open_metadata_root()
                 try:
@@ -543,26 +702,14 @@ class StagingStore:
                     dir_fd=root_fd,
                 )
                 temporary_created = True
-                source_digest = hashlib.sha256()
-                total = 0
-                while chunk := os.read(source_fd, _CHUNK_SIZE):
-                    total += len(chunk)
-                    if total > self.max_file_bytes:
-                        raise StagingError("file exceeds the configured size limit")
-                    source_digest.update(chunk)
-                    _write_all(output_fd, chunk)
-                source_after = os.fstat(source_fd)
-                if _signature(source_metadata) != _signature(source_after) or (
-                    total != source_metadata.st_size
-                ):
-                    raise StagingError("source changed while it was copied")
+                _write_all(output_fd, envelope)
                 os.fsync(output_fd)
                 copied_size, copied_hash = hash_verified_descriptor(
                     output_fd,
-                    maximum_bytes=self.max_file_bytes,
+                    maximum_bytes=self._cipher.maximum_envelope_bytes,
                 )
-                if copied_size != total or copied_hash != source_digest.hexdigest():
-                    raise StagingError("staged copy failed integrity verification")
+                if copied_size != len(envelope) or copied_hash != envelope_hash:
+                    raise StagingError("encrypted staged copy failed integrity verification")
                 os.close(output_fd)
                 output_fd = None
                 os.rename(
@@ -574,7 +721,6 @@ class StagingStore:
                 temporary_created = False
                 published = True
                 os.fsync(root_fd)
-                detected = mimetypes.guess_type(filename)[0] or "application/octet-stream"
                 record = StagedFile(
                     opaque_id=opaque_id,
                     adapter=adapter,
@@ -582,13 +728,18 @@ class StagingStore:
                     filename=filename,
                     declared_mime=declared_mime,
                     detected_mime=detected,
-                    size=total,
-                    sha256=copied_hash,
+                    size=context.size,
+                    sha256=context.sha256,
                     path=self.root / opaque_id,
-                    created_at=int(time.time()),
+                    created_at=created_at,
+                    envelope_size=copied_size,
+                    envelope_sha256=copied_hash,
+                    encryption_key_ref=self._cipher.key_reference,
                 )
                 self._write_metadata(record)
                 metadata_published = True
+                self._insert_catalog(record)
+                catalog_published = True
                 return record
         except BaseException:
             if output_fd is not None:
@@ -599,9 +750,17 @@ class StagingStore:
                 if temporary_created:
                     with suppress(FileNotFoundError):
                         os.unlink(temporary_name, dir_fd=root_fd)
-                if published and not metadata_published:
+                if published and not catalog_published:
                     with suppress(FileNotFoundError):
                         os.unlink(opaque_id, dir_fd=root_fd)
+                if metadata_published and not catalog_published:
+                    metadata_fd = self._open_metadata_root()
+                    try:
+                        with suppress(FileNotFoundError):
+                            os.unlink(f"{opaque_id}.json", dir_fd=metadata_fd)
+                        os.fsync(metadata_fd)
+                    finally:
+                        os.close(metadata_fd)
                 os.fsync(root_fd)
             finally:
                 os.close(root_fd)
@@ -632,7 +791,7 @@ class StagingStore:
             value: Any = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise StagingError("staged object metadata is invalid") from exc
-        if not isinstance(value, dict) or set(value) != _METADATA_KEYS or value.get("format") != 1:
+        if not isinstance(value, dict) or set(value) != _METADATA_KEYS or value.get("format") != 2:
             raise StagingError("staged object metadata is invalid")
         fields = (
             "opaque_id",
@@ -642,11 +801,15 @@ class StagingStore:
             "declared_mime",
             "detected_mime",
             "sha256",
+            "envelope_format",
+            "envelope_sha256",
+            "encryption_key_ref",
         )
         if any(not isinstance(value.get(field), str) for field in fields):
             raise StagingError("staged object metadata is invalid")
         size = value.get("size")
         created_at = value.get("created_at")
+        envelope_size = value.get("envelope_size")
         if (
             isinstance(size, bool)
             or not isinstance(size, int)
@@ -657,6 +820,12 @@ class StagingStore:
             or created_at < 0
             or value["opaque_id"] != opaque_id
             or not _SHA256_RE.fullmatch(value["sha256"])
+            or value["envelope_format"] != ATTACHMENT_ENVELOPE_FORMAT
+            or isinstance(envelope_size, bool)
+            or not isinstance(envelope_size, int)
+            or envelope_size != self._cipher.envelope_size(size)
+            or not _SHA256_RE.fullmatch(value["envelope_sha256"])
+            or value["encryption_key_ref"] != self._cipher.key_reference
         ):
             raise StagingError("staged object metadata is invalid")
         try:
@@ -675,12 +844,19 @@ class StagingStore:
                 sha256=value["sha256"],
                 path=self.root / opaque_id,
                 created_at=created_at,
+                envelope_format=value["envelope_format"],
+                envelope_size=envelope_size,
+                envelope_sha256=value["envelope_sha256"],
+                encryption_key_ref=value["encryption_key_ref"],
             )
         except StagingError as exc:
             raise StagingError("staged object metadata is invalid") from exc
 
     def _scoped_record(self, opaque_id: str, *, adapter: str, account: str) -> StagedFile:
         record = self._load_record(opaque_id)
+        catalog = self._catalog_record(opaque_id)
+        if not self._same_record(record, catalog):
+            raise StagingError("staged object catalog failed integrity verification")
         if record.adapter != adapter or record.account != account:
             raise StagingError("staged object was not found in this scope")
         return record
@@ -692,18 +868,38 @@ class StagingStore:
             expected_root_identity=self._root_identity,
         )
 
+    def _read_plaintext(self, record: StagedFile) -> bytes:
+        descriptor = self._open_record(record)
+        try:
+            envelope = read_verified_descriptor(
+                descriptor,
+                maximum_bytes=self._cipher.maximum_envelope_bytes,
+            )
+        finally:
+            os.close(descriptor)
+        if (
+            len(envelope) != record.envelope_size
+            or not hmac.compare_digest(
+                hashlib.sha256(envelope).hexdigest(), record.envelope_sha256
+            )
+        ):
+            raise StagingError("staged object envelope failed integrity verification")
+        try:
+            return self._cipher.decrypt(
+                envelope,
+                context=self._context(record),
+                key_reference=record.encryption_key_ref,
+            )
+        except AttachmentEnvelopeError as exc:
+            raise StagingError("staged object failed authenticated decryption") from exc
+
     def resolve(self, opaque_id: str, *, adapter: str, account: str) -> StagedFile:
         with self._locked():
             record = self._scoped_record(opaque_id, adapter=adapter, account=account)
-            descriptor = self._open_record(record)
-            try:
-                size, digest = hash_verified_descriptor(
-                    descriptor,
-                    maximum_bytes=self.max_file_bytes,
-                )
-            finally:
-                os.close(descriptor)
-            if size != record.size or digest != record.sha256:
+            plaintext = self._read_plaintext(record)
+            if len(plaintext) != record.size or not hmac.compare_digest(
+                hashlib.sha256(plaintext).hexdigest(), record.sha256
+            ):
                 raise StagingError("staged object failed integrity verification")
             return record
 
@@ -717,17 +913,48 @@ class StagingStore:
         """Return metadata and byte-identical content from one verified descriptor."""
         with self._locked():
             record = self._scoped_record(opaque_id, adapter=adapter, account=account)
-            descriptor = self._open_record(record)
-            try:
-                content = read_verified_descriptor(
-                    descriptor,
-                    maximum_bytes=self.max_file_bytes,
-                )
-            finally:
-                os.close(descriptor)
-            if len(content) != record.size or hashlib.sha256(content).hexdigest() != record.sha256:
+            content = self._read_plaintext(record)
+            if len(content) != record.size or not hmac.compare_digest(
+                hashlib.sha256(content).hexdigest(), record.sha256
+            ):
                 raise StagingError("staged object failed integrity verification")
             return record, content
+
+    @contextmanager
+    def plaintext_descriptor(
+        self,
+        opaque_id: str,
+        *,
+        adapter: str,
+        account: str,
+        expected_size: int,
+        expected_sha256: str,
+    ) -> Iterator[tuple[StagedFile, int]]:
+        """Yield approved plaintext only through a mode-0600 anonymous descriptor."""
+
+        with self._locked():
+            record = self._scoped_record(opaque_id, adapter=adapter, account=account)
+            if record.size != expected_size or not hmac.compare_digest(
+                record.sha256, expected_sha256
+            ):
+                raise StagingError("staged object no longer matches approved metadata")
+            plaintext = self._read_plaintext(record)
+        with tempfile.TemporaryFile(mode="w+b", dir=self.root) as temporary:
+            os.fchmod(temporary.fileno(), 0o600)
+            metadata = os.fstat(temporary.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 0:
+                raise StagingError("platform did not create an anonymous plaintext file")
+            _write_all(temporary.fileno(), plaintext)
+            del plaintext
+            os.fsync(temporary.fileno())
+            size, digest = _hash_stable_descriptor(
+                temporary.fileno(),
+                maximum_bytes=self.max_file_bytes,
+                allowed_link_counts=frozenset({0}),
+            )
+            if size != record.size or not hmac.compare_digest(digest, record.sha256):
+                raise StagingError("plaintext descriptor failed integrity verification")
+            yield record, temporary.fileno()
 
     def purge(
         self,
@@ -743,6 +970,18 @@ class StagingStore:
                 if adapter is None or account is None:
                     raise ValueError("adapter and account must be supplied together")
                 self._scoped_record(opaque_id, adapter=adapter, account=account)
+            with self.database.read() as connection:
+                catalog = connection.execute(
+                    """
+                    SELECT consumed_request_id, storage_path, purged_at
+                    FROM staged_objects WHERE attachment_id = ?
+                    """,
+                    (opaque_id,),
+                ).fetchone()
+            if catalog is None or catalog["purged_at"] is not None:
+                return
+            if catalog["consumed_request_id"] is not None:
+                raise StagingError("a consumed staged object requires retention-owned purge")
             root_fd = self._open_root()
             metadata_fd = self._open_metadata_root()
             try:
@@ -757,6 +996,17 @@ class StagingStore:
             finally:
                 os.close(metadata_fd)
                 os.close(root_fd)
+            with self.database.transaction() as connection:
+                updated = connection.execute(
+                    """
+                    UPDATE staged_objects SET storage_path = NULL, purged_at = ?
+                    WHERE attachment_id = ? AND consumed_request_id IS NULL
+                      AND storage_path = ? AND purged_at IS NULL
+                    """,
+                    (int(time.time()), opaque_id, catalog["storage_path"]),
+                ).rowcount
+            if updated != 1:
+                raise StagingError("staged object catalog changed during purge")
 
     def purge_verified(
         self,
@@ -765,6 +1015,7 @@ class StagingStore:
         expected_path: Path,
         expected_size: int,
         expected_sha256: str,
+        purged_at: int,
         missing_ok: bool = False,
     ) -> None:
         """Unlink one DB-owned object and sidecar after confined integrity checks.
@@ -785,11 +1036,55 @@ class StagingStore:
             or expected_size > self.max_file_bytes
             or not isinstance(expected_sha256, str)
             or _SHA256_RE.fullmatch(expected_sha256) is None
+            or isinstance(purged_at, bool)
+            or not isinstance(purged_at, int)
+            or purged_at < 0
             or not isinstance(missing_ok, bool)
         ):
             raise ValueError("staged object purge expectation is invalid")
 
         with self._locked():
+            with self.database.read() as connection:
+                row = connection.execute(
+                    """
+                    SELECT attachment_id, adapter, account, filename, declared_mime,
+                           detected_mime, size_bytes, sha256, storage_path,
+                           envelope_format, envelope_size, envelope_sha256,
+                           encryption_key_ref, created_at, purged_at
+                    FROM staged_objects WHERE attachment_id = ?
+                    """,
+                    (opaque_id,),
+                ).fetchone()
+            if row is None:
+                raise StagingError("staged object catalog entry is unavailable")
+            if row["purged_at"] is not None:
+                if missing_ok and row["storage_path"] is None:
+                    return
+                raise StagingError("staged object was already purged")
+            record = StagedFile(
+                opaque_id=str(row["attachment_id"]),
+                adapter=str(row["adapter"]),
+                account=str(row["account"]),
+                filename=str(row["filename"]),
+                declared_mime=str(row["declared_mime"]),
+                detected_mime=str(row["detected_mime"]),
+                size=int(row["size_bytes"]),
+                sha256=str(row["sha256"]),
+                path=Path(str(row["storage_path"])),
+                created_at=int(row["created_at"]),
+                envelope_format=str(row["envelope_format"]),
+                envelope_size=int(row["envelope_size"]),
+                envelope_sha256=str(row["envelope_sha256"]),
+                encryption_key_ref=str(row["encryption_key_ref"]),
+            )
+            if (
+                record.path != candidate
+                or record.size != expected_size
+                or not hmac.compare_digest(record.sha256, expected_sha256)
+                or record.envelope_format != ATTACHMENT_ENVELOPE_FORMAT
+                or record.encryption_key_ref != self._cipher.key_reference
+            ):
+                raise StagingError("staged object catalog does not match purge expectation")
             root_fd = self._open_root()
             metadata_fd = self._open_metadata_root()
             content_fd: int | None = None
@@ -808,12 +1103,37 @@ class StagingStore:
                     opened = os.fstat(content_fd)
                     if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
                         raise StagingError("staged object is unsafe")
-                    size, digest = hash_verified_descriptor(
+                    envelope = read_verified_descriptor(
                         content_fd,
-                        maximum_bytes=self.max_file_bytes,
+                        maximum_bytes=self._cipher.maximum_envelope_bytes,
                     )
-                    if size != expected_size or digest != expected_sha256:
+                    if (
+                        len(envelope) != record.envelope_size
+                        or not hmac.compare_digest(
+                            hashlib.sha256(envelope).hexdigest(),
+                            record.envelope_sha256,
+                        )
+                    ):
                         raise StagingError("staged object failed purge integrity verification")
+                    try:
+                        plaintext = self._cipher.decrypt(
+                            envelope,
+                            context=self._context(record),
+                            key_reference=record.encryption_key_ref,
+                        )
+                    except AttachmentEnvelopeError as exc:
+                        raise StagingError(
+                            "staged object failed purge integrity verification"
+                        ) from exc
+                    if (
+                        len(plaintext) != expected_size
+                        or not hmac.compare_digest(
+                            hashlib.sha256(plaintext).hexdigest(), expected_sha256
+                        )
+                    ):
+                        raise StagingError(
+                            "staged object failed purge integrity verification"
+                        )
                     named = os.stat(opaque_id, dir_fd=root_fd, follow_symlinks=False)
                     if (
                         not stat.S_ISREG(named.st_mode)
@@ -849,6 +1169,26 @@ class StagingStore:
                     os.close(content_fd)
                 os.close(metadata_fd)
                 os.close(root_fd)
+            with self.database.transaction() as connection:
+                updated = connection.execute(
+                    """
+                    UPDATE staged_objects SET storage_path = NULL, purged_at = ?
+                    WHERE attachment_id = ? AND storage_path = ? AND purged_at IS NULL
+                      AND size_bytes = ? AND sha256 = ?
+                      AND envelope_size = ? AND envelope_sha256 = ?
+                    """,
+                    (
+                        purged_at,
+                        opaque_id,
+                        str(candidate),
+                        expected_size,
+                        expected_sha256,
+                        record.envelope_size,
+                        record.envelope_sha256,
+                    ),
+                ).rowcount
+            if updated != 1:
+                raise StagingError("staged object catalog changed during purge")
 
     def sweep_orphans(
         self,

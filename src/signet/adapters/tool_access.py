@@ -20,6 +20,7 @@ from signet.adapters.base import (
     Reconciliation,
     copy_json_object,
 )
+from signet.models import AttachmentReference
 
 _ALIAS = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _TOOL = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
@@ -76,6 +77,12 @@ class ToolAccessAdapter:
             "reason": arguments["reason"],
             "tool": arguments["tool"],
         }
+
+    def freeze_attachments(
+        self, arguments: Mapping[str, Any]
+    ) -> tuple[AttachmentReference, ...]:
+        self.validate(arguments)
+        return ()
 
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> ApprovalSummary:
         proposal = self.canonicalize(arguments)

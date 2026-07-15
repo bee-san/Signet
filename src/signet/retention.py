@@ -99,6 +99,12 @@ class RetentionMatrix:
     def delay(self, intent: PurgeIntent, state: RequestState) -> int | None:
         if intent is PurgeIntent.ATTACHMENTS:
             return self.attachment_delays[state]
+        if intent is PurgeIntent.ENCRYPTION_KEY:
+            attachment_delay = self.attachment_delays[state]
+            payload_delay = self.payload_delays[state]
+            if attachment_delay is None or payload_delay is None:
+                return None
+            return max(attachment_delay, payload_delay)
         return self.payload_delays[state]
 
 
@@ -330,7 +336,7 @@ class RetentionManager:
                         ),
                     )
                 if self.mode is RetentionMode.ISOLATED_PER_REQUEST_KEY and (
-                    self._has_undestroyed_payload_keys(connection, request_id)
+                    self._has_undestroyed_keys(connection, request_id)
                 ):
                     inserted += self._schedule_intent(
                         connection,
@@ -354,7 +360,14 @@ class RetentionManager:
                 WHERE job.intent != 'backup_pin' AND job.completed_at IS NULL
                   AND job.created_at <= ?
                   AND (job.started_at IS NULL OR job.started_at < ?)
-                ORDER BY job.created_at, job.purge_job_id
+                ORDER BY job.created_at,
+                         CASE job.intent
+                             WHEN 'attachments' THEN 0
+                             WHEN 'sensitive_rows' THEN 1
+                             WHEN 'encryption_key' THEN 2
+                             ELSE 3
+                         END,
+                         job.purge_job_id
                 LIMIT 256
                 """,
                 (now, stale_before),
@@ -456,6 +469,7 @@ class RetentionManager:
                     expected_path=Path(str(row["storage_path"])),
                     expected_size=int(row["size_bytes"]),
                     expected_sha256=str(row["sha256"]),
+                    purged_at=now,
                     missing_ok=True,
                 )
             except (StagingError, ValueError) as exc:
@@ -516,6 +530,16 @@ class RetentionManager:
             raise _JobFailure("key_destroyer_unavailable")
         with self.database.transaction() as connection:
             self._ensure_claim(connection, claim)
+            remaining_attachments = connection.execute(
+                """
+                SELECT 1 FROM staged_objects
+                WHERE consumed_request_id = ? AND storage_path IS NOT NULL
+                  AND purged_at IS NULL LIMIT 1
+                """,
+                (claim.request_id,),
+            ).fetchone()
+            if remaining_attachments is not None:
+                raise _JobFailure("attachment_key_still_required")
             key_references = self._verified_isolated_references(connection, claim.request_id)
         for key_reference in key_references:
             try:
@@ -551,6 +575,16 @@ class RetentionManager:
                     claim.request_id,
                 ),
             )
+            connection.execute(
+                """
+                UPDATE staged_objects
+                SET encryption_key_ref = NULL,
+                    key_destroyed_at = COALESCE(key_destroyed_at, ?)
+                WHERE consumed_request_id = ? AND key_destroyed_at IS NULL
+                  AND storage_path IS NULL AND purged_at IS NOT NULL
+                """,
+                (now, claim.request_id),
+            )
             self._tombstone_idempotency(connection, claim.request_id, now=now)
             self._complete_claim(connection, claim, now=now)
 
@@ -561,9 +595,11 @@ class RetentionManager:
             """
             SELECT encryption_key_ref FROM payload_versions
             WHERE request_id = ? AND key_destroyed_at IS NULL
-            ORDER BY version
+            UNION ALL
+            SELECT encryption_key_ref FROM staged_objects
+            WHERE consumed_request_id = ? AND key_destroyed_at IS NULL
             """,
-            (request_id,),
+            (request_id, request_id),
         ).fetchall()
         if not rows:
             return ()
@@ -576,10 +612,13 @@ class RetentionManager:
         for reference in references:
             owners = connection.execute(
                 """
-                SELECT DISTINCT request_id FROM payload_versions
+                SELECT request_id FROM payload_versions
                 WHERE encryption_key_ref = ?
+                UNION
+                SELECT consumed_request_id AS request_id FROM staged_objects
+                WHERE encryption_key_ref = ? AND consumed_request_id IS NOT NULL
                 """,
-                (reference,),
+                (reference, reference),
             ).fetchall()
             if len(owners) != 1 or owners[0]["request_id"] != request_id:
                 raise _JobFailure("key_reference_shared")
@@ -656,14 +695,19 @@ class RetentionManager:
         return payload is not None or tombstone is not None
 
     @staticmethod
-    def _has_undestroyed_payload_keys(connection: Any, request_id: str) -> bool:
+    def _has_undestroyed_keys(connection: Any, request_id: str) -> bool:
         return (
             connection.execute(
                 """
-                SELECT 1 FROM payload_versions
-                WHERE request_id = ? AND key_destroyed_at IS NULL LIMIT 1
+                SELECT 1 FROM (
+                    SELECT encryption_key_ref FROM payload_versions
+                    WHERE request_id = ? AND key_destroyed_at IS NULL
+                    UNION ALL
+                    SELECT encryption_key_ref FROM staged_objects
+                    WHERE consumed_request_id = ? AND key_destroyed_at IS NULL
+                ) WHERE encryption_key_ref IS NOT NULL LIMIT 1
                 """,
-                (request_id,),
+                (request_id, request_id),
             ).fetchone()
             is not None
         )

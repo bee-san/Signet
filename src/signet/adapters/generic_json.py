@@ -32,6 +32,7 @@ from signet.adapters.base import (
     copy_json_object,
     redact_json,
 )
+from signet.models import AttachmentReference
 
 DEFAULT_INPUT_SCHEMA: Mapping[str, Any] = MappingProxyType(
     {
@@ -102,6 +103,12 @@ class GenericJSONAdapter:
         if not isinstance(value, dict):  # pragma: no cover - guarded by validate
             raise AdapterValidationError("arguments must be a JSON object")
         return value
+
+    def freeze_attachments(
+        self, arguments: Mapping[str, Any]
+    ) -> tuple[AttachmentReference, ...]:
+        self.validate(arguments)
+        return ()
 
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> ApprovalSummary:
         canonical = self.canonicalize(arguments)

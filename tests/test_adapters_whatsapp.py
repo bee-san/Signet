@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -22,8 +21,8 @@ from signet.adapters import (
     WhatsAppTextAdapter,
 )
 from signet.delivery import standardize_safe_metadata
-from signet.staging import StagingStore
 from signet.wacli_wrapper import WacliConfig, WacliError, WacliWrapper
+from tests.attachment_fixtures import staging_store as make_staging_store
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -359,13 +358,13 @@ async def test_wacli_wrapper_rejects_oversized_output_as_ambiguous(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_media_is_staged_and_wrapper_receives_only_confined_path(
+async def test_whatsapp_media_is_decrypted_only_to_an_inherited_anonymous_descriptor(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "sources"
     source_root.mkdir()
     staging_root = tmp_path / "staging"
-    store = StagingStore(
+    store = make_staging_store(
         staging_root,
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
@@ -384,7 +383,7 @@ async def test_whatsapp_media_is_staged_and_wrapper_receives_only_confined_path(
     assert len(payload["expected_sha256"]) == 64
 
     executable, log = make_fake_wacli(tmp_path)
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path))
+    wrapper = WacliWrapper(wrapper_config(executable, tmp_path), staging_store=store)
     result = await adapter.execute(wrapper, payload)
 
     assert result["sent"] is True
@@ -400,7 +399,7 @@ async def test_wacli_wrapper_rehashes_open_descriptor_after_adapter_prepare(
     source_root = tmp_path / "sources"
     source_root.mkdir()
     staging_root = tmp_path / "staging"
-    store = StagingStore(
+    store = make_staging_store(
         staging_root,
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
@@ -419,9 +418,9 @@ async def test_wacli_wrapper_rehashes_open_descriptor_after_adapter_prepare(
     )
     arguments = {"to": "+15550102030", "media": reference}
     payload = adapter.prepare_for_execution(adapter_request("send_file", arguments))
-    Path(payload["file_path"]).write_bytes(b"changed--bytes")
+    (store.root / reference["staged_id"]).write_bytes(b"changed--bytes")
     executable, log = make_fake_wacli(tmp_path)
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path))
+    wrapper = WacliWrapper(wrapper_config(executable, tmp_path), staging_store=store)
 
     with pytest.raises(WacliError) as caught:
         await adapter.execute(wrapper, payload)
@@ -442,7 +441,7 @@ async def test_wacli_wrapper_rejects_media_outside_staging_before_process(tmp_pa
         await wrapper.send_file(
             {
                 "to": "+15550102030",
-                "file_path": str(outside),
+                "staged_id": "../../outside",
                 "filename": "outside.txt",
                 "mime_type": "text/plain",
                 "expected_size": outside.stat().st_size,
@@ -459,27 +458,43 @@ async def test_wacli_wrapper_rejects_symlinked_media_directory_before_process(
     tmp_path: Path,
 ) -> None:
     executable, log = make_fake_wacli(tmp_path)
-    staging = tmp_path / "staging"
-    real = staging / "real"
-    real.mkdir(parents=True)
-    media = real / "media.bin"
-    media.write_bytes(b"approved bytes")
-    (staging / "alias").symlink_to(real, target_is_directory=True)
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path))
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "media.bin"
+    source.write_bytes(b"approved bytes")
+    store = make_staging_store(
+        tmp_path / "staging",
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    record = store.stage_path(
+        source,
+        adapter="whatsapp",
+        account="personal",
+        filename="media.bin",
+        declared_mime="application/octet-stream",
+    )
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(record.path.read_bytes())
+    record.path.unlink()
+    record.path.symlink_to(outside)
+    wrapper = WacliWrapper(
+        wrapper_config(executable, tmp_path), staging_store=store
+    )
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_file(
             {
                 "to": "+15550102030",
-                "file_path": str(staging / "alias" / "media.bin"),
+                "staged_id": record.opaque_id,
                 "filename": "media.bin",
                 "mime_type": "application/octet-stream",
-                "expected_size": media.stat().st_size,
-                "expected_sha256": hashlib.sha256(b"approved bytes").hexdigest(),
+                "expected_size": record.size,
+                "expected_sha256": record.sha256,
             }
         )
 
-    assert caught.value.code == "invalid_media_path"
+    assert caught.value.code == "media_integrity_mismatch"
     assert caught.value.dispatch_may_have_occurred is False
     assert not log.exists()
 

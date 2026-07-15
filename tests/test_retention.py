@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from signet.db import Database
+from signet.db import Database, IntegrityError
 from signet.models import AttachmentReference, EnqueueRequest, RequestState
 from signet.retention import (
     BackupPinConflict,
@@ -18,6 +18,7 @@ from signet.retention import (
 )
 from signet.staging import StagedFile, StagingStore
 from signet.state_machine import ApprovalStateMachine
+from tests.attachment_fixtures import attachment_cipher
 
 DAY = 24 * 60 * 60
 COMPLETED_AT = 1_000
@@ -45,11 +46,13 @@ def database(tmp_path: Path) -> Database:
 
 
 @pytest.fixture
-def staging(tmp_path: Path) -> StagingStore:
+def staging(tmp_path: Path, database: Database) -> StagingStore:
     sources = tmp_path / "sources"
     sources.mkdir()
     return StagingStore(
         tmp_path / "staging",
+        database=database,
+        cipher=attachment_cipher(),
         allowed_source_roots=(sources,),
         max_file_bytes=1024 * 1024,
         max_total_bytes=8 * 1024 * 1024,
@@ -483,7 +486,10 @@ def test_attachment_purge_verifies_hash_and_path_and_stores_only_generic_error(
 
     outside = tmp_path / "outside-private"
     outside.write_bytes(b"fake changed bytes")
-    with database.transaction() as connection:
+    with (
+        pytest.raises(IntegrityError, match="catalog path mismatch"),
+        database.transaction() as connection,
+    ):
         connection.execute(
             """
             UPDATE attachments SET storage_path = ?
@@ -491,14 +497,6 @@ def test_attachment_purge_verifies_hash_and_path_and_stores_only_generic_error(
             """,
             (str(outside),),
         )
-        connection.execute(
-            """
-            UPDATE purge_jobs SET created_at = ?, started_at = NULL
-            WHERE request_id = 'attachment-tampered' AND intent = 'attachments'
-            """,
-            (COMPLETED_AT,),
-        )
-    assert manager.run_due(now=COMPLETED_AT).failed == 1
     assert outside.exists()
 
 

@@ -33,6 +33,7 @@ from signet.adapters.base import (
     copy_json_object,
     redact_json,
 )
+from signet.models import AttachmentReference
 from signet.staging import StagedFile, StagingError, StagingStore
 from signet.wacli_wrapper import WacliError, normalize_destination, validate_message
 
@@ -191,6 +192,33 @@ class WhatsAppAdapter:
         self.validate(arguments)
         return copy_json_object(arguments)
 
+    def freeze_attachments(
+        self, arguments: Mapping[str, Any]
+    ) -> tuple[AttachmentReference, ...]:
+        canonical = self.canonicalize(arguments)
+        if self.tool_name == "send_text":
+            return ()
+        if self.staging_store is None:
+            raise StagingError("WhatsApp media staging is not configured")
+        reference = cast(dict[str, Any], canonical["media"])
+        record = self.staging_store.resolve(
+            cast(str, reference["staged_id"]),
+            adapter=self.downstream_alias,
+            account=self.account,
+        )
+        if self._media_reference(record) != reference:
+            raise StagingError("frozen media metadata no longer matches staging")
+        return (
+            AttachmentReference(
+                attachment_id=record.opaque_id,
+                filename=record.filename,
+                mime_type=record.declared_mime,
+                size_bytes=record.size,
+                sha256=record.sha256,
+                storage_path=str(record.path),
+            ),
+        )
+
     def stage_media(
         self,
         source: Path,
@@ -286,7 +314,7 @@ class WhatsAppAdapter:
                 raise StagingError("frozen media metadata no longer matches staging")
             payload.update(
                 {
-                    "file_path": str(record.path),
+                    "staged_id": record.opaque_id,
                     "filename": record.filename,
                     "mime_type": record.declared_mime,
                     "expected_size": record.size,
@@ -304,7 +332,7 @@ class WhatsAppAdapter:
         if self.tool_name == "send_text":
             self.validate(detached)
         else:
-            expected = {"to", "file_path", "filename", "mime_type"}
+            expected = {"to", "staged_id", "filename", "mime_type"}
             if not expected <= set(detached):
                 raise AdapterValidationError("prepared WhatsApp media payload is incomplete")
         result = await downstream.call_tool(self.tool_name, detached)

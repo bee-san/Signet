@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from signet.adapters.base import DispatchError, copy_json_object
-from signet.staging import StagingError, hash_verified_descriptor, open_confined_readonly
+from signet.staging import StagingError, StagingStore
 
 DEFAULT_WACLI_EXECUTABLE = Path("/opt/homebrew/bin/wacli")
 REVIEWED_WACLI_VERSION = "0.12.0"
@@ -168,8 +168,20 @@ async def _read_bounded(stream: asyncio.StreamReader, limit: int) -> bytes:
 class WacliWrapper:
     """An injected downstream client for the owned WhatsApp adapter contract."""
 
-    def __init__(self, config: WacliConfig) -> None:
+    def __init__(
+        self,
+        config: WacliConfig,
+        *,
+        staging_store: StagingStore | None = None,
+    ) -> None:
         self.config = config
+        if staging_store is not None and not isinstance(staging_store, StagingStore):
+            raise TypeError("wacli staging store is invalid")
+        if staging_store is not None and (
+            config.staging_root is None or staging_store.root != config.staging_root
+        ):
+            raise ValueError("wacli staging store does not match its reviewed root")
+        self._staging_store = staging_store
         self._version_lock = asyncio.Lock()
         self._verified_signature: tuple[int, int, int, int, str] | None = None
 
@@ -448,43 +460,6 @@ class WacliWrapper:
                 raise WacliError("version_mismatch", dispatch_may_have_occurred=False)
             self._verified_signature = signature
 
-    def _open_confined_media(
-        self,
-        value: object,
-        *,
-        expected_size: object,
-        expected_sha256: object,
-    ) -> int:
-        if not isinstance(value, str) or self.config.staging_root is None:
-            raise WacliError("invalid_media_path", dispatch_may_have_occurred=False)
-        if (
-            not isinstance(expected_size, int)
-            or expected_size < 0
-            or not isinstance(expected_sha256, str)
-            or not _HASH_RE.fullmatch(expected_sha256)
-        ):
-            raise WacliError("invalid_media_integrity", dispatch_may_have_occurred=False)
-        try:
-            descriptor = open_confined_readonly(self.config.staging_root, Path(value))
-        except (OSError, StagingError, ValueError) as exc:
-            raise WacliError("invalid_media_path", dispatch_may_have_occurred=False) from exc
-        try:
-            size, digest = hash_verified_descriptor(
-                descriptor,
-                maximum_bytes=100 * 1024 * 1024,
-            )
-            if size != expected_size or digest != expected_sha256:
-                raise WacliError("media_integrity_mismatch", dispatch_may_have_occurred=False)
-            return descriptor
-        except StagingError as exc:
-            os.close(descriptor)
-            raise WacliError(
-                "media_integrity_mismatch", dispatch_may_have_occurred=False
-            ) from exc
-        except BaseException:
-            os.close(descriptor)
-            raise
-
     async def call_tool(
         self, tool_name: str, arguments: Mapping[str, Any]
     ) -> Mapping[str, Any]:
@@ -536,7 +511,7 @@ class WacliWrapper:
     async def send_file(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {
             "to",
-            "file_path",
+            "staged_id",
             "filename",
             "mime_type",
             "caption",
@@ -547,7 +522,7 @@ class WacliWrapper:
         }
         required = {
             "to",
-            "file_path",
+            "staged_id",
             "filename",
             "mime_type",
             "expected_size",
@@ -582,40 +557,58 @@ class WacliWrapper:
             raise WacliError("invalid_reply", dispatch_may_have_occurred=False)
         if reply_sender is not None and not isinstance(reply_sender, str):
             raise WacliError("invalid_reply", dispatch_may_have_occurred=False)
-        descriptor = self._open_confined_media(
-            arguments.get("file_path"),
-            expected_size=arguments.get("expected_size"),
-            expected_sha256=arguments.get("expected_sha256"),
-        )
+        staged_id = arguments.get("staged_id")
+        expected_size = arguments.get("expected_size")
+        expected_sha256 = arguments.get("expected_sha256")
+        if (
+            not isinstance(staged_id, str)
+            or not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size < 0
+            or not isinstance(expected_sha256, str)
+            or not _HASH_RE.fullmatch(expected_sha256)
+            or self._staging_store is None
+        ):
+            raise WacliError("invalid_media_integrity", dispatch_may_have_occurred=False)
         try:
-            await self.verify_version()
-            assert self._verified_signature is not None
-            command = [
-                "send",
-                "file",
-                "--to",
-                normalize_destination(to),
-                "--file",
-                f"/dev/fd/{descriptor}",
-                "--filename",
-                filename,
-                "--mime",
-                mime_type,
-            ]
-            if caption is not None:
-                command.extend(("--caption", caption))
-            if reply_to is not None:
-                command.extend(("--reply-to", reply_to))
-            if reply_sender is not None:
-                command.extend(
-                    ("--reply-to-sender", normalize_destination(reply_sender))
-                )
-            result, _ = await self._run_json(
-                tuple(command),
-                dispatch_may_have_occurred=True,
-                required_signature=self._verified_signature,
-                pass_fds=(descriptor,),
+            plaintext = self._staging_store.plaintext_descriptor(
+                staged_id,
+                adapter="whatsapp",
+                account=self.config.account,
+                expected_size=expected_size,
+                expected_sha256=expected_sha256,
             )
-            return result
-        finally:
-            os.close(descriptor)
+            with plaintext as (_, descriptor):
+                await self.verify_version()
+                assert self._verified_signature is not None
+                command = [
+                    "send",
+                    "file",
+                    "--to",
+                    normalize_destination(to),
+                    "--file",
+                    f"/dev/fd/{descriptor}",
+                    "--filename",
+                    filename,
+                    "--mime",
+                    mime_type,
+                ]
+                if caption is not None:
+                    command.extend(("--caption", caption))
+                if reply_to is not None:
+                    command.extend(("--reply-to", reply_to))
+                if reply_sender is not None:
+                    command.extend(
+                        ("--reply-to-sender", normalize_destination(reply_sender))
+                    )
+                result, _ = await self._run_json(
+                    tuple(command),
+                    dispatch_may_have_occurred=True,
+                    required_signature=self._verified_signature,
+                    pass_fds=(descriptor,),
+                )
+                return result
+        except StagingError as exc:
+            raise WacliError(
+                "media_integrity_mismatch", dispatch_may_have_occurred=False
+            ) from exc

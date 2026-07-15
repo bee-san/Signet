@@ -41,6 +41,7 @@ from signet.adapters.base import (
     copy_json_object,
     redact_json,
 )
+from signet.models import AttachmentReference
 from signet.staging import StagedFile, StagingError, StagingStore
 
 _HEADER_FORBIDDEN = frozenset(
@@ -312,6 +313,35 @@ class FastmailAdapter:
     def canonicalize(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         self.validate(arguments)
         return copy_json_object(arguments)
+
+    def freeze_attachments(
+        self, arguments: Mapping[str, Any]
+    ) -> tuple[AttachmentReference, ...]:
+        canonical = self.canonicalize(arguments)
+        references = cast(list[dict[str, Any]], canonical["attachments"])
+        if references and self.staging_store is None:
+            raise StagingError("Fastmail attachment staging is not configured")
+        frozen: list[AttachmentReference] = []
+        for reference in references:
+            assert self.staging_store is not None
+            record = self.staging_store.resolve(
+                cast(str, reference["staged_id"]),
+                adapter=self.downstream_alias,
+                account=self.account,
+            )
+            if self._attachment_reference(record) != reference:
+                raise StagingError("frozen attachment metadata no longer matches staging")
+            frozen.append(
+                AttachmentReference(
+                    attachment_id=record.opaque_id,
+                    filename=record.filename,
+                    mime_type=record.declared_mime,
+                    size_bytes=record.size,
+                    sha256=record.sha256,
+                    storage_path=str(record.path),
+                )
+            )
+        return tuple(frozen)
 
     def stage_attachment(
         self,

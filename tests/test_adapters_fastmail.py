@@ -20,6 +20,7 @@ from signet.adapters import (
 )
 from signet.delivery import standardize_safe_metadata
 from signet.staging import StagingError, StagingStore
+from tests.attachment_fixtures import staging_store as make_staging_store
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -66,7 +67,7 @@ def adapter_request(arguments: Mapping[str, Any]) -> AdapterRequest:
 def staging_store(tmp_path: Path) -> tuple[StagingStore, Path]:
     source_root = tmp_path / "sources"
     source_root.mkdir()
-    store = StagingStore(
+    store = make_staging_store(
         tmp_path / "staging",
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
@@ -235,7 +236,7 @@ def test_fastmail_verified_bytes_survive_staging_store_restart(
         filename="report.txt",
         mime_type="text/plain",
     )
-    restarted = StagingStore(
+    restarted = make_staging_store(
         store.root,
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,

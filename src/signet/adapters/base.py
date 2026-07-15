@@ -26,7 +26,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Protocol, cast, final, runtime_checkable
 
-from signet.models import ReadOnlyToolViolation
+from signet.models import AttachmentReference, ReadOnlyToolViolation
 
 JSON_OBJECT_ERROR = "value must be a JSON object"
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -231,6 +231,10 @@ class ApprovalAdapter(Protocol):
     def validate(self, arguments: Mapping[str, Any]) -> None: ...
 
     def canonicalize(self, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def freeze_attachments(
+        self, arguments: Mapping[str, Any]
+    ) -> tuple[AttachmentReference, ...]: ...
 
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> ApprovalSummary: ...
 

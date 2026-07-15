@@ -11,7 +11,8 @@ import yaml
 
 from signet.canonical import CanonicalizationError, canonical_json, payload_fingerprint
 from signet.policy import PolicyError, PolicyMode, load_policy, parse_policy
-from signet.staging import StagingError, StagingStore
+from signet.staging import StagingError
+from tests.attachment_fixtures import attachment_cipher, staging_store
 
 
 def test_canonical_json_preserves_exact_strings_and_null_vs_omitted() -> None:
@@ -257,7 +258,7 @@ def test_staging_is_private_scoped_and_integrity_checked(tmp_path: Path) -> None
     source_root.mkdir()
     source = source_root / "note.txt"
     source.write_bytes(b"private body")
-    store = StagingStore(
+    store = staging_store(
         tmp_path / "staging",
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
@@ -270,6 +271,25 @@ def test_staging_is_private_scoped_and_integrity_checked(tmp_path: Path) -> None
         declared_mime="text/plain",
     )
     assert stat_mode(record.path) == 0o600
+    envelope = record.path.read_bytes()
+    assert b"private body" not in envelope
+    assert hashlib.sha256(envelope).hexdigest() == record.envelope_sha256
+    with store.database.read() as connection:
+        catalog = connection.execute(
+            "SELECT * FROM staged_objects WHERE attachment_id = ?",
+            (record.opaque_id,),
+        ).fetchone()
+    assert catalog["storage_path"] == str(record.path)
+    assert catalog["encryption_key_ref"] == record.encryption_key_ref
+    with store.plaintext_descriptor(
+        record.opaque_id,
+        adapter="fastmail",
+        account="primary",
+        expected_size=record.size,
+        expected_sha256=record.sha256,
+    ) as (_, descriptor):
+        assert os.fstat(descriptor).st_nlink == 0
+        assert os.read(descriptor, record.size) == b"private body"
     assert store.resolve(record.opaque_id, adapter="fastmail", account="primary") == record
     with pytest.raises(StagingError, match="not found"):
         store.resolve(record.opaque_id, adapter="fastmail", account="other")
@@ -287,7 +307,7 @@ def test_staging_rejects_links_traversal_and_outside_roots(tmp_path: Path) -> No
     source_root.mkdir()
     source = source_root / "data.bin"
     source.write_bytes(b"data")
-    store = StagingStore(
+    store = staging_store(
         tmp_path / "staging",
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
@@ -328,7 +348,7 @@ def test_staged_catalog_and_verified_bytes_survive_store_restart(tmp_path: Path)
     source = source_root / "durable.bin"
     source.write_bytes(b"durable before enqueue")
     staging_root = tmp_path / "staging"
-    first = StagingStore(
+    first = staging_store(
         staging_root,
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
@@ -341,7 +361,7 @@ def test_staged_catalog_and_verified_bytes_survive_store_restart(tmp_path: Path)
         declared_mime="application/octet-stream",
     )
 
-    restarted = StagingStore(
+    restarted = staging_store(
         staging_root,
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
@@ -364,10 +384,11 @@ def test_staging_capacity_comes_from_durable_files_not_process_memory(tmp_path: 
     first_source.write_bytes(b"1234")
     second_source.write_bytes(b"5678")
     staging_root = tmp_path / "staging"
-    first = StagingStore(
+    one_envelope_plus_headroom = attachment_cipher().envelope_size(4) + 3
+    first = staging_store(
         staging_root,
         allowed_source_roots=(source_root,),
-        max_total_bytes=7,
+        max_total_bytes=one_envelope_plus_headroom,
         minimum_free_bytes=0,
     )
     first.stage_path(
@@ -378,10 +399,10 @@ def test_staging_capacity_comes_from_durable_files_not_process_memory(tmp_path: 
         declared_mime="application/octet-stream",
     )
 
-    restarted = StagingStore(
+    restarted = staging_store(
         staging_root,
         allowed_source_roots=(source_root,),
-        max_total_bytes=7,
+        max_total_bytes=one_envelope_plus_headroom,
         minimum_free_bytes=0,
     )
     with pytest.raises(StagingError, match="total"):
@@ -403,7 +424,7 @@ def test_metadata_publish_failure_leaves_no_visible_staged_object(
     source = source_root / "fixture.bin"
     source.write_bytes(b"fixture")
     staging_root = tmp_path / "staging"
-    store = StagingStore(
+    store = staging_store(
         staging_root,
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
@@ -435,7 +456,7 @@ def test_orphan_sweep_preserves_catalogued_and_explicitly_protected_objects(
     source = source_root / "kept.bin"
     source.write_bytes(b"kept")
     staging_root = tmp_path / "staging"
-    store = StagingStore(
+    store = staging_store(
         staging_root,
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
@@ -482,7 +503,7 @@ def test_source_open_rejects_intermediate_symlinks_and_hardlinks(tmp_path: Path)
     original.write_bytes(b"hard linked")
     hardlink = source_root / "hardlink.bin"
     os.link(original, hardlink)
-    store = StagingStore(
+    store = staging_store(
         tmp_path / "staging",
         allowed_source_roots=(source_root,),
         minimum_free_bytes=0,
