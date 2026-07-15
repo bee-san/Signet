@@ -73,7 +73,7 @@
   },
   "reconciliation": {
     "lookup": "search_email",
-    "confirmation": "exact captured provider message or submission identifier",
+    "confirmation": "exact captured provider message or submission identifier plus exact immutable frozen sender, recipients, subject, and body from a bounded Sent result",
     "empty_result": "inconclusive",
     "confirmed_no_effect_supported": false
   }

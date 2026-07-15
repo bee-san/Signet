@@ -64,6 +64,24 @@ def adapter_request(arguments: Mapping[str, Any]) -> AdapterRequest:
     )
 
 
+def sent_search_candidate(
+    arguments: Mapping[str, Any],
+    *,
+    identity: str = "message-safe-id",
+) -> dict[str, Any]:
+    return {
+        "messageId": identity,
+        "folder": "Sent",
+        "status": "sent",
+        "from": arguments["from"],
+        "to": arguments["to"],
+        "cc": arguments.get("cc", []),
+        "bcc": arguments.get("bcc", []),
+        "subject": arguments["subject"],
+        "body": arguments["body"],
+    }
+
+
 def staging_store(tmp_path: Path) -> tuple[StagingStore, Path]:
     source_root = tmp_path / "sources"
     source_root.mkdir()
@@ -283,9 +301,10 @@ def test_fastmail_verified_bytes_survive_staging_store_restart(
 @pytest.mark.asyncio
 async def test_fastmail_reconcile_confirms_only_a_captured_provider_identity() -> None:
     adapter = FastmailAdapter(account="primary")
-    request = adapter_request(fixture_arguments())
+    arguments = fixture_arguments()
+    request = adapter_request(arguments)
     downstream = FakeFastmailClient(
-        search_result={"messages": [{"messageId": "message-safe-id", "folder": "Sent"}]}
+        search_result={"messages": [sent_search_candidate(arguments)]}
     )
     restricted = ReadOnlyMCPClient(downstream, adapter.reconciliation_tools)
     attempt = ExecutionAttempt(
@@ -330,6 +349,72 @@ async def test_fastmail_reconcile_never_claims_no_effect_from_missing_or_empty_s
         is Reconciliation.INCONCLUSIVE
     )
     assert adapter.supports_idempotency is False
+
+
+@pytest.mark.asyncio
+async def test_fastmail_reconcile_rejects_unbound_malformed_and_error_hits() -> None:
+    adapter = FastmailAdapter(account="primary")
+    arguments = fixture_arguments()
+    request = adapter_request(arguments)
+    attempt = ExecutionAttempt(
+        attempt_id="attempt_untrusted_search",
+        started_at=datetime.now(UTC),
+        downstream_result={"messageId": "message-safe-id"},
+    )
+    unrelated = sent_search_candidate(arguments)
+    unrelated["body"] = "A different message with a stale or wrong provider ID."
+    cases: tuple[Mapping[str, Any], ...] = (
+        {"messages": [{"messageId": "message-safe-id", "folder": "Sent"}]},
+        {"messages": [unrelated]},
+        {"messages": [sent_search_candidate(arguments, identity="different-id")]},
+        {"messages": ["malformed"]},
+        {"messages": [{}] * 11},
+        {"isError": True, "messages": [sent_search_candidate(arguments)]},
+        {"data": {"is_error": True, "messages": [sent_search_candidate(arguments)]}},
+    )
+
+    for search_result in cases:
+        downstream = FakeFastmailClient(search_result=search_result)
+        restricted = ReadOnlyMCPClient(downstream, adapter.reconciliation_tools)
+        assert (
+            await adapter.reconcile(restricted, request, attempt)
+            is Reconciliation.INCONCLUSIVE
+        )
+        assert len(downstream.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fastmail_reconcile_with_attachments_requires_characterized_binding() -> None:
+    adapter = FastmailAdapter(account="primary")
+    arguments = fixture_arguments()
+    arguments["attachments"] = [
+        {
+            "staged_id": "stg_FakeAttachment01",
+            "filename": "reviewed.txt",
+            "mime_type": "text/plain",
+            "detected_mime": "text/plain",
+            "size": 7,
+            "sha256": "a" * 64,
+        }
+    ]
+    request = adapter_request(arguments)
+    downstream = FakeFastmailClient(
+        search_result={"messages": [sent_search_candidate(arguments)]}
+    )
+    restricted = ReadOnlyMCPClient(downstream, adapter.reconciliation_tools)
+
+    assert (
+        await adapter.reconcile(
+            restricted,
+            request,
+            ExecutionAttempt(
+                attempt_id="attempt_attachment_search",
+                started_at=datetime.now(UTC),
+                downstream_result={"messageId": "message-safe-id"},
+            ),
+        )
+        is Reconciliation.INCONCLUSIVE
+    )
 
 
 def test_fastmail_ambiguous_tool_error_remains_unknown() -> None:

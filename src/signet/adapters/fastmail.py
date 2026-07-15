@@ -1,12 +1,13 @@
 """Fastmail send adapter with local attachment staging.
 
-The public input contract uses opaque Signet attachment references.  Provider
+The public input contract uses opaque Signet attachment references. Provider
 uploads happen only while executing an approved request, immediately before the
-single ``send_email`` call.  The currently reviewed Fastmail MCP surface does not
-promise a stable idempotency key.  Reconciliation can therefore confirm an
-effect only when a captured result contains a provider message/submission ID that
-the read-only sent-mail lookup returns; an empty search is never treated as proof
-of no effect.
+single ``send_email`` call. The currently reviewed Fastmail MCP surface does not
+promise a stable idempotency key. Reconciliation can therefore confirm an effect
+only when a captured result contains a provider message/submission ID and the
+read-only sent-mail lookup returns that ID with the exact immutable frozen message
+fields. An empty or partial search result is never treated as proof of either
+effect or no effect.
 """
 
 from __future__ import annotations
@@ -265,19 +266,71 @@ def _candidate_send_identity(value: Mapping[str, Any] | None) -> str | None:
 
 
 def _candidate_objects(result: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    if result.get("isError") is True or result.get("is_error") is True:
+        return ()
     for key in ("messages", "emails", "results", "items"):
         candidates = result.get(key)
         if isinstance(candidates, list):
-            return tuple(candidate for candidate in candidates if isinstance(candidate, Mapping))
+            if len(candidates) > 10 or any(
+                not isinstance(candidate, Mapping) for candidate in candidates
+            ):
+                return ()
+            return tuple(cast(Mapping[str, Any], candidate) for candidate in candidates)
     data = result.get("data")
     if isinstance(data, Mapping):
+        if data.get("isError") is True or data.get("is_error") is True:
+            return ()
         for key in ("messages", "emails", "results", "items"):
             candidates = data.get(key)
             if isinstance(candidates, list):
-                return tuple(
-                    candidate for candidate in candidates if isinstance(candidate, Mapping)
-                )
+                if len(candidates) > 10 or any(
+                    not isinstance(candidate, Mapping) for candidate in candidates
+                ):
+                    return ()
+                return tuple(cast(Mapping[str, Any], candidate) for candidate in candidates)
     return ()
+
+
+def _candidate_matches_request(
+    candidate: Mapping[str, Any],
+    *,
+    identity: str,
+    request: AdapterRequest,
+) -> bool:
+    """Require a sent hit to bind the provider ID to the exact frozen message."""
+
+    if (
+        candidate.get("isError") is True
+        or candidate.get("is_error") is True
+        or _candidate_send_identity(candidate) != identity
+        or candidate.get("folder") != "Sent"
+        or candidate.get("status") not in _FASTMAIL_PROVIDER_STATUSES
+        or request.arguments.get("attachments")
+    ):
+        return False
+    expected = {
+        "from": request.arguments.get("from"),
+        "to": request.arguments.get("to", []),
+        "cc": request.arguments.get("cc", []),
+        "bcc": request.arguments.get("bcc", []),
+        "subject": request.arguments.get("subject"),
+        "body": request.arguments.get("body"),
+    }
+    try:
+        actual = copy_json_object(
+            {
+                "from": candidate.get("from"),
+                "to": candidate.get("to", []),
+                "cc": candidate.get("cc", []),
+                "bcc": candidate.get("bcc", []),
+                "subject": candidate.get("subject"),
+                "body": candidate.get("body"),
+            }
+        )
+        detached_expected = copy_json_object(expected)
+    except (TypeError, ValueError):
+        return False
+    return actual == detached_expected
 
 
 class FastmailAdapter:
@@ -292,8 +345,9 @@ class FastmailAdapter:
     reconciliation_tools = frozenset({"search_email"})
     input_schema = FASTMAIL_SEND_SCHEMA
     reconciliation_characterization = (
-        "search_email can confirm a captured provider ID in Sent mail; it cannot prove "
-        "non-delivery and never returns confirmed_no_effect"
+        "search_email can confirm a captured provider ID only when the Sent hit also "
+        "matches every immutable frozen message field; it cannot prove non-delivery "
+        "and never returns confirmed_no_effect"
     )
 
     def __init__(
@@ -579,10 +633,8 @@ class FastmailAdapter:
             "search_email",
             {"query": identity, "folder": "Sent", "limit": 10},
         )
-        if result.get("isError") is True or result.get("is_error") is True:
-            return Reconciliation.INCONCLUSIVE
         if any(
-            _candidate_send_identity(candidate) == identity
+            _candidate_matches_request(candidate, identity=identity, request=request)
             for candidate in _candidate_objects(result)
         ):
             return Reconciliation.CONFIRMED_EFFECT
