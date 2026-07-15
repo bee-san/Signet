@@ -12,7 +12,6 @@ of no effect.
 from __future__ import annotations
 
 import base64
-import hashlib
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -354,16 +353,13 @@ class FastmailAdapter:
             raise StagingError("Fastmail attachment staging is not configured")
         for reference in references:
             assert self.staging_store is not None
-            record = self.staging_store.resolve(
+            record, content = self.staging_store.read_verified(
                 cast(str, reference["staged_id"]),
                 adapter=self.downstream_alias,
                 account=self.account,
             )
             if self._attachment_reference(record) != reference:
                 raise StagingError("frozen attachment metadata no longer matches staging")
-            content = record.path.read_bytes()
-            if hashlib.sha256(content).hexdigest() != record.sha256:
-                raise StagingError("staged attachment changed before execution")
             resolved.append(
                 {
                     **reference,

@@ -234,3 +234,180 @@ def test_staging_rejects_links_traversal_and_outside_roots(tmp_path: Path) -> No
             filename="outside",
             declared_mime="application/octet-stream",
         )
+
+
+def test_staged_catalog_and_verified_bytes_survive_store_restart(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "durable.bin"
+    source.write_bytes(b"durable before enqueue")
+    staging_root = tmp_path / "staging"
+    first = StagingStore(
+        staging_root,
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    record = first.stage_path(
+        source,
+        adapter="fastmail",
+        account="primary",
+        filename="durable.bin",
+        declared_mime="application/octet-stream",
+    )
+
+    restarted = StagingStore(
+        staging_root,
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    resolved, content = restarted.read_verified(
+        record.opaque_id,
+        adapter="fastmail",
+        account="primary",
+    )
+
+    assert resolved == record
+    assert content == b"durable before enqueue"
+
+
+def test_staging_capacity_comes_from_durable_files_not_process_memory(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    first_source = source_root / "first.bin"
+    second_source = source_root / "second.bin"
+    first_source.write_bytes(b"1234")
+    second_source.write_bytes(b"5678")
+    staging_root = tmp_path / "staging"
+    first = StagingStore(
+        staging_root,
+        allowed_source_roots=(source_root,),
+        max_total_bytes=7,
+        minimum_free_bytes=0,
+    )
+    first.stage_path(
+        first_source,
+        adapter="a",
+        account="b",
+        filename="first.bin",
+        declared_mime="application/octet-stream",
+    )
+
+    restarted = StagingStore(
+        staging_root,
+        allowed_source_roots=(source_root,),
+        max_total_bytes=7,
+        minimum_free_bytes=0,
+    )
+    with pytest.raises(StagingError, match="total"):
+        restarted.stage_path(
+            second_source,
+            adapter="a",
+            account="b",
+            filename="second.bin",
+            declared_mime="application/octet-stream",
+        )
+
+
+def test_metadata_publish_failure_leaves_no_visible_staged_object(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "fixture.bin"
+    source.write_bytes(b"fixture")
+    staging_root = tmp_path / "staging"
+    store = StagingStore(
+        staging_root,
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+
+    def fail_publish(record: object) -> None:
+        del record
+        raise OSError("injected metadata fsync failure")
+
+    monkeypatch.setattr(store, "_write_metadata", fail_publish)
+    with pytest.raises(OSError, match="injected"):
+        store.stage_path(
+            source,
+            adapter="a",
+            account="b",
+            filename="fixture.bin",
+            declared_mime="application/octet-stream",
+        )
+
+    assert not [path for path in staging_root.iterdir() if path.name.startswith("stg_")]
+    assert not list((staging_root / ".metadata").iterdir())
+
+
+def test_orphan_sweep_preserves_catalogued_and_explicitly_protected_objects(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "kept.bin"
+    source.write_bytes(b"kept")
+    staging_root = tmp_path / "staging"
+    store = StagingStore(
+        staging_root,
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    kept = store.stage_path(
+        source,
+        adapter="a",
+        account="b",
+        filename="kept.bin",
+        declared_mime="application/octet-stream",
+    )
+    orphan_id = "stg_" + "o" * 20
+    protected_id = "stg_" + "p" * 20
+    temporary_id = "stg_" + "t" * 20
+    orphan = staging_root / orphan_id
+    protected = staging_root / protected_id
+    temporary = staging_root / f".{temporary_id}.tmp"
+    for path in (orphan, protected, temporary):
+        path.write_bytes(b"unpublished")
+        os.utime(path, (100, 100))
+
+    removed = store.sweep_orphans(
+        protected_ids={protected_id},
+        minimum_age_seconds=10,
+        now=1_000,
+    )
+
+    assert removed == 2
+    assert not orphan.exists()
+    assert not temporary.exists()
+    assert protected.exists()
+    assert kept.path.exists()
+    assert store.resolve(kept.opaque_id, adapter="a", account="b") == kept
+
+
+def test_source_open_rejects_intermediate_symlinks_and_hardlinks(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "value.bin").write_bytes(b"outside")
+    (source_root / "linked").symlink_to(outside, target_is_directory=True)
+    original = source_root / "original.bin"
+    original.write_bytes(b"hard linked")
+    hardlink = source_root / "hardlink.bin"
+    os.link(original, hardlink)
+    store = StagingStore(
+        tmp_path / "staging",
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+
+    for unsafe in (source_root / "linked" / "value.bin", hardlink):
+        with pytest.raises(StagingError, match="safely"):
+            store.stage_path(
+                unsafe,
+                adapter="a",
+                account="b",
+                filename="value.bin",
+                declared_mime="application/octet-stream",
+            )

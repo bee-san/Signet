@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -168,6 +169,37 @@ def test_fastmail_rehashes_staged_attachment_before_execution(tmp_path: Path) ->
 
     with pytest.raises(StagingError, match="integrity"):
         adapter.prepare_for_execution(adapter_request(arguments))
+
+
+def test_fastmail_verified_bytes_survive_staging_store_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, source_root = staging_store(tmp_path)
+    source = source_root / "report.txt"
+    source.write_bytes(b"restart-safe bytes")
+    reference = FastmailAdapter(staging_store=store, account="primary").stage_attachment(
+        source,
+        filename="report.txt",
+        mime_type="text/plain",
+    )
+    restarted = StagingStore(
+        store.root,
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    adapter = FastmailAdapter(staging_store=restarted, account="primary")
+    arguments = fixture_arguments()
+    arguments["attachments"] = [reference]
+
+    def reject_path_read(self: Path) -> bytes:
+        raise AssertionError(f"unsafe pathname read attempted: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_path_read)
+    payload = adapter.prepare_for_execution(adapter_request(arguments))
+
+    encoded = payload["_signet_resolved_attachments"][0]["content_base64"]
+    assert base64.b64decode(encoded, validate=True) == b"restart-safe bytes"
 
 
 @pytest.mark.asyncio

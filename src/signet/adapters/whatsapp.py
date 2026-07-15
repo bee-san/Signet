@@ -9,7 +9,6 @@ an ambiguous repeated send, so reconciliation is unconditionally inconclusive.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -259,9 +258,6 @@ class WhatsAppAdapter:
             )
             if self._media_reference(record) != reference:
                 raise StagingError("frozen media metadata no longer matches staging")
-            digest = hashlib.sha256(record.path.read_bytes()).hexdigest()
-            if digest != record.sha256:
-                raise StagingError("staged media changed before execution")
             payload.update(
                 {
                     "file_path": str(record.path),

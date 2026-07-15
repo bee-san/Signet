@@ -72,6 +72,12 @@ def test_encrypted_bundle_restores_database_attachments_and_key_manifest(
     assert ApprovalStateMachine(restored_database).get_request("backupfixture")["state"] == (
         "pending_approval"
     )
+    with restored_database.read() as connection:
+        restored_path = connection.execute(
+            "SELECT storage_path FROM attachments WHERE attachment_id = 'stg_backup'"
+        ).fetchone()[0]
+    assert restored_path == str(restored.attachments_root / "00000000.bin")
+    assert restored_path != str(attachment)
 
 
 def test_bundle_tamper_and_wrong_key_fail_before_restore(tmp_path: Path) -> None:
@@ -124,3 +130,62 @@ def test_manager_repr_redacts_key(tmp_path: Path) -> None:
         encryption_key=b"private-key-material-32-bytes!!!!"[:32],
     )
     assert "private-key" not in repr(manager)
+
+
+def test_backup_attachment_rows_are_read_from_the_sqlite_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    attachment = staging / "stg_backup"
+    attachment.write_bytes(b"snapshot-owned bytes")
+    database = Database(tmp_path / "live" / "approvals.sqlite3")
+    database.initialize()
+    ApprovalStateMachine(database).enqueue(
+        _request(attachment, hashlib.sha256(b"snapshot-owned bytes").hexdigest())
+    )
+    original_snapshot = database.create_snapshot
+
+    def snapshot_then_change_live_database(destination: Path) -> Path:
+        snapshot = original_snapshot(destination)
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE attachments SET storage_path = ? WHERE attachment_id = 'stg_backup'",
+                (str(tmp_path / "missing-after-snapshot"),),
+            )
+        return snapshot
+
+    monkeypatch.setattr(database, "create_snapshot", snapshot_then_change_live_database)
+    manager = BackupBundleManager(database, staging_root=staging, encryption_key=b"k" * 32)
+
+    bundle = manager.create(tmp_path / "backup.signet")
+    restored = manager.restore(bundle, tmp_path / "restored")
+
+    assert (restored.attachments_root / "00000000.bin").read_bytes() == (
+        b"snapshot-owned bytes"
+    )
+
+
+def test_backup_rejects_symlink_replacement_of_snapshot_attachment(tmp_path: Path) -> None:
+    import hashlib
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    attachment = staging / "stg_backup"
+    attachment.write_bytes(b"approved")
+    database = Database(tmp_path / "live" / "approvals.sqlite3")
+    database.initialize()
+    ApprovalStateMachine(database).enqueue(
+        _request(attachment, hashlib.sha256(b"approved").hexdigest())
+    )
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"approved")
+    attachment.unlink()
+    attachment.symlink_to(outside)
+    manager = BackupBundleManager(database, staging_root=staging, encryption_key=b"k" * 32)
+
+    with pytest.raises(BackupError, match="unsafe"):
+        manager.create(tmp_path / "backup.signet")

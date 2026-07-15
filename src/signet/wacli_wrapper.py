@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from signet.adapters.base import DispatchError, copy_json_object
+from signet.staging import StagingError, hash_verified_descriptor, open_confined_readonly
 
 DEFAULT_WACLI_EXECUTABLE = Path("/opt/homebrew/bin/wacli")
 REVIEWED_WACLI_VERSION = "0.12.0"
@@ -279,24 +280,22 @@ class WacliWrapper:
         ):
             raise WacliError("invalid_media_integrity", dispatch_may_have_occurred=False)
         try:
-            path = Path(value).resolve(strict=True)
-            path.relative_to(self.config.staging_root)
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except (OSError, ValueError) as exc:
+            descriptor = open_confined_readonly(self.config.staging_root, Path(value))
+        except (OSError, StagingError, ValueError) as exc:
             raise WacliError("invalid_media_path", dispatch_may_have_occurred=False) from exc
         try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise WacliError("invalid_media_path", dispatch_may_have_occurred=False)
-            if metadata.st_size > 100 * 1024 * 1024 or metadata.st_size != expected_size:
+            size, digest = hash_verified_descriptor(
+                descriptor,
+                maximum_bytes=100 * 1024 * 1024,
+            )
+            if size != expected_size or digest != expected_sha256:
                 raise WacliError("media_integrity_mismatch", dispatch_may_have_occurred=False)
-            digest = hashlib.sha256()
-            while chunk := os.read(descriptor, 1024 * 1024):
-                digest.update(chunk)
-            if digest.hexdigest() != expected_sha256:
-                raise WacliError("media_integrity_mismatch", dispatch_may_have_occurred=False)
-            os.lseek(descriptor, 0, os.SEEK_SET)
             return descriptor
+        except StagingError as exc:
+            os.close(descriptor)
+            raise WacliError(
+                "media_integrity_mismatch", dispatch_may_have_occurred=False
+            ) from exc
         except BaseException:
             os.close(descriptor)
             raise

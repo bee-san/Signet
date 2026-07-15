@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -366,6 +367,36 @@ async def test_wacli_wrapper_rejects_media_outside_staging_before_process(tmp_pa
             }
         )
 
+    assert caught.value.dispatch_may_have_occurred is False
+    assert not log.exists()
+
+
+@pytest.mark.asyncio
+async def test_wacli_wrapper_rejects_symlinked_media_directory_before_process(
+    tmp_path: Path,
+) -> None:
+    executable, log = make_fake_wacli(tmp_path)
+    staging = tmp_path / "staging"
+    real = staging / "real"
+    real.mkdir(parents=True)
+    media = real / "media.bin"
+    media.write_bytes(b"approved bytes")
+    (staging / "alias").symlink_to(real, target_is_directory=True)
+    wrapper = WacliWrapper(wrapper_config(executable, tmp_path))
+
+    with pytest.raises(WacliError) as caught:
+        await wrapper.send_file(
+            {
+                "to": "+15550102030",
+                "file_path": str(staging / "alias" / "media.bin"),
+                "filename": "media.bin",
+                "mime_type": "application/octet-stream",
+                "expected_size": media.stat().st_size,
+                "expected_sha256": hashlib.sha256(b"approved bytes").hexdigest(),
+            }
+        )
+
+    assert caught.value.code == "invalid_media_path"
     assert caught.value.dispatch_may_have_occurred is False
     assert not log.exists()
 
