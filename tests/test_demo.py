@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -273,6 +274,9 @@ async def test_mcp_fake_read_approval_deny_and_web_only_approval_surface(
             )
             assert denied.isError is True
             assert denied.structuredContent["error"]["code"] == "policy_denied"
+            pending_fastmail = await session.call_tool("send_email", FASTMAIL_ARGUMENTS)
+            assert pending_fastmail.isError is False
+            fastmail_request_id = str(pending_fastmail.structuredContent["request_id"])
 
         async with mcp_session(client, "whatsapp") as session:
             read = await session.call_tool("list_chats", {})
@@ -281,6 +285,7 @@ async def test_mcp_fake_read_approval_deny_and_web_only_approval_surface(
             assert denied.isError is True
             pending = await session.call_tool("send_text", WHATSAPP_ARGUMENTS)
             assert pending.structuredContent["status"] == "pending_approval"
+            whatsapp_request_id = str(pending.structuredContent["request_id"])
 
         async with mcp_session(client, "approvals") as session:
             listed = await session.list_tools()
@@ -292,6 +297,28 @@ async def test_mcp_fake_read_approval_deny_and_web_only_approval_surface(
                 "cancel_request",
                 "request_tool_access",
             ]
+            pending = await session.call_tool("list_pending_approvals", {})
+            assert pending.isError is False
+            serialized = json.dumps(pending.structuredContent)
+            assert FASTMAIL_ARGUMENTS["to"][0] not in serialized
+            assert WHATSAPP_ARGUMENTS["to"] not in serialized
+            summaries = {
+                str(item["request_id"]): str(item["destination_summary"])
+                for item in pending.structuredContent["requests"]
+            }
+            assert summaries[fastmail_request_id] == "f***@demo.invalid"
+            assert summaries[whatsapp_request_id] == "*******0123@s.whatsapp.net"
+            for request_id, raw_destination in (
+                (fastmail_request_id, FASTMAIL_ARGUMENTS["to"][0]),
+                (whatsapp_request_id, WHATSAPP_ARGUMENTS["to"]),
+            ):
+                status = await session.call_tool(
+                    "check_approval_status", {"request_id": request_id}
+                )
+                assert status.isError is False
+                status_json = json.dumps(status.structuredContent)
+                assert raw_destination not in status_json
+                assert status.structuredContent["summary_available"] is True
             with pytest.raises(McpError):
                 await session.call_tool(
                     "approve_request",

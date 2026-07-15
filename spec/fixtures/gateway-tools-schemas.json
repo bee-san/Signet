@@ -28,7 +28,16 @@
       "outputSchema": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["request_id", "status", "version", "expires_at"],
+        "required": [
+          "request_id",
+          "status",
+          "service",
+          "tool",
+          "destination_summary",
+          "summary_available",
+          "version",
+          "expires_at"
+        ],
         "properties": {
           "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
           "status": {
@@ -44,6 +53,14 @@
               "cancelled"
             ]
           },
+          "service": {"type": "string", "minLength": 1},
+          "tool": {"type": "string", "minLength": 1},
+          "destination_summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "summary_available": {"type": "boolean"},
           "version": {"type": "integer", "minimum": 1},
           "expires_at": {"type": "string", "format": "date-time"},
           "safe_result_metadata": {"type": "object"},
@@ -57,12 +74,25 @@
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
-        "maxProperties": 0
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^[A-Za-z0-9_-]+$"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "default": 10
+          }
+        }
       },
       "outputSchema": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["requests"],
+        "required": ["requests", "next_cursor", "has_more"],
         "properties": {
           "requests": {
             "type": "array",
@@ -74,6 +104,7 @@
                 "service",
                 "tool",
                 "destination_summary",
+                "summary_available",
                 "age_seconds",
                 "expires_at",
                 "version_hash_prefix"
@@ -82,7 +113,12 @@
                 "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
                 "service": {"type": "string", "minLength": 1},
                 "tool": {"type": "string", "minLength": 1},
-                "destination_summary": {"type": "string", "minLength": 1},
+                "destination_summary": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2048
+                },
+                "summary_available": {"type": "boolean"},
                 "age_seconds": {"type": "integer", "minimum": 0},
                 "expires_at": {"type": "string", "format": "date-time"},
                 "version_hash_prefix": {
@@ -91,7 +127,14 @@
                 }
               }
             }
-          }
+          },
+          "next_cursor": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^[A-Za-z0-9_-]+$"
+          },
+          "has_more": {"type": "boolean"}
         }
       }
     },
@@ -127,7 +170,11 @@
           "status": {"const": "approved"},
           "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
           "tool": {"type": "string", "minLength": 1},
-          "destination_summary": {"type": "string", "minLength": 1},
+          "destination_summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
           "version": {"type": "integer", "minimum": 1},
           "version_hash_prefix": {
             "type": "string",

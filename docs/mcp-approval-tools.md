@@ -88,7 +88,10 @@ reviewed adapter projection and never a raw provider response.
   "outputSchema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["request_id", "status", "version", "expires_at"],
+    "required": [
+      "request_id", "status", "service", "tool", "destination_summary",
+      "summary_available", "version", "expires_at"
+    ],
     "properties": {
       "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
       "status": {
@@ -97,6 +100,12 @@ reviewed adapter projection and never a raw provider response.
           "failed", "outcome_unknown", "denied", "expired", "cancelled"
         ]
       },
+      "service": {"type": "string", "minLength": 1},
+      "tool": {"type": "string", "minLength": 1},
+      "destination_summary": {
+        "type": "string", "minLength": 1, "maxLength": 2048
+      },
+      "summary_available": {"type": "boolean"},
       "version": {"type": "integer", "minimum": 1},
       "expires_at": {"type": "string", "format": "date-time"},
       "safe_result_metadata": {"type": "object"},
@@ -106,7 +115,11 @@ reviewed adapter projection and never a raw provider response.
 }
 ```
 
-`safe_result_metadata` and `failure_code` are optional. Treat
+`safe_result_metadata` and `failure_code` are optional. The service, tool, and
+destination are the same privacy-safe projection used by listing and approval
+receipts. If authenticated payload review is unavailable, `summary_available` is
+false and the destination is a fixed unavailable message; no private bytes are
+returned. Treat
 `outcome_unknown` as a prominent unresolved state: an external effect may have
 occurred, so the caller must not resubmit blindly. Signet performs only the
 adapter's bounded read-only reconciliation and, where a reviewed stable provider
@@ -123,12 +136,18 @@ It never returns message bodies, full targets, attachments, or credentials.
   "inputSchema": {
     "type": "object",
     "additionalProperties": false,
-    "maxProperties": 0
+    "properties": {
+      "cursor": {
+        "type": "string", "minLength": 1, "maxLength": 512,
+        "pattern": "^[A-Za-z0-9_-]+$"
+      },
+      "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10}
+    }
   },
   "outputSchema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["requests"],
+    "required": ["requests", "next_cursor", "has_more"],
     "properties": {
       "requests": {
         "type": "array",
@@ -137,13 +156,16 @@ It never returns message bodies, full targets, attachments, or credentials.
           "additionalProperties": false,
           "required": [
             "request_id", "service", "tool", "destination_summary",
-            "age_seconds", "expires_at", "version_hash_prefix"
+            "summary_available", "age_seconds", "expires_at", "version_hash_prefix"
           ],
           "properties": {
             "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
             "service": {"type": "string", "minLength": 1},
             "tool": {"type": "string", "minLength": 1},
-            "destination_summary": {"type": "string", "minLength": 1},
+            "destination_summary": {
+              "type": "string", "minLength": 1, "maxLength": 2048
+            },
+            "summary_available": {"type": "boolean"},
             "age_seconds": {"type": "integer", "minimum": 0},
             "expires_at": {"type": "string", "format": "date-time"},
             "version_hash_prefix": {
@@ -151,11 +173,27 @@ It never returns message bodies, full targets, attachments, or credentials.
             }
           }
         }
-      }
+      },
+      "next_cursor": {
+        "type": ["string", "null"], "minLength": 1, "maxLength": 512,
+        "pattern": "^[A-Za-z0-9_-]+$"
+      },
+      "has_more": {"type": "boolean"}
     }
   }
 }
 ```
+
+The default page has ten entries and the hard maximum is 25. When `has_more` is
+true, pass `next_cursor` back as `cursor`; ordering is deterministic by creation
+time and request ID. Signet reviews no more private summaries than the requested
+page size. A corrupt or purged row remains visible with `summary_available=false`
+without suppressing healthy rows, and cannot be approved through MCP.
+
+Fastmail recipient hints retain only one local-part character and the normalized
+domain, for example `a***@example.test`, and show at most three recipients plus a
+count. WhatsApp hints retain only the final four digits and JID class, for example
+`*******0123@s.whatsapp.net`. Complete addresses and JIDs are web-only.
 
 The version hash prefix is the review binding for chat approval. An edit creates a
 new immutable version and hash; callers must list again rather than reuse a stale
@@ -194,7 +232,9 @@ MCP path, and one attempt. A code cannot authorize two actions.
       "status": {"const": "approved"},
       "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
       "tool": {"type": "string", "minLength": 1},
-      "destination_summary": {"type": "string", "minLength": 1},
+      "destination_summary": {
+        "type": "string", "minLength": 1, "maxLength": 2048
+      },
       "version": {"type": "integer", "minimum": 1},
       "version_hash_prefix": {
         "type": "string", "pattern": "^[a-f0-9]{8,64}$"
@@ -351,6 +391,7 @@ performs no policy change.
 | `totp_unavailable` | `TOTP verification is unavailable; use the authenticated web app.` |
 | `totp_binding_invalid` | `The TOTP proof was not bound to this exact request version.` |
 | `totp_replayed` | `This TOTP code has already authorized another action.` |
+| `private_summary_unavailable` | `The private request summary is unavailable; review this request in the web app.` |
 
 For mirrored downstream aliases, relevant stable errors additionally include
 `policy_denied`, `schema_unreviewed`, `schema_invalid`, `invalid_arguments`,

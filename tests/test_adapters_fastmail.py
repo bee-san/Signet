@@ -80,13 +80,35 @@ def test_fastmail_fixture_validates_and_private_summary_is_complete() -> None:
     arguments = fixture_arguments()
     adapter.validate(arguments)
     summary = adapter.summarize_for_web(arguments)
+    masked = adapter.masked_destination_summary(arguments)
 
     assert summary.destination_summary == "recipient@example.test"
+    assert masked == "r***@example.test"
+    assert summary.destination_summary not in masked
     assert any(block.value == arguments["body"] for block in summary.detail_blocks)
     audit = repr(adapter.redact_for_audit(arguments))
     assert arguments["body"] not in audit
     assert arguments["subject"] not in audit
     assert "recipient_count" in audit
+
+
+def test_fastmail_agent_summary_is_deterministic_bounded_and_never_full() -> None:
+    adapter = FastmailAdapter(account="primary")
+    arguments = fixture_arguments()
+    raw_recipients = [
+        "one@example.test",
+        "Two Person <two@elsewhere.test>",
+        "three@example.test",
+        "four@example.test",
+    ]
+    arguments.update({"to": raw_recipients, "cc": [], "bcc": []})
+
+    first = adapter.masked_destination_summary(arguments)
+    second = adapter.masked_destination_summary(arguments)
+
+    assert first == second
+    assert first == "o***@example.test, t***@elsewhere.test, t***@example.test, (+1 more)"
+    assert all(recipient not in first for recipient in raw_recipients)
 
 
 @pytest.mark.parametrize(

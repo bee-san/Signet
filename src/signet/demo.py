@@ -32,7 +32,7 @@ from signet.access_requests import FrozenAccessRequestFactory
 from signet.adapters.base import ApprovalAdapter, MCPClient, copy_json_object
 from signet.adapters.fastmail import FASTMAIL_SEND_SCHEMA, FastmailAdapter
 from signet.adapters.tool_access import ToolAccessAdapter
-from signet.adapters.whatsapp import WHATSAPP_TEXT_SCHEMA, WhatsAppTextAdapter
+from signet.adapters.whatsapp import WHATSAPP_TEXT_SCHEMA, WhatsAppAdapter, WhatsAppTextAdapter
 from signet.admission import QueueAdmissionLimits
 from signet.attachment_crypto import AttachmentCipher
 from signet.auth import (
@@ -345,10 +345,15 @@ class ReviewedSummaryProvider:
             version=version,
             payload_hash=payload_hash,
         )
+        adapter = reviewed.adapter
+        if isinstance(adapter, (FastmailAdapter, WhatsAppAdapter)):
+            destination_summary = adapter.masked_destination_summary(reviewed.arguments)
+        else:
+            destination_summary = reviewed.summary.destination_summary
         return SafeRequestSummary(
             service=reviewed.summary.service,
-            tool=reviewed.adapter.tool_name,
-            destination_summary=reviewed.summary.destination_summary,
+            tool=adapter.tool_name,
+            destination_summary=destination_summary,
         )
 
 

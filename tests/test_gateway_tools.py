@@ -87,6 +87,7 @@ class FakeSummaries:
     def __init__(self) -> None:
         self.values: dict[str, SafeRequestSummary] = {}
         self.calls: list[tuple[str, int, str]] = []
+        self.failures: set[str] = set()
 
     def add(
         self,
@@ -100,6 +101,8 @@ class FakeSummaries:
 
     def get(self, request_id: str, *, version: int, payload_hash: str) -> SafeRequestSummary:
         self.calls.append((request_id, version, payload_hash))
+        if request_id in self.failures:
+            raise ValueError("fake corrupt encrypted payload")
         return self.values[request_id]
 
 
@@ -458,13 +461,102 @@ async def test_list_pending_is_caller_scoped_masked_and_omits_expired(
                 "service": "Fastmail",
                 "tool": "send_email",
                 "destination_summary": "a***@example.test",
+                "summary_available": True,
                 "age_seconds": 10,
                 "expires_at": "2027-01-15T08:10:00Z",
                 "version_hash_prefix": digest("body-one")[:12],
             }
-        ]
+        ],
+        "next_cursor": None,
+        "has_more": False,
     }
     assert harness.summaries.calls == [("req_Own", 1, digest("body-one"))]
+
+
+@pytest.mark.asyncio
+async def test_list_pending_is_hard_bounded_and_keyset_paginated(
+    machine: ApprovalStateMachine,
+) -> None:
+    harness = make_harness(machine)
+    request_ids = [f"req_Page{index:02d}" for index in range(30)]
+    for index, request_id in enumerate(reversed(request_ids)):
+        machine.enqueue(
+            enqueue_request(
+                request_id,
+                payload=f"page-body-{index}",
+                created_at=NOW,
+            )
+        )
+        harness.summaries.add(request_id)
+
+    first = structured(
+        await harness.tools.call_tool(
+            "list_pending_approvals", {}, principal=own_principal()
+        )
+    )
+
+    assert [item["request_id"] for item in first["requests"]] == request_ids[:10]
+    assert first["has_more"] is True
+    assert isinstance(first["next_cursor"], str)
+    assert len(harness.summaries.calls) == 10
+
+    second = structured(
+        await harness.tools.call_tool(
+            "list_pending_approvals",
+            {"cursor": first["next_cursor"], "limit": 25},
+            principal=own_principal(),
+        )
+    )
+
+    assert [item["request_id"] for item in second["requests"]] == request_ids[10:]
+    assert second["has_more"] is False
+    assert second["next_cursor"] is None
+    assert len(harness.summaries.calls) == 30
+
+
+@pytest.mark.asyncio
+async def test_list_pending_rejects_oversized_pages_and_invalid_cursors(
+    machine: ApprovalStateMachine,
+) -> None:
+    harness = make_harness(machine)
+
+    with pytest.raises(McpError):
+        await harness.tools.call_tool(
+            "list_pending_approvals", {"limit": 26}, principal=own_principal()
+        )
+    with pytest.raises(McpError):
+        await harness.tools.call_tool(
+            "list_pending_approvals", {"cursor": "bad"}, principal=own_principal()
+        )
+    assert harness.summaries.calls == []
+
+
+@pytest.mark.asyncio
+async def test_list_pending_isolates_corrupt_or_unmasked_private_summaries(
+    machine: ApprovalStateMachine,
+) -> None:
+    harness = make_harness(machine)
+    for request_id in ("req_Corrupt", "req_Good", "req_Unmasked"):
+        machine.enqueue(enqueue_request(request_id, payload=request_id))
+    harness.summaries.failures.add("req_Corrupt")
+    harness.summaries.add("req_Good", destination="g***@example.test")
+    raw_destination = "private-recipient@example.test"
+    harness.summaries.add("req_Unmasked", destination=raw_destination)
+
+    result = structured(
+        await harness.tools.call_tool(
+            "list_pending_approvals", {"limit": 3}, principal=own_principal()
+        )
+    )
+
+    by_id = {item["request_id"]: item for item in result["requests"]}
+    assert by_id["req_Good"]["destination_summary"] == "g***@example.test"
+    assert by_id["req_Good"]["summary_available"] is True
+    for request_id in ("req_Corrupt", "req_Unmasked"):
+        assert by_id[request_id]["summary_available"] is False
+        assert "unavailable" in by_id[request_id]["destination_summary"].lower()
+    assert raw_destination not in json.dumps(result)
+    assert len(harness.summaries.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -506,6 +598,7 @@ async def test_check_status_returns_authoritative_safe_outcome_metadata(
 ) -> None:
     harness = make_harness(machine)
     machine.enqueue(enqueue_request("req_Status"))
+    harness.summaries.add("req_Status")
     machine.approve(
         "req_Status",
         expected_version=1,
@@ -534,6 +627,10 @@ async def test_check_status_returns_authoritative_safe_outcome_metadata(
     )
 
     assert result["status"] == "succeeded"
+    assert result["service"] == "Fastmail"
+    assert result["tool"] == "send_email"
+    assert result["destination_summary"] == "a***@example.test"
+    assert result["summary_available"] is True
     assert result["version"] == 1
     assert result["safe_result_metadata"] == {
         "message_id": "sgref_07055ac0b625e7c7fb975c3f283ef742",
@@ -598,6 +695,37 @@ async def test_approve_binds_exact_revision_consumes_once_and_returns_safe_recei
         ("new_pending", "fastmail", "send_email"),
         ("mcp_approved", "fastmail", "send_email"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_approval_fails_closed_when_summary_is_corrupt_or_unmasked(
+    machine: ApprovalStateMachine,
+) -> None:
+    for request_id, corrupt in (("req_CorruptReceipt", True), ("req_RawReceipt", False)):
+        harness = make_harness(machine)
+        machine.enqueue(enqueue_request(request_id, payload=request_id))
+        if corrupt:
+            harness.summaries.failures.add(request_id)
+        else:
+            harness.summaries.add(
+                request_id,
+                destination="private-recipient@example.test",
+            )
+
+        result = await harness.tools.call_tool(
+            "approve_request",
+            {
+                "request_id": request_id,
+                "totp_code": FAKE_SCHEMA_PROOF,
+                "expected_version_hash": digest(request_id)[:12],
+            },
+            principal=own_principal(),
+        )
+
+        assert error_code(result) == "private_summary_unavailable"
+        assert "private-recipient@example.test" not in json.dumps(result)
+        assert machine.get_request(request_id)["state"] == "pending_approval"
+        assert harness.totp.consumed_successes == []
 
 
 @pytest.mark.asyncio

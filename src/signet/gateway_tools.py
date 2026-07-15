@@ -9,6 +9,7 @@ decrypting reviewed payloads or learning downstream credentials.
 
 from __future__ import annotations
 
+import base64
 import copy
 import hmac
 import inspect
@@ -18,7 +19,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol, cast
+from typing import Any, Never, Protocol, cast
 
 import mcp.types as types
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
@@ -47,6 +48,15 @@ from signet.models import (
 from signet.state_machine import ApprovalStateMachine
 from signet.totp import InvalidTotp, TotpNotEnrolled, TotpUnavailable, VerifiedTotp
 
+DEFAULT_PENDING_PAGE_SIZE = 10
+MAX_PENDING_PAGE_SIZE = 25
+_MAX_SUMMARY_LENGTH = 2_048
+_UNAVAILABLE_DESTINATION_SUMMARY = "Private summary unavailable; review in the web app."
+_REQUEST_ID_RE = re.compile(r"^req_[A-Za-z0-9]+$")
+_WHATSAPP_MASK_RE = re.compile(
+    r"(?:\+[0-9*]+|[0-9*]+(?:@(s\.whatsapp\.net|g\.us|newsletter))?)"
+)
+
 GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "check_approval_status",
@@ -65,7 +75,16 @@ GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "outputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["request_id", "status", "version", "expires_at"],
+            "required": [
+                "request_id",
+                "status",
+                "service",
+                "tool",
+                "destination_summary",
+                "summary_available",
+                "version",
+                "expires_at",
+            ],
             "properties": {
                 "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
                 "status": {
@@ -81,6 +100,14 @@ GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "cancelled",
                     ]
                 },
+                "service": {"type": "string", "minLength": 1},
+                "tool": {"type": "string", "minLength": 1},
+                "destination_summary": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": _MAX_SUMMARY_LENGTH,
+                },
+                "summary_available": {"type": "boolean"},
                 "version": {"type": "integer", "minimum": 1},
                 "expires_at": {"type": "string", "format": "date-time"},
                 "safe_result_metadata": {"type": "object"},
@@ -94,12 +121,25 @@ GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "maxProperties": 0,
+            "properties": {
+                "cursor": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512,
+                    "pattern": "^[A-Za-z0-9_-]+$",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_PENDING_PAGE_SIZE,
+                    "default": DEFAULT_PENDING_PAGE_SIZE,
+                },
+            },
         },
         "outputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["requests"],
+            "required": ["requests", "next_cursor", "has_more"],
             "properties": {
                 "requests": {
                     "type": "array",
@@ -111,6 +151,7 @@ GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                             "service",
                             "tool",
                             "destination_summary",
+                            "summary_available",
                             "age_seconds",
                             "expires_at",
                             "version_hash_prefix",
@@ -122,7 +163,12 @@ GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                             },
                             "service": {"type": "string", "minLength": 1},
                             "tool": {"type": "string", "minLength": 1},
-                            "destination_summary": {"type": "string", "minLength": 1},
+                            "destination_summary": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": _MAX_SUMMARY_LENGTH,
+                            },
+                            "summary_available": {"type": "boolean"},
                             "age_seconds": {"type": "integer", "minimum": 0},
                             "expires_at": {"type": "string", "format": "date-time"},
                             "version_hash_prefix": {
@@ -130,8 +176,15 @@ GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                                 "pattern": "^[a-f0-9]{8,64}$",
                             },
                         },
-                    }
-                }
+                    },
+                },
+                "next_cursor": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": 512,
+                    "pattern": "^[A-Za-z0-9_-]+$",
+                },
+                "has_more": {"type": "boolean"},
             },
         },
     },
@@ -170,7 +223,11 @@ GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "status": {"const": "approved"},
                 "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
                 "tool": {"type": "string", "minLength": 1},
-                "destination_summary": {"type": "string", "minLength": 1},
+                "destination_summary": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": _MAX_SUMMARY_LENGTH,
+                },
                 "version": {"type": "integer", "minimum": 1},
                 "version_hash_prefix": {
                     "type": "string",
@@ -286,6 +343,13 @@ class SafeRequestSummary:
     def __post_init__(self) -> None:
         if not self.service or not self.tool or not self.destination_summary:
             raise ValueError("safe request summaries must not contain empty fields")
+        if (
+            len(self.service) > 128
+            or len(self.tool) > 128
+            or len(self.destination_summary) > _MAX_SUMMARY_LENGTH
+            or any(ord(character) < 32 for character in self.destination_summary)
+        ):
+            raise ValueError("safe request summary fields exceed their public bounds")
 
 
 class SafeSummaryProvider(Protocol):
@@ -393,9 +457,14 @@ class GatewayTools:
             raise RuntimeError("the gateway clock returned an invalid Unix timestamp")
 
         if name == "check_approval_status":
-            result = self._check_status(cast(str, values["request_id"]), principal)
+            result = await self._check_status(cast(str, values["request_id"]), principal)
         elif name == "list_pending_approvals":
-            result = await self._list_pending(principal, now=now)
+            result = await self._list_pending(
+                principal,
+                now=now,
+                cursor=cast(str | None, values.get("cursor")),
+                limit=cast(int, values.get("limit", DEFAULT_PENDING_PAGE_SIZE)),
+            )
         elif name == "approve_request":
             result = await self._approve(values, principal, now=now)
         elif name == "cancel_request":
@@ -436,7 +505,7 @@ class GatewayTools:
             ) from exc
         return values
 
-    def _check_status(
+    async def _check_status(
         self, request_id: str, principal: GatewayPrincipal
     ) -> dict[str, Any]:
         try:
@@ -444,9 +513,14 @@ class GatewayTools:
         except RequestNotFound:
             return _not_found_result()
 
+        summary, summary_available = await self._public_summary(request)
         value: dict[str, Any] = {
             "request_id": request.request_id,
             "status": request.state,
+            "service": summary.service,
+            "tool": request.tool,
+            "destination_summary": summary.destination_summary,
+            "summary_available": summary_available,
             "version": request.version,
             "expires_at": _timestamp(request.expires_at),
         }
@@ -460,12 +534,21 @@ class GatewayTools:
         return _success_result(value)
 
     async def _list_pending(
-        self, principal: GatewayPrincipal, *, now: int
+        self,
+        principal: GatewayPrincipal,
+        *,
+        now: int,
+        cursor: str | None,
+        limit: int,
     ) -> dict[str, Any]:
-        requests = self._pending_requests(principal.namespace, now=now)
-        summaries = [await _resolve(self._summary(request)) for request in requests]
-        for request, summary in zip(requests, summaries, strict=True):
-            _require_matching_tool(request, summary)
+        after = _decode_pending_cursor(cursor) if cursor is not None else None
+        requests, has_more = self._pending_requests(
+            principal.namespace,
+            now=now,
+            after=after,
+            limit=limit,
+        )
+        summaries = [await self._public_summary(request) for request in requests]
         value = {
             "requests": [
                 {
@@ -473,14 +556,21 @@ class GatewayTools:
                     "service": summary.service,
                     "tool": request.tool,
                     "destination_summary": summary.destination_summary,
+                    "summary_available": summary_available,
                     "age_seconds": max(0, now - request.created_at),
                     "expires_at": _timestamp(request.expires_at),
                     "version_hash_prefix": version_hash_prefix(
                         request.payload_hash, self._hash_prefix_length
                     ),
                 }
-                for request, summary in zip(requests, summaries, strict=True)
-            ]
+                for request, (summary, summary_available) in zip(
+                    requests, summaries, strict=True
+                )
+            ],
+            "next_cursor": (
+                _encode_pending_cursor(requests[-1]) if has_more and requests else None
+            ),
+            "has_more": has_more,
         }
         return _success_result(value)
 
@@ -576,8 +666,14 @@ class GatewayTools:
                 "The TOTP proof was not bound to this exact request version.",
             )
 
-        summary = await _resolve(self._summary(request))
-        _require_matching_tool(request, summary)
+        try:
+            summary = await self._review_summary(request)
+        except Exception:
+            return domain_error_result(
+                "private_summary_unavailable",
+                "The private request summary is unavailable; review this request in the web app.",
+            )
+
         confirmation = ApprovalConfirmation(
             kind=ConfirmationKind.TOTP,
             use_id=proof.use_id,
@@ -740,21 +836,69 @@ class GatewayTools:
             raise RequestNotFound(request_id)
         return _snapshot(row)
 
-    def _pending_requests(self, namespace: str, *, now: int) -> list[_RequestSnapshot]:
+    def _pending_requests(
+        self,
+        namespace: str,
+        *,
+        now: int,
+        after: tuple[int, str] | None,
+        limit: int,
+    ) -> tuple[list[_RequestSnapshot], bool]:
+        if limit < 1 or limit > MAX_PENDING_PAGE_SIZE:
+            raise ValueError("pending approval page size is outside its hard bound")
         with self._state_machine.database.read() as connection:
-            rows = connection.execute(
-                """
-                SELECT request_id, downstream_alias, tool_name, state,
-                       current_version, current_payload_hash, created_at, expires_at,
-                       gateway_internal, safe_outcome_json, failure_reason
-                FROM approval_requests
-                WHERE origin_namespace = ? AND state = 'pending_approval'
-                  AND expires_at > ?
-                ORDER BY created_at, request_id
-                """,
-                (namespace, now),
-            ).fetchall()
-        return [_snapshot(row) for row in rows]
+            if after is None:
+                rows = connection.execute(
+                    """
+                    SELECT request_id, downstream_alias, tool_name, state,
+                           current_version, current_payload_hash, created_at, expires_at,
+                           gateway_internal, safe_outcome_json, failure_reason
+                    FROM approval_requests
+                    WHERE origin_namespace = ? AND state = 'pending_approval'
+                      AND expires_at > ?
+                    ORDER BY created_at, request_id
+                    LIMIT ?
+                    """,
+                    (namespace, now, limit + 1),
+                ).fetchall()
+            else:
+                created_at, request_id = after
+                rows = connection.execute(
+                    """
+                    SELECT request_id, downstream_alias, tool_name, state,
+                           current_version, current_payload_hash, created_at, expires_at,
+                           gateway_internal, safe_outcome_json, failure_reason
+                    FROM approval_requests
+                    WHERE origin_namespace = ? AND state = 'pending_approval'
+                      AND expires_at > ?
+                      AND (created_at > ? OR (created_at = ? AND request_id > ?))
+                    ORDER BY created_at, request_id
+                    LIMIT ?
+                    """,
+                    (namespace, now, created_at, created_at, request_id, limit + 1),
+                ).fetchall()
+        visible = rows[:limit]
+        return [_snapshot(row) for row in visible], len(rows) > limit
+
+    async def _review_summary(self, request: _RequestSnapshot) -> SafeRequestSummary:
+        summary = await _resolve(self._summary(request))
+        _require_safe_summary(request, summary)
+        return summary
+
+    async def _public_summary(
+        self, request: _RequestSnapshot
+    ) -> tuple[SafeRequestSummary, bool]:
+        try:
+            return await self._review_summary(request), True
+        except Exception:
+            return (
+                SafeRequestSummary(
+                    service=_service_label(request.service),
+                    tool=request.tool,
+                    destination_summary=_UNAVAILABLE_DESTINATION_SUMMARY,
+                ),
+                False,
+            )
 
     def _summary(
         self, request: _RequestSnapshot
@@ -815,11 +959,98 @@ def _snapshot(row: Mapping[str, Any]) -> _RequestSnapshot:
     )
 
 
-def _require_matching_tool(
-    request: _RequestSnapshot, summary: SafeRequestSummary
-) -> None:
+def _require_safe_summary(request: _RequestSnapshot, summary: SafeRequestSummary) -> None:
     if summary.tool != request.tool:
         raise RuntimeError("safe request summary does not match the frozen request tool")
+    destination = summary.destination_summary
+    if request.service == "fastmail":
+        if summary.service.casefold() != "fastmail" or not _is_masked_email_summary(
+            destination
+        ):
+            raise RuntimeError("Fastmail agent summary is not safely masked")
+    elif request.service == "whatsapp" and (
+        summary.service.casefold() != "whatsapp"
+        or "***" not in destination
+        or _WHATSAPP_MASK_RE.fullmatch(destination) is None
+    ):
+        raise RuntimeError("WhatsApp agent summary is not safely masked")
+
+
+def _is_masked_email_summary(value: str) -> bool:
+    parts = value.split(", ")
+    if parts and re.fullmatch(r"\(\+[1-9][0-9]{0,2} more\)", parts[-1]):
+        parts.pop()
+    if not parts or len(parts) > 3:
+        return False
+    for mailbox in parts:
+        local, separator, domain = mailbox.partition("@")
+        if (
+            separator != "@"
+            or re.fullmatch(r"[A-Za-z0-9]\*{3}", local) is None
+            or not domain
+            or len(domain) > 253
+            or any(character.isspace() or ord(character) < 33 for character in domain)
+            or any(character in domain for character in "@,")
+        ):
+            return False
+    return True
+
+
+def _service_label(service: str) -> str:
+    return {"fastmail": "Fastmail", "whatsapp": "WhatsApp"}.get(service, service)
+
+
+def _encode_pending_cursor(request: _RequestSnapshot) -> str:
+    return _encode_pending_cursor_values(request.created_at, request.request_id)
+
+
+def _encode_pending_cursor_values(created_at: int, request_id: str) -> str:
+    payload = json.dumps(
+        [created_at, request_id],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_pending_cursor(value: str) -> tuple[int, str]:
+    try:
+        padding = "=" * (-len(value) % 4)
+        decoded = base64.b64decode(
+            value + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        parsed = json.loads(decoded.decode("ascii"))
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        _raise_invalid_cursor()
+    if (
+        not isinstance(parsed, list)
+        or len(parsed) != 2
+        or not isinstance(parsed[0], int)
+        or isinstance(parsed[0], bool)
+        or parsed[0] < 0
+        or parsed[0] > 2**63 - 1
+        or not isinstance(parsed[1], str)
+        or len(parsed[1]) > 128
+        or _REQUEST_ID_RE.fullmatch(parsed[1]) is None
+    ):
+        _raise_invalid_cursor()
+    created_at, request_id = cast(tuple[int, str], tuple(parsed))
+    if not hmac.compare_digest(
+        _encode_pending_cursor_values(created_at, request_id), value
+    ):
+        _raise_invalid_cursor()
+    return created_at, request_id
+
+
+def _raise_invalid_cursor() -> Never:
+    raise McpError(
+        types.ErrorData(
+            code=types.INVALID_PARAMS,
+            message="Invalid arguments for list_pending_approvals",
+        )
+    )
 
 
 async def _resolve[T](value: T | Awaitable[T]) -> T:

@@ -288,6 +288,16 @@ class WhatsAppAdapter:
             ),
         )
 
+    def masked_destination_summary(self, arguments: Mapping[str, Any]) -> str:
+        """Return only the destination shape and final four digits."""
+
+        destination = normalize_destination(cast(str, self.canonicalize(arguments)["to"]))
+        numeric, separator, jid_class = destination.partition("@")
+        prefix = "+" if numeric.startswith("+") else ""
+        digits = numeric.removeprefix("+")
+        hidden = "*" * (len(digits) - 4)
+        return f"{prefix}{hidden}{digits[-4:]}{separator}{jid_class}"
+
     def redact_for_audit(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         canonical = self.canonicalize(arguments)
         return redact_json(

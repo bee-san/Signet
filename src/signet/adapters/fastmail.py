@@ -12,6 +12,7 @@ of no effect.
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -158,6 +159,17 @@ def _parse_mailbox(value: str) -> Address:
 def _mailbox_key(value: str) -> str:
     address = _parse_mailbox(value)
     return f"{address.username.casefold()}@{address.domain.lower()}"
+
+
+def _masked_mailbox(value: str) -> str:
+    address = _parse_mailbox(value)
+    domain = address.domain
+    if len(domain) > 253:
+        domain = f"domain-{hashlib.sha256(domain.encode('ascii')).hexdigest()[:12]}.invalid"
+    hint = address.username[0]
+    if not hint.isascii() or not hint.isalnum():
+        hint = "x"
+    return f"{hint}***@{domain}"
 
 
 def _normalize_header(value: str, *, name: str) -> str:
@@ -403,6 +415,16 @@ class FastmailAdapter:
             detail_blocks=blocks,
             warnings=warnings,
         )
+
+    def masked_destination_summary(self, arguments: Mapping[str, Any]) -> str:
+        """Return a bounded recipient hint without exposing complete mailboxes."""
+
+        canonical = self.canonicalize(arguments)
+        recipients = [*canonical["to"], *canonical["cc"], *canonical["bcc"]]
+        visible = [_masked_mailbox(value) for value in cast(list[str], recipients[:3])]
+        if len(recipients) > len(visible):
+            visible.append(f"(+{len(recipients) - len(visible)} more)")
+        return ", ".join(visible)
 
     def redact_for_audit(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         canonical = self.canonicalize(arguments)

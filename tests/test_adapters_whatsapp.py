@@ -104,7 +104,10 @@ async def test_whatsapp_text_reply_executes_exact_owned_tool_once() -> None:
     arguments = text_arguments()
     arguments.update({"reply_to": "message-123", "reply_to_sender": "+15550102030"})
     summary = adapter.summarize_for_web(arguments)
+    masked = adapter.masked_destination_summary(arguments)
     assert summary.destination_summary == "+15550102030"
+    assert masked == "+*******2030"
+    assert summary.destination_summary not in masked
     assert any(block.kind == "reply" for block in summary.detail_blocks)
 
     downstream = FakeOwnedClient()
@@ -116,6 +119,20 @@ async def test_whatsapp_text_reply_executes_exact_owned_tool_once() -> None:
         "status": "sent",
         "chat_message_id": "wa-safe-id",
     }
+
+
+def test_whatsapp_jid_agent_summary_is_deterministic_and_never_full() -> None:
+    adapter = WhatsAppTextAdapter(account="personal")
+    arguments = {
+        "to": "15555550123@s.whatsapp.net",
+        "message": "private message",
+    }
+
+    first = adapter.masked_destination_summary(arguments)
+    second = adapter.masked_destination_summary(arguments)
+
+    assert first == second == "*******0123@s.whatsapp.net"
+    assert arguments["to"] not in first
 
 
 def test_whatsapp_safe_result_accepts_only_the_owned_wrapper_shape() -> None:
