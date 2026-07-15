@@ -402,8 +402,12 @@ class WacliWrapper:
             raise WacliError("process_start_failed", dispatch_may_have_occurred=False) from exc
         finally:
             os.close(executable_fd)
-        assert process.stdout is not None
-        assert process.stderr is not None
+        if process.stdout is None or process.stderr is None:
+            await self._terminate(process)
+            raise WacliError(
+                "process_pipe_unavailable",
+                dispatch_may_have_occurred=dispatch_may_have_occurred,
+            )
         try:
             async with asyncio.timeout(self.config.timeout_seconds):
                 stdout, stderr, return_code = await asyncio.gather(
@@ -512,11 +516,13 @@ class WacliWrapper:
                 raise WacliError("invalid_reply", dispatch_may_have_occurred=False)
             command.extend(("--reply-to-sender", normalize_destination(reply_sender)))
         await self.verify_version()
-        assert self._verified_signature is not None
+        verified_signature = self._verified_signature
+        if verified_signature is None:
+            raise WacliError("version_verification_failed", dispatch_may_have_occurred=False)
         result, _ = await self._run_json(
             tuple(command),
             dispatch_may_have_occurred=True,
-            required_signature=self._verified_signature,
+            required_signature=verified_signature,
         )
         return result
 
@@ -592,7 +598,12 @@ class WacliWrapper:
             )
             with plaintext as (_, descriptor):
                 await self.verify_version()
-                assert self._verified_signature is not None
+                verified_signature = self._verified_signature
+                if verified_signature is None:
+                    raise WacliError(
+                        "version_verification_failed",
+                        dispatch_may_have_occurred=False,
+                    )
                 command = [
                     "send",
                     "file",
@@ -616,7 +627,7 @@ class WacliWrapper:
                 result, _ = await self._run_json(
                     tuple(command),
                     dispatch_may_have_occurred=True,
-                    required_signature=self._verified_signature,
+                    required_signature=verified_signature,
                     pass_fds=(descriptor,),
                 )
                 return result

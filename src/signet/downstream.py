@@ -264,18 +264,22 @@ async def _official_stdio_connector(
     finally:
         os.close(executable_descriptor)
 
+    stdout = process.stdout
+    stdin = process.stdin
+    if stdout is None or stdin is None:
+        await _terminate_stdio_process(process)
+        raise DownstreamConnectionError("downstream stdio pipes are unavailable")
     read_sender, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](0)
     write_stream, write_receiver = anyio.create_memory_object_stream[SessionMessage](0)
 
     async def stdout_reader() -> None:
-        assert process.stdout is not None
         buffer = bytearray()
         try:
             async with read_sender:
                 while True:
                     remaining = parameters.output_limit_bytes + 1 - len(buffer)
                     try:
-                        chunk = await process.stdout.receive(min(65_536, remaining))
+                        chunk = await stdout.receive(min(65_536, remaining))
                     except anyio.EndOfStream:
                         return
                     buffer.extend(chunk)
@@ -304,14 +308,13 @@ async def _official_stdio_connector(
             await anyio.lowlevel.checkpoint()
 
     async def stdin_writer() -> None:
-        assert process.stdin is not None
         try:
             async with write_receiver:
                 async for session_message in write_receiver:
                     encoded = session_message.message.model_dump_json(
                         by_alias=True, exclude_none=True
                     )
-                    await process.stdin.send(
+                    await stdin.send(
                         (encoded + "\n").encode(
                             encoding=parameters.encoding,
                             errors=parameters.encoding_error_handler,
@@ -749,9 +752,11 @@ class DownstreamClient:
     async def _enter_transport(self, stack: AsyncExitStack, credential: Secret) -> TransportStreams:
         revealed = credential.reveal()
         if self._config.transport == "http":
-            assert self._config.url is not None
+            url = self._config.url
+            if url is None:
+                raise DownstreamConfigurationError("HTTP downstream endpoint is unavailable")
             context = self._http_connector(
-                self._config.url,
+                url,
                 {"Authorization": f"Bearer {revealed}"},
                 self._config.timeout_seconds,
                 self._config.output_limit_bytes,
@@ -763,8 +768,10 @@ class DownstreamClient:
             raise DownstreamConfigurationError(
                 "downstream credentials may not appear in process arguments"
             )
-        assert self._config.executable_sha256 is not None
-        assert self._config.execution_snapshot_root is not None
+        executable_sha256 = self._config.executable_sha256
+        snapshot_root = self._config.execution_snapshot_root
+        if executable_sha256 is None or snapshot_root is None:
+            raise DownstreamConfigurationError("stdio executable review is unavailable")
         parameters = ReviewedStdioServerParameters(
             command=executable,
             args=list(arguments),
@@ -775,8 +782,8 @@ class DownstreamClient:
                 _credential_environment_name(self._alias): revealed,
             },
             cwd=self._config.working_directory,
-            expected_sha256=self._config.executable_sha256,
-            execution_snapshot_root=self._config.execution_snapshot_root,
+            expected_sha256=executable_sha256,
+            execution_snapshot_root=snapshot_root,
             output_limit_bytes=self._config.output_limit_bytes,
             test_only_allow_script=self._config.test_only_allow_script,
         )

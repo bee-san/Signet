@@ -919,7 +919,8 @@ class ApprovalStateMachine:
             raise ConfirmationReplay("confirmation was already consumed") from exc
 
         if confirmation.kind == ConfirmationKind.TOTP:
-            assert confirmation.attempt_id is not None
+            if confirmation.attempt_id is None:
+                raise InvalidConfirmation("TOTP confirmation attempt is unavailable")
             for scope in confirmation.attempt_scope_keys:
                 connection.execute(
                     """
@@ -970,7 +971,8 @@ class ApprovalStateMachine:
         if self._capabilities is None:
             raise InvalidConfirmation("proof capability verification is unavailable")
         try:
-            assert confirmation.action is not None
+            if confirmation.action is None:
+                raise ValueError
             binding = ActionBinding(
                 confirmation.action,
                 confirmation.bound_request_id,
@@ -1002,46 +1004,45 @@ class ApprovalStateMachine:
                 )
                 domain = TOTP_PROOF_DOMAIN
             else:
-                required = (
-                    confirmation.credential_id,
-                    confirmation.credential_user_id,
-                    confirmation.challenge_id,
-                    confirmation.expected_counter,
-                    confirmation.new_counter,
-                    confirmation.device_type,
-                    confirmation.expected_backup_eligible,
-                    confirmation.new_backup_eligible,
-                    confirmation.previous_backed_up,
-                    confirmation.new_backed_up,
-                )
-                if any(value is None for value in required):
+                credential_id = confirmation.credential_id
+                challenge_id = confirmation.challenge_id
+                expected_counter = confirmation.expected_counter
+                new_counter = confirmation.new_counter
+                device_type = confirmation.device_type
+                expected_backup_eligible = confirmation.expected_backup_eligible
+                new_backup_eligible = confirmation.new_backup_eligible
+                previous_backed_up = confirmation.previous_backed_up
+                new_backed_up = confirmation.new_backed_up
+                if (
+                    credential_id is None
+                    or confirmation.credential_user_id is None
+                    or challenge_id is None
+                    or expected_counter is None
+                    or new_counter is None
+                    or device_type is None
+                    or expected_backup_eligible is None
+                    or new_backup_eligible is None
+                    or previous_backed_up is None
+                    or new_backed_up is None
+                ):
                     raise ValueError
-                assert confirmation.credential_id is not None
-                assert confirmation.challenge_id is not None
-                assert confirmation.expected_counter is not None
-                assert confirmation.new_counter is not None
-                assert confirmation.device_type is not None
-                assert confirmation.expected_backup_eligible is not None
-                assert confirmation.new_backup_eligible is not None
-                assert confirmation.previous_backed_up is not None
-                assert confirmation.new_backed_up is not None
                 claims = webauthn_proof_claims(
-                    credential_id=confirmation.credential_id,
+                    credential_id=credential_id,
                     credential_user_id=confirmation.credential_user_id or "",
                     user_id=confirmation.user_id or "",
-                    challenge_id=confirmation.challenge_id,
+                    challenge_id=challenge_id,
                     use_id=confirmation.use_id,
                     binding=binding,
                     path=confirmation.path,
                     session_id=confirmation.session_id or "",
                     http_method=confirmation.http_method or "",
-                    expected_counter=confirmation.expected_counter,
-                    new_counter=confirmation.new_counter,
-                    device_type=confirmation.device_type,
-                    expected_backup_eligible=confirmation.expected_backup_eligible,
-                    new_backup_eligible=confirmation.new_backup_eligible,
-                    previous_backed_up=confirmation.previous_backed_up,
-                    new_backed_up=confirmation.new_backed_up,
+                    expected_counter=expected_counter,
+                    new_counter=new_counter,
+                    device_type=device_type,
+                    expected_backup_eligible=expected_backup_eligible,
+                    new_backup_eligible=new_backup_eligible,
+                    previous_backed_up=previous_backed_up,
+                    new_backed_up=new_backed_up,
                 )
                 domain = WEBAUTHN_PROOF_DOMAIN
         except (AssertionError, TypeError, ValueError):
@@ -1060,33 +1061,27 @@ class ApprovalStateMachine:
         *,
         now: int,
     ) -> None:
-        required = (
-            confirmation.credential_id,
-            confirmation.credential_user_id,
-            confirmation.expected_counter,
-            confirmation.new_counter,
-            confirmation.expected_backup_eligible,
-            confirmation.new_backup_eligible,
-            confirmation.previous_backed_up,
-            confirmation.new_backed_up,
-        )
-        if any(value is None for value in required):
-            raise InvalidConfirmation("WebAuthn confirmation is missing credential state")
-        if confirmation.credential_user_id != confirmation.user_id:
-            raise InvalidConfirmation("WebAuthn credential ownership does not match")
-
+        credential_id = confirmation.credential_id
+        credential_user_id = confirmation.credential_user_id
         expected_counter = confirmation.expected_counter
         new_counter = confirmation.new_counter
         expected_eligible = confirmation.expected_backup_eligible
         new_eligible = confirmation.new_backup_eligible
         previous_backed_up = confirmation.previous_backed_up
         new_backed_up = confirmation.new_backed_up
-        assert expected_counter is not None
-        assert new_counter is not None
-        assert expected_eligible is not None
-        assert new_eligible is not None
-        assert previous_backed_up is not None
-        assert new_backed_up is not None
+        if (
+            credential_id is None
+            or credential_user_id is None
+            or expected_counter is None
+            or new_counter is None
+            or expected_eligible is None
+            or new_eligible is None
+            or previous_backed_up is None
+            or new_backed_up is None
+        ):
+            raise InvalidConfirmation("WebAuthn confirmation is missing credential state")
+        if credential_user_id != confirmation.user_id:
+            raise InvalidConfirmation("WebAuthn credential ownership does not match")
         if expected_counter < 0 or not (
             expected_counter == new_counter == 0 or new_counter > expected_counter
         ):
@@ -1113,8 +1108,8 @@ class ApprovalStateMachine:
                 int(new_eligible),
                 int(new_backed_up),
                 now,
-                confirmation.credential_id,
-                confirmation.credential_user_id,
+                credential_id,
+                credential_user_id,
                 expected_counter,
                 int(expected_eligible),
                 int(previous_backed_up),

@@ -85,7 +85,8 @@ class PushMessage:
             "url": "/",
         }
         if self.kind is NotificationKind.DAILY_DIGEST:
-            assert self.count is not None
+            if self.count is None:
+                raise ValueError("daily digest count is unavailable")
             payload.update(
                 {
                     "body": f"{self.count} requests waiting for approval",
@@ -93,7 +94,8 @@ class PushMessage:
                 }
             )
         else:
-            assert self.service is not None and self.action is not None
+            if self.service is None or self.action is None:
+                raise ValueError("event notification labels are unavailable")
             payload.update(
                 {
                     "body": body_by_kind[self.kind],

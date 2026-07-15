@@ -323,8 +323,10 @@ class FastmailAdapter:
             raise StagingError("Fastmail attachment staging is not configured")
         frozen: list[AttachmentReference] = []
         for reference in references:
-            assert self.staging_store is not None
-            record = self.staging_store.resolve(
+            store = self.staging_store
+            if store is None:
+                raise StagingError("Fastmail attachment staging is not configured")
+            record = store.resolve(
                 cast(str, reference["staged_id"]),
                 adapter=self.downstream_alias,
                 account=self.account,
@@ -432,8 +434,10 @@ class FastmailAdapter:
         if references and self.staging_store is None:
             raise StagingError("Fastmail attachment staging is not configured")
         for reference in references:
-            assert self.staging_store is not None
-            record, content = self.staging_store.read_verified(
+            store = self.staging_store
+            if store is None:
+                raise StagingError("Fastmail attachment staging is not configured")
+            record, content = store.read_verified(
                 cast(str, reference["staged_id"]),
                 adapter=self.downstream_alias,
                 account=self.account,
