@@ -649,7 +649,7 @@ def create_web_app(
         body = await _json_object(request)
         user_id = body.get("user_id")
         if not isinstance(user_id, str) or not user_id or len(user_id) > 256:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         return backend.begin_passkey_login(
             user_id,
             source=source(request),
@@ -668,7 +668,7 @@ def create_web_app(
         challenge_id = body.get("challenge_id")
         assertion = body.get("assertion")
         if not isinstance(challenge_id, str) or not isinstance(assertion, dict):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         token = backend.complete_passkey_login(
             challenge_id,
             assertion,
@@ -828,7 +828,7 @@ def create_web_app(
         body = await _json_object(request)
         action = body.get("action")
         if action not in _HUMAN_ACTIONS:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         expected_version = body.get("expected_version")
         payload_hash = body.get("expected_payload_hash")
         prospective = body.get("prospective_arguments_json")
@@ -841,7 +841,7 @@ def create_web_app(
             or (prospective is not None and not isinstance(prospective, str))
             or (decision_note is not None and not isinstance(decision_note, str))
         ):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         normalized_note = _decision_note_input(action, decision_note)
         return backend.begin_passkey_action(
             selected,
@@ -863,7 +863,7 @@ def create_web_app(
         challenge_id = body.get("challenge_id")
         assertion = body.get("assertion")
         if not isinstance(challenge_id, str) or not isinstance(assertion, dict):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         final_state = backend.complete_passkey_action(
             selected,
             request_id,
@@ -892,7 +892,7 @@ def create_web_app(
         body = await _json_object(request)
         endpoint = body.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint or len(endpoint) > 4096:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         backend.unsubscribe_push(selected, endpoint, now=now_fn())
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -915,9 +915,9 @@ def _decision_note_input(action: HumanAction, value: str | None) -> str | None:
     try:
         normalized = normalize_decision_note(value)
     except ValueError:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY) from None
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT) from None
     if normalized is not None and action not in {"approve", "deny"}:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
     return normalized
 
 
@@ -933,7 +933,7 @@ async def _json_object(request: Request) -> dict[str, Any]:
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST) from None
     if not isinstance(value, dict):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
     return value
 
 
