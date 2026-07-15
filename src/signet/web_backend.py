@@ -624,6 +624,21 @@ class WebBackend:
             )
         blocked_until: int | None = None
         with self._database.transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM auth_attempts WHERE rowid IN (
+                    SELECT rowid FROM auth_attempts
+                    WHERE (
+                        scope_key LIKE 'passkey-login:source:%'
+                        OR scope_key LIKE 'passkey-login:account:%'
+                    )
+                      AND updated_at + ? <= ?
+                      AND (locked_until IS NULL OR locked_until <= ?)
+                    ORDER BY updated_at LIMIT 500
+                )
+                """,
+                (self._passkey_login_window_seconds, now, now),
+            )
             placeholders = ",".join("?" for _ in scopes)
             rows = {
                 str(row["scope_key"]): row

@@ -54,8 +54,9 @@ def test_session_cookie_is_signed_opaque_and_has_host_cookie_controls() -> None:
     record = repository.get(principal.session_id)
     assert record is not None
     assert principal.session_id not in repr(record)
+    replacement = "A" if token[-1] != "A" else "B"
     with pytest.raises(InvalidSession, match="invalid or expired"):
-        manager.authenticate(f"{token[:-1]}A", now=1_001)
+        manager.authenticate(f"{token[:-1]}{replacement}", now=1_001)
 
     settings = SessionCookieSettings()
     assert settings.name.startswith("__Host-")

@@ -525,6 +525,32 @@ def test_unknown_passkey_accounts_create_no_users_sessions_or_challenges(
     assert limiter_rows == 2
 
 
+def test_passkey_limiter_prunes_expired_untrusted_source_scopes(
+    bundle: BackendBundle,
+) -> None:
+    window_seconds = 10 * 60
+    for window in range(8):
+        for source_index in range(200):
+            with pytest.raises(WebUnauthorized):
+                bundle.backend.begin_passkey_login(
+                    f"unknown-{window}-{source_index}",
+                    source=f"untrusted-{window}-{source_index}",
+                    http_method="POST",
+                    now=NOW + window * window_seconds,
+                )
+
+    with bundle.database.read() as connection:
+        limiter_rows = int(
+            connection.execute(
+                """
+                SELECT count(*) FROM auth_attempts
+                WHERE scope_key LIKE 'passkey-login:%'
+                """
+            ).fetchone()[0]
+        )
+    assert limiter_rows <= 201
+
+
 def test_passkey_challenge_cap_is_checked_before_creating_an_extra_session(
     bundle: BackendBundle,
 ) -> None:
