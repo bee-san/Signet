@@ -992,33 +992,38 @@ class StagingStore:
                 if adapter is None or account is None:
                     raise ValueError("adapter and account must be supplied together")
                 self._scoped_record(opaque_id, adapter=adapter, account=account)
-            with self.database.read() as connection:
+            with self.database.transaction() as connection:
                 catalog = connection.execute(
                     """
-                    SELECT consumed_request_id, storage_path, purged_at
+                    SELECT adapter, account, consumed_request_id, storage_path, purged_at
                     FROM staged_objects WHERE attachment_id = ?
                     """,
                     (opaque_id,),
                 ).fetchone()
-            if catalog is None or catalog["purged_at"] is not None:
-                return
-            if catalog["consumed_request_id"] is not None:
-                raise StagingError("a consumed staged object requires retention-owned purge")
-            root_fd = self._open_root()
-            metadata_fd = self._open_metadata_root()
-            try:
-                for descriptor, name in (
-                    (root_fd, opaque_id),
-                    (metadata_fd, f"{opaque_id}.json"),
+                if catalog is None or catalog["purged_at"] is not None:
+                    return
+                if (
+                    adapter is not None
+                    and account is not None
+                    and (catalog["adapter"] != adapter or catalog["account"] != account)
                 ):
-                    with suppress(FileNotFoundError):
-                        os.unlink(name, dir_fd=descriptor)
-                os.fsync(root_fd)
-                os.fsync(metadata_fd)
-            finally:
-                os.close(metadata_fd)
-                os.close(root_fd)
-            with self.database.transaction() as connection:
+                    raise StagingError("staged object was not found in this scope")
+                if catalog["consumed_request_id"] is not None:
+                    raise StagingError("a consumed staged object requires retention-owned purge")
+                root_fd = self._open_root()
+                metadata_fd = self._open_metadata_root()
+                try:
+                    for descriptor, name in (
+                        (root_fd, opaque_id),
+                        (metadata_fd, f"{opaque_id}.json"),
+                    ):
+                        with suppress(FileNotFoundError):
+                            os.unlink(name, dir_fd=descriptor)
+                    os.fsync(root_fd)
+                    os.fsync(metadata_fd)
+                finally:
+                    os.close(metadata_fd)
+                    os.close(root_fd)
                 updated = connection.execute(
                     """
                     UPDATE staged_objects SET storage_path = NULL, purged_at = ?

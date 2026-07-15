@@ -26,8 +26,9 @@ from signet.delivery import (
     FrozenRequestLoader,
     PayloadDecryptor,
 )
-from signet.models import EnqueueRequest, InvalidTransition
+from signet.models import AttachmentReference, EnqueueRequest, InvalidTransition
 from signet.state_machine import ApprovalStateMachine
+from tests.attachment_fixtures import register_catalog_attachment
 
 NOW = 1_900_000_000
 
@@ -129,9 +130,16 @@ class FakeAdapter:
     reconciliation_tools = frozenset({"lookup"})
     input_schema: Mapping[str, Any] = {"type": "object"}
 
-    def __init__(self, *, supports_idempotency: bool = False, fail_prepare: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        supports_idempotency: bool = False,
+        fail_prepare: bool = False,
+        attachments: tuple[AttachmentReference, ...] = (),
+    ) -> None:
         self.supports_idempotency = supports_idempotency
         self.fail_prepare = fail_prepare
+        self.attachments = attachments
         self.prepared: list[AdapterRequest] = []
 
     def validate(self, arguments: Mapping[str, Any]) -> None:
@@ -141,6 +149,10 @@ class FakeAdapter:
     def canonicalize(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         self.validate(arguments)
         return dict(arguments)
+
+    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
+        self.validate(arguments)
+        return self.attachments
 
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> Any:
         raise NotImplementedError
@@ -208,11 +220,13 @@ def enqueue_approved(
     request_id: str,
     *,
     arguments: Mapping[str, Any] | None = None,
+    attachments: tuple[AttachmentReference, ...] = (),
 ) -> bytes:
     frozen, payload_hash = payload_fingerprint(
         alias="fake",
         tool="send",
         arguments=arguments or {"value": "private"},
+        staged_file_hashes=tuple(attachment.sha256 for attachment in attachments),
         policy_version=1,
         adapter_version="1",
     )
@@ -235,6 +249,7 @@ def enqueue_approved(
             editor_actor="caller:test",
             canonical_size=len(frozen),
             encryption_key_ref="keychain://Signet/fake-payload",
+            attachments=attachments,
         )
     )
     with machine.database.transaction() as connection:
@@ -246,6 +261,40 @@ def enqueue_approved(
             (NOW + 1, request_id, 1, payload_hash),
         )
     return frozen
+
+
+@pytest.mark.asyncio
+async def test_missing_catalog_attachment_snapshot_fails_before_network(
+    machine: ApprovalStateMachine,
+) -> None:
+    attachment_id = "stg_" + "a" * 20
+    attachment = register_catalog_attachment(
+        machine.database,
+        attachment_id=attachment_id,
+        storage_path=f"/private/staging/{attachment_id}",
+        adapter="fake",
+    )
+    enqueue_approved(
+        machine,
+        "attachment-tamper",
+        arguments={"value": "private", "staged_id": attachment_id},
+        attachments=(attachment,),
+    )
+    with machine.database.transaction() as connection:
+        connection.execute(
+            "DELETE FROM attachments WHERE request_id = ?",
+            ("attachment-tamper",),
+        )
+    adapter = FakeAdapter(attachments=(attachment,))
+    client = FakeClient(machine, [{"status": "sent"}])
+
+    with pytest.raises(DeliveryPreparationError, match="before network"):
+        await dispatcher(machine, adapter, client).dispatch(
+            "attachment-tamper", worker_id="worker", now=NOW + 2
+        )
+
+    assert client.calls == []
+    assert machine.get_request("attachment-tamper")["state"] == "failed"
 
 
 def dispatcher(
@@ -395,9 +444,7 @@ async def test_cancellation_after_boundary_records_unknown_and_propagates(
     adapter = FakeAdapter()
     client = BlockingClient(machine)
     selected = dispatcher(machine, adapter, client)
-    task = asyncio.create_task(
-        selected.dispatch("cancelled", worker_id="worker", now=NOW + 2)
-    )
+    task = asyncio.create_task(selected.dispatch("cancelled", worker_id="worker", now=NOW + 2))
     await client.started.wait()
 
     task.cancel()

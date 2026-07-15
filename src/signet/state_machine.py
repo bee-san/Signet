@@ -101,9 +101,7 @@ class ApprovalStateMachine:
             raise TypeError("free-space provider must be callable")
         self._free_space_provider = free_space_provider or _filesystem_free_bytes
         self._notification_user_id = (
-            canonical_user_id(notification_user_id)
-            if notification_user_id is not None
-            else None
+            canonical_user_id(notification_user_id) if notification_user_id is not None else None
         )
 
     @property
@@ -334,6 +332,55 @@ class ApprovalStateMachine:
             raise RequestNotFound(f"{request_id}@{version}")
         return dict(row)
 
+    def get_attachment_references(
+        self,
+        request_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+    ) -> tuple[AttachmentReference, ...]:
+        """Load the exact active attachment snapshot for one payload revision."""
+
+        self._validate_hash(payload_hash)
+        with self.database.read() as connection:
+            payload = connection.execute(
+                """
+                SELECT 1 FROM payload_versions
+                WHERE request_id = ? AND version = ? AND payload_hash = ?
+                """,
+                (request_id, version, payload_hash),
+            ).fetchone()
+            if payload is None:
+                raise RequestNotFound(f"{request_id}@{version}")
+            rows = connection.execute(
+                """
+                SELECT attachment_id, filename, mime_type, size_bytes, sha256,
+                       storage_path, purge_after, purged_at
+                FROM attachments
+                WHERE request_id = ? AND version = ? AND payload_hash = ?
+                ORDER BY attachment_id
+                """,
+                (request_id, version, payload_hash),
+            ).fetchall()
+        if any(
+            row["purged_at"] is not None or not isinstance(row["storage_path"], str) for row in rows
+        ):
+            raise InvalidTransition("attachment snapshot is unavailable")
+        attachments = tuple(
+            AttachmentReference(
+                attachment_id=str(row["attachment_id"]),
+                filename=str(row["filename"]),
+                mime_type=str(row["mime_type"]),
+                size_bytes=int(row["size_bytes"]),
+                sha256=str(row["sha256"]),
+                storage_path=str(row["storage_path"]),
+                purge_after=(int(row["purge_after"]) if row["purge_after"] is not None else None),
+            )
+            for row in rows
+        )
+        self._validate_attachments(attachments)
+        return attachments
+
     def list_events(self, request_id: str) -> list[dict[str, Any]]:
         with self.database.read() as connection:
             rows = connection.execute(
@@ -426,6 +473,12 @@ class ApprovalStateMachine:
                 )
             else:
                 self._validate_attachments(attachments)
+                self._require_attachment_catalog_entries(
+                    connection,
+                    downstream_alias=str(request["downstream_alias"]),
+                    request_id=request_id,
+                    attachments=attachments,
+                )
                 self._insert_attachments(
                     connection,
                     request_id=request_id,
@@ -1040,8 +1093,7 @@ class ApprovalStateMachine:
             raise InvalidConfirmation("WebAuthn signature counter transition is invalid")
         if (
             expected_eligible != new_eligible
-            or confirmation.device_type
-            != ("multi_device" if new_eligible else "single_device")
+            or confirmation.device_type != ("multi_device" if new_eligible else "single_device")
             or (not new_eligible and new_backed_up)
             or (previous_backed_up and not new_backed_up)
         ):
@@ -1598,8 +1650,7 @@ class ApprovalStateMachine:
                     action=request["tool_name"],
                     now=now,
                     dedupe_key=(
-                        f"outcome_unknown_entered:{lease.attempt_id}:"
-                        f"{lease.worker_generation}"
+                        f"outcome_unknown_entered:{lease.attempt_id}:{lease.worker_generation}"
                     ),
                 )
             self._fault("outcome:before_commit")
@@ -1816,9 +1867,7 @@ class ApprovalStateMachine:
                     service=request["downstream_alias"],
                     action=request["tool_name"],
                     now=now,
-                    dedupe_key=(
-                        f"outcome_unknown_resolved:{attempt['attempt_id']}:{count}"
-                    ),
+                    dedupe_key=(f"outcome_unknown_resolved:{attempt['attempt_id']}:{count}"),
                 )
             elif action == ReconciliationAction.EXHAUSTED:
                 self._notification(
@@ -2067,8 +2116,7 @@ class ApprovalStateMachine:
                     now=now,
                 )
             elif (
-                state in {RequestState.DENIED, RequestState.CANCELLED}
-                and origin_namespace is None
+                state in {RequestState.DENIED, RequestState.CANCELLED} and origin_namespace is None
             ):
                 raise InvalidConfirmation("human deny and cancel require confirmation")
             updated = connection.execute(
@@ -2500,9 +2548,24 @@ class ApprovalStateMachine:
                 raise ValueError("invalid attachment reference")
             attachment_ids.add(attachment.attachment_id)
 
+    @classmethod
+    def _require_attachment_catalog(cls, connection: Any, request: EnqueueRequest) -> None:
+        cls._require_attachment_catalog_entries(
+            connection,
+            downstream_alias=request.downstream_alias,
+            request_id=request.request_id,
+            attachments=request.attachments,
+        )
+
     @staticmethod
-    def _require_attachment_catalog(connection: Any, request: EnqueueRequest) -> None:
-        for attachment in request.attachments:
+    def _require_attachment_catalog_entries(
+        connection: Any,
+        *,
+        downstream_alias: str,
+        request_id: str,
+        attachments: tuple[AttachmentReference, ...],
+    ) -> None:
+        for attachment in attachments:
             row = connection.execute(
                 """
                 SELECT adapter, filename, declared_mime, size_bytes, sha256,
@@ -2514,7 +2577,7 @@ class ApprovalStateMachine:
             ).fetchone()
             if (
                 row is None
-                or row["adapter"] != request.downstream_alias
+                or row["adapter"] != downstream_alias
                 or row["filename"] != attachment.filename
                 or row["declared_mime"] != attachment.mime_type
                 or row["size_bytes"] != attachment.size_bytes
@@ -2524,7 +2587,7 @@ class ApprovalStateMachine:
                 or not row["encryption_key_ref"]
                 or row["purged_at"] is not None
                 or row["key_destroyed_at"] is not None
-                or row["consumed_request_id"] not in {None, request.request_id}
+                or row["consumed_request_id"] not in {None, request_id}
             ):
                 raise InvalidTransition(
                     "a staged attachment is unavailable, changed, or already consumed"

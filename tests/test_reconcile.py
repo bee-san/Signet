@@ -18,7 +18,7 @@ from signet.adapters.base import (
 from signet.canonical import payload_fingerprint
 from signet.db import Database
 from signet.delivery import DeliveryDispatcher, FrozenRequestLoader, PayloadDecryptor
-from signet.models import EnqueueRequest
+from signet.models import AttachmentReference, EnqueueRequest
 from signet.reconcile import ReconciliationCoordinator
 from signet.state_machine import ApprovalStateMachine
 
@@ -94,6 +94,10 @@ class FakeAdapter:
     def canonicalize(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         self.validate(arguments)
         return dict(arguments)
+
+    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
+        self.validate(arguments)
+        return ()
 
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> Any:
         raise NotImplementedError
@@ -218,9 +222,7 @@ def services(
         {"fake": provider},
         schedule=schedule,
         reviewed_tools=(
-            {("fake", "send"): frozenset({"lookup"})}
-            if reviewed_tools is None
-            else reviewed_tools
+            {("fake", "send"): frozenset({"lookup"})} if reviewed_tools is None else reviewed_tools
         ),
     )
     return dispatcher, coordinator
@@ -371,9 +373,7 @@ async def test_missing_policy_review_blocks_declared_reconciliation_tool(
     )
     await dispatcher.dispatch("unreviewed", worker_id="sender", now=NOW + 2)
 
-    result = await coordinator.reconcile_once(
-        "unreviewed", worker_id="reader", now=NOW + 3
-    )
+    result = await coordinator.reconcile_once("unreviewed", worker_id="reader", now=NOW + 3)
 
     assert result.decision.value == "inconclusive"
     assert result.result.action.value == "rescheduled"

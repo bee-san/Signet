@@ -21,7 +21,13 @@ from typing import Any, Protocol, cast
 
 from signet.adapters.base import AdapterRequest, ApprovalAdapter, MCPClient, Outcome
 from signet.canonical import CanonicalizationError, canonical_json
-from signet.models import ExecutionLease, ExecutionPhase, OutcomeClassification, ResultAlias
+from signet.models import (
+    AttachmentReference,
+    ExecutionLease,
+    ExecutionPhase,
+    OutcomeClassification,
+    ResultAlias,
+)
 from signet.safe_metadata import public_safe_metadata
 from signet.state_machine import ApprovalStateMachine
 
@@ -137,9 +143,8 @@ class FrozenRequestLoader:
 
     def load(self, lease: ExecutionLease) -> LoadedFrozenRequest:
         request_row = self.state_machine.get_request(lease.request_id)
-        if (
-            request_row["current_version"] != lease.version
-            or not _same_text(request_row["current_payload_hash"], lease.payload_hash)
+        if request_row["current_version"] != lease.version or not _same_text(
+            request_row["current_payload_hash"], lease.payload_hash
         ):
             raise FrozenPayloadError("execution lease no longer names the current request version")
 
@@ -216,6 +221,26 @@ class FrozenRequestLoader:
         if adapter.adapter_version != adapter_version:
             raise FrozenPayloadError("reviewed adapter version does not match the frozen envelope")
         try:
+            canonical_arguments = adapter.canonicalize(cast(dict[str, Any], arguments))
+            if canonical_json(canonical_arguments) != canonical_json(arguments):
+                raise ValueError
+            frozen_attachments = adapter.freeze_attachments(canonical_arguments)
+            stored_attachments = self.state_machine.get_attachment_references(
+                lease.request_id,
+                version=lease.version,
+                payload_hash=lease.payload_hash,
+            )
+        except Exception:
+            raise FrozenPayloadError(
+                "frozen payload attachment snapshot could not be authenticated"
+            ) from None
+        if tuple(attachment.sha256 for attachment in frozen_attachments) != tuple(
+            cast(list[str], staged_hashes)
+        ) or _sorted_attachment_identities(frozen_attachments) != _sorted_attachment_identities(
+            stored_attachments
+        ):
+            raise FrozenPayloadError("frozen payload attachment snapshot does not match")
+        try:
             account = self._account_namespaces[alias]
         except KeyError as exc:
             raise DeliveryPreparationError("downstream account scope is not configured") from exc
@@ -226,7 +251,7 @@ class FrozenRequestLoader:
                 request_id=lease.request_id,
                 downstream_alias=alias,
                 tool_name=tool,
-                arguments=cast(dict[str, Any], arguments),
+                arguments=canonical_arguments,
                 account=account,
                 payload_hash=lease.payload_hash,
                 version=lease.version,
@@ -234,6 +259,27 @@ class FrozenRequestLoader:
                 created_at=datetime.fromtimestamp(payload_row["created_at"], tz=UTC),
             ),
         )
+
+
+def _attachment_identity(
+    attachment: AttachmentReference,
+) -> tuple[str, str, str, int, str, str]:
+    if not isinstance(attachment, AttachmentReference):
+        raise FrozenPayloadError("frozen payload attachment snapshot is invalid")
+    return (
+        attachment.attachment_id,
+        attachment.filename,
+        attachment.mime_type,
+        attachment.size_bytes,
+        attachment.sha256,
+        attachment.storage_path,
+    )
+
+
+def _sorted_attachment_identities(
+    attachments: tuple[AttachmentReference, ...],
+) -> tuple[tuple[str, str, str, int, str, str], ...]:
+    return tuple(sorted(_attachment_identity(attachment) for attachment in attachments))
 
 
 class DeliveryDispatcher:
@@ -474,8 +520,10 @@ def _same_text(left: object, right: str) -> bool:
 
 
 def _is_sha256(value: object) -> bool:
-    return isinstance(value, str) and len(value) == 64 and all(
-        character in "0123456789abcdef" for character in value
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 

@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 
 import pytest
 import yaml
 
 from signet.canonical import CanonicalizationError, canonical_json, payload_fingerprint
+from signet.models import AttachmentReference, EnqueueRequest, InvalidTransition
 from signet.policy import PolicyError, PolicyMode, load_policy, parse_policy
 from signet.staging import StagingError
+from signet.state_machine import ApprovalStateMachine
 from tests.attachment_fixtures import attachment_cipher, staging_store
 
 
@@ -492,6 +496,105 @@ def test_orphan_sweep_preserves_catalogued_and_explicitly_protected_objects(
     assert protected.exists()
     assert kept.path.exists()
     assert store.resolve(kept.opaque_id, adapter="a", account="b") == kept
+
+
+def test_unconsumed_purge_serializes_against_attachment_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "race.bin"
+    source.write_bytes(b"purge versus enqueue")
+    store = staging_store(
+        tmp_path / "staging",
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    record = store.stage_path(
+        source,
+        adapter="fastmail",
+        account="primary",
+        filename="race.bin",
+        declared_mime="application/octet-stream",
+    )
+    payload_hash = hashlib.sha256(b"frozen request").hexdigest()
+    request = EnqueueRequest(
+        request_id="purge-enqueue-race",
+        downstream_alias="fastmail",
+        tool_name="send_email",
+        policy_mode="approval",
+        origin_namespace="profile:test",
+        encrypted_payload=b"encrypted:frozen request",
+        payload_hash=payload_hash,
+        payload_fingerprint=payload_hash,
+        pending_result=b'{"status":"pending_approval"}',
+        created_at=record.created_at,
+        expires_at=record.created_at + 600,
+        policy_version="1",
+        adapter_version="1",
+        schema_version="1",
+        editor_actor="caller:test",
+        canonical_size=len(b"frozen request"),
+        encryption_key_ref="keychain://Signet/fake-payload",
+        attachments=(
+            AttachmentReference(
+                attachment_id=record.opaque_id,
+                filename=record.filename,
+                mime_type=record.declared_mime,
+                size_bytes=record.size,
+                sha256=record.sha256,
+                storage_path=str(record.path),
+            ),
+        ),
+    )
+    machine = ApprovalStateMachine(store.database)
+    attempting = Event()
+    outcomes: list[BaseException | None] = []
+
+    def enqueue() -> None:
+        attempting.set()
+        try:
+            machine.enqueue(request)
+        except BaseException as exc:
+            outcomes.append(exc)
+        else:
+            outcomes.append(None)
+
+    original_unlink = os.unlink
+    contender: Thread | None = None
+
+    def racing_unlink(path: str, *args: Any, **kwargs: Any) -> None:
+        nonlocal contender
+        if path == record.opaque_id and contender is None:
+            contender = Thread(target=enqueue, daemon=True)
+            contender.start()
+            assert attempting.wait(timeout=1)
+            time.sleep(0.05)
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", racing_unlink)
+    store.purge(record.opaque_id, adapter="fastmail", account="primary")
+    assert contender is not None
+    contender.join(timeout=2)
+
+    assert not contender.is_alive()
+    assert len(outcomes) == 1 and isinstance(outcomes[0], InvalidTransition)
+    with store.database.read() as connection:
+        catalog = connection.execute(
+            """
+            SELECT consumed_request_id, storage_path, purged_at
+            FROM staged_objects WHERE attachment_id = ?
+            """,
+            (record.opaque_id,),
+        ).fetchone()
+        request_count = connection.execute(
+            "SELECT count(*) FROM approval_requests WHERE request_id = ?",
+            (request.request_id,),
+        ).fetchone()[0]
+    assert tuple(catalog) == (None, None, catalog["purged_at"])
+    assert catalog["purged_at"] is not None
+    assert request_count == 0
 
 
 def test_source_open_rejects_intermediate_symlinks_and_hardlinks(tmp_path: Path) -> None:

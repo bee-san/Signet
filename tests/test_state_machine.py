@@ -320,9 +320,7 @@ def test_attachment_references_commit_atomically_with_pending_ack(database: Data
     )
     candidate = replace(
         request("with-attachment", invocation_key="attachment-call"),
-        attachments=(
-            attachment,
-        ),
+        attachments=(attachment,),
     )
     ApprovalStateMachine(database).enqueue(candidate)
     with database.read() as connection:
@@ -345,9 +343,7 @@ def test_body_edit_preserves_attachment_snapshot_and_explicit_empty_removes_it(
     )
     candidate = replace(
         request("edit-attachment"),
-        attachments=(
-            attachment,
-        ),
+        attachments=(attachment,),
     )
     machine.enqueue(candidate)
     second_hash = digest("body-two")
@@ -415,6 +411,64 @@ def test_body_edit_preserves_attachment_snapshot_and_explicit_empty_removes_it(
             ("edit-attachment",),
         ).fetchone()[0]
     assert current_count == 0
+
+
+def test_edit_rejects_attachment_from_another_adapter_atomically(
+    machine: ApprovalStateMachine,
+    database: Database,
+) -> None:
+    machine.enqueue(request("edit-cross-adapter"))
+    attachment_id = "stg_" + "c" * 20
+    attachment = register_catalog_attachment(
+        database,
+        attachment_id=attachment_id,
+        storage_path=f"/private/staging/{attachment_id}",
+        adapter="whatsapp",
+    )
+    prospective_hash = digest("cross-adapter-edit")
+    confirmation = totp_confirmation(
+        machine,
+        "edit-cross-adapter",
+        action="edit",
+        version=1,
+        payload_hash=digest("body-one"),
+        prospective_payload_hash=prospective_hash,
+        use_id="edit-cross-adapter-v1",
+    )
+
+    with pytest.raises(InvalidTransition, match="unavailable"):
+        machine.edit(
+            "edit-cross-adapter",
+            expected_version=1,
+            expected_payload_hash=digest("body-one"),
+            encrypted_payload=b"encrypted:cross-adapter-edit",
+            payload_hash=prospective_hash,
+            canonical_size=18,
+            policy_version="policy-1",
+            adapter_version="adapter-1",
+            schema_version="schema-1",
+            editor_actor="human:web",
+            confirmation=confirmation,
+            now=NOW + 1,
+            attachments=(attachment,),
+        )
+
+    assert machine.get_request("edit-cross-adapter")["current_version"] == 1
+    with database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM auth_proof_consumptions WHERE use_id = ?",
+                (confirmation.use_id,),
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT consumed_request_id FROM staged_objects WHERE attachment_id = ?",
+                (attachment_id,),
+            ).fetchone()[0]
+            is None
+        )
 
 
 def test_hash_bindings_are_database_constraints(database: Database) -> None:
@@ -697,16 +751,17 @@ def test_tampered_totp_confirmation_claims_fail_before_mutation(
         )
     assert machine.get_request("tampered-capability")["state"] == "pending_approval"
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM auth_proof_consumptions"
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            """
+        assert connection.execute("SELECT count(*) FROM auth_proof_consumptions").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                """
             SELECT last_used_at FROM auth_credentials
             WHERE credential_id = ?
             """,
-            (TOTP_CREDENTIAL_ID,),
-        ).fetchone()[0] is None
+                (TOTP_CREDENTIAL_ID,),
+            ).fetchone()[0]
+            is None
+        )
 
 
 def test_webauthn_challenge_cannot_cross_sessions_and_cas_rolls_back(
@@ -758,46 +813,54 @@ def test_webauthn_challenge_cannot_cross_sessions_and_cas_rolls_back(
             "cross-session",
             expected_version=1,
             expected_payload_hash=payload_hash,
-            confirmation=signed_webauthn_confirmation(ApprovalConfirmation(
-                kind=ConfirmationKind.WEBAUTHN,
-                use_id="cross-session-assertion-proof",
-                path="web",
-                capability="",
-                user_id=HUMAN_USER,
-                action="approve",
-                bound_request_id="cross-session",
-                bound_version=1,
-                bound_payload_hash=payload_hash,
-                session_id=other_session,
-                http_method="POST",
-                challenge_id="cross-session-challenge-opaque",
-                credential_id="cross-session-credential",
-                credential_user_id=HUMAN_USER,
-                expected_counter=3,
-                new_counter=4,
-                device_type="single_device",
-                expected_backup_eligible=False,
-                new_backup_eligible=False,
-                previous_backed_up=False,
-                new_backed_up=False,
-            )),
+            confirmation=signed_webauthn_confirmation(
+                ApprovalConfirmation(
+                    kind=ConfirmationKind.WEBAUTHN,
+                    use_id="cross-session-assertion-proof",
+                    path="web",
+                    capability="",
+                    user_id=HUMAN_USER,
+                    action="approve",
+                    bound_request_id="cross-session",
+                    bound_version=1,
+                    bound_payload_hash=payload_hash,
+                    session_id=other_session,
+                    http_method="POST",
+                    challenge_id="cross-session-challenge-opaque",
+                    credential_id="cross-session-credential",
+                    credential_user_id=HUMAN_USER,
+                    expected_counter=3,
+                    new_counter=4,
+                    device_type="single_device",
+                    expected_backup_eligible=False,
+                    new_backup_eligible=False,
+                    previous_backed_up=False,
+                    new_backed_up=False,
+                )
+            ),
             actor="human:web",
             now=NOW + 1,
         )
 
     with database.read() as connection:
-        assert connection.execute(
-            """
+        assert (
+            connection.execute(
+                """
             SELECT sign_count FROM auth_credentials
             WHERE credential_id = 'cross-session-credential'
             """
-        ).fetchone()[0] == 3
-        assert connection.execute(
-            """
+            ).fetchone()[0]
+            == 3
+        )
+        assert (
+            connection.execute(
+                """
             SELECT consumed_at FROM auth_challenges
             WHERE challenge_id = 'cross-session-challenge-opaque'
             """
-        ).fetchone()[0] is None
+            ).fetchone()[0]
+            is None
+        )
     assert machine.get_request("cross-session")["state"] == "pending_approval"
 
 
@@ -847,10 +910,13 @@ def test_confirmed_terminal_fault_rolls_back_proof_and_transition(
         )
     assert machine.get_request(request_id)["state"] == "pending_approval"
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM confirmation_consumptions WHERE use_id = ?",
-            (proof.use_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM confirmation_consumptions WHERE use_id = ?",
+                (proof.use_id,),
+            ).fetchone()[0]
+            == 0
+        )
 
     getattr(machine, terminal)(
         request_id,
@@ -906,16 +972,22 @@ def test_edit_fault_rolls_back_proof_and_new_revision(database: Database) -> Non
         )
     assert machine.get_request("rollback-edit")["current_version"] == 1
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM confirmation_consumptions WHERE use_id = ?",
-            (proof.use_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM confirmation_consumptions WHERE use_id = ?",
+                (proof.use_id,),
+            ).fetchone()[0]
+            == 0
+        )
 
-    assert machine.edit(
-        "rollback-edit",
-        now=NOW + 2,
-        **arguments,  # type: ignore[arg-type]
-    ) == 2
+    assert (
+        machine.edit(
+            "rollback-edit",
+            now=NOW + 2,
+            **arguments,  # type: ignore[arg-type]
+        )
+        == 2
+    )
 
 
 def test_caller_cancel_is_code_free_but_exactly_namespace_scoped(
@@ -981,29 +1053,31 @@ def test_webauthn_credential_state_and_approval_commit_atomically(
         "webauthn-approval",
         expected_version=1,
         expected_payload_hash=payload_hash,
-        confirmation=signed_webauthn_confirmation(ApprovalConfirmation(
-            kind=ConfirmationKind.WEBAUTHN,
-            use_id="assertion-one",
-            path="web",
-            capability="",
-            user_id=HUMAN_USER,
-            action="approve",
-            bound_request_id="webauthn-approval",
-            bound_version=1,
-            bound_payload_hash=payload_hash,
-            session_id=WEB_SESSION_ID,
-            http_method="POST",
-            challenge_id="challenge-one-opaque",
-            credential_id="credential-one",
-            credential_user_id="owner",
-            expected_counter=7,
-            new_counter=8,
-            device_type="multi_device",
-            expected_backup_eligible=True,
-            new_backup_eligible=True,
-            previous_backed_up=False,
-            new_backed_up=True,
-        )),
+        confirmation=signed_webauthn_confirmation(
+            ApprovalConfirmation(
+                kind=ConfirmationKind.WEBAUTHN,
+                use_id="assertion-one",
+                path="web",
+                capability="",
+                user_id=HUMAN_USER,
+                action="approve",
+                bound_request_id="webauthn-approval",
+                bound_version=1,
+                bound_payload_hash=payload_hash,
+                session_id=WEB_SESSION_ID,
+                http_method="POST",
+                challenge_id="challenge-one-opaque",
+                credential_id="credential-one",
+                credential_user_id="owner",
+                expected_counter=7,
+                new_counter=8,
+                device_type="multi_device",
+                expected_backup_eligible=True,
+                new_backup_eligible=True,
+                previous_backed_up=False,
+                new_backed_up=True,
+            )
+        ),
         actor="human:web",
         now=NOW + 1,
     )
@@ -1100,8 +1174,7 @@ def test_invalid_webauthn_state_rolls_back_challenge_and_approval(
 
     with database.read() as connection:
         challenge = connection.execute(
-            "SELECT consumed_at FROM auth_challenges "
-            "WHERE challenge_id = 'challenge-bad-opaque'"
+            "SELECT consumed_at FROM auth_challenges WHERE challenge_id = 'challenge-bad-opaque'"
         ).fetchone()
         credential = connection.execute(
             """
