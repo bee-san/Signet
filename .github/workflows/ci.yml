@@ -29,6 +29,8 @@ jobs:
           version: "0.11.28"
       - name: Install locked environment
         run: uv sync --frozen
+      - name: Install Chromium for browser acceptance
+        run: uv run playwright install --with-deps chromium
       - name: Lint
         run: uv run ruff check .
       - name: Check formatting

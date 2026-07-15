@@ -45,10 +45,10 @@ a { color: inherit; }
   text-transform: uppercase;
 }
 
-.brand { align-items: center; display: flex; font-size: 1.3rem; font-weight: 760; gap: 10px; text-decoration: none; }
+.brand { align-items: center; display: flex; font-size: 1.3rem; font-weight: 760; gap: 10px; min-height: 44px; text-decoration: none; }
 .brand img { border-radius: 6px; display: block; }
 nav { align-items: center; display: flex; gap: 18px; }
-nav a { color: var(--muted); font-weight: 650; text-decoration: none; }
+nav a { align-items: center; color: var(--muted); display: inline-flex; font-weight: 650; justify-content: center; min-height: 44px; min-width: 44px; text-decoration: none; }
 nav form { margin: 0; }
 
 .app-main { margin: 0 auto; max-width: 1120px; padding: 28px 20px 64px; }
@@ -163,7 +163,7 @@ h4 { font-size: .86rem; line-height: 1.35; }
 .muted-value { color: var(--muted); margin-bottom: 0; }
 .passkey-actions, .button-row { display: flex; flex-wrap: wrap; gap: 10px; }
 .authenticator-fallback { margin-top: 18px; }
-summary { cursor: pointer; font-weight: 700; }
+summary { cursor: pointer; font-weight: 700; min-height: 44px; }
 .totp-action { display: grid; gap: 10px; margin-top: 14px; max-width: 560px; }
 label { color: var(--muted); font-size: .86rem; font-weight: 680; }
 input, textarea { background: var(--surface); border: 1px solid #aab4af; border-radius: 5px; color: var(--ink); min-height: 44px; padding: 9px 11px; width: 100%; }
@@ -176,6 +176,7 @@ textarea { line-height: 1.5; resize: vertical; }
 .event-integrity { display: grid; gap: 12px; grid-template-columns: 90px minmax(0, 1fr); margin: 12px 0 0; }
 .timeline pre { margin-top: 12px; }
 .dedicated-link { font-weight: 700; margin: 20px 0 10px; }
+.dedicated-link a { align-items: center; display: inline-flex; min-height: 44px; }
 
 .login-shell { margin: 5vh auto 0; max-width: 420px; }
 .login-mark { border-radius: 8px; display: block; margin-bottom: 18px; }

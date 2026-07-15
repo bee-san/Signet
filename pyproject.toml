@@ -47,6 +47,7 @@ signet = "signet.app:main"
 dev = [
   "httpx>=0.28,<1",
   "mypy>=1.14,<2",
+  "playwright==1.61.0",
   "pytest>=8.3,<10",
   "pytest-asyncio>=0.25,<2",
   "pytest-cov>=6,<8",
