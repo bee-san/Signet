@@ -1,0 +1,650 @@
+"""Supervised, role-separated MCP clients for reviewed downstream servers."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import os
+import re
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    suppress,
+)
+from datetime import timedelta
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Protocol, cast
+from urllib.parse import urlsplit
+
+import httpx
+import mcp.types as types
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
+
+from signet.adapters.base import AdapterProtocolError, copy_json_object
+from signet.config import DownstreamConfig
+from signet.credential_broker import Secret, SecretReference, SecretStore
+from signet.mcp_mirror import (
+    MirrorError,
+    raw_model,
+)
+from signet.mcp_mirror import (
+    discover_all_tools as _discover_all_tools,
+)
+
+_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_MAX_TOOL_NAME_LENGTH = 256
+_MAX_EXECUTABLE_LENGTH = 4096
+_MAX_ARGUMENT_COUNT = 64
+_MAX_ARGUMENT_LENGTH = 4096
+_MAX_ARGUMENT_BYTES = 32_768
+_SHELL_EXECUTABLES = frozenset(
+    {
+        "bash",
+        "cmd",
+        "cmd.exe",
+        "csh",
+        "dash",
+        "fish",
+        "ksh",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "sh",
+        "tcsh",
+        "zsh",
+    }
+)
+_RELATED_TASK_META = "io.modelcontextprotocol/related-task"
+
+
+class DownstreamError(RuntimeError):
+    """Base class for secret-free downstream client failures."""
+
+
+class DownstreamConfigurationError(DownstreamError, ValueError):
+    """A downstream endpoint or process definition is not safely constrained."""
+
+
+class DownstreamLifecycleError(DownstreamError):
+    """An operation was attempted outside an initialized client lifecycle."""
+
+
+class DownstreamConnectionError(DownstreamError):
+    """A transport or initialization operation failed."""
+
+
+class DownstreamCallError(DownstreamError):
+    """A downstream tools/call request failed before a valid result was captured."""
+
+
+class DownstreamProtocolError(AdapterProtocolError, DownstreamError):
+    """The downstream returned an unsupported or malformed MCP value."""
+
+
+class RedactedStdioServerParameters(StdioServerParameters):
+    """Official SDK process parameters whose display never renders the environment."""
+
+    def __repr__(self) -> str:
+        return (
+            "RedactedStdioServerParameters("
+            f"command={self.command!r}, args_count={len(self.args)}, env=<redacted>)"
+        )
+
+    def __str__(self) -> str:
+        return repr(self)
+
+
+class _Lifecycle(StrEnum):
+    NEW = "new"
+    STARTING = "starting"
+    RUNNING = "running"
+    CLOSING = "closing"
+    CLOSED = "closed"
+    FAILED = "failed"
+
+
+TransportStreams = tuple[Any, Any] | tuple[Any, Any, Callable[[], str | None]]
+HTTPConnector = Callable[
+    [str, Mapping[str, str], float], AbstractAsyncContextManager[TransportStreams]
+]
+StdioConnector = Callable[[StdioServerParameters], AbstractAsyncContextManager[TransportStreams]]
+
+
+class DownstreamSession(Protocol):
+    async def initialize(self) -> Any: ...
+
+    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any: ...
+
+
+SessionFactory = Callable[[Any, Any, timedelta], AbstractAsyncContextManager[DownstreamSession]]
+
+
+@asynccontextmanager
+async def _official_http_connector(
+    url: str, headers: Mapping[str, str], timeout_seconds: float
+) -> AsyncIterator[TransportStreams]:
+    timeout = httpx.Timeout(timeout_seconds)
+    async with (
+        httpx.AsyncClient(
+            headers=dict(headers),
+            timeout=timeout,
+            trust_env=False,
+        ) as http_client,
+        streamable_http_client(
+            url,
+            http_client=http_client,
+            terminate_on_close=True,
+        ) as streams,
+    ):
+        yield cast(TransportStreams, streams)
+
+
+@asynccontextmanager
+async def _official_stdio_connector(
+    parameters: StdioServerParameters,
+) -> AsyncIterator[TransportStreams]:
+    with Path(os.devnull).open("w", encoding="utf-8") as error_sink:
+        async with stdio_client(parameters, errlog=error_sink) as streams:
+            yield cast(TransportStreams, streams)
+
+
+def _official_session_factory(
+    read_stream: Any, write_stream: Any, timeout: timedelta
+) -> AbstractAsyncContextManager[DownstreamSession]:
+    session = ClientSession(
+        read_stream,
+        write_stream,
+        read_timeout_seconds=timeout,
+        client_info=types.Implementation(name="signet-downstream", version="0.1.0"),
+    )
+    return cast(AbstractAsyncContextManager[DownstreamSession], session)
+
+
+def _credential_environment_name(alias: str) -> str:
+    normalized = alias.upper().replace("-", "_")
+    return f"SIGNET_DOWNSTREAM_{normalized}_CREDENTIAL"
+
+
+def _validate_json_object(value: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        return copy_json_object(value)
+    except (TypeError, ValueError):
+        pass
+    raise DownstreamProtocolError("downstream value must be a JSON object")
+
+
+def _is_task_result(raw: Mapping[str, Any]) -> bool:
+    if "task" in raw:
+        return True
+    meta = raw.get("_meta")
+    return isinstance(meta, Mapping) and _RELATED_TASK_META in meta
+
+
+def validate_call_tool_result(value: Any) -> dict[str, Any]:
+    """Validate and detach a complete non-task ``CallToolResult`` losslessly."""
+
+    if isinstance(value, types.CreateTaskResult):
+        raise DownstreamProtocolError("downstream task results are not supported")
+    if isinstance(value, types.CallToolResult):
+        captured = raw_model(value)
+    elif isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise DownstreamProtocolError("downstream CallToolResult must be a JSON object")
+        captured = copy.deepcopy(dict(value))
+    else:
+        raise DownstreamProtocolError("downstream CallToolResult must be a JSON object")
+
+    try:
+        json.dumps(captured, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        invalid_json = True
+    else:
+        invalid_json = False
+    if invalid_json:
+        raise DownstreamProtocolError("downstream CallToolResult is not valid JSON")
+    if _is_task_result(captured):
+        raise DownstreamProtocolError("downstream task results are not supported")
+    if "isError" in captured and type(captured["isError"]) is not bool:
+        raise DownstreamProtocolError("downstream CallToolResult has an invalid error marker")
+
+    try:
+        validated = types.CallToolResult.model_validate(captured, strict=True)
+        normalized = raw_model(validated)
+    except Exception:
+        invalid_result = True
+        normalized = {}
+    else:
+        invalid_result = False
+    if invalid_result:
+        raise DownstreamProtocolError("downstream returned an invalid CallToolResult")
+    if normalized != captured:
+        raise DownstreamProtocolError("the pinned MCP SDK changed a downstream CallToolResult")
+    return copy.deepcopy(captured)
+
+
+def structured_adapter_result(raw_result: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract a detached object result and add the envelope error bit without ambiguity."""
+
+    raw = validate_call_tool_result(raw_result)
+    structured = raw.get("structuredContent")
+    if not isinstance(structured, Mapping):
+        raise DownstreamProtocolError("downstream structuredContent must be a JSON object")
+    detached = _validate_json_object(structured)
+    envelope_error = raw.get("isError", False)
+    if type(envelope_error) is not bool:  # also documents the invariant after validation
+        raise DownstreamProtocolError("downstream CallToolResult has an invalid error marker")
+    for marker in ("isError", "is_error"):
+        if marker not in detached:
+            continue
+        structured_error = detached[marker]
+        if type(structured_error) is not bool or structured_error is not envelope_error:
+            raise DownstreamProtocolError("downstream result contains contradictory error markers")
+    detached.setdefault("isError", envelope_error)
+    return detached
+
+
+class DownstreamClient:
+    """One independently initialized and supervised downstream MCP client role.
+
+    ``start`` is idempotent only while the client is running. A failed or closed
+    instance is terminal and must be replaced, which prevents accidental replay
+    through an implicitly re-established mutation session.
+    """
+
+    def __init__(
+        self,
+        alias: str,
+        config: DownstreamConfig,
+        secret_store: SecretStore,
+        *,
+        http_connector: HTTPConnector = _official_http_connector,
+        stdio_connector: StdioConnector = _official_stdio_connector,
+        session_factory: SessionFactory = _official_session_factory,
+    ) -> None:
+        self._validate_config(alias, config)
+        self._alias = alias
+        self._config = config
+        self._credential_reference = SecretReference.parse(config.credential_ref)
+        self._secret_store = secret_store
+        self._http_connector = http_connector
+        self._stdio_connector = stdio_connector
+        self._session_factory = session_factory
+        self._state = _Lifecycle.NEW
+        self._session: DownstreamSession | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._ready: asyncio.Future[None] | None = None
+        self._stop_event: asyncio.Event | None = None
+        self._supervisor_task: asyncio.Task[None] | None = None
+        self._active_operations: set[asyncio.Task[Any]] = set()
+        self._close_failure: DownstreamConnectionError | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"DownstreamClient(alias={self._alias!r}, transport={self._config.transport!r}, "
+            f"state={self._state.value!r}, credential=<redacted>)"
+        )
+
+    @property
+    def alias(self) -> str:
+        return self._alias
+
+    @property
+    def state(self) -> str:
+        return self._state.value
+
+    @property
+    def is_running(self) -> bool:
+        return self._state is _Lifecycle.RUNNING
+
+    async def __aenter__(self) -> DownstreamClient:
+        return await self.start()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        await self.close()
+
+    async def start(self) -> DownstreamClient:
+        """Initialize this downstream role, or return it unchanged when already running."""
+
+        async with self._lifecycle_lock:
+            if self._state is _Lifecycle.RUNNING:
+                return self
+            if self._state is not _Lifecycle.NEW:
+                raise DownstreamLifecycleError(
+                    "downstream client cannot be started from its current lifecycle state"
+                )
+
+            loop = asyncio.get_running_loop()
+            self._state = _Lifecycle.STARTING
+            self._ready = loop.create_future()
+            self._stop_event = asyncio.Event()
+            self._supervisor_task = asyncio.create_task(
+                self._supervise(self._ready, self._stop_event),
+                name=f"signet-downstream-{self._alias}",
+            )
+            try:
+                await self._ready
+            except asyncio.CancelledError:
+                if not self._ready.done():
+                    self._ready.cancel()
+                self._stop_event.set()
+                self._supervisor_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await asyncio.shield(self._supervisor_task)
+                self._state = _Lifecycle.FAILED
+                raise
+            except DownstreamConnectionError:
+                await self._supervisor_task
+                self._state = _Lifecycle.FAILED
+                raise
+            return self
+
+    async def close(self) -> None:
+        """Cancel in-flight operations and close the owned session and transport once."""
+
+        async with self._lifecycle_lock:
+            if self._state is _Lifecycle.CLOSED:
+                return
+            if self._state is _Lifecycle.NEW:
+                self._state = _Lifecycle.CLOSED
+                return
+
+            self._state = _Lifecycle.CLOSING
+            current = asyncio.current_task()
+            active = [task for task in self._active_operations if task is not current]
+            for task in active:
+                task.cancel()
+            cancellation: asyncio.CancelledError | None = None
+            try:
+                if active:
+                    await asyncio.gather(*active, return_exceptions=True)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+            finally:
+                if self._stop_event is not None:
+                    self._stop_event.set()
+
+            if self._supervisor_task is not None:
+                while not self._supervisor_task.done():
+                    try:
+                        await asyncio.shield(self._supervisor_task)
+                    except asyncio.CancelledError as exc:
+                        cancellation = cancellation or exc
+            self._session = None
+            self._state = _Lifecycle.CLOSED
+            if cancellation is not None:
+                raise cancellation
+            if self._close_failure is not None:
+                raise self._close_failure
+
+    async def discover_all_tools(self) -> list[dict[str, Any]]:
+        """Exhaust the official tools/list pagination for this initialized role."""
+
+        session, operation = await self._begin_operation()
+        connection_failed = False
+        protocol_failed = False
+        try:
+            try:
+                tools = await _discover_all_tools(session)
+            except asyncio.CancelledError:
+                raise
+            except MirrorError:
+                protocol_failed = True
+                tools = []
+            except Exception:
+                connection_failed = True
+                tools = []
+            if protocol_failed:
+                raise DownstreamProtocolError("downstream tool discovery was malformed")
+            if connection_failed:
+                raise DownstreamConnectionError("downstream tool discovery failed")
+            self._enforce_output_limit(tools)
+            return copy.deepcopy(tools)
+        finally:
+            self._active_operations.discard(operation)
+
+    async def discover_tools(self) -> list[dict[str, Any]]:
+        """Compatibility spelling for ``discover_all_tools``."""
+
+        return await self.discover_all_tools()
+
+    async def call_tool_raw(self, tool_name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Return an exact detached MCP result for passthrough mirroring."""
+
+        self._validate_tool_name(tool_name)
+        try:
+            detached_arguments = copy_json_object(arguments)
+        except (TypeError, ValueError):
+            invalid_arguments = True
+            detached_arguments = {}
+        else:
+            invalid_arguments = False
+        if invalid_arguments:
+            raise DownstreamProtocolError("downstream tool arguments must be a JSON object")
+
+        session, operation = await self._begin_operation()
+        failed = False
+        raw_value: Any = None
+        try:
+            try:
+                raw_value = await session.call_tool(tool_name, detached_arguments)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                failed = True
+            if failed:
+                raise DownstreamCallError("downstream tool call failed")
+            captured = validate_call_tool_result(raw_value)
+            self._enforce_output_limit(captured)
+            return captured
+        finally:
+            self._active_operations.discard(operation)
+
+    async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return only the detached structured object consumed by provider adapters."""
+
+        raw = await self.call_tool_raw(tool_name, arguments)
+        return structured_adapter_result(raw)
+
+    async def _begin_operation(self) -> tuple[DownstreamSession, asyncio.Task[Any]]:
+        async with self._lifecycle_lock:
+            if self._state is not _Lifecycle.RUNNING or self._session is None:
+                raise DownstreamLifecycleError("downstream client is not initialized")
+            operation = asyncio.current_task()
+            if operation is None:  # pragma: no cover - asyncio always supplies one here
+                raise DownstreamLifecycleError("downstream operation has no owning task")
+            self._active_operations.add(operation)
+            return self._session, operation
+
+    async def _supervise(self, ready: asyncio.Future[None], stop_event: asyncio.Event) -> None:
+        stack = AsyncExitStack()
+        failure: DownstreamConnectionError | None = None
+        cancelled = False
+        try:
+            try:
+                async with asyncio.timeout(self._config.timeout_seconds):
+                    credential = self._secret_store.get(self._credential_reference)
+                    if (
+                        not isinstance(credential, Secret)
+                        or not credential.reveal()
+                        or any(character in credential.reveal() for character in "\x00\r\n")
+                    ):
+                        raise DownstreamConfigurationError(
+                            "downstream credential material is unavailable"
+                        )
+                    streams = await self._enter_transport(stack, credential)
+                    if len(streams) not in (2, 3):
+                        raise DownstreamProtocolError(
+                            "downstream connector returned invalid transport streams"
+                        )
+                    session_context = self._session_factory(
+                        streams[0],
+                        streams[1],
+                        timedelta(seconds=self._config.timeout_seconds),
+                    )
+                    session = await stack.enter_async_context(session_context)
+                    await session.initialize()
+            except asyncio.CancelledError:
+                cancelled = True
+            except BaseException:
+                failure = DownstreamConnectionError("downstream transport initialization failed")
+
+            if not cancelled and failure is None:
+                self._session = session
+                self._state = _Lifecycle.RUNNING
+                ready.set_result(None)
+                try:
+                    await stop_event.wait()
+                except asyncio.CancelledError:
+                    cancelled = True
+        finally:
+            if cancelled:
+                task = asyncio.current_task()
+                if task is not None:
+                    while task.cancelling():
+                        task.uncancel()
+            try:
+                await stack.aclose()
+            except BaseException:
+                self._close_failure = DownstreamConnectionError(
+                    "downstream transport cleanup failed"
+                )
+                if failure is None and not ready.done():
+                    failure = self._close_failure
+            self._session = None
+            if not ready.done():
+                ready.set_exception(
+                    failure
+                    or DownstreamConnectionError("downstream transport initialization failed")
+                )
+            if self._state not in {_Lifecycle.CLOSING, _Lifecycle.CLOSED}:
+                self._state = _Lifecycle.FAILED
+
+    async def _enter_transport(self, stack: AsyncExitStack, credential: Secret) -> TransportStreams:
+        revealed = credential.reveal()
+        if self._config.transport == "http":
+            assert self._config.url is not None
+            context = self._http_connector(
+                self._config.url,
+                {"Authorization": f"Bearer {revealed}"},
+                self._config.timeout_seconds,
+            )
+            return await stack.enter_async_context(context)
+
+        executable, *arguments = self._config.command
+        if any(revealed in argument for argument in arguments):
+            raise DownstreamConfigurationError(
+                "downstream credentials may not appear in process arguments"
+            )
+        parameters = RedactedStdioServerParameters(
+            command=executable,
+            args=list(arguments),
+            env={_credential_environment_name(self._alias): revealed},
+            cwd=self._config.working_directory,
+        )
+        return await stack.enter_async_context(self._stdio_connector(parameters))
+
+    def _enforce_output_limit(self, value: Any) -> None:
+        try:
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            invalid_json = True
+            encoded = b""
+        else:
+            invalid_json = False
+        if invalid_json:
+            raise DownstreamProtocolError("downstream response is not valid JSON")
+        if len(encoded) > self._config.output_limit_bytes:
+            raise DownstreamProtocolError("downstream response exceeds its configured limit")
+
+    @staticmethod
+    def _validate_tool_name(tool_name: str) -> None:
+        if (
+            not isinstance(tool_name, str)
+            or not tool_name
+            or len(tool_name) > _MAX_TOOL_NAME_LENGTH
+            or "\x00" in tool_name
+        ):
+            raise DownstreamConfigurationError("downstream tool name is invalid")
+
+    @staticmethod
+    def _validate_config(alias: str, config: DownstreamConfig) -> None:
+        if not isinstance(alias, str) or not _ALIAS_RE.fullmatch(alias):
+            raise DownstreamConfigurationError("downstream alias is invalid")
+        if not isinstance(config, DownstreamConfig):
+            raise DownstreamConfigurationError("downstream configuration is invalid")
+
+        if config.transport == "http":
+            if config.url is None or config.command or config.working_directory is not None:
+                raise DownstreamConfigurationError("HTTP downstream configuration is invalid")
+            parsed = urlsplit(config.url)
+            try:
+                port = parsed.port
+            except ValueError:
+                raise DownstreamConfigurationError(
+                    "HTTP downstream endpoint is invalid"
+                ) from None
+            if (
+                len(config.url) > _MAX_EXECUTABLE_LENGTH
+                or parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or port is not None
+                and not 1 <= port <= 65535
+            ):
+                raise DownstreamConfigurationError("HTTP downstream endpoint is invalid")
+            if parsed.scheme == "http" and parsed.hostname not in {
+                "127.0.0.1",
+                "::1",
+                "localhost",
+            }:
+                raise DownstreamConfigurationError(
+                    "cleartext HTTP downstream endpoints must be loopback"
+                )
+            return
+
+        if config.url is not None or not config.command:
+            raise DownstreamConfigurationError("stdio downstream configuration is invalid")
+        executable, *arguments = config.command
+        executable_path = Path(executable)
+        if (
+            not executable_path.is_absolute()
+            or not executable
+            or len(executable) > _MAX_EXECUTABLE_LENGTH
+            or "\x00" in executable
+            or executable_path.name.casefold() in _SHELL_EXECUTABLES
+        ):
+            raise DownstreamConfigurationError("stdio executable must be a pinned non-shell path")
+        if (
+            len(arguments) > _MAX_ARGUMENT_COUNT
+            or any(
+                not isinstance(argument, str)
+                or len(argument) > _MAX_ARGUMENT_LENGTH
+                or "\x00" in argument
+                for argument in arguments
+            )
+            or sum(len(argument.encode("utf-8")) for argument in arguments) > _MAX_ARGUMENT_BYTES
+        ):
+            raise DownstreamConfigurationError("stdio process arguments exceed safe bounds")
+        if config.working_directory is not None and not config.working_directory.is_absolute():
+            raise DownstreamConfigurationError("stdio working directory must be absolute")
