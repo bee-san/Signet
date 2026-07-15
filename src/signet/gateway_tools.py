@@ -54,7 +54,7 @@ _MAX_SUMMARY_LENGTH = 2_048
 _UNAVAILABLE_DESTINATION_SUMMARY = "Private summary unavailable; review in the web app."
 _REQUEST_ID_RE = re.compile(r"^req_[A-Za-z0-9]+$")
 _WHATSAPP_MASK_RE = re.compile(
-    r"(?:\+[0-9*]+|[0-9*]+(?:@(s\.whatsapp\.net|g\.us|newsletter))?)"
+    r"(?:\+\*{4,11}[0-9]{4}|\*{3,28}[0-9]{4}@(s\.whatsapp\.net|g\.us|newsletter))"
 )
 
 GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [

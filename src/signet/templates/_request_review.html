@@ -1,4 +1,6 @@
 {% macro request_review(item, csrf_token, id_suffix, show_detail_link=false) %}
+{% set created_time = item.created_at|utc_time %}
+{% set expiry_time = item.expires_at|utc_time %}
 <div class="request-review" data-request-id="{{ item.request_id }}" data-csrf="{{ csrf_token }}">
   <header class="detail-heading">
     <div>
@@ -41,14 +43,14 @@
     <dl class="context-grid">
       <div><dt>Request</dt><dd class="hash-value">{{ item.request_id }}</dd></div>
       <div><dt>State</dt><dd>{{ item.state|replace('_', ' ') }}</dd></div>
-      <div><dt>Created</dt><dd><time datetime="{{ item.created_at }}">{{ item.created_at }}</time></dd></div>
-      <div><dt>Expires</dt><dd><time datetime="{{ item.expires_at }}">{{ item.expires_at }}</time></dd></div>
+      <div><dt>Created</dt><dd><time datetime="{{ created_time.iso }}">{{ created_time.display }}</time></dd></div>
+      <div><dt>Expires</dt><dd><time datetime="{{ expiry_time.iso }}">{{ expiry_time.display }}</time></dd></div>
       <div><dt>Version</dt><dd>{{ item.version }}</dd></div>
       <div class="context-wide"><dt>Payload hash</dt><dd class="hash-value">{{ item.payload_hash }}</dd></div>
       <div><dt>Reviewed content</dt><dd>{{ 'Available' if item.review_available else ('Purged' if item.content_purged else 'Unavailable') }}</dd></div>
       {% if item.canonical_size is not none %}<div><dt>Canonical bytes</dt><dd>{{ item.canonical_size }}</dd></div>{% endif %}
       {% if item.editor_actor %}<div><dt>Revision actor</dt><dd>{{ item.editor_actor }}</dd></div>{% endif %}
-      {% if item.content_purged_at %}<div><dt>Content purged</dt><dd><time datetime="{{ item.content_purged_at }}">{{ item.content_purged_at }}</time></dd></div>{% endif %}
+      {% if item.content_purged_at %}{% set purged_time = item.content_purged_at|utc_time %}<div><dt>Content purged</dt><dd><time datetime="{{ purged_time.iso }}">{{ purged_time.display }}</time></dd></div>{% endif %}
       {% if item.content_purge_reason %}<div class="context-wide"><dt>Purge reason</dt><dd>{{ item.content_purge_reason }}</dd></div>{% endif %}
       <div><dt>Downstream</dt><dd>{{ item.downstream_alias }}</dd></div>
       <div><dt>Tool</dt><dd>{{ item.tool_name }}</dd></div>
@@ -63,9 +65,9 @@
       {% if item.retry_of_request_id %}
       <div class="context-wide"><dt>Retry of request</dt><dd class="hash-value">{{ item.retry_of_request_id }}</dd></div>
       {% endif %}
-      {% if item.approved_at %}<div><dt>Approved</dt><dd><time datetime="{{ item.approved_at }}">{{ item.approved_at }}</time></dd></div>{% endif %}
-      {% if item.execution_started_at %}<div><dt>Execution started</dt><dd><time datetime="{{ item.execution_started_at }}">{{ item.execution_started_at }}</time></dd></div>{% endif %}
-      {% if item.completed_at %}<div><dt>Completed</dt><dd><time datetime="{{ item.completed_at }}">{{ item.completed_at }}</time></dd></div>{% endif %}
+      {% if item.approved_at %}{% set approved_time = item.approved_at|utc_time %}<div><dt>Approved</dt><dd><time datetime="{{ approved_time.iso }}">{{ approved_time.display }}</time></dd></div>{% endif %}
+      {% if item.execution_started_at %}{% set execution_time = item.execution_started_at|utc_time %}<div><dt>Execution started</dt><dd><time datetime="{{ execution_time.iso }}">{{ execution_time.display }}</time></dd></div>{% endif %}
+      {% if item.completed_at %}{% set completed_time = item.completed_at|utc_time %}<div><dt>Completed</dt><dd><time datetime="{{ completed_time.iso }}">{{ completed_time.display }}</time></dd></div>{% endif %}
     </dl>
   </section>
 
@@ -227,12 +229,19 @@
     {% if item.events %}
     <ol>
       {% for event in item.events %}
+      {% set event_time = event.occurred_at|utc_time %}
       <li>
         <div class="timeline-heading">
-          <time datetime="{{ event.occurred_at }}">{{ event.occurred_at }}</time>
+          <time datetime="{{ event_time.iso }}">{{ event_time.display }}</time>
           <strong>{{ event.action }}</strong>
           <span>{{ event.actor }}</span>
         </div>
+        {% if event.decision_confirmation %}
+        <p class="confirmation-provenance">
+          Confirmation: {{ 'Passkey' if event.confirmation_kind == 'webauthn' else ('TOTP' if event.confirmation_kind == 'totp' else 'method unavailable') }}
+          via {{ event.confirmation_path or 'path unavailable' }}
+        </p>
+        {% endif %}
         <dl class="event-integrity">
           <div><dt>Version</dt><dd>{{ event.version }}</dd></div>
           <div><dt>Payload hash</dt><dd class="hash-value">{{ event.payload_hash }}</dd></div>

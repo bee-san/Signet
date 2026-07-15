@@ -577,6 +577,78 @@ async def test_list_pending_isolates_corrupt_or_unmasked_private_summaries(
 
 
 @pytest.mark.asyncio
+async def test_whatsapp_summary_validation_rejects_clear_digits_outside_final_four(
+    machine: ApprovalStateMachine,
+) -> None:
+    harness = make_harness(machine)
+    machine.enqueue(enqueue_request("req_WhatsAppLeaked"))
+    with machine.database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE approval_requests
+            SET downstream_alias = 'whatsapp', tool_name = 'send_text'
+            WHERE request_id = 'req_WhatsAppLeaked'
+            """
+        )
+    leaked = "+15551234567***"
+    harness.summaries.add(
+        "req_WhatsAppLeaked",
+        service="WhatsApp",
+        tool="send_text",
+        destination=leaked,
+    )
+
+    result = structured(
+        await harness.tools.call_tool(
+            "list_pending_approvals",
+            {},
+            principal=own_principal(),
+        )
+    )
+
+    assert result["requests"][0]["summary_available"] is False
+    assert leaked not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "destination",
+    ("+*******2030", "*******0123@s.whatsapp.net"),
+)
+@pytest.mark.asyncio
+async def test_whatsapp_summary_validation_accepts_owned_adapter_masks(
+    machine: ApprovalStateMachine,
+    destination: str,
+) -> None:
+    harness = make_harness(machine)
+    machine.enqueue(enqueue_request("req_WhatsAppMasked"))
+    with machine.database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE approval_requests
+            SET downstream_alias = 'whatsapp', tool_name = 'send_text'
+            WHERE request_id = 'req_WhatsAppMasked'
+            """
+        )
+    harness.summaries.add(
+        "req_WhatsAppMasked",
+        service="WhatsApp",
+        tool="send_text",
+        destination=destination,
+    )
+
+    result = structured(
+        await harness.tools.call_tool(
+            "list_pending_approvals",
+            {},
+            principal=own_principal(),
+        )
+    )
+
+    assert result["requests"][0]["summary_available"] is True
+    assert result["requests"][0]["destination_summary"] == destination
+
+
+@pytest.mark.asyncio
 async def test_unknown_and_foreign_ids_are_indistinguishable_for_all_scoped_tools(
     machine: ApprovalStateMachine,
 ) -> None:

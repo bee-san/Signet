@@ -857,13 +857,18 @@ def test_decision_history_is_metadata_only_until_exact_request_expansion(
     reviewer = ReviewerSpy(original)
     cast(Any, bundle.backend)._payloads = reviewer
 
-    decisions = bundle.backend.list_decisions(principal)
+    page = bundle.backend.list_decisions(principal)
+    decisions = page.items
 
     assert [(entry.request_id, entry.decision) for entry in decisions] == [
         (denied_id, "denied"),
         (approved_id, "approved"),
     ]
     assert decisions[1].confirmation_path == "web"
+    assert decisions[1].confirmation_kind == "totp"
+    assert decisions[0].confirmation_path == "web"
+    assert decisions[0].confirmation_kind == "totp"
+    assert page.has_more is False and page.next_event_id is None
     assert reviewer.review_calls == []
     approved = bundle.backend.get_detail(principal, approved_id)
     denied = bundle.backend.get_detail(principal, denied_id)
@@ -873,10 +878,100 @@ def test_decision_history_is_metadata_only_until_exact_request_expansion(
     denied_event = next(event for event in denied.events if event["action"] == "denied")
     assert approved_event["decision_note"] == "Release scope reviewed <script>alert(1)</script>"
     assert denied_event["decision_note"] == "Recipient does not match the requested change."
+    assert (approved_event["confirmation_kind"], approved_event["confirmation_path"]) == (
+        "totp",
+        "web",
+    )
+    assert (denied_event["confirmation_kind"], denied_event["confirmation_path"]) == (
+        "totp",
+        "web",
+    )
     assert approved_event["details_json"] is None
     assert denied_event["details_json"] is None
     assert len(reviewer.review_calls) == 2
     assert bundle.adapter.downstream_calls == []
+
+
+def test_decision_history_is_bounded_and_keyset_paginated(
+    bundle: BackendBundle,
+) -> None:
+    cast(Any, bundle.backend).max_decision_entries = 2
+    request_ids = [bundle.enqueue(body=f"decision-{index}") for index in range(5)]
+    _, principal = bundle.session()
+    for index, request_id in enumerate(request_ids):
+        payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+        assert (
+            bundle.backend.complete_totp_action(
+                principal,
+                request_id,
+                "deny",
+                f"fake:{610 + index}",
+                expected_version=1,
+                expected_payload_hash=payload_hash,
+                prospective_arguments_json=None,
+                now=NOW + index + 1,
+            )
+            == "denied"
+        )
+    original = cast(PrivatePayloadReviewer, cast(Any, bundle.backend)._payloads)
+    reviewer = ReviewerSpy(original)
+    cast(Any, bundle.backend)._payloads = reviewer
+
+    first = bundle.backend.list_decisions(principal)
+    second = bundle.backend.list_decisions(principal, before_event_id=first.next_event_id)
+    third = bundle.backend.list_decisions(principal, before_event_id=second.next_event_id)
+
+    assert [entry.request_id for entry in first.items] == list(reversed(request_ids[-2:]))
+    assert [entry.request_id for entry in second.items] == list(reversed(request_ids[1:3]))
+    assert [entry.request_id for entry in third.items] == [request_ids[0]]
+    assert first.has_more is True and first.next_event_id is not None
+    assert second.has_more is True and second.next_event_id is not None
+    assert third.has_more is False and third.next_event_id is None
+    assert reviewer.review_calls == []
+
+    for invalid in (0, 2**63, True):
+        with pytest.raises(WebConflict, match="cursor is invalid"):
+            bundle.backend.list_decisions(principal, before_event_id=cast(Any, invalid))
+
+
+def test_passkey_decision_provenance_is_safe_and_visible(
+    bundle: BackendBundle,
+) -> None:
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    options = bundle.backend.begin_passkey_action(
+        principal,
+        request_id,
+        "deny",
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+        prospective_arguments_json=None,
+        http_method="POST",
+        now=NOW + 1,
+    )
+    assert (
+        bundle.backend.complete_passkey_action(
+            principal,
+            request_id,
+            options.challenge_id,
+            cast(Mapping[str, Any], bundle.assertion(options.challenge_id)),
+            http_method="POST",
+            now=NOW + 2,
+        )
+        == "denied"
+    )
+
+    decision = bundle.backend.list_decisions(principal).items[0]
+    detail = bundle.backend.get_detail(principal, request_id)
+    event = next(value for value in detail.events if value["action"] == "denied")
+
+    assert (decision.confirmation_kind, decision.confirmation_path) == ("webauthn", "web")
+    assert (event["confirmation_kind"], event["confirmation_path"]) == (
+        "webauthn",
+        "web",
+    )
+    assert "credential" not in str(decision).lower()
 
 
 @pytest.mark.parametrize("invalid_note", ["x" * 1_001, "unsafe\x00control"])
@@ -957,7 +1052,7 @@ def test_terminal_purged_request_retains_decision_metadata_and_timeline(
     assert "purge this private body" not in str(detail)
     decision = next(event for event in detail.events if event["action"] == "denied")
     assert decision["decision_note"] == "Request is outside the approved scope."
-    assert bundle.backend.list_decisions(principal)[0].request_id == request_id
+    assert bundle.backend.list_decisions(principal).items[0].request_id == request_id
     assert bundle.adapter.downstream_calls == []
 
 

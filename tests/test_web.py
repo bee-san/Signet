@@ -16,6 +16,7 @@ from signet.web import (
     AuditEntry,
     CsrfManager,
     DecisionEntry,
+    DecisionPage,
     DetailBlock,
     LoginOptions,
     PushSubscriptionInput,
@@ -44,6 +45,8 @@ class FakeBackend:
     review_available: bool = True
     queue_has_more: bool = False
     queue_cursors: list[str | None] = field(default_factory=list)
+    decision_before_event_ids: list[int | None] = field(default_factory=list)
+    decision_has_more: bool = False
     decision_notes: list[str | None] = field(default_factory=list)
     staged_decision_note: str | None = None
     event_decision_note: str | None = None
@@ -221,33 +224,45 @@ class FakeBackend:
         assert principal.user_id == "autumn"
         return (AuditEntry(NOW, "caller:test", "queued", "req_test", HASH[:12]),)
 
-    def list_decisions(self, principal: SessionPrincipal) -> tuple[DecisionEntry, ...]:
+    def list_decisions(
+        self,
+        principal: SessionPrincipal,
+        *,
+        before_event_id: int | None = None,
+    ) -> DecisionPage:
         assert principal.user_id == "autumn"
-        return (
-            DecisionEntry(
-                NOW + 1,
-                "web:autumn",
-                "approved",
-                "web",
-                "req_approved",
-                "succeeded",
-                "fastmail",
-                "send_email",
-                1,
-                "b" * 12,
+        self.decision_before_event_ids.append(before_event_id)
+        return DecisionPage(
+            items=(
+                DecisionEntry(
+                    NOW + 1,
+                    "web:autumn",
+                    "approved",
+                    "web",
+                    "webauthn",
+                    "req_approved",
+                    "succeeded",
+                    "fastmail",
+                    "send_email",
+                    1,
+                    "b" * 12,
+                ),
+                DecisionEntry(
+                    NOW,
+                    "web:autumn",
+                    "denied",
+                    "web",
+                    "totp",
+                    "req_test",
+                    "denied",
+                    "fastmail",
+                    "send_email",
+                    1,
+                    HASH[:12],
+                ),
             ),
-            DecisionEntry(
-                NOW,
-                "web:autumn",
-                "denied",
-                None,
-                "req_test",
-                "denied",
-                "fastmail",
-                "send_email",
-                1,
-                HASH[:12],
-            ),
+            has_more=self.decision_has_more,
+            next_event_id=41 if self.decision_has_more else None,
         )
 
     def begin_passkey_action(
@@ -474,6 +489,8 @@ def test_expanded_review_fragment_contains_complete_bound_context(client: TestCl
     assert 'name="decision_note"' in response.text
     assert 'maxlength="1000"' in response.text
     assert "No downstream execution" in response.text
+    assert '<time datetime="2027-01-15T07:59:00Z">2027-01-15 07:59:00 UTC</time>' in response.text
+    assert '<time datetime="2027-01-15T08:10:00Z">2027-01-15 08:10:00 UTC</time>' in response.text
     assert '<script src="https://evil.test' not in response.text
     assert "&lt;script" in response.text
 
@@ -494,6 +511,10 @@ def test_audit_decisions_are_private_when_collapsed_and_terminal_review_expands(
     assert "person@example.test" not in audit.text
     assert "Requested for the Tuesday release" not in audit.text
     assert "Append-only events" in audit.text
+    assert "Passkey" in audit.text
+    assert "TOTP" in audit.text
+    assert "via web" in audit.text
+    assert '<time datetime="2027-01-15T08:00:00Z">2027-01-15 08:00:00 UTC</time>' in audit.text
 
     backend.detail_state = "denied"
     expanded = client.get("/requests/req_test/review")
@@ -503,6 +524,38 @@ def test_audit_decisions_are_private_when_collapsed_and_terminal_review_expands(
     assert 'class="totp-action"' not in expanded.text
     assert "data-passkey-action" not in expanded.text
     assert "Nothing was executed downstream" in expanded.text
+
+
+def test_decision_history_cursor_is_session_bound_and_tamper_resistant(
+    client: TestClient,
+    backend: FakeBackend,
+) -> None:
+    backend.decision_has_more = True
+    authenticate(client)
+
+    first = client.get("/audit")
+    match = re.search(r'href="/audit\?before=([A-Za-z0-9.]+)"', first.text)
+    assert first.status_code == 200 and match is not None
+    cursor = match.group(1)
+
+    second = client.get(f"/audit?before={cursor}")
+    replacement = "0" if cursor[-1] != "0" else "1"
+    tampered = client.get(f"/audit?before={cursor[:-1]}{replacement}")
+
+    assert second.status_code == 200
+    assert backend.decision_before_event_ids == [None, 41]
+    assert tampered.status_code == 409
+    assert backend.decision_before_event_ids == [None, 41]
+
+
+def test_mobile_styles_preserve_audit_navigation(client: TestClient) -> None:
+    authenticate(client)
+    page = client.get("/")
+    stylesheet = (ROOT / "src" / "signet" / "static" / "app.css").read_text()
+
+    assert 'class="primary-audit-link" href="/audit"' in page.text
+    assert "nav .primary-audit-link" in stylesheet
+    assert "nav a { display: none; }" not in stylesheet
 
 
 def test_unavailable_review_fragment_is_metadata_only_and_has_no_actions(

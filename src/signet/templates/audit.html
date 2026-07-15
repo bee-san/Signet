@@ -8,6 +8,7 @@
     {% if decisions %}
     <ol class="request-list">
       {% for decision in decisions %}
+      {% set decision_time = decision.occurred_at|utc_time %}
       <li id="decision-{{ decision.request_id }}">
         <details class="request-expander decision-{{ decision.decision }}">
           <summary>
@@ -18,8 +19,12 @@
             </span>
             <span class="request-summary-meta">
               <span class="state state-{{ decision.current_state }}">{{ decision.current_state|replace('_', ' ') }}</span>
-              <time datetime="{{ decision.occurred_at }}">{{ decision.occurred_at }}</time>
-              <span>{{ decision.actor }}{% if decision.confirmation_path %} via {{ decision.confirmation_path }}{% endif %}</span>
+              <time datetime="{{ decision_time.iso }}">{{ decision_time.display }}</time>
+              <span>
+                {{ decision.actor }}
+                / {{ 'Passkey' if decision.confirmation_kind == 'webauthn' else ('TOTP' if decision.confirmation_kind == 'totp' else 'method unavailable') }}
+                via {{ decision.confirmation_path or 'path unavailable' }}
+              </span>
             </span>
           </summary>
           <div class="request-expansion" data-review-fragment data-review-url="/requests/{{ decision.request_id }}/review">
@@ -30,6 +35,12 @@
       </li>
       {% endfor %}
     </ol>
+    {% if has_more_decisions and next_decision_cursor %}
+    <nav class="decision-pagination" aria-label="Decision history pages">
+      <span>Earlier decisions remain</span>
+      <a class="button button-quiet" href="/audit?before={{ next_decision_cursor }}">Earlier decisions</a>
+    </nav>
+    {% endif %}
     {% else %}
     <p class="muted-value">No approval or denial decision is retained.</p>
     {% endif %}
@@ -42,8 +53,9 @@
       <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Request</th><th>Hash</th></tr></thead>
       <tbody>
       {% for entry in entries %}
+      {% set entry_time = entry.occurred_at|utc_time %}
         <tr>
-          <td>{{ entry.occurred_at }}</td>
+          <td><time datetime="{{ entry_time.iso }}">{{ entry_time.display }}</time></td>
           <td>{{ entry.actor }}</td>
           <td>{{ entry.action }}</td>
           <td>{{ entry.request_id or '' }}</td>

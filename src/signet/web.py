@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
@@ -164,12 +165,26 @@ class DecisionEntry:
     actor: str
     decision: Literal["approved", "denied"]
     confirmation_path: str | None
+    confirmation_kind: str | None
     request_id: str
     current_state: str
     downstream_alias: str
     tool_name: str
     version: int
     payload_hash_prefix: str
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionPage:
+    items: tuple[DecisionEntry, ...]
+    has_more: bool
+    next_event_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UtcTime:
+    iso: str
+    display: str
 
 
 class LoginOptions(BaseModel):
@@ -250,7 +265,12 @@ class WebBackend(Protocol):
 
     def list_audit(self, principal: SessionPrincipal) -> tuple[AuditEntry, ...]: ...
 
-    def list_decisions(self, principal: SessionPrincipal) -> tuple[DecisionEntry, ...]: ...
+    def list_decisions(
+        self,
+        principal: SessionPrincipal,
+        *,
+        before_event_id: int | None = None,
+    ) -> DecisionPage: ...
 
     def begin_passkey_action(
         self,
@@ -344,6 +364,42 @@ class CsrfManager:
             return False
         expected = self.session_token(session_id, purpose)
         return hmac.compare_digest(expected, supplied)
+
+    def cursor_token(self, session_id: str, purpose: str, position: int) -> str:
+        if (
+            not session_id
+            or not purpose
+            or len(purpose) > 128
+            or not isinstance(position, int)
+            or isinstance(position, bool)
+            or position < 1
+            or position > (2**63 - 1)
+        ):
+            raise ValueError("invalid cursor binding")
+        value = str(position)
+        signature = self._signature(session_id, f"cursor:{purpose}:{value}")
+        return f"p1.{value}.{signature}"
+
+    def cursor_position(self, session_id: str, purpose: str, supplied: str) -> int:
+        if not session_id or not purpose or len(purpose) > 128 or len(supplied) > 96:
+            raise ValueError("invalid cursor")
+        try:
+            version, value, signature = supplied.split(".")
+            position = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("invalid cursor") from None
+        if (
+            version != "p1"
+            or value != str(position)
+            or position < 1
+            or position > (2**63 - 1)
+            or not hmac.compare_digest(
+                signature,
+                self._signature(session_id, f"cursor:{purpose}:{value}"),
+            )
+        ):
+            raise ValueError("invalid cursor")
+        return position
 
     def _signature(self, subject: str, purpose: str) -> str:
         return hmac.new(
@@ -506,6 +562,7 @@ def create_web_app(
     now_fn = clock or (lambda: int(time.time()))
     package_root = Path(__file__).resolve().parent
     templates = Jinja2Templates(directory=package_root / "templates")
+    templates.env.filters["utc_time"] = _utc_time
     app = FastAPI(title="Signet", docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(SecurityHeadersMiddleware, public_origin=settings.public_origin)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts))
@@ -778,8 +835,31 @@ def create_web_app(
         )
 
     @app.get("/audit", response_class=HTMLResponse)
-    async def audit(request: Request) -> Response:
+    async def audit(request: Request, before: str | None = None) -> Response:
         selected = principal(request)
+        before_event_id = None
+        if before is not None:
+            try:
+                before_event_id = csrf.cursor_position(
+                    selected.session_id,
+                    "decision-history",
+                    before,
+                )
+            except ValueError:
+                raise WebConflict("decision history cursor is invalid") from None
+        decision_page = backend.list_decisions(
+            selected,
+            before_event_id=before_event_id,
+        )
+        next_decision_cursor = (
+            csrf.cursor_token(
+                selected.session_id,
+                "decision-history",
+                decision_page.next_event_id,
+            )
+            if decision_page.has_more and decision_page.next_event_id is not None
+            else None
+        )
         return cast(
             Response,
             templates.TemplateResponse(
@@ -787,7 +867,9 @@ def create_web_app(
                 "audit.html",
                 {
                     **context(request, selected),
-                    "decisions": backend.list_decisions(selected),
+                    "decisions": decision_page.items,
+                    "has_more_decisions": decision_page.has_more,
+                    "next_decision_cursor": next_decision_cursor,
                     "entries": backend.list_audit(selected),
                     "logout_csrf": csrf.session_token(selected.session_id, "logout"),
                 },
@@ -961,4 +1043,17 @@ def _set_session_cookie(
         httponly=True,
         samesite="strict",
         path="/",
+    )
+
+
+def _utc_time(value: int) -> UtcTime:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("invalid Unix timestamp")
+    try:
+        selected = datetime.fromtimestamp(value, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("invalid Unix timestamp") from None
+    return UtcTime(
+        iso=selected.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        display=selected.strftime("%Y-%m-%d %H:%M:%S UTC"),
     )

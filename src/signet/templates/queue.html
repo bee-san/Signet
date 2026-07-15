@@ -10,6 +10,7 @@
 {% if items %}
 <ol class="request-list">
   {% for item in items %}
+  {% set expiry_time = item.expires_at|utc_time %}
   <li>
     <details class="request-expander">
       <summary>
@@ -22,7 +23,7 @@
           <span class="state state-{{ item.state }}">{{ item.state|replace('_', ' ') }}</span>
           <span>v{{ item.version }}</span>
           {% if item.state == 'pending_approval' %}
-          <time datetime="{{ item.expires_at }}">Expires in {{ [item.expires_at - now, 0]|max }}s</time>
+          <time datetime="{{ expiry_time.iso }}">Expires in {{ [item.expires_at - now, 0]|max }}s</time>
           {% else %}
           <span>Reconciliation required</span>
           {% endif %}

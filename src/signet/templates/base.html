@@ -18,8 +18,8 @@
     </a>
     {% if principal %}
     <nav aria-label="Primary">
-      <a href="/">Queue</a>
-      <a href="/audit">Audit</a>
+      <a class="primary-queue-link" href="/">Queue</a>
+      <a class="primary-audit-link" href="/audit">Audit</a>
       <form action="/logout" method="post">
         <input type="hidden" name="csrf_token" value="{{ logout_csrf }}">
         <button class="button button-quiet" type="submit">Sign out</button>

@@ -61,6 +61,7 @@ from signet.web import (
     ActionOptions,
     AuditEntry,
     DecisionEntry,
+    DecisionPage,
     DetailBlock,
     HumanAction,
     LoginOptions,
@@ -987,7 +988,16 @@ class WebBackend:
                 """,
                 (request_id, version),
             ).fetchall()
-        rendered_events = tuple(_render_request_event(event) for event in events)
+            confirmation_rows = connection.execute(
+                """
+                SELECT kind, path, action, consumed_at, version, payload_hash
+                FROM confirmation_consumptions
+                WHERE request_id = ? AND action IN ('approve', 'deny')
+                """,
+                (request_id,),
+            ).fetchall()
+        provenance = _confirmation_provenance(confirmation_rows)
+        rendered_events = tuple(_render_request_event(event, provenance) for event in events)
         if payload_metadata is None:
             return _unavailable_request_detail(
                 request,
@@ -1100,34 +1110,66 @@ class WebBackend:
             for row in rows
         )
 
-    def list_decisions(self, principal: SessionPrincipal) -> tuple[DecisionEntry, ...]:
+    def list_decisions(
+        self,
+        principal: SessionPrincipal,
+        *,
+        before_event_id: int | None = None,
+    ) -> DecisionPage:
         _require_ui_principal(principal)
+        if before_event_id is not None and (
+            not isinstance(before_event_id, int)
+            or isinstance(before_event_id, bool)
+            or before_event_id < 1
+            or before_event_id > (2**63 - 1)
+        ):
+            raise WebConflict("decision history cursor is invalid")
         with self._database.read() as connection:
             rows = connection.execute(
                 """
-                SELECT event.occurred_at, event.actor, event.action,
+                SELECT event.event_id, event.occurred_at, event.actor, event.action,
                        event.request_id, event.version, event.payload_hash,
-                       request.state, request.downstream_alias, request.tool_name
+                       request.state, request.downstream_alias, request.tool_name,
+                       confirmation.kind AS confirmation_kind,
+                       confirmation.path AS confirmation_path
                 FROM request_events AS event
                 JOIN approval_requests AS request
                   ON request.request_id = event.request_id
-                WHERE event.action = 'denied'
-                   OR event.action LIKE 'approved_via_%'
+                LEFT JOIN confirmation_consumptions AS confirmation
+                  ON confirmation.request_id = event.request_id
+                 AND confirmation.version = event.version
+                 AND confirmation.payload_hash = event.payload_hash
+                 AND confirmation.consumed_at = event.occurred_at
+                 AND confirmation.action = CASE
+                       WHEN event.action = 'denied' THEN 'deny'
+                       ELSE 'approve'
+                     END
+                WHERE (event.action = 'denied'
+                   OR event.action LIKE 'approved_via_%')
+                  AND (? IS NULL OR event.event_id < ?)
                 ORDER BY event.event_id DESC
                 LIMIT ?
                 """,
-                (self.max_decision_entries,),
+                (
+                    before_event_id,
+                    before_event_id,
+                    self.max_decision_entries + 1,
+                ),
             ).fetchall()
+        visible = rows[: self.max_decision_entries]
+        has_more = len(rows) > self.max_decision_entries
         decisions: list[DecisionEntry] = []
-        for row in rows:
+        for row in visible:
             action = str(row["action"])
             approved = action.startswith("approved_via_")
+            confirmation_path, confirmation_kind = _decision_provenance(row, action=action)
             decisions.append(
                 DecisionEntry(
                     occurred_at=int(row["occurred_at"]),
                     actor=str(row["actor"]),
                     decision="approved" if approved else "denied",
-                    confirmation_path=action.removeprefix("approved_via_") if approved else None,
+                    confirmation_path=confirmation_path,
+                    confirmation_kind=confirmation_kind,
                     request_id=str(row["request_id"]),
                     current_state=str(row["state"]),
                     downstream_alias=str(row["downstream_alias"]),
@@ -1136,7 +1178,13 @@ class WebBackend:
                     payload_hash_prefix=str(row["payload_hash"])[:12],
                 )
             )
-        return tuple(decisions)
+        return DecisionPage(
+            items=tuple(decisions),
+            has_more=has_more,
+            next_event_id=(
+                int(visible[-1]["event_id"]) if has_more and visible else None
+            ),
+        )
 
     def begin_passkey_action(
         self,
@@ -1742,17 +1790,89 @@ def _unavailable_request_detail(
     )
 
 
-def _render_request_event(event: Mapping[str, Any]) -> dict[str, Any]:
+def _render_request_event(
+    event: Mapping[str, Any],
+    provenance: Mapping[tuple[str, int, str, int], tuple[str, str]],
+) -> dict[str, Any]:
     details_json, decision_note = _event_details(event["safe_details_json"])
+    action = str(event["action"])
+    confirmation_action = _event_confirmation_action(action)
+    confirmation = (
+        provenance.get(
+            (
+                confirmation_action,
+                int(event["version"]),
+                str(event["payload_hash"]),
+                int(event["occurred_at"]),
+            )
+        )
+        if confirmation_action is not None
+        else None
+    )
+    confirmation_kind = confirmation[0] if confirmation is not None else None
+    confirmation_path = confirmation[1] if confirmation is not None else None
+    if confirmation_path is None and action.startswith("approved_via_"):
+        candidate = action.removeprefix("approved_via_")
+        if candidate in {"web", "mcp"}:
+            confirmation_path = candidate
     return {
         "occurred_at": int(event["occurred_at"]),
         "actor": str(event["actor"]),
-        "action": str(event["action"]),
+        "action": action,
         "version": int(event["version"]),
         "payload_hash": str(event["payload_hash"]),
         "details_json": details_json,
         "decision_note": decision_note,
+        "confirmation_kind": confirmation_kind,
+        "confirmation_path": confirmation_path,
+        "decision_confirmation": confirmation_action is not None,
     }
+
+
+def _confirmation_provenance(
+    rows: tuple[Any, ...] | list[Any],
+) -> dict[tuple[str, int, str, int], tuple[str, str]]:
+    result: dict[tuple[str, int, str, int], tuple[str, str]] = {}
+    for row in rows:
+        action = str(row["action"])
+        kind = str(row["kind"])
+        path = str(row["path"])
+        if action not in {"approve", "deny"} or kind not in {"totp", "webauthn"} or path not in {
+            "web",
+            "mcp",
+        }:
+            raise WebConflict("request confirmation provenance is unavailable")
+        key = (
+            action,
+            int(row["version"]),
+            str(row["payload_hash"]),
+            int(row["consumed_at"]),
+        )
+        value = (kind, path)
+        if key in result and result[key] != value:
+            raise WebConflict("request confirmation provenance is ambiguous")
+        result[key] = value
+    return result
+
+
+def _event_confirmation_action(action: str) -> str | None:
+    if action.startswith("approved_via_"):
+        return "approve"
+    if action == "denied":
+        return "deny"
+    return None
+
+
+def _decision_provenance(row: Mapping[str, Any], *, action: str) -> tuple[str | None, str | None]:
+    raw_path = row["confirmation_path"]
+    raw_kind = row["confirmation_kind"]
+    path = str(raw_path) if raw_path in {"web", "mcp"} else None
+    kind = str(raw_kind) if raw_kind in {"totp", "webauthn"} else None
+    if path is None and action.startswith("approved_via_"):
+        candidate = action.removeprefix("approved_via_")
+        if candidate in {"web", "mcp"}:
+            path = candidate
+    return path, kind
 
 
 def _event_details(value: object) -> tuple[str | None, str | None]:
