@@ -60,6 +60,11 @@ _HEADER_FORBIDDEN = frozenset(
     }
 )
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+_OPAQUE_PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~:@/+=-]{0,255}$")
+_FASTMAIL_RESULT_FIELDS = frozenset(
+    {"messageId", "submissionId", "threadId", "status", "isError"}
+)
+_FASTMAIL_PROVIDER_STATUSES = frozenset({"sent", "submitted"})
 FASTMAIL_SEND_SCHEMA: Mapping[str, Any] = MappingProxyType(
     {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -161,28 +166,68 @@ def _normalize_header(value: str, *, name: str) -> str:
     return normalized
 
 
-def _identifier(value: Mapping[str, Any] | None, keys: tuple[str, ...]) -> str | None:
-    if value is None:
-        return None
-    for key in keys:
-        candidate = value.get(key)
-        if isinstance(candidate, str) and candidate:
-            return candidate
-    data = value.get("data")
-    if isinstance(data, Mapping):
-        return _identifier(data, keys)
+def _opaque_provider_id(value: object) -> str | None:
+    if isinstance(value, str) and _OPAQUE_PROVIDER_ID_RE.fullmatch(value):
+        return value
     return None
 
 
-def _attachment_id(value: Mapping[str, Any] | None) -> str | None:
-    return _identifier(value, ("attachmentId", "attachment_id", "blobId", "blob_id", "id"))
+def _one_level_result_payload(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Accept a direct result or one explicit MCP-style ``data`` envelope."""
+
+    if not all(isinstance(key, str) for key in value):
+        return None
+    if "data" not in value:
+        return value
+    if set(value) not in ({"data"}, {"data", "isError"}):
+        return None
+    if "isError" in value and value["isError"] is not False:
+        return None
+    payload = value.get("data")
+    if not isinstance(payload, Mapping) or not all(isinstance(key, str) for key in payload):
+        return None
+    return payload
 
 
-def _send_identity(value: Mapping[str, Any] | None) -> str | None:
-    return _identifier(
-        value,
-        ("messageId", "message_id", "emailId", "email_id", "submissionId", "submission_id"),
-    )
+def _reviewed_attachment_id(value: Mapping[str, Any]) -> str | None:
+    payload = _one_level_result_payload(value)
+    if payload is None or set(payload) not in (
+        {"attachmentId"},
+        {"attachmentId", "isError"},
+    ):
+        return None
+    if "isError" in payload and payload["isError"] is not False:
+        return None
+    return _opaque_provider_id(payload.get("attachmentId"))
+
+
+def _reviewed_send_result(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    payload = _one_level_result_payload(value)
+    if payload is None or not set(payload) <= _FASTMAIL_RESULT_FIELDS:
+        return None
+    if "isError" in payload and payload["isError"] is not False:
+        return None
+    if not ({"messageId", "submissionId"} & set(payload)):
+        return None
+    for field in ("messageId", "submissionId", "threadId"):
+        if field in payload and _opaque_provider_id(payload[field]) is None:
+            return None
+    status = payload.get("status")
+    if "status" in payload and status not in _FASTMAIL_PROVIDER_STATUSES:
+        return None
+    return payload
+
+
+def _candidate_send_identity(value: Mapping[str, Any] | None) -> str | None:
+    """Read a bounded provider identity from one read-only search candidate."""
+
+    if value is None:
+        return None
+    for key in ("messageId", "submissionId"):
+        candidate = _opaque_provider_id(value.get(key))
+        if candidate is not None:
+            return candidate
+    return None
 
 
 def _candidate_objects(result: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
@@ -192,7 +237,12 @@ def _candidate_objects(result: Mapping[str, Any]) -> tuple[Mapping[str, Any], ..
             return tuple(candidate for candidate in candidates if isinstance(candidate, Mapping))
     data = result.get("data")
     if isinstance(data, Mapping):
-        return _candidate_objects(data)
+        for key in ("messages", "emails", "results", "items"):
+            candidates = data.get(key)
+            if isinstance(candidates, list):
+                return tuple(
+                    candidate for candidate in candidates if isinstance(candidate, Mapping)
+                )
     return ()
 
 
@@ -404,7 +454,7 @@ class FastmailAdapter:
                     "Fastmail attachment upload was rejected before email dispatch",
                     dispatch_may_have_occurred=False,
                 )
-            attachment_id = _attachment_id(result)
+            attachment_id = _reviewed_attachment_id(result)
             if attachment_id is None:
                 raise DispatchError(
                     "Fastmail attachment upload returned no reviewed identifier",
@@ -428,13 +478,13 @@ class FastmailAdapter:
 
     def classify_outcome(self, result_or_error: object) -> Outcome:
         common = conservative_outcome(result_or_error)
-        if common is not Outcome.OUTCOME_UNKNOWN:
+        if common is Outcome.DEFINITE_FAILURE:
             return common
-        if isinstance(result_or_error, Mapping):
-            if result_or_error.get("isError") is True or result_or_error.get("is_error") is True:
-                return Outcome.OUTCOME_UNKNOWN
-            if _send_identity(result_or_error) is not None:
-                return Outcome.SUCCEEDED
+        if (
+            isinstance(result_or_error, Mapping)
+            and _reviewed_send_result(result_or_error) is not None
+        ):
+            return Outcome.SUCCEEDED
         return Outcome.OUTCOME_UNKNOWN
 
     async def reconcile(
@@ -445,7 +495,7 @@ class FastmailAdapter:
     ) -> Reconciliation:
         if request.downstream_alias != self.downstream_alias or request.tool_name != self.tool_name:
             raise AdapterValidationError("request does not match the Fastmail adapter")
-        identity = _send_identity(attempt.downstream_result)
+        identity = _candidate_send_identity(attempt.downstream_result)
         if identity is None:
             return Reconciliation.INCONCLUSIVE
         result = await downstream.call_tool(
@@ -454,30 +504,24 @@ class FastmailAdapter:
         )
         if result.get("isError") is True or result.get("is_error") is True:
             return Reconciliation.INCONCLUSIVE
-        if any(_send_identity(candidate) == identity for candidate in _candidate_objects(result)):
+        if any(
+            _candidate_send_identity(candidate) == identity
+            for candidate in _candidate_objects(result)
+        ):
             return Reconciliation.CONFIRMED_EFFECT
         return Reconciliation.INCONCLUSIVE
 
     def safe_result_metadata(self, downstream_result: Mapping[str, Any]) -> dict[str, Any]:
-        detached = copy_json_object(downstream_result)
+        payload = _reviewed_send_result(downstream_result)
+        if payload is None:
+            return {}
         safe: dict[str, Any] = {}
-        field_map = {
-            "messageId": "message_id",
-            "message_id": "message_id",
-            "emailId": "message_id",
-            "email_id": "message_id",
-            "submissionId": "submission_id",
-            "submission_id": "submission_id",
-            "threadId": "thread_id",
-            "thread_id": "thread_id",
-            "status": "provider_status",
-        }
-        for key, safe_key in field_map.items():
-            value = detached.get(key)
-            if key in detached and (value is None or isinstance(value, (str, int, bool))):
-                safe[safe_key] = value
-        data = detached.get("data")
-        if isinstance(data, Mapping):
-            for key, value in self.safe_result_metadata(data).items():
-                safe.setdefault(key, value)
+        if "messageId" in payload:
+            safe["message_id"] = payload["messageId"]
+        if "submissionId" in payload:
+            safe["submission_id"] = payload["submissionId"]
+        if "threadId" in payload:
+            safe["thread_id"] = payload["threadId"]
+        if "status" in payload:
+            safe["provider_status"] = payload["status"]
         return safe

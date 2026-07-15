@@ -21,6 +21,7 @@ from signet.adapters import (
     WhatsAppFileAdapter,
     WhatsAppTextAdapter,
 )
+from signet.delivery import standardize_safe_metadata
 from signet.staging import StagingStore
 from signet.wacli_wrapper import WacliConfig, WacliError, WacliWrapper
 
@@ -35,7 +36,7 @@ class FakeOwnedClient:
         self, tool_name: str, arguments: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         self.calls.append((tool_name, dict(arguments)))
-        return {"data": {"sent": True, "message_id": "wa-safe-id", "chat_jid": "chat-safe"}}
+        return {"data": {"sent": True, "message_id": "wa-safe-id"}}
 
 
 def text_arguments() -> dict[str, Any]:
@@ -114,6 +115,51 @@ async def test_whatsapp_text_reply_executes_exact_owned_tool_once() -> None:
         "status": "sent",
         "chat_message_id": "wa-safe-id",
     }
+
+
+def test_whatsapp_safe_result_accepts_only_the_owned_wrapper_shape() -> None:
+    adapter = WhatsAppTextAdapter(account="personal")
+    result = {
+        "data": {"sent": True, "message_id": "3EB0.Abc_123:def@example.test"},
+        "isError": False,
+    }
+
+    assert adapter.classify_outcome(result) is Outcome.SUCCEEDED
+    assert adapter.safe_result_metadata(result) == {
+        "status": "sent",
+        "chat_message_id": "3EB0.Abc_123:def@example.test",
+    }
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "sent": True,
+            "message_id": "wa-safe-id",
+            "message": "private request content echoed by provider",
+        },
+        {"sent": True, "message_id": "private request content echoed by provider"},
+        {"sent": True, "message_id": "m" * 257},
+        {"sent": True, "message_id": 12345},
+        {"sent": True, "id": "wa-safe-id"},
+        {"sent": True, "message_id": "wa-safe-id", "status": "private message"},
+        {"sent": True},
+        {"data": {"data": {"sent": True, "message_id": "wa-safe-id"}}},
+        {
+            "data": {"sent": True, "message_id": "wa-safe-id"},
+            "unexpected": "private request content",
+        },
+    ],
+)
+def test_whatsapp_safe_result_rejects_echoes_nesting_and_unreviewed_fields(
+    result: dict[str, Any],
+) -> None:
+    adapter = WhatsAppTextAdapter(account="personal")
+
+    assert adapter.safe_result_metadata(result) == {}
+    assert dict(standardize_safe_metadata(adapter, result)) == {}
+    assert adapter.classify_outcome(result) is Outcome.OUTCOME_UNKNOWN
 
 
 @pytest.mark.parametrize(

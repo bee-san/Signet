@@ -9,6 +9,7 @@ an ambiguous repeated send, so reconciliation is unconditionally inconclusive.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -40,6 +41,8 @@ _COMMON_PROPERTIES: dict[str, Any] = {
     "reply_to": {"type": "string", "minLength": 1, "maxLength": 512},
     "reply_to_sender": {"type": "string", "minLength": 7, "maxLength": 64},
 }
+_OPAQUE_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~:@/+=-]{0,255}$")
+_WHATSAPP_RESULT_FIELDS = frozenset({"sent", "message_id", "isError"})
 
 WHATSAPP_TEXT_SCHEMA: Mapping[str, Any] = MappingProxyType(
     {
@@ -93,13 +96,36 @@ WHATSAPP_FILE_SCHEMA: Mapping[str, Any] = MappingProxyType(
     }
 )
 
-def _contains_sent(result: Mapping[str, Any]) -> bool:
-    if result.get("isError") is True or result.get("is_error") is True:
-        return False
-    if result.get("sent") is True:
-        return True
-    data = result.get("data")
-    return isinstance(data, Mapping) and _contains_sent(data)
+def _reviewed_send_result(result: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Validate the exact owned-wrapper result, with one optional data envelope."""
+
+    if not all(isinstance(key, str) for key in result):
+        return None
+    payload: Mapping[str, Any] = result
+    if "data" in result:
+        if set(result) not in ({"data"}, {"data", "isError"}):
+            return None
+        if "isError" in result and result["isError"] is not False:
+            return None
+        nested = result.get("data")
+        if not isinstance(nested, Mapping) or not all(isinstance(key, str) for key in nested):
+            return None
+        payload = nested
+    if set(payload) not in (
+        {"sent", "message_id"},
+        {"sent", "message_id", "isError"},
+    ):
+        return None
+    if not set(payload) <= _WHATSAPP_RESULT_FIELDS:
+        return None
+    if payload.get("sent") is not True:
+        return None
+    if "isError" in payload and payload["isError"] is not False:
+        return None
+    message_id = payload.get("message_id")
+    if not isinstance(message_id, str) or not _OPAQUE_MESSAGE_ID_RE.fullmatch(message_id):
+        return None
+    return payload
 
 
 class WhatsAppAdapter:
@@ -288,9 +314,12 @@ class WhatsAppAdapter:
 
     def classify_outcome(self, result_or_error: object) -> Outcome:
         common = conservative_outcome(result_or_error)
-        if common is not Outcome.OUTCOME_UNKNOWN:
+        if common is Outcome.DEFINITE_FAILURE:
             return common
-        if isinstance(result_or_error, Mapping) and _contains_sent(result_or_error):
+        if (
+            isinstance(result_or_error, Mapping)
+            and _reviewed_send_result(result_or_error) is not None
+        ):
             return Outcome.SUCCEEDED
         return Outcome.OUTCOME_UNKNOWN
 
@@ -304,25 +333,10 @@ class WhatsAppAdapter:
         return Reconciliation.INCONCLUSIVE
 
     def safe_result_metadata(self, downstream_result: Mapping[str, Any]) -> dict[str, Any]:
-        detached = copy_json_object(downstream_result)
-        safe: dict[str, Any] = {}
-        field_map = {
-            "message_id": "chat_message_id",
-            "id": "chat_message_id",
-            "status": "provider_status",
-            "timestamp": "delivered_at",
-        }
-        for key, safe_key in field_map.items():
-            value = detached.get(key)
-            if key in detached and (value is None or isinstance(value, (str, int, bool))):
-                safe[safe_key] = value
-        if detached.get("sent") is True:
-            safe["status"] = "sent"
-        data = detached.get("data")
-        if isinstance(data, Mapping):
-            for key, value in self.safe_result_metadata(data).items():
-                safe.setdefault(key, value)
-        return safe
+        payload = _reviewed_send_result(downstream_result)
+        if payload is None:
+            return {}
+        return {"status": "sent", "chat_message_id": payload["message_id"]}
 
 
 class WhatsAppTextAdapter(WhatsAppAdapter):

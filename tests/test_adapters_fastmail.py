@@ -18,6 +18,7 @@ from signet.adapters import (
     ReadOnlyMCPClient,
     Reconciliation,
 )
+from signet.delivery import standardize_safe_metadata
 from signet.staging import StagingError, StagingStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +40,6 @@ class FakeFastmailClient:
                 "messageId": "message-safe-id",
                 "threadId": "thread-safe-id",
                 "status": "sent",
-                "body": "provider must not expose this through status",
             }
         if tool_name == "search_email":
             return self.search_result
@@ -153,6 +153,58 @@ async def test_fastmail_stages_locally_then_uploads_and_sends_once_after_prepare
         "provider_status": "sent",
         "thread_id": "thread-safe-id",
     }
+
+
+def test_fastmail_safe_result_accepts_only_the_reviewed_shape_and_statuses() -> None:
+    adapter = FastmailAdapter(account="primary")
+    result = {
+        "data": {
+            "messageId": "m_0123456789.ABC:def@example.test",
+            "submissionId": "submission/0123+abc=",
+            "threadId": "thread-0123",
+            "status": "submitted",
+        },
+        "isError": False,
+    }
+
+    assert adapter.classify_outcome(result) is Outcome.SUCCEEDED
+    assert adapter.safe_result_metadata(result) == {
+        "message_id": "m_0123456789.ABC:def@example.test",
+        "submission_id": "submission/0123+abc=",
+        "thread_id": "thread-0123",
+        "provider_status": "submitted",
+    }
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "messageId": "message-safe-id",
+            "status": "sent",
+            "body": "private request content echoed by provider",
+        },
+        {"messageId": "private request content echoed by provider", "status": "sent"},
+        {"messageId": "m" * 257, "status": "sent"},
+        {"messageId": "message-safe-id", "status": "private email body"},
+        {"messageId": "message-safe-id", "status": "ok"},
+        {"message_id": "message-safe-id", "status": "sent"},
+        {"messageId": 12345, "status": "sent"},
+        {"data": {"data": {"messageId": "message-safe-id", "status": "sent"}}},
+        {
+            "data": {"messageId": "message-safe-id", "status": "sent"},
+            "unexpected": "private request content",
+        },
+    ],
+)
+def test_fastmail_safe_result_rejects_echoes_nesting_and_unreviewed_fields(
+    result: dict[str, Any],
+) -> None:
+    adapter = FastmailAdapter(account="primary")
+
+    assert adapter.safe_result_metadata(result) == {}
+    assert dict(standardize_safe_metadata(adapter, result)) == {}
+    assert adapter.classify_outcome(result) is Outcome.OUTCOME_UNKNOWN
 
 
 def test_fastmail_rehashes_staged_attachment_before_execution(tmp_path: Path) -> None:
