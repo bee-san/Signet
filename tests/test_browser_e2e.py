@@ -15,6 +15,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -27,8 +28,13 @@ from signet.demo import (
     DEMO_GRACEFUL_SHUTDOWN_SECONDS,
     DEMO_NAMESPACE,
     DEMO_USER_ID,
+    build_demo,
     credential_value,
     initialize_demo,
+)
+
+BROWSER_ATTACHMENT_CONTENT = (
+    b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert("not executed")</script></svg>'
 )
 
 EMAIL_ARGUMENTS = {
@@ -44,8 +50,10 @@ WHATSAPP_ARGUMENTS = {
     "to": "15555550123@s.whatsapp.net",
     "message": "Send the fake-only incident handoff after a human review.",
 }
-APPROVAL_NOTE = "Approved after checking the recipient, content, and frozen payload."
-DENIAL_NOTE = "Denied because this fake incident handoff is no longer required."
+APPROVAL_NOTE = "exact_request_approved"
+APPROVAL_REASON = "Exact content, destination, and scope reviewed and approved"
+DENIAL_NOTE = "request_no_longer_needed"
+DENIAL_REASON = "Request is no longer needed"
 
 NO_EGRESS_DEMO_ENTRYPOINT = r"""
 import errno
@@ -138,6 +146,7 @@ class BrowserSignals:
     external_requests: int = 0
     post_requests: int = 0
     exact_post_origins: bool = True
+    expected_download_url: str | None = None
 
 
 def _available_ports() -> tuple[int, int]:
@@ -257,7 +266,31 @@ def _served_demo(tmp_path: Path) -> Iterator[LiveDemo]:
                 pytest.fail("fake demo server reported an internal error", pytrace=False)
 
 
-async def _enqueue(demo: LiveDemo) -> tuple[str, str]:
+async def _enqueue(demo: LiveDemo) -> tuple[str, str, dict[str, Any]]:
+    source = demo.root / "imports" / "payroll-review.svg"
+    source.write_bytes(BROWSER_ATTACHMENT_CONTENT)
+    source.chmod(0o600)
+    assembly = build_demo(demo.root)
+    staged = assembly.staging.stage_path(
+        source,
+        adapter="fastmail",
+        account="fake:fastmail-account",
+        filename="payroll-review.svg",
+        declared_mime="image/svg+xml",
+    )
+    attachment = {
+        "staged_id": staged.opaque_id,
+        "filename": staged.filename,
+        "mime_type": staged.declared_mime,
+        "detected_mime": staged.detected_mime,
+        "detection_source": staged.detection_source,
+        "size": staged.size,
+        "sha256": staged.sha256,
+    }
+    email_arguments: dict[str, Any] = {
+        **EMAIL_ARGUMENTS,
+        "attachments": [attachment],
+    }
     token = credential_value(demo.root, "mcp-token")
     async with httpx.AsyncClient(
         headers={"Authorization": f"Bearer {token}"},
@@ -266,7 +299,7 @@ async def _enqueue(demo: LiveDemo) -> tuple[str, str]:
     ) as client:
         request_ids: list[str] = []
         for alias, tool_name, arguments in (
-            ("fastmail", "send_email", EMAIL_ARGUMENTS),
+            ("fastmail", "send_email", email_arguments),
             ("whatsapp", "send_text", WHATSAPP_ARGUMENTS),
         ):
             async with (
@@ -287,10 +320,10 @@ async def _enqueue(demo: LiveDemo) -> tuple[str, str]:
             ):
                 raise RuntimeError("fake MCP did not enqueue an approval request")
             request_ids.append(content["request_id"])
-    return request_ids[0], request_ids[1]
+    return request_ids[0], request_ids[1], email_arguments
 
 
-def _enqueue_requests(demo: LiveDemo) -> tuple[str, str]:
+def _enqueue_requests(demo: LiveDemo) -> tuple[str, str, dict[str, Any]]:
     try:
         return asyncio.run(_enqueue(demo))
     except Exception:
@@ -326,12 +359,20 @@ def _install_network_guards(page: Page, demo: LiveDemo, signals: BrowserSignals)
         if message.type == "error":
             signals.console_errors += 1
 
+    def observe_failed(request: Request) -> None:
+        # Chromium reports a successful browser-managed download as ERR_ABORTED.
+        # Ignore only the exact link selected by this acceptance test.
+        if (
+            request.method == "GET"
+            and request.url == signals.expected_download_url
+            and request.failure == "net::ERR_ABORTED"
+        ):
+            return
+        signals.failed_requests += 1
+
     page.context.route("**/*", route_request)
     page.on("request", observe_request)
-    page.on(
-        "requestfailed",
-        lambda _request: setattr(signals, "failed_requests", signals.failed_requests + 1),
-    )
+    page.on("requestfailed", observe_failed)
     page.on(
         "response",
         lambda response: setattr(
@@ -480,7 +521,11 @@ def _assert_bound_context(
         pytest.fail("expanded request context did not match the frozen request", pytrace=False)
 
     attachment_band = review.locator(".attachment-band")
-    if (
+    expected_attachments = arguments.get("attachments", [])
+    if expected_attachments:
+        if attachment_band.locator("tbody tr").count() != len(expected_attachments):
+            pytest.fail("expanded request context omitted an attachment", pytrace=False)
+    elif (
         _normalized_text(attachment_band).count("None") != 2
         or attachment_band.locator("table").count() != 0
     ):
@@ -544,12 +589,82 @@ def _submit_decision(
     action: str,
     note: str,
 ) -> None:
-    review.locator("[data-decision-note]").fill(note)
+    selector = "[data-approval-reason]" if action == "approve" else "[data-denial-reason]"
+    review.locator(selector).select_option(note)
     form = review.locator("form.totp-action").first
     form.locator("input[name='totp_proof']").fill(credential_value(demo.root, "web-action-proof"))
     with page.expect_navigation(wait_until="domcontentloaded"):
         form.locator(f"button[name='action'][value='{action}']").click()
     page.wait_for_url(re.compile(rf"{re.escape(demo.web_origin)}/audit#decision-{request_id}$"))
+
+
+def _assert_passkey_note_routing(review: Locator) -> None:
+    approval_reason = "exact_request_approved"
+    denial_reason = "wrong_destination"
+    review.locator("[data-approval-reason]").select_option(approval_reason)
+    review.locator("[data-denial-reason]").select_option(denial_reason)
+    captured = review.evaluate(
+        """
+        async (root) => {
+          const originalFetch = window.fetch;
+          const bodies = [];
+          window.fetch = async (url, options = {}) => {
+            if (String(url).includes("/actions/passkey/options")) {
+              bodies.push(JSON.parse(options.body));
+              return new Response(
+                JSON.stringify({ error: { message: "captured without a ceremony" } }),
+                { status: 422, headers: { "Content-Type": "application/json" } }
+              );
+            }
+            return originalFetch.call(window, url, options);
+          };
+          try {
+            for (const action of [
+              "approve", "deny", "cancel", "edit",
+              "promote_approval", "promote_passthrough"
+            ]) {
+              const button = document.createElement("button");
+              button.type = "button";
+              button.dataset.passkeyAction = action;
+              root.append(button);
+              button.click();
+              button.remove();
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+            root.dataset.gatewayInternal = "true";
+            const policyApprove = document.createElement("button");
+            policyApprove.type = "button";
+            policyApprove.dataset.passkeyAction = "approve";
+            root.append(policyApprove);
+            policyApprove.click();
+            policyApprove.remove();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            return bodies;
+          } finally {
+            window.fetch = originalFetch;
+          }
+        }
+        """
+    )
+    if [body["action"] for body in captured] != [
+        "approve",
+        "deny",
+        "cancel",
+        "edit",
+        "promote_approval",
+        "promote_passthrough",
+        "approve",
+    ]:
+        pytest.fail("passkey action capture was incomplete", pytrace=False)
+    for index, body in enumerate(captured):
+        expected_note = {
+            "approve": approval_reason,
+            "deny": denial_reason,
+        }.get(body["action"])
+        if index == len(captured) - 1:
+            expected_note = None
+        if body.get("decision_note") != expected_note:
+            pytest.fail("passkey action routed rationale to the wrong action", pytrace=False)
 
 
 def _wait_for_success(page: Page, demo: LiveDemo, request_id: str) -> None:
@@ -587,7 +702,7 @@ def _assert_keyboard_focus(page: Page) -> None:
 
 def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
     with _served_demo(tmp_path) as demo:
-        approved_id, denied_id = _enqueue_requests(demo)
+        approved_id, denied_id, email_arguments = _enqueue_requests(demo)
         signals = BrowserSignals()
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
@@ -622,7 +737,7 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
                 state="pending_approval",
                 alias="fastmail",
                 tool_name="send_email",
-                arguments=EMAIL_ARGUMENTS,
+                arguments=email_arguments,
             )
             email_text = email_review.text_content() or ""
             for expected in (
@@ -633,6 +748,35 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
             ):
                 if expected not in email_text:
                     pytest.fail("expanded email context omitted reviewed content", pytrace=False)
+            attachment_row = email_review.locator(".attachment-band tbody tr")
+            if attachment_row.count() != 1:
+                pytest.fail("expanded email context omitted its frozen attachment", pytrace=False)
+            attachment_text = _normalized_text(attachment_row)
+            attachment = email_arguments["attachments"][0]
+            for expected in (
+                "payroll-review.svg",
+                "image/svg+xml",
+                str(attachment["detected_mime"]),
+                str(attachment["sha256"]),
+            ):
+                if expected not in attachment_text:
+                    pytest.fail("attachment review omitted frozen metadata", pytrace=False)
+            download_link = attachment_row.get_by_role("link", name="Download frozen bytes")
+            signals.expected_download_url = download_link.evaluate("(node) => node.href")
+            with page.expect_download() as download_info:
+                download_link.click()
+            download = download_info.value
+            if download.suggested_filename != "signet-attachment.bin":
+                pytest.fail("attachment download exposed an unsafe source filename", pytrace=False)
+            downloaded_path = download.path()
+            if (
+                downloaded_path is None
+                or downloaded_path.read_bytes() != BROWSER_ATTACHMENT_CONTENT
+            ):
+                pytest.fail(
+                    "attachment download did not preserve the exact frozen bytes",
+                    pytrace=False,
+                )
             _assert_layout(page)
             for viewport in (
                 {"width": 390, "height": 844},
@@ -693,8 +837,13 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
                     approved_id,
                     "fastmail",
                     "send_email",
-                    EMAIL_ARGUMENTS,
-                    ("succeeded", "Downstream effect confirmed", APPROVAL_NOTE),
+                    email_arguments,
+                    (
+                        "succeeded",
+                        "Downstream effect confirmed",
+                        APPROVAL_NOTE,
+                        APPROVAL_REASON,
+                    ),
                 ),
                 (
                     denied_review,
@@ -702,7 +851,7 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
                     "whatsapp",
                     "send_text",
                     WHATSAPP_ARGUMENTS,
-                    ("denied", "Nothing was executed downstream", DENIAL_NOTE),
+                    ("denied", "Nothing was executed downstream", DENIAL_NOTE, DENIAL_REASON),
                 ),
             ):
                 _assert_bound_context(
@@ -780,4 +929,59 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
         if signals.post_requests < 3 or not signals.exact_post_origins:
             pytest.fail(
                 "browser form POSTs did not carry the exact same-origin Origin", pytrace=False
+            )
+
+
+def test_fake_demo_browser_cancel_omits_shared_decision_rationale(tmp_path: Path) -> None:
+    with _served_demo(tmp_path) as demo:
+        request_id, _other_request_id, _email_arguments = _enqueue_requests(demo)
+        signals = BrowserSignals()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                locale="en-US",
+                timezone_id="UTC",
+                service_workers="block",
+            )
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.set_default_navigation_timeout(15_000)
+            _install_network_guards(page, demo, signals)
+            _login(page, demo)
+            review = _expand_request(page, request_id)
+            _assert_passkey_note_routing(review)
+
+            rejected_note = "duplicate_request"
+            review.locator("[data-denial-reason]").select_option(rejected_note)
+            form = review.locator("form[data-decision-form]")
+            form.locator("input[name='totp_proof']").fill(
+                credential_value(demo.root, "web-action-proof")
+            )
+            with page.expect_navigation(wait_until="domcontentloaded"):
+                form.locator("button[name='action'][value='cancel']").click()
+            page.wait_for_url(f"{demo.web_origin}/requests/{request_id}")
+
+            detail = _normalized_text(page.locator("main"))
+            if "cancelled" not in detail or "Nothing was executed downstream" not in detail:
+                pytest.fail("browser cancellation did not preserve terminal truth", pytrace=False)
+            if rejected_note in detail:
+                pytest.fail("cancellation retained a decision-only rationale", pytrace=False)
+            _assert_layout(page)
+            context.close()
+            browser.close()
+
+        if (
+            signals.console_errors != 0
+            or signals.page_errors != 0
+            or signals.failed_requests != 0
+            or signals.error_responses != 0
+            or signals.external_requests != 0
+        ):
+            pytest.fail(
+                "browser cancellation emitted an application or network error", pytrace=False
+            )
+        if signals.post_requests < 2 or not signals.exact_post_origins:
+            pytest.fail(
+                "browser cancellation did not carry the exact same-origin Origin", pytrace=False
             )

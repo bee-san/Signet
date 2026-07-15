@@ -6,7 +6,6 @@ import fcntl
 import hashlib
 import hmac
 import json
-import mimetypes
 import os
 import re
 import secrets
@@ -19,6 +18,8 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any
+
+import puremagic
 
 from signet.attachment_crypto import (
     ATTACHMENT_ENVELOPE_FORMAT,
@@ -78,6 +79,7 @@ class StagedFile:
     envelope_size: int = 0
     envelope_sha256: str = ""
     encryption_key_ref: str = ""
+    detection_source: str = "content_signature_v1"
 
     def __repr__(self) -> str:
         return (
@@ -88,7 +90,7 @@ class StagedFile:
 
 _OPAQUE_ID_RE = re.compile(r"stg_[A-Za-z0-9_]{20,64}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-_METADATA_KEYS = {
+_METADATA_V2_KEYS = {
     "format",
     "opaque_id",
     "adapter",
@@ -104,8 +106,10 @@ _METADATA_KEYS = {
     "envelope_sha256",
     "encryption_key_ref",
 }
+_METADATA_KEYS = {*_METADATA_V2_KEYS, "detection_source"}
 _CHUNK_SIZE = 1024 * 1024
 _METADATA_LIMIT = 64 * 1024
+_CONTENT_SNIFF_LIMIT = 64 * 1024
 
 
 def _validate_filename(filename: str) -> str:
@@ -136,6 +140,30 @@ def _validate_bounded_text(value: str, *, name: str, maximum: int = 512) -> str:
     ):
         raise StagingError(f"{name} is invalid")
     return value
+
+
+def _detected_content_mime(content: bytes) -> str:
+    """Return a bounded best-effort content signature, never a filename guess."""
+
+    sample = content[:_CONTENT_SNIFF_LIMIT]
+    if not sample:
+        return "application/octet-stream"
+    try:
+        detected = puremagic.from_string(sample, mime=True)
+    except puremagic.PureError:
+        detected = None
+    if isinstance(detected, str) and detected and len(detected) <= 255:
+        return detected
+    try:
+        decoded = sample.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return "application/octet-stream"
+    if decoded and all(
+        character in "\t\n\r" or (ord(character) >= 32 and ord(character) != 127)
+        for character in decoded
+    ):
+        return "text/plain"
+    return "application/octet-stream"
 
 
 def _directory_flags() -> int:
@@ -482,9 +510,11 @@ class StagingStore:
             raise StagingError("insufficient disk headroom")
 
     @staticmethod
-    def _metadata_document(record: StagedFile) -> bytes:
+    def _metadata_document(record: StagedFile, *, format_version: int = 3) -> bytes:
+        if format_version not in {2, 3}:
+            raise ValueError("staged object metadata format is unsupported")
         document = {
-            "format": 2,
+            "format": format_version,
             "opaque_id": record.opaque_id,
             "adapter": record.adapter,
             "account": record.account,
@@ -499,6 +529,8 @@ class StagingStore:
             "envelope_sha256": record.envelope_sha256,
             "encryption_key_ref": record.encryption_key_ref,
         }
+        if format_version == 3:
+            document["detection_source"] = record.detection_source
         encoded = json.dumps(
             document,
             ensure_ascii=True,
@@ -508,12 +540,12 @@ class StagingStore:
         return encoded.encode("utf-8")
 
     @classmethod
-    def metadata_document(cls, record: StagedFile) -> bytes:
+    def metadata_document(cls, record: StagedFile, *, format_version: int = 3) -> bytes:
         """Serialize one validated sidecar for backup restoration."""
 
         if not isinstance(record, StagedFile):
             raise TypeError("staged object metadata record is invalid")
-        return cls._metadata_document(record)
+        return cls._metadata_document(record, format_version=format_version)
 
     def _write_metadata(self, record: StagedFile) -> None:
         metadata_fd = self._open_metadata_root()
@@ -564,10 +596,10 @@ class StagingStore:
                     """
                     INSERT INTO staged_objects(
                         attachment_id, adapter, account, filename, declared_mime,
-                        detected_mime, size_bytes, sha256, storage_path,
+                        detected_mime, detection_source, size_bytes, sha256, storage_path,
                         envelope_format, envelope_size, envelope_sha256,
                         encryption_key_ref, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.opaque_id,
@@ -576,6 +608,7 @@ class StagingStore:
                         record.filename,
                         record.declared_mime,
                         record.detected_mime,
+                        record.detection_source,
                         record.size,
                         record.sha256,
                         str(record.path),
@@ -594,7 +627,7 @@ class StagingStore:
             row = connection.execute(
                 """
                 SELECT attachment_id, adapter, account, filename, declared_mime,
-                       detected_mime, size_bytes, sha256, storage_path,
+                       detected_mime, detection_source, size_bytes, sha256, storage_path,
                        envelope_format, envelope_size, envelope_sha256,
                        encryption_key_ref, created_at, purged_at, key_destroyed_at
                 FROM staged_objects WHERE attachment_id = ?
@@ -624,6 +657,7 @@ class StagingStore:
             envelope_size=int(row["envelope_size"]),
             envelope_sha256=str(row["envelope_sha256"]),
             encryption_key_ref=str(row["encryption_key_ref"]),
+            detection_source=str(row["detection_source"]),
         )
 
     @staticmethod
@@ -679,7 +713,7 @@ class StagingStore:
                     maximum_bytes=self.max_file_bytes,
                 )
                 plaintext_hash = hashlib.sha256(plaintext).hexdigest()
-                detected = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                detected = _detected_content_mime(plaintext)
                 created_at = int(time.time())
                 context = AttachmentContext(
                     opaque_id=opaque_id,
@@ -804,7 +838,11 @@ class StagingStore:
             value: Any = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise StagingError("staged object metadata is invalid") from exc
-        if not isinstance(value, dict) or set(value) != _METADATA_KEYS or value.get("format") != 2:
+        if not isinstance(value, dict):
+            raise StagingError("staged object metadata is invalid")
+        metadata_format = value.get("format")
+        expected_keys = _METADATA_V2_KEYS if metadata_format == 2 else _METADATA_KEYS
+        if metadata_format not in {2, 3} or set(value) != expected_keys:
             raise StagingError("staged object metadata is invalid")
         fields = (
             "opaque_id",
@@ -820,6 +858,9 @@ class StagingStore:
         )
         if any(not isinstance(value.get(field), str) for field in fields):
             raise StagingError("staged object metadata is invalid")
+        detection_source = (
+            "legacy_filename_unverified" if metadata_format == 2 else value.get("detection_source")
+        )
         size = value.get("size")
         created_at = value.get("created_at")
         envelope_size = value.get("envelope_size")
@@ -839,6 +880,7 @@ class StagingStore:
             or envelope_size != self._cipher.envelope_size(size)
             or not _SHA256_RE.fullmatch(value["envelope_sha256"])
             or value["encryption_key_ref"] != self._cipher.key_reference
+            or detection_source not in {"legacy_filename_unverified", "content_signature_v1"}
         ):
             raise StagingError("staged object metadata is invalid")
         try:
@@ -861,6 +903,7 @@ class StagingStore:
                 envelope_size=envelope_size,
                 envelope_sha256=value["envelope_sha256"],
                 encryption_key_ref=value["encryption_key_ref"],
+                detection_source=detection_source,
             )
         except StagingError as exc:
             raise StagingError("staged object metadata is invalid") from exc
@@ -872,7 +915,7 @@ class StagingStore:
             raise StagingError("staged object catalog failed integrity verification")
         if record.adapter != adapter or record.account != account:
             raise StagingError("staged object was not found in this scope")
-        return record
+        return catalog
 
     def _open_record(self, record: StagedFile) -> int:
         return open_confined_readonly(

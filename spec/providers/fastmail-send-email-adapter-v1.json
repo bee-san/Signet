@@ -58,6 +58,10 @@
               "filename": {"type": "string", "minLength": 1, "maxLength": 255},
               "mime_type": {"type": "string", "minLength": 3, "maxLength": 255},
               "detected_mime": {"type": "string", "minLength": 3, "maxLength": 255},
+              "detection_source": {
+                "type": "string",
+                "enum": ["content_signature_v1"]
+              },
               "size": {"type": "integer", "minimum": 0, "maximum": 26214400},
               "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
             }

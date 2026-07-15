@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from signet.auth import InvalidSession, SessionPrincipal
 from signet.web import (
     ActionOptions,
+    AttachmentDownload,
     AuditEntry,
     CsrfManager,
     DecisionEntry,
@@ -50,6 +51,9 @@ class FakeBackend:
     decision_notes: list[str | None] = field(default_factory=list)
     staged_decision_note: str | None = None
     event_decision_note: str | None = None
+    attachment_detection_source: str | None = "content_signature_v1"
+    gateway_internal: bool = False
+    attachment_calls: list[tuple[str, str, int, str]] = field(default_factory=list)
 
     def authenticate(self, token: str | None, *, now: int) -> SessionPrincipal:
         assert now == NOW
@@ -197,12 +201,14 @@ class FakeBackend:
             attachments=(
                 (
                     RequestAttachment(
-                        "stg_test",
+                        "stg_" + "x" * 20,
                         "agenda<script>.pdf",
                         "application/pdf",
                         1234,
                         "b" * 64,
                         False,
+                        "application/pdf",
+                        self.attachment_detection_source,
                     ),
                 )
                 if self.review_available
@@ -218,7 +224,31 @@ class FakeBackend:
             schema_version="schema-reviewed-1",
             origin_namespace="profile:web-test",
             review_available=self.review_available,
+            gateway_internal=self.gateway_internal,
         )
+
+    def get_attachment(
+        self,
+        principal: SessionPrincipal,
+        request_id: str,
+        attachment_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+    ) -> AttachmentDownload:
+        assert principal.user_id == "autumn"
+        self.attachment_calls.append(
+            (request_id, attachment_id, expected_version, expected_payload_hash)
+        )
+        if (
+            request_id != "req_test"
+            or attachment_id != "stg_" + "x" * 20
+            or expected_version != 1
+            or expected_payload_hash != HASH
+        ):
+            raise WebConflict("attachment inspection binding is stale")
+        content = b'<svg onload="alert(1)">hostile attachment</svg>'
+        return AttachmentDownload(content, len(content), "c" * 64)
 
     def list_audit(self, principal: SessionPrincipal) -> tuple[AuditEntry, ...]:
         assert principal.user_id == "autumn"
@@ -486,13 +516,74 @@ def test_expanded_review_fragment_contains_complete_bound_context(client: TestCl
     assert "b" * 64 in response.text
     assert f'name="expected_payload_hash" value="{HASH}"' in response.text
     assert 'name="expected_version" value="1"' in response.text
-    assert 'name="decision_note"' in response.text
-    assert 'maxlength="1000"' in response.text
+    assert 'data-decision-note name="decision_note"' not in response.text
+    assert 'name="decision_note"' not in response.text
+    assert "data-decision-form" in response.text
+    assert "data-approval-reason" in response.text
+    assert "data-denial-reason" in response.text
+    approval_select = re.search(
+        r'<select id="approval-reason-([a-f0-9]+)" name="approval_reason" '
+        r'form="totp-action-\1" data-approval-reason>',
+        response.text,
+    )
+    denial_select = re.search(
+        r'<select id="denial-reason-([a-f0-9]+)" name="denial_reason" '
+        r'form="totp-action-\1" data-denial-reason>',
+        response.text,
+    )
+    assert approval_select is not None and denial_select is not None
+    assert "Approval reason" in response.text and "Denial reason" in response.text
+    assert "Exact content, destination, and scope reviewed and approved" in response.text
     assert "No downstream execution" in response.text
     assert '<time datetime="2027-01-15T07:59:00Z">2027-01-15 07:59:00 UTC</time>' in response.text
     assert '<time datetime="2027-01-15T08:10:00Z">2027-01-15 08:10:00 UTC</time>' in response.text
     assert '<script src="https://evil.test' not in response.text
     assert "&lt;script" in response.text
+
+
+def test_legacy_attachment_filename_guess_is_never_labeled_as_byte_detection(
+    client: TestClient,
+    backend: FakeBackend,
+) -> None:
+    backend.attachment_detection_source = "legacy_filename_unverified"
+    authenticate(client)
+
+    response = client.get("/requests/req_test/review")
+
+    assert response.status_code == 200
+    assert "Legacy filename guess (unverified: application/pdf)" in response.text
+    assert "Bounded byte signature" not in response.text
+
+
+def test_attachment_inspection_is_authenticated_exact_and_forced_binary(
+    client: TestClient,
+    backend: FakeBackend,
+) -> None:
+    attachment_id = "stg_" + "x" * 20
+    path = f"/requests/req_test/attachments/{attachment_id}?version=1&payload_hash={HASH}"
+
+    unauthenticated = client.get(path)
+    assert unauthenticated.status_code == 401
+    assert backend.attachment_calls == []
+
+    authenticate(client)
+    response = client.get(path)
+
+    assert response.status_code == 200
+    assert response.content == b'<svg onload="alert(1)">hostile attachment</svg>'
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="signet-attachment.bin"'
+    )
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-signet-content-sha256"] == "c" * 64
+    assert "agenda" not in response.headers["content-disposition"]
+    assert backend.attachment_calls == [("req_test", attachment_id, 1, HASH)]
+
+    stale = client.get(path.replace(f"payload_hash={HASH}", f"payload_hash={'d' * 64}"))
+    assert stale.status_code == 409
+    assert b"hostile attachment" not in stale.content
 
 
 def test_audit_decisions_are_private_when_collapsed_and_terminal_review_expands(
@@ -558,6 +649,20 @@ def test_mobile_styles_preserve_audit_navigation(client: TestClient) -> None:
     assert "nav a { display: none; }" not in stylesheet
 
 
+def test_no_javascript_hides_inert_controls_and_keeps_login_fallback(
+    client: TestClient,
+) -> None:
+    page = client.get("/login")
+    stylesheet = (ROOT / "src" / "signet" / "static" / "app.css").read_text()
+
+    assert page.status_code == 200
+    assert "data-passkey-login" in page.text
+    assert 'action="/login/password" method="post"' in page.text
+    assert ".no-js [data-passkey-login]" in stylesheet
+    assert ".no-js [data-passkey-action]" in stylesheet
+    assert ".no-js [data-enable-push]" in stylesheet
+
+
 def test_unavailable_review_fragment_is_metadata_only_and_has_no_actions(
     client: TestClient,
     backend: FakeBackend,
@@ -615,7 +720,7 @@ def test_valid_totp_action_and_stale_conflict_are_explicit(
         "expected_version": "1",
         "expected_payload_hash": HASH,
         "totp_proof": "fake:proof",
-        "decision_note": "Destination and scope reviewed.",
+        "decision_note": "exact_request_approved",
         "csrf_token": csrf.session_token("session-id", "request:req_test"),
     }
     response = client.post(
@@ -627,7 +732,7 @@ def test_valid_totp_action_and_stale_conflict_are_explicit(
     assert response.status_code == 303
     assert response.headers["location"] == "/audit#decision-req_test"
     assert backend.actions == [("approve", "req_test", "fake:proof")]
-    assert backend.decision_notes == ["Destination and scope reviewed."]
+    assert backend.decision_notes == ["exact_request_approved"]
 
     backend.conflict = True
     response = client.post(
@@ -639,7 +744,173 @@ def test_valid_totp_action_and_stale_conflict_are_explicit(
     assert response.json()["error"]["code"] == "stale_request"
 
 
-@pytest.mark.parametrize("decision_note", ["x" * 1_001, "unsafe\x00control"])
+@pytest.mark.parametrize(
+    ("action", "field", "reason"),
+    (
+        ("approve", "approval_reason", "expected_and_authorized"),
+        ("deny", "denial_reason", "wrong_destination"),
+    ),
+)
+def test_javascript_free_totp_decisions_submit_action_specific_reasons(
+    client: TestClient,
+    backend: FakeBackend,
+    csrf: CsrfManager,
+    action: str,
+    field: str,
+    reason: str,
+) -> None:
+    authenticate(client)
+    response = client.post(
+        "/requests/req_test/actions/totp",
+        data={
+            "action": action,
+            "expected_version": "1",
+            "expected_payload_hash": HASH,
+            "totp_proof": "fake:proof",
+            field: reason,
+            "csrf_token": csrf.session_token("session-id", "request:req_test"),
+        },
+        headers={"Origin": ORIGIN},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert backend.decision_notes == [reason]
+
+
+def test_javascript_free_gateway_policy_approval_has_no_ordinary_reason(
+    client: TestClient,
+    backend: FakeBackend,
+    csrf: CsrfManager,
+) -> None:
+    backend.gateway_internal = True
+    authenticate(client)
+    review = client.get("/requests/req_test/review")
+    assert review.status_code == 200
+    assert 'data-gateway-internal="true"' in review.text
+    assert "data-approval-reason" not in review.text
+    assert "data-denial-reason" in review.text
+
+    token = csrf.session_token("session-id", "request:req_test")
+    approved = client.post(
+        "/requests/req_test/actions/totp",
+        data={
+            "action": "approve",
+            "expected_version": "1",
+            "expected_payload_hash": HASH,
+            "totp_proof": "fake:proof",
+            "csrf_token": token,
+        },
+        headers={"Origin": ORIGIN},
+        follow_redirects=False,
+    )
+    assert approved.status_code == 303
+    assert backend.decision_notes == [None]
+
+    reasoned_approval = client.post(
+        "/requests/req_test/actions/totp",
+        data={
+            "action": "approve",
+            "approval_reason": "exact_request_approved",
+            "expected_version": "1",
+            "expected_payload_hash": HASH,
+            "totp_proof": "fake:proof",
+            "csrf_token": token,
+        },
+        headers={"Origin": ORIGIN},
+    )
+    assert reasoned_approval.status_code == 422
+
+    missing_denial = client.post(
+        "/requests/req_test/actions/totp",
+        data={
+            "action": "deny",
+            "expected_version": "1",
+            "expected_payload_hash": HASH,
+            "totp_proof": "fake:proof",
+            "csrf_token": token,
+        },
+        headers={"Origin": ORIGIN},
+    )
+    assert missing_denial.status_code == 422
+
+
+def test_passkey_gateway_policy_approval_stages_and_completes_without_reason(
+    client: TestClient,
+    backend: FakeBackend,
+    csrf: CsrfManager,
+) -> None:
+    backend.gateway_internal = True
+    authenticate(client)
+    token = csrf.session_token("session-id", "request:req_test")
+    options = client.post(
+        "/requests/req_test/actions/passkey/options",
+        json={
+            "action": "approve",
+            "expected_version": 1,
+            "expected_payload_hash": HASH,
+            "decision_note": None,
+        },
+        headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+    )
+    assert options.status_code == 200
+    assert backend.staged_decision_note is None
+
+    complete = client.post(
+        "/requests/req_test/actions/passkey/complete",
+        json={"challenge_id": "challenge-action", "assertion": {"fake": True}},
+        headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+    )
+    assert complete.status_code == 200
+    assert backend.decision_notes == [None]
+
+    reasoned = client.post(
+        "/requests/req_test/actions/passkey/options",
+        json={
+            "action": "approve",
+            "expected_version": 1,
+            "expected_payload_hash": HASH,
+            "decision_note": "exact_request_approved",
+        },
+        headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+    )
+    assert reasoned.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("action", "field", "reason"),
+    (
+        ("approve", "approval_reason", "wrong_destination"),
+        ("deny", "denial_reason", "exact_request_approved"),
+    ),
+)
+def test_javascript_free_totp_decisions_reject_cross_action_reasons(
+    client: TestClient,
+    backend: FakeBackend,
+    csrf: CsrfManager,
+    action: str,
+    field: str,
+    reason: str,
+) -> None:
+    authenticate(client)
+    response = client.post(
+        "/requests/req_test/actions/totp",
+        data={
+            "action": action,
+            "expected_version": "1",
+            "expected_payload_hash": HASH,
+            "totp_proof": "fake:proof",
+            field: reason,
+            "csrf_token": csrf.session_token("session-id", "request:req_test"),
+        },
+        headers={"Origin": ORIGIN},
+    )
+
+    assert response.status_code == 422
+    assert backend.actions == []
+
+
+@pytest.mark.parametrize("decision_note", ["not_a_reason", "unsafe\x00control"])
 def test_invalid_decision_rationale_is_rejected_before_mutation(
     client: TestClient,
     backend: FakeBackend,
@@ -664,20 +935,21 @@ def test_invalid_decision_rationale_is_rejected_before_mutation(
     assert backend.actions == []
 
 
-def test_decision_note_is_escaped_in_expanded_event_timeline(
+def test_decision_reason_is_rendered_as_a_fixed_label(
     client: TestClient,
     backend: FakeBackend,
 ) -> None:
     backend.detail_state = "denied"
-    backend.event_decision_note = '<script src="https://evil.test/note.js"></script>'
+    backend.event_decision_note = "wrong_destination"
     authenticate(client)
 
     response = client.get("/requests/req_test/review")
 
     assert response.status_code == 200
-    assert "Decision note" in response.text
-    assert '<script src="https://evil.test/note.js">' not in response.text
-    assert "&lt;script src=&#34;https://evil.test/note.js&#34;&gt;" in response.text
+    assert "Decision reason" in response.text
+    assert "Recipient or destination is incorrect" in response.text
+    assert "Reason code:" in response.text
+    assert "wrong_destination" in response.text
 
 
 def test_passkey_action_is_session_method_and_csrf_bound(
@@ -693,7 +965,7 @@ def test_passkey_action_is_session_method_and_csrf_bound(
             "action": "approve",
             "expected_version": 1,
             "expected_payload_hash": HASH,
-            "decision_note": "Passkey decision rationale.",
+            "decision_note": "exact_request_approved",
         },
         headers={"Origin": ORIGIN, "X-CSRF-Token": token},
     )
@@ -710,7 +982,7 @@ def test_passkey_action_is_session_method_and_csrf_bound(
         "redirect_url": "/audit#decision-req_test",
     }
     assert backend.actions == [("passkey", "req_test", "approve")]
-    assert backend.decision_notes == ["Passkey decision rationale."]
+    assert backend.decision_notes == ["exact_request_approved"]
 
 
 def test_login_csrf_session_cookie_and_fixation_input(client: TestClient) -> None:

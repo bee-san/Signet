@@ -1,7 +1,7 @@
 {% macro request_review(item, csrf_token, id_suffix, show_detail_link=false) %}
 {% set created_time = item.created_at|utc_time %}
 {% set expiry_time = item.expires_at|utc_time %}
-<div class="request-review" data-request-id="{{ item.request_id }}" data-csrf="{{ csrf_token }}">
+<div class="request-review" data-request-id="{{ item.request_id }}" data-csrf="{{ csrf_token }}" data-gateway-internal="{{ 'true' if item.gateway_internal else 'false' }}">
   <header class="detail-heading">
     <div>
       <p class="eyebrow">{{ item.service }} / {{ item.action }}</p>
@@ -98,15 +98,36 @@
     {% if item.attachments %}
     <div class="table-scroll" role="region" aria-label="Attachment details" tabindex="0">
       <table class="attachments-table">
-        <thead><tr><th>Name</th><th>Type</th><th>Bytes</th><th>SHA-256</th><th>State</th></tr></thead>
+        <thead><tr><th>Name</th><th>Declared type</th><th>Observed type</th><th>Evidence</th><th>Bytes</th><th>SHA-256</th><th>State</th><th>Inspect</th></tr></thead>
         <tbody>
           {% for attachment in item.attachments %}
           <tr>
             <td>{{ attachment.filename }}</td>
             <td>{{ attachment.mime_type }}</td>
+            <td>
+              {% if attachment.detection_source == 'content_signature_v1' %}
+              {{ attachment.detected_mime or 'Unavailable' }}
+              {% else %}
+              Unavailable
+              {% endif %}
+            </td>
+            <td>
+              {% if attachment.detection_source == 'content_signature_v1' %}
+              Bounded byte signature
+              {% else %}
+              Legacy filename guess (unverified{% if attachment.detected_mime %}: {{ attachment.detected_mime }}{% endif %})
+              {% endif %}
+            </td>
             <td>{{ attachment.size_bytes }}</td>
             <td class="hash-value">{{ attachment.sha256 }}</td>
-            <td>{{ 'Purged' if attachment.purged else 'Available' }}</td>
+            <td>{{ 'Purged' if attachment.purged else 'Retained (verified on download)' }}</td>
+            <td>
+              {% if attachment.purged %}
+              Unavailable
+              {% else %}
+              <a href="/requests/{{ item.request_id }}/attachments/{{ attachment.attachment_id }}?version={{ item.version }}&amp;payload_hash={{ item.payload_hash }}">Download frozen bytes</a>
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>
@@ -165,8 +186,28 @@
       <input type="hidden" name="expected_version" value="{{ item.version }}">
       <input type="hidden" name="expected_payload_hash" value="{{ item.payload_hash }}">
     </div>
-    <label for="decision-note-{{ id_suffix }}">Decision rationale (optional)</label>
-    <textarea id="decision-note-{{ id_suffix }}" data-decision-note name="decision_note" form="totp-action-{{ id_suffix }}" rows="3" maxlength="1000"></textarea>
+    <div class="decision-reasons">
+      {% if not item.gateway_internal %}
+      <div>
+        <label for="approval-reason-{{ id_suffix }}">Approval reason</label>
+        <select id="approval-reason-{{ id_suffix }}" name="approval_reason" form="totp-action-{{ id_suffix }}" data-approval-reason>
+          <option value="">Choose before approving</option>
+          {% for code, label in approval_reason_labels.items() if code not in ['mcp_chat_confirmation', 'authenticated_exact_review'] %}
+          <option value="{{ code }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
+      <div>
+        <label for="denial-reason-{{ id_suffix }}">Denial reason</label>
+        <select id="denial-reason-{{ id_suffix }}" name="denial_reason" form="totp-action-{{ id_suffix }}" data-denial-reason>
+          <option value="">Choose before denying</option>
+          {% for code, label in denial_reason_labels.items() if code != 'authenticated_denial' %}
+          <option value="{{ code }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
     {% if not fake_only_ui %}
     <div class="passkey-actions">
       <button class="button button-primary" type="button" data-passkey-action="approve">Approve</button>
@@ -176,7 +217,7 @@
     {% endif %}
     <details class="authenticator-fallback"{% if fake_only_ui %} open{% endif %}>
       <summary>{{ 'Use fake action proof' if fake_only_ui else 'Use authenticator code' }}</summary>
-      <form id="totp-action-{{ id_suffix }}" class="totp-action" action="/requests/{{ item.request_id }}/actions/totp" method="post">
+      <form id="totp-action-{{ id_suffix }}" class="totp-action" data-decision-form action="/requests/{{ item.request_id }}/actions/totp" method="post">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="expected_version" value="{{ item.version }}">
         <input type="hidden" name="expected_payload_hash" value="{{ item.payload_hash }}">
@@ -247,7 +288,11 @@
           <div><dt>Payload hash</dt><dd class="hash-value">{{ event.payload_hash }}</dd></div>
         </dl>
         {% if event.decision_note %}
-        <div class="decision-note"><h4>Decision note</h4><pre>{{ event.decision_note }}</pre></div>
+        <div class="decision-note">
+          <h4>Decision reason</h4>
+          <p>{{ event.decision_note|decision_reason_label }}</p>
+          <p class="reason-code">Reason code: <code>{{ event.decision_note }}</code></p>
+        </div>
         {% endif %}
         {% if event.details_json %}<pre>{{ event.details_json }}</pre>{% endif %}
       </li>

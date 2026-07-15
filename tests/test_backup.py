@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -100,6 +105,86 @@ def _restored_store(restored: RestoredBundle) -> StagingStore:
     )
 
 
+def _rewrite_encrypted_archive(
+    bundle: Path,
+    destination: Path,
+    mutator: Callable[[dict[str, bytes]], None],
+) -> Path:
+    with tempfile.TemporaryFile(mode="w+b") as archive:
+        descriptor = os.open(bundle, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            backup_module._decrypt_bundle_to_archive(
+                descriptor,
+                archive,
+                encryption_key=b"k" * 32,
+                maximum_bytes=512 * 1024 * 1024,
+            )
+        finally:
+            os.close(descriptor)
+        archive.seek(0)
+        with zipfile.ZipFile(archive, mode="r") as zipped:
+            members = {info.filename: zipped.read(info) for info in zipped.infolist()}
+
+    mutator(members)
+    with tempfile.TemporaryFile(mode="w+b") as rewritten:
+        with zipfile.ZipFile(rewritten, mode="w", compression=zipfile.ZIP_STORED) as zipped:
+            for name, content in members.items():
+                zipped.writestr(name, content)
+        archive_size = rewritten.seek(0, os.SEEK_END)
+        rewritten.seek(0)
+        backup_module._encrypt_archive_to_path(
+            rewritten,
+            archive_size=archive_size,
+            destination=destination,
+            encryption_key=b"k" * 32,
+        )
+    return destination
+
+
+def _downgrade_catalog_to_schema_12(database: Database) -> None:
+    with database.transaction() as connection:
+        connection.execute("DROP TRIGGER IF EXISTS request_events_structured_reason_insert")
+        connection.execute("DROP TRIGGER IF EXISTS web_action_drafts_structured_reason_insert")
+        connection.execute("DROP TRIGGER staged_objects_immutable_context")
+        connection.execute("ALTER TABLE staged_objects DROP COLUMN detection_source")
+        connection.execute(
+            """
+            CREATE TRIGGER staged_objects_immutable_context
+            BEFORE UPDATE OF
+                attachment_id, adapter, account, filename, declared_mime, detected_mime,
+                size_bytes, sha256, envelope_format, envelope_size, envelope_sha256,
+                created_at, consumed_request_id, consumed_at
+            ON staged_objects
+            FOR EACH ROW
+            WHEN
+                OLD.attachment_id IS NOT NEW.attachment_id OR
+                OLD.adapter IS NOT NEW.adapter OR
+                OLD.account IS NOT NEW.account OR
+                OLD.filename IS NOT NEW.filename OR
+                OLD.declared_mime IS NOT NEW.declared_mime OR
+                OLD.detected_mime IS NOT NEW.detected_mime OR
+                OLD.size_bytes IS NOT NEW.size_bytes OR
+                OLD.sha256 IS NOT NEW.sha256 OR
+                OLD.envelope_format IS NOT NEW.envelope_format OR
+                OLD.envelope_size IS NOT NEW.envelope_size OR
+                OLD.envelope_sha256 IS NOT NEW.envelope_sha256 OR
+                OLD.created_at IS NOT NEW.created_at OR
+                NOT (
+                    (OLD.consumed_request_id IS NEW.consumed_request_id AND
+                     OLD.consumed_at IS NEW.consumed_at) OR
+                    (OLD.consumed_request_id IS NULL AND OLD.consumed_at IS NULL AND
+                     NEW.consumed_request_id IS NOT NULL AND NEW.consumed_at IS NOT NULL)
+                )
+            BEGIN
+                SELECT RAISE(ABORT, 'staged object immutable context changed');
+            END
+            """
+        )
+        connection.execute("DROP TABLE privacy_maintenance")
+        connection.execute("DELETE FROM schema_meta WHERE migration_id = 13")
+        connection.execute("PRAGMA user_version = 12")
+
+
 def test_encrypted_bundle_restores_catalogued_envelopes_and_key_manifest(
     tmp_path: Path,
 ) -> None:
@@ -168,6 +253,106 @@ def test_bundle_tamper_and_wrong_backup_key_fail_before_restore(tmp_path: Path) 
     wrong = _manager(database, staging, key=b"w" * 32)
     with pytest.raises(BackupError, match="authentication"):
         wrong.restore(bundle, tmp_path / "wrong-restore")
+
+
+def test_restore_rejects_valid_but_mismatched_manifest_detection_source(
+    tmp_path: Path,
+) -> None:
+    database, staging, _ = _fixture(tmp_path, content=b"signature-detected fixture")
+    manager = _manager(database, staging)
+    bundle = manager.create(tmp_path / "backup.signet")
+
+    def change_provenance(members: dict[str, bytes]) -> None:
+        manifest = json.loads(members["manifest.json"])
+        assert manifest["attachments"][0]["detection_source"] == "content_signature_v1"
+        manifest["attachments"][0]["detection_source"] = "legacy_filename_unverified"
+        members["manifest.json"] = json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    rewritten = _rewrite_encrypted_archive(
+        bundle,
+        tmp_path / "validly-encrypted-tampered-manifest.signet",
+        change_provenance,
+    )
+
+    with pytest.raises(BackupError, match="manifest is inconsistent"):
+        manager.restore(rewritten, tmp_path / "tampered-restore")
+    assert not (tmp_path / "tampered-restore").exists()
+
+
+def test_schema_12_format_2_backup_restores_and_upgrades_legacy_provenance(
+    tmp_path: Path,
+) -> None:
+    database, staging, staged = _fixture(
+        tmp_path,
+        content=b"legacy filename-era attachment",
+    )
+    _downgrade_catalog_to_schema_12(database)
+    manager = _manager(database, staging)
+    current_bundle = manager.create(tmp_path / "schema-12-current-writer.signet")
+
+    def convert_to_legacy_bundle(members: dict[str, bytes]) -> None:
+        manifest = json.loads(members["manifest.json"])
+        assert manifest["schema_version"] == 12
+        item = manifest["attachments"][0]
+        assert item.pop("detection_source") == "legacy_filename_unverified"
+        metadata_path = item["metadata_archive_path"]
+        metadata = json.loads(members[metadata_path])
+        assert metadata["format"] == 3
+        assert metadata.pop("detection_source") == "legacy_filename_unverified"
+        metadata["format"] = 2
+        members[metadata_path] = json.dumps(
+            metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        members["manifest.json"] = json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    legacy_bundle = _rewrite_encrypted_archive(
+        current_bundle,
+        tmp_path / "schema-12-format-2.signet",
+        convert_to_legacy_bundle,
+    )
+    restored = manager.restore(legacy_bundle, tmp_path / "legacy-restored")
+    restored_item = restored.manifest["attachments"][0]
+    assert "detection_source" not in restored_item
+    restored_metadata = json.loads(
+        (restored.attachments_root / ".metadata" / f"{staged.opaque_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert restored_metadata["format"] == 2
+    assert "detection_source" not in restored_metadata
+
+    restored_database = Database(restored.database_path)
+    restored_staging = StagingStore(
+        restored.attachments_root,
+        database=restored_database,
+        cipher=attachment_cipher(),
+        minimum_free_bytes=0,
+    )
+    restored_manager = _manager(restored_database, restored_staging)
+    migration_backups = tmp_path / "restore-migration-backups"
+    migration_backups.mkdir(mode=0o700)
+    restored_database.initialize(
+        pre_migration_backup=restored_manager.create_pre_migration_callback(migration_backups)
+    )
+
+    migrated_record, plaintext = restored_staging.read_verified(
+        staged.opaque_id,
+        adapter="fastmail",
+        account="primary",
+    )
+    assert plaintext == b"legacy filename-era attachment"
+    assert migrated_record.detection_source == "legacy_filename_unverified"
+    assert len(tuple(migration_backups.glob("pre-migration-v12-*.signet-backup"))) == 1
 
 
 def test_backup_preflights_limit_before_archive_or_aead_allocation(

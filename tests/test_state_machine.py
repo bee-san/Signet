@@ -311,6 +311,47 @@ def test_pending_ack_is_returned_only_after_full_durable_commit(database: Databa
     assert ApprovalStateMachine(database).get_request("committed")["state"] == "pending_approval"
 
 
+@pytest.mark.parametrize(
+    ("downstream_alias", "tool_name", "expected_service", "expected_action"),
+    (
+        ("fastmail", "send:thing", "fastmail", "requested action"),
+        ("fastmail", "send\nthing", "fastmail", "requested action"),
+        ("fastmail", "envoyer_é", "fastmail", "requested action"),
+        ("fastmail", "x" * 65, "fastmail", "requested action"),
+        ("bad:alias", "send_email", "Downstream service", "send_email"),
+    ),
+)
+def test_unsafe_notification_label_never_blocks_durable_enqueue(
+    database: Database,
+    downstream_alias: str,
+    tool_name: str,
+    expected_service: str,
+    expected_action: str,
+) -> None:
+    machine = ApprovalStateMachine(database, notification_user_id=HUMAN_USER)
+    request_id = (
+        "unsafe-label-"
+        + hashlib.sha256(f"{downstream_alias}:{tool_name}".encode()).hexdigest()[:12]
+    )
+
+    result = machine.enqueue(
+        replace(
+            request(request_id),
+            downstream_alias=downstream_alias,
+            tool_name=tool_name,
+        )
+    )
+
+    assert result.created is True
+    assert machine.get_request(request_id)["state"] == "pending_approval"
+    with database.read() as connection:
+        notification = connection.execute(
+            "SELECT service, action FROM notification_outbox WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+    assert tuple(notification) == (expected_service, expected_action)
+
+
 def test_attachment_references_commit_atomically_with_pending_ack(database: Database) -> None:
     attachment_id = "stg_" + "f" * 20
     attachment = register_catalog_attachment(

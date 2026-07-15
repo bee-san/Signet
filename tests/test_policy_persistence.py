@@ -282,13 +282,13 @@ def test_passkey_approval_note_survives_draft_restart_and_reaches_event(
         prospective_arguments_json=None,
         http_method="POST",
         now=NOW + 1,
-        decision_note="Exact destination and request scope reviewed.",
+        decision_note="exact_request_approved",
     )
     assertion = bundle.assertion(options.challenge_id)
     restarted = SQLiteActionDraftRepository(Database(bundle.database.path))
     stored = restarted.find(options.challenge_id)
     assert stored is not None
-    assert stored.decision_note == "Exact destination and request scope reviewed."
+    assert stored.decision_note == "exact_request_approved"
     bundle.backend._action_drafts = restarted
 
     assert (
@@ -304,7 +304,7 @@ def test_passkey_approval_note_survives_draft_restart_and_reaches_event(
     )
     detail = bundle.backend.get_detail(principal, request_id)
     approved = next(event for event in detail.events if event["action"] == "approved_via_web")
-    assert approved["decision_note"] == "Exact destination and request scope reviewed."
+    assert approved["decision_note"] == "exact_request_approved"
 
 
 def test_failed_draft_save_invalidates_the_issued_challenge(
@@ -335,6 +335,7 @@ def test_failed_draft_save_invalidates_the_issued_challenge(
             prospective_arguments_json=None,
             http_method="POST",
             now=NOW + 1,
+            decision_note="exact_request_approved",
         )
     with bundle.database.read() as connection:
         challenge = connection.execute(
@@ -508,6 +509,7 @@ def test_stale_policy_passkey_cannot_apply_after_request_terminalizes(
         expected_payload_hash=payload_hash,
         prospective_arguments_json=None,
         now=NOW + 2,
+        decision_note="authenticated_denial",
     )
     with pytest.raises(WebConflict, match="stale"):
         bundle.backend.complete_passkey_action(

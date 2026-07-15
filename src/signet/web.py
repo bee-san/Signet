@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Form, HTTPException, Request, Response, status
+from fastapi import FastAPI, Form, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -25,7 +25,14 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from signet.auth import InvalidSession, SessionPrincipal
-from signet.decision_notes import MAX_DECISION_NOTE_CHARS, normalize_decision_note
+from signet.decision_notes import (
+    APPROVAL_REASON_LABELS,
+    DENIAL_REASON_LABELS,
+    MAX_DECISION_NOTE_CHARS,
+    decision_reason_label,
+    normalize_decision_note,
+    reason_for_action,
+)
 from signet.http_security import RequestBodyLimitMiddleware
 
 type HumanAction = Literal[
@@ -104,6 +111,18 @@ class RequestAttachment:
     size_bytes: int
     sha256: str
     purged: bool
+    detected_mime: str | None = None
+    detection_source: str | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AttachmentDownload:
+    content: bytes
+    size_bytes: int
+    sha256: str
+
+    def __repr__(self) -> str:
+        return "AttachmentDownload(content=<redacted>)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +281,16 @@ class WebBackend(Protocol):
     ) -> QueuePage: ...
 
     def get_detail(self, principal: SessionPrincipal, request_id: str) -> RequestDetail: ...
+
+    def get_attachment(
+        self,
+        principal: SessionPrincipal,
+        request_id: str,
+        attachment_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+    ) -> AttachmentDownload: ...
 
     def list_audit(self, principal: SessionPrincipal) -> tuple[AuditEntry, ...]: ...
 
@@ -563,6 +592,9 @@ def create_web_app(
     package_root = Path(__file__).resolve().parent
     templates = Jinja2Templates(directory=package_root / "templates")
     templates.env.filters["utc_time"] = _utc_time
+    templates.env.filters["decision_reason_label"] = decision_reason_label
+    templates.env.globals["approval_reason_labels"] = APPROVAL_REASON_LABELS
+    templates.env.globals["denial_reason_labels"] = DENIAL_REASON_LABELS
     app = FastAPI(title="Signet", docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(SecurityHeadersMiddleware, public_origin=settings.public_origin)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts))
@@ -813,6 +845,33 @@ def create_web_app(
             ),
         )
 
+    @app.get("/requests/{request_id}/attachments/{attachment_id}")
+    def inspect_attachment(
+        request: Request,
+        request_id: str,
+        attachment_id: str,
+        version: Annotated[int, Query(ge=1)],
+        payload_hash: Annotated[str, Query(min_length=64, max_length=64)],
+    ) -> Response:
+        selected = principal(request)
+        download = backend.get_attachment(
+            selected,
+            request_id,
+            attachment_id,
+            expected_version=version,
+            expected_payload_hash=payload_hash,
+        )
+        return Response(
+            content=download.content,
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-store, max-age=0",
+                "Content-Disposition": 'attachment; filename="signet-attachment.bin"',
+                "X-Content-Type-Options": "nosniff",
+                "X-Signet-Content-SHA256": download.sha256,
+            },
+        )
+
     @app.get("/requests/{request_id}/review", response_class=HTMLResponse)
     async def review_fragment(request: Request, request_id: str) -> Response:
         selected = principal(request)
@@ -893,10 +952,31 @@ def create_web_app(
             str | None,
             Form(max_length=MAX_DECISION_NOTE_CHARS),
         ] = None,
+        approval_reason: Annotated[
+            str | None,
+            Form(max_length=MAX_DECISION_NOTE_CHARS),
+        ] = None,
+        denial_reason: Annotated[
+            str | None,
+            Form(max_length=MAX_DECISION_NOTE_CHARS),
+        ] = None,
     ) -> Response:
         selected = principal(request)
         require_csrf(request, selected, f"request:{request_id}", csrf_token)
-        normalized_note = _decision_note_input(action, decision_note)
+        selected_note = decision_note
+        if selected_note is None:
+            if action == "approve":
+                selected_note = approval_reason or None
+            elif action == "deny":
+                selected_note = denial_reason or None
+        policy_change = (
+            action == "approve" and backend.get_detail(selected, request_id).gateway_internal
+        )
+        normalized_note = _decision_note_input(
+            action,
+            selected_note,
+            policy_change=policy_change,
+        )
         final_state = backend.complete_totp_action(
             selected,
             request_id,
@@ -934,7 +1014,14 @@ def create_web_app(
             or (decision_note is not None and not isinstance(decision_note, str))
         ):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
-        normalized_note = _decision_note_input(action, decision_note)
+        policy_change = (
+            action == "approve" and backend.get_detail(selected, request_id).gateway_internal
+        )
+        normalized_note = _decision_note_input(
+            action,
+            decision_note,
+            policy_change=policy_change,
+        )
         return backend.begin_passkey_action(
             selected,
             request_id,
@@ -1003,13 +1090,29 @@ _HUMAN_ACTIONS: frozenset[str] = frozenset(
 )
 
 
-def _decision_note_input(action: HumanAction, value: str | None) -> str | None:
+def _decision_note_input(
+    action: HumanAction,
+    value: str | None,
+    *,
+    policy_change: bool = False,
+) -> str | None:
     try:
         normalized = normalize_decision_note(value)
     except ValueError:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT) from None
+    if policy_change:
+        if action != "approve" or normalized is not None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        return None
     if normalized is not None and action not in {"approve", "deny"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+    if action in {"approve", "deny"}:
+        if normalized is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        try:
+            return reason_for_action(cast(Literal["approve", "deny"], action), normalized)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT) from None
     return normalized
 
 

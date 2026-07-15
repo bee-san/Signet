@@ -33,7 +33,7 @@ from signet.auth import (
 )
 from signet.canonical import CanonicalizationError, canonical_json
 from signet.db import Database
-from signet.decision_notes import normalize_decision_note
+from signet.decision_notes import decision_reason_label, normalize_decision_note, reason_for_action
 from signet.models import (
     ApprovalConfirmation,
     AttachmentReference,
@@ -50,6 +50,7 @@ from signet.notifications import (
     PushRepository,
     PushSubscription,
 )
+from signet.staging import StagingError, StagingStore
 from signet.state_machine import ApprovalStateMachine
 from signet.totp import (
     InvalidTotp,
@@ -59,6 +60,7 @@ from signet.totp import (
 )
 from signet.web import (
     ActionOptions,
+    AttachmentDownload,
     AuditEntry,
     DecisionEntry,
     DecisionPage,
@@ -199,6 +201,15 @@ class PrivatePayloadReviewer(Protocol):
         prospective_arguments_json: str,
     ) -> PreparedEdit: ...
 
+    def read_attachment(
+        self,
+        request_id: str,
+        attachment_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+    ) -> AttachmentDownload: ...
+
 
 class EncryptedPayloadReviewer:
     """Decrypt, authenticate, and adapter-validate exact current revisions."""
@@ -209,6 +220,7 @@ class EncryptedPayloadReviewer:
         codec: PayloadCodec,
         adapters: Mapping[tuple[str, str], ApprovalAdapter],
         *,
+        staging: StagingStore | None = None,
         max_payload_bytes: int = 16 * 1024 * 1024,
     ) -> None:
         if max_payload_bytes <= 0 or max_payload_bytes > 64 * 1024 * 1024:
@@ -223,6 +235,7 @@ class EncryptedPayloadReviewer:
         self._state_machine = state_machine
         self._codec = codec
         self._adapters = dict(adapters)
+        self._staging = staging
         self.max_payload_bytes = max_payload_bytes
 
     def review(
@@ -404,6 +417,50 @@ class EncryptedPayloadReviewer:
             encryption_key_ref=self._codec.key_reference,
         )
 
+    def read_attachment(
+        self,
+        request_id: str,
+        attachment_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+    ) -> AttachmentDownload:
+        reviewed = self.review(request_id, version=version, payload_hash=payload_hash)
+        matching = tuple(
+            attachment
+            for attachment in reviewed.attachments
+            if attachment.attachment_id == attachment_id
+        )
+        if len(matching) != 1 or self._staging is None:
+            raise WebPayloadError("frozen attachment is unavailable for inspection")
+        expected = matching[0]
+        account = getattr(reviewed.adapter, "account", None)
+        if not isinstance(account, str) or not account:
+            raise WebPayloadError("frozen attachment scope is unavailable")
+        try:
+            record, content = self._staging.read_verified(
+                attachment_id,
+                adapter=reviewed.adapter.downstream_alias,
+                account=account,
+            )
+        except StagingError:
+            raise WebPayloadError("frozen attachment is unavailable for inspection") from None
+        if (
+            record.filename != expected.filename
+            or record.declared_mime != expected.mime_type
+            or record.size != expected.size_bytes
+            or not hmac.compare_digest(record.sha256, expected.sha256)
+            or str(record.path) != expected.storage_path
+            or len(content) != expected.size_bytes
+            or not hmac.compare_digest(hashlib.sha256(content).hexdigest(), expected.sha256)
+        ):
+            raise WebPayloadError("frozen attachment no longer matches its reviewed metadata")
+        return AttachmentDownload(
+            content=content,
+            size_bytes=expected.size_bytes,
+            sha256=expected.sha256,
+        )
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class WebActionDraft:
@@ -484,6 +541,7 @@ class WebBackend:
         self,
         database: Database,
         *,
+        authorized_user_id: str,
         sessions: SessionManager,
         passwords: PasswordAuthenticator,
         totp: TotpVerifier,
@@ -506,6 +564,10 @@ class WebBackend:
     ) -> None:
         if max_audit_entries <= 0 or max_audit_entries > 10_000:
             raise ValueError("audit read limit is invalid")
+        try:
+            self._authorized_user_id = canonical_user_id(authorized_user_id)
+        except (InvalidCredentials, TypeError, ValueError):
+            raise ValueError("authorized web user ID is invalid") from None
         if max_decision_entries <= 0 or max_decision_entries > 1_000:
             raise ValueError("decision read limit is invalid")
         if max_queue_entries <= 0 or max_queue_entries > _MAX_QUEUE_PAGE_SIZE:
@@ -544,8 +606,12 @@ class WebBackend:
 
     def authenticate(self, token: str | None, *, now: int) -> SessionPrincipal:
         principal = self._sessions.authenticate(token, now=now)
-        if _is_preauth_method(principal.auth_method):
-            raise InvalidSession("authentication has not completed")
+        try:
+            self._require_ui_principal(principal)
+        except WebUnauthorized:
+            raise InvalidSession(
+                "authentication has not completed for the authorized user"
+            ) from None
         return principal
 
     def password_totp_login(
@@ -566,6 +632,8 @@ class WebBackend:
                 source_id=source,
                 now=now,
             )
+            if not self._is_authorized_user(password_user.user_id):
+                raise InvalidCredentials("invalid credentials")
             preauth_token = self._sessions.create_session(
                 password_user.user_id,
                 auth_method="preauth:password",
@@ -607,14 +675,18 @@ class WebBackend:
             raise WebUnauthorized("invalid credentials")
         try:
             canonical_user = canonical_user_id(user_id)
-            credentials = self._webauthn_repository.credentials_for_user(canonical_user)
-        except (TypeError, ValueError, WebAuthnError):
+            credentials = (
+                self._webauthn_repository.credentials_for_user(canonical_user)
+                if self._is_authorized_user(canonical_user)
+                else ()
+            )
+        except (InvalidCredentials, TypeError, ValueError, WebAuthnError):
             canonical_user = None
             credentials = ()
         try:
             self._reserve_passkey_login(
                 source,
-                account=canonical_user if credentials else None,
+                account=canonical_user,
                 now=now,
             )
         except AuthenticationRateLimited as exc:
@@ -845,7 +917,11 @@ class WebBackend:
         if not source or len(source) > 256:
             raise WebUnauthorized("invalid credentials")
         challenge = self._webauthn_repository.find_challenge(challenge_id)
-        if challenge is None or challenge.binding != ActionBinding("login"):
+        if (
+            challenge is None
+            or challenge.binding != ActionBinding("login")
+            or not self._is_authorized_user(challenge.user_id)
+        ):
             raise WebUnauthorized("invalid credentials")
         try:
             proof = self._webauthn_verifier.verify(
@@ -888,7 +964,7 @@ class WebBackend:
         now: int,
         cursor: str | None = None,
     ) -> QueuePage:
-        _require_ui_principal(principal)
+        self._require_ui_principal(principal)
         cursor_values = _decode_queue_cursor(cursor) if cursor is not None else None
         with self._database.read() as connection:
             if cursor_values is None:
@@ -959,7 +1035,7 @@ class WebBackend:
         )
 
     def get_detail(self, principal: SessionPrincipal, request_id: str) -> RequestDetail:
-        _require_ui_principal(principal)
+        self._require_ui_principal(principal)
         try:
             request = self._state_machine.get_request(request_id)
             events = self._state_machine.list_events(request_id)
@@ -979,10 +1055,15 @@ class WebBackend:
             ).fetchone()
             attachment_rows = connection.execute(
                 """
-                SELECT attachment_id, filename, mime_type, size_bytes, sha256, purged_at
-                FROM attachments
-                WHERE request_id = ? AND version = ?
-                ORDER BY attachment_id
+                SELECT attachment.attachment_id, attachment.filename,
+                       attachment.mime_type, attachment.size_bytes,
+                       attachment.sha256, attachment.purged_at,
+                       staged.detected_mime, staged.detection_source
+                FROM attachments AS attachment
+                LEFT JOIN staged_objects AS staged
+                  ON staged.attachment_id = attachment.attachment_id
+                WHERE attachment.request_id = ? AND attachment.version = ?
+                ORDER BY attachment.attachment_id
                 """,
                 (request_id, version),
             ).fetchall()
@@ -1057,6 +1138,14 @@ class WebBackend:
                     size_bytes=int(row["size_bytes"]),
                     sha256=str(row["sha256"]),
                     purged=row["purged_at"] is not None,
+                    detected_mime=(
+                        str(row["detected_mime"]) if row["detected_mime"] is not None else None
+                    ),
+                    detection_source=(
+                        str(row["detection_source"])
+                        if row["detection_source"] is not None
+                        else None
+                    ),
                 )
                 for row in attachment_rows
             ),
@@ -1087,8 +1176,74 @@ class WebBackend:
             editor_actor=str(payload_metadata["editor_actor"]),
         )
 
+    def get_attachment(
+        self,
+        principal: SessionPrincipal,
+        request_id: str,
+        attachment_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+    ) -> AttachmentDownload:
+        self._require_ui_principal(principal)
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 1
+            or not _is_sha256(expected_payload_hash)
+            or not isinstance(attachment_id, str)
+            or not attachment_id.startswith("stg_")
+            or not 24 <= len(attachment_id) <= 68
+            or not attachment_id.isascii()
+            or not attachment_id.removeprefix("stg_").replace("_", "a").isalnum()
+        ):
+            raise WebConflict("attachment inspection binding is invalid")
+        try:
+            request = self._state_machine.get_request(request_id)
+        except RequestNotFound:
+            raise WebConflict("frozen attachment is unavailable for inspection") from None
+        if int(request["current_version"]) != expected_version or not hmac.compare_digest(
+            str(request["current_payload_hash"]), expected_payload_hash
+        ):
+            raise WebConflict("attachment inspection binding is stale")
+        with self._database.read() as connection:
+            row = connection.execute(
+                """
+                SELECT size_bytes, sha256, storage_path, purged_at, payload_hash
+                FROM attachments
+                WHERE request_id = ? AND version = ? AND attachment_id = ?
+                """,
+                (request_id, expected_version, attachment_id),
+            ).fetchone()
+        if (
+            row is None
+            or row["storage_path"] is None
+            or row["purged_at"] is not None
+            or not hmac.compare_digest(str(row["payload_hash"]), expected_payload_hash)
+        ):
+            raise WebConflict("frozen attachment is unavailable for inspection")
+        try:
+            download = self._payloads.read_attachment(
+                request_id,
+                attachment_id,
+                version=expected_version,
+                payload_hash=expected_payload_hash,
+            )
+        except (RequestNotFound, WebPayloadError):
+            raise WebConflict("frozen attachment is unavailable for inspection") from None
+        if (
+            download.size_bytes != int(row["size_bytes"])
+            or len(download.content) != download.size_bytes
+            or not hmac.compare_digest(download.sha256, str(row["sha256"]))
+            or not hmac.compare_digest(
+                hashlib.sha256(download.content).hexdigest(), download.sha256
+            )
+        ):
+            raise WebConflict("frozen attachment failed integrity verification")
+        return download
+
     def list_audit(self, principal: SessionPrincipal) -> tuple[AuditEntry, ...]:
-        _require_ui_principal(principal)
+        self._require_ui_principal(principal)
         with self._database.read() as connection:
             rows = connection.execute(
                 """
@@ -1114,7 +1269,7 @@ class WebBackend:
         *,
         before_event_id: int | None = None,
     ) -> DecisionPage:
-        _require_ui_principal(principal)
+        self._require_ui_principal(principal)
         if before_event_id is not None and (
             not isinstance(before_event_id, int)
             or isinstance(before_event_id, bool)
@@ -1142,8 +1297,7 @@ class WebBackend:
                        WHEN event.action = 'denied' THEN 'deny'
                        ELSE 'approve'
                      END
-                WHERE (event.action = 'denied'
-                   OR event.action LIKE 'approved_via_%')
+                WHERE event.action IN ('denied', 'approved_via_web', 'approved_via_mcp')
                   AND (? IS NULL OR event.event_id < ?)
                 ORDER BY event.event_id DESC
                 LIMIT ?
@@ -1159,7 +1313,7 @@ class WebBackend:
         decisions: list[DecisionEntry] = []
         for row in visible:
             action = str(row["action"])
-            approved = action.startswith("approved_via_")
+            approved = action in {"approved_via_web", "approved_via_mcp"}
             confirmation_path, confirmation_kind = _decision_provenance(row, action=action)
             decisions.append(
                 DecisionEntry(
@@ -1195,7 +1349,7 @@ class WebBackend:
         now: int,
         decision_note: str | None = None,
     ) -> ActionOptions:
-        _require_ui_principal(principal)
+        self._require_ui_principal(principal)
         request = self._require_pending_revision(
             request_id,
             expected_version=expected_version,
@@ -1300,7 +1454,7 @@ class WebBackend:
         http_method: str,
         now: int,
     ) -> str:
-        _require_ui_principal(principal)
+        self._require_ui_principal(principal)
         draft = self._action_drafts.find(challenge_id)
         challenge = self._webauthn_repository.find_challenge(challenge_id)
         if (
@@ -1375,7 +1529,7 @@ class WebBackend:
         now: int,
         decision_note: str | None = None,
     ) -> str:
-        _require_ui_principal(principal)
+        self._require_ui_principal(principal)
         request = self._require_pending_revision(
             request_id,
             expected_version=expected_version,
@@ -1477,7 +1631,7 @@ class WebBackend:
         *,
         now: int,
     ) -> None:
-        _require_ui_principal(principal)
+        self._require_ui_principal(principal)
         try:
             categories = frozenset(NotificationKind(value) for value in subscription.categories)
             self._pushes.save(
@@ -1502,8 +1656,23 @@ class WebBackend:
         *,
         now: int,
     ) -> None:
-        _require_ui_principal(principal)
+        self._require_ui_principal(principal)
         self._pushes.unsubscribe(principal.user_id, endpoint, now=now)
+
+    def _is_authorized_user(self, user_id: str) -> bool:
+        try:
+            selected = canonical_user_id(user_id)
+        except (InvalidCredentials, TypeError, ValueError):
+            return False
+        return hmac.compare_digest(selected, self._authorized_user_id)
+
+    def _require_ui_principal(self, principal: SessionPrincipal) -> None:
+        if (
+            not isinstance(principal, SessionPrincipal)
+            or _is_preauth_method(principal.auth_method)
+            or not self._is_authorized_user(principal.user_id)
+        ):
+            raise WebUnauthorized("a completed authorized human session is required")
 
     def _require_pending_revision(
         self,
@@ -1715,6 +1884,12 @@ def _unavailable_request_detail(
                 size_bytes=int(row["size_bytes"]),
                 sha256=str(row["sha256"]),
                 purged=row["purged_at"] is not None,
+                detected_mime=(
+                    str(row["detected_mime"]) if row["detected_mime"] is not None else None
+                ),
+                detection_source=(
+                    str(row["detection_source"]) if row["detection_source"] is not None else None
+                ),
             )
             for row in attachment_rows
         )
@@ -1788,8 +1963,8 @@ def _render_request_event(
     event: Mapping[str, Any],
     provenance: Mapping[tuple[str, int, str, int], tuple[str, str]],
 ) -> dict[str, Any]:
-    details_json, decision_note = _event_details(event["safe_details_json"])
     action = str(event["action"])
+    details_json, decision_note = _event_details(event["safe_details_json"], action=action)
     confirmation_action = _event_confirmation_action(action)
     confirmation = (
         provenance.get(
@@ -1805,7 +1980,7 @@ def _render_request_event(
     )
     confirmation_kind = confirmation[0] if confirmation is not None else None
     confirmation_path = confirmation[1] if confirmation is not None else None
-    if confirmation_path is None and action.startswith("approved_via_"):
+    if confirmation_path is None and action in {"approved_via_web", "approved_via_mcp"}:
         candidate = action.removeprefix("approved_via_")
         if candidate in {"web", "mcp"}:
             confirmation_path = candidate
@@ -1854,8 +2029,8 @@ def _confirmation_provenance(
     return result
 
 
-def _event_confirmation_action(action: str) -> str | None:
-    if action.startswith("approved_via_"):
+def _event_confirmation_action(action: str) -> Literal["approve", "deny"] | None:
+    if action in {"approved_via_web", "approved_via_mcp"}:
         return "approve"
     if action == "denied":
         return "deny"
@@ -1867,14 +2042,14 @@ def _decision_provenance(row: Mapping[str, Any], *, action: str) -> tuple[str | 
     raw_kind = row["confirmation_kind"]
     path = str(raw_path) if raw_path in {"web", "mcp"} else None
     kind = str(raw_kind) if raw_kind in {"totp", "webauthn"} else None
-    if path is None and action.startswith("approved_via_"):
+    if path is None and action in {"approved_via_web", "approved_via_mcp"}:
         candidate = action.removeprefix("approved_via_")
         if candidate in {"web", "mcp"}:
             path = candidate
     return path, kind
 
 
-def _event_details(value: object) -> tuple[str | None, str | None]:
+def _event_details(value: object, *, action: str) -> tuple[str | None, str | None]:
     if value is None:
         return None, None
     if not isinstance(value, str):
@@ -1883,15 +2058,26 @@ def _event_details(value: object) -> tuple[str | None, str | None]:
         details = _strict_json_object(value)
     except WebPayloadError:
         raise WebConflict("request event details are unavailable") from None
+    note_present = "decision_note" in details
     note_value = details.pop("decision_note", None)
     decision_note = None
-    if isinstance(note_value, str):
+    if note_present:
         try:
             candidate = normalize_decision_note(note_value)
-        except ValueError:
-            candidate = None
-        if candidate == note_value:
-            decision_note = candidate
+            if candidate is None or candidate != note_value:
+                raise ValueError
+            decision_action = _event_confirmation_action(action)
+            if candidate == "legacy_unstructured_reason":
+                if decision_action is None:
+                    raise ValueError
+            elif decision_action is None:
+                raise ValueError
+            else:
+                reason_for_action(decision_action, candidate)
+            decision_reason_label(candidate)
+        except (TypeError, ValueError):
+            raise WebConflict("request event decision reason is unavailable") from None
+        decision_note = candidate
     details_json = (
         json.dumps(
             details,
@@ -2015,6 +2201,13 @@ def _decision_note_for_action(
         raise WebConflict("decision rationale is invalid") from None
     if normalized is not None and (action not in {"approve", "deny"} or policy_change):
         raise WebConflict("decision rationale does not match this action")
+    if action in {"approve", "deny"} and not policy_change:
+        if normalized is None:
+            raise WebConflict("a decision reason is required")
+        try:
+            return reason_for_action(cast(Literal["approve", "deny"], action), normalized)
+        except ValueError:
+            raise WebConflict("decision rationale is invalid") from None
     return normalized
 
 
@@ -2132,11 +2325,6 @@ def _sorted_attachment_identities(
 
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and set(value) <= _SHA256
-
-
-def _require_ui_principal(principal: SessionPrincipal) -> None:
-    if not isinstance(principal, SessionPrincipal) or _is_preauth_method(principal.auth_method):
-        raise WebUnauthorized("a completed human session is required")
 
 
 def _actor(principal: SessionPrincipal) -> str:

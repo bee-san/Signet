@@ -122,7 +122,7 @@ uv run signet deployment validate \
   --config "$HOME/.hermes/services/signet/config/disabled.json"
 ```
 
-`init` creates a new config and schema-12 database. It refuses an existing config
+`init` creates a new config and schema-13 database. It refuses an existing config
 or database and does not create a password, TOTP secret, passkey, session key,
 provider credential, policy, downstream alias, or queued request. `validate`
 reports database integrity and the fixed disabled invariants without reporting
@@ -217,18 +217,45 @@ replacement, revoke that replacement ID, and retry; the old token remains valid.
 Do not reuse a token across profile namespaces.
 
 Legacy rows in the older unconstrained `caller_tokens` table are not loaded. The
-schema-12 `mcp_caller_tokens` table accepts only the current exact `sgt_` format and
-retains revoked records. To upgrade an existing schema-11 database, first choose a
-new private snapshot path and run:
+`mcp_caller_tokens` table introduced by schema 12 accepts only the current exact
+`sgt_` format and retains revoked records. To upgrade any supported older database,
+including schema 11 or 12, stop both Signet services and every other database
+writer, reserve space for the snapshot plus at least one additional database-sized
+`VACUUM` copy, choose a new private snapshot path, and run:
 
 ```console
 uv run signet deployment migrate --config /ABSOLUTE/PATH/disabled.json \
-  --backup-snapshot /ABSOLUTE/PRIVATE/PATH/pre-schema-12.sqlite3
+  --backup-snapshot /ABSOLUTE/PRIVATE/PATH/pre-schema-13.sqlite3
 ```
 
 That snapshot is an unencrypted SQLite migration primitive, not a completed Signet
 backup bundle. Keep it mode `0600` inside an owned directory, protect it under the
 deployment backup policy, and do not retain it longer than that policy requires.
+Schema 13 replaces legacy free-form approval/denial rationale with fixed reason
+codes and records whether an attachment type came from a bounded byte signature or
+an unverified legacy filename guess. It invalidates any unconsumed action draft
+whose legacy rationale cannot be represented exactly. A pre-schema-13 snapshot can
+therefore contain the removed free-form text. Treat it as sensitive, time-bound
+migration material. The migration can take substantial time and temporary disk
+space on a large database; do not interrupt it merely because `VACUUM` is quiet.
+Malformed event-detail JSON, including duplicate or escaped duplicate keys, is
+replaced wholesale with the fixed legacy decision sentinel or `NULL`; no arbitrary
+legacy detail text is copied into the sanitized row.
+
+When legacy rationale is present, startup sanitizes it transactionally, writes an
+append-only migration event, checkpoints the WAL, and runs `VACUUM` under the
+database maintenance lock before serving. An interrupted maintenance pass resumes
+on the next startup without taking a second backup. Do not bypass that restart and
+do not retain older backups beyond the reviewed backup policy; `VACUUM` cannot
+remove sensitive text from snapshots or backup bundles that already exist.
+This is a deliberate one-time exception to the normal append-only event contract:
+schema 13 rewrites only affected historical `safe_details_json`, preserves each
+event's identity and immutable request/version/hash fields, appends a sanitation
+event naming the affected event ID, and reinstalls the no-update trigger in the same
+migration transaction. The required pre-migration snapshot is the only retained
+copy of the original free-form text.
+After the command succeeds, run `deployment validate` before restarting either
+service. Keep both services stopped if migration or validation fails.
 
 ### Human-auth context is validation, not enrollment
 

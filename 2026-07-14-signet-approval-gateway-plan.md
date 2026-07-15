@@ -345,7 +345,7 @@ Privacy defaults:
 - Push notification payloads contain only service, action type, and counts — never bodies, subjects, recipients, or filenames.
 - Pending requests expire after 7 days unless a stricter tool policy applies.
 - Sensitive payloads and attachments are envelope-encrypted with per-request data keys where the deployment key boundary can protect them. Purge is cryptographic key destruction plus idempotent file/row cleanup; without an isolated key boundary it is explicitly only logical deletion and may remain recoverable from WAL, free pages, APFS snapshots, or backups.
-- Sent, denied, expired, cancelled, definite-failed, and unresolved-unknown states follow an explicit retention matrix. `outcome_unknown` content remains available for reconciliation until resolved or manually purged under policy.
+- Sent, denied, expired, cancelled, and definite-failed states follow an explicit retention matrix. Production retains unresolved or exhausted `outcome_unknown` content indefinitely until it resolves or a future schema-backed action consumes fresh request/version/hash-bound human confirmation. Only the marker-guarded fake demo offers acknowledged logical redaction for fault-injection data; it preserves the unknown state and permanently freezes reconciliation.
 - Attachments purge immediately after confirmed success or denial, and after 24 hours for expired/cancelled requests, unless an unresolved execution or consistent-backup pin requires retention.
 - Backups are encrypted bundles made with the SQLite backup API plus a manifest of gateway-owned attachment hashes and key references. A backup is usable only after restore into a separate path passes `integrity_check`, `foreign_key_check`, and attachment-hash verification.
 

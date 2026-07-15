@@ -20,7 +20,7 @@ import yaml
 
 from signet.auth import ActionBinding
 from signet.db import Database, IntegrityError
-from signet.decision_notes import normalize_decision_note
+from signet.decision_notes import DecisionAction, normalize_decision_note, reason_for_action
 from signet.models import (
     ApprovalConfirmation,
     InvalidConfirmation,
@@ -1210,6 +1210,13 @@ def _validate_draft(draft: WebActionDraft) -> None:
             and (draft.action not in {"approve", "deny"} or draft.policy_change)
         )
     ):
+        raise ValueError("action draft is invalid")
+    if draft.action in {"approve", "deny"} and not draft.policy_change:
+        try:
+            reason_for_action(cast(DecisionAction, draft.action), draft.decision_note)
+        except ValueError:
+            raise ValueError("action draft is invalid") from None
+    elif normalized_note is not None:
         raise ValueError("action draft is invalid")
     if edit is not None and (
         not edit.encrypted_payload

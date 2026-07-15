@@ -89,6 +89,10 @@ WHATSAPP_FILE_SCHEMA: Mapping[str, Any] = MappingProxyType(
                         "minLength": 3,
                         "maxLength": 255,
                     },
+                    "detection_source": {
+                        "type": "string",
+                        "enum": ["content_signature_v1"],
+                    },
                     "size": {"type": "integer", "minimum": 0, "maximum": 50 * 1024 * 1024},
                     "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
                 },
@@ -239,7 +243,7 @@ class WhatsAppAdapter:
 
     @staticmethod
     def _media_reference(record: StagedFile) -> dict[str, Any]:
-        return {
+        reference = {
             "staged_id": record.opaque_id,
             "filename": record.filename,
             "mime_type": record.declared_mime,
@@ -247,6 +251,9 @@ class WhatsAppAdapter:
             "size": record.size,
             "sha256": record.sha256,
         }
+        if record.detection_source == "content_signature_v1":
+            reference["detection_source"] = record.detection_source
+        return reference
 
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> ApprovalSummary:
         canonical = self.canonicalize(arguments)
@@ -280,7 +287,14 @@ class WhatsAppAdapter:
                 *(
                     ("Declared and detected media MIME types differ.",)
                     if self.tool_name == "send_file"
+                    and canonical["media"].get("detection_source") == "content_signature_v1"
                     and canonical["media"]["mime_type"] != canonical["media"]["detected_mime"]
+                    else ()
+                ),
+                *(
+                    ("Media content type was not byte-verified for this legacy request.",)
+                    if self.tool_name == "send_file"
+                    and canonical["media"].get("detection_source") != "content_signature_v1"
                     else ()
                 ),
             ),

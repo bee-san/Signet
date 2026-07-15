@@ -23,7 +23,7 @@ from .auth import (
     webauthn_proof_claims,
 )
 from .db import Database, IntegrityError
-from .decision_notes import normalize_decision_note
+from .decision_notes import reason_for_action
 from .models import (
     AdmissionRejected,
     ApprovalConfirmation,
@@ -674,7 +674,14 @@ class ApprovalStateMachine:
         now: int,
         decision_note: str | None = None,
     ) -> None:
-        normalized_note = normalize_decision_note(decision_note)
+        try:
+            normalized_note = reason_for_action(
+                "approve",
+                decision_note,
+                confirmation_path=confirmation.path,
+            )
+        except ValueError:
+            raise InvalidConfirmation("decision rationale is invalid") from None
         with self.database.transaction() as connection:
             request = self._request_for_update(connection, request_id)
             self._require_current(request, expected_version, expected_payload_hash)
@@ -1137,7 +1144,14 @@ class ApprovalStateMachine:
         now: int,
         decision_note: str | None = None,
     ) -> None:
-        normalized_note = normalize_decision_note(decision_note)
+        try:
+            normalized_note = reason_for_action(
+                "deny",
+                decision_note,
+                confirmation_path=confirmation.path,
+            )
+        except ValueError:
+            raise InvalidConfirmation("decision rationale is invalid") from None
         self._finish_pending(
             request_id,
             expected_version=expected_version,

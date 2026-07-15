@@ -228,8 +228,8 @@ The read returns only `fake:`/`.invalid` fixture data. The send returns a durabl
 the complete frozen arguments, reason, warnings, policy/adapter/schema versions,
 hashes, attachments, origin, and event timeline.
 
-First enter a specific fake decision rationale and deny one fake request in the web
-form with the value returned by `web-action-proof`. Then call the status tool with
+First choose a specific denial reason and deny one fake request in the web form
+with the value returned by `web-action-proof`. Then call the status tool with
 its ID:
 
 ```text
@@ -240,8 +240,8 @@ Call mcp_signet_demo_approvals_check_approval_status with
 It must return `denied`, and the expanded timeline must show zero provider calls.
 The action proof is visibly constant, but every accepted use receives a distinct
 durable fake-only use ID, including across restart. Retrieve `web-action-proof`
-again, then create a second identical fake send, review its full context, enter a
-different explicit approval rationale, and approve it in the web form. The bounded
+again, then create a second identical fake send, review its full context, choose an
+explicit approval reason, and approve it in the web form. The bounded
 fake delivery worker must make exactly one in-process fake-provider call and reach
 `succeeded`; status returns only safe result metadata, not the frozen private
 payload. Calling
@@ -250,7 +250,7 @@ payload. Calling
 
 Open **Audit**, find **Recent approvals and denials**, and expand both retained
 decisions. For each, verify the decision actor, confirmation method and path, full
-frozen request content, entered rationale, outcome, attachment metadata/content
+frozen request content, selected reason code and label, outcome, attachment metadata/content
 references, and complete event timeline. The queue is for pending work; retained
 approved and denied context remains discoverable from this audit section.
 
@@ -351,6 +351,25 @@ the payload keys needed to read restored fake state, and rotates the MCP token, 
 password, session/capability keys, and future backup key. Retrieve restored fake
 credentials only through `demo credentials`; the original Hermes token must not
 authenticate the restored instance.
+
+All supported demo backup, restore, and pre-migration backup entry points share the
+marker-guarded `.backup-maintenance.lock`. A clean operation releases its retention
+pins automatically. If and only if a demo backup process was forcibly terminated,
+stop the demo server and every backup, restore, and snapshot process, identify an
+inclusive cutoff older than the terminated operation, and release those abandoned
+fake-only pin rows with:
+
+```console
+uv run signet demo release-abandoned-pins --data-dir "$SIGNET_DEMO_DIR" \
+  --created-at-or-before UNIX_SECONDS \
+  --acknowledge-no-backup-active
+```
+
+The command refuses a running server, an active backup-maintenance lock, an invalid
+demo marker, a future cutoff, or a missing acknowledgement. Its JSON output reports
+only the cutoff and released/remaining row counts. Never use the cutoff to release
+pins for an operation that might still be running, and never edit `purge_jobs`
+directly.
 
 Start the restored tree on alternate ports in terminal A:
 

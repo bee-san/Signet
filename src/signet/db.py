@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - CPython's bundled driver is normal
 
 
 IntegrityError = sqlite3.IntegrityError
-LATEST_SCHEMA_VERSION = 12
+LATEST_SCHEMA_VERSION = 13
 MIN_SUPPORTED_SCHEMA_VERSION = 1
 MINIMUM_SQLITE_VERSION = (3, 51, 3)
 _MIGRATION_PATTERN = re.compile(r"^(\d{4})_[a-z0-9_]+\.sql$")
@@ -168,6 +168,8 @@ class Database:
                     fault_injector=fault_injector,
                 )
 
+            self._complete_privacy_maintenance(connection, fault_injector=fault_injector)
+
             self._verify_applied_migrations(connection, migrations)
             integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
             foreign_keys = tuple(connection.execute("PRAGMA foreign_key_check"))
@@ -177,6 +179,54 @@ class Database:
                 raise MigrationIntegrityError("post-migration database integrity check failed")
         finally:
             connection.close()
+
+    @staticmethod
+    def _complete_privacy_maintenance(
+        connection: Any,
+        *,
+        fault_injector: MigrationFaultInjector | None,
+    ) -> None:
+        table = connection.execute(
+            """
+            SELECT 1 FROM sqlite_schema
+            WHERE type = 'table' AND name = 'privacy_maintenance'
+            """
+        ).fetchone()
+        if table is None:
+            return
+        row = connection.execute(
+            """
+            SELECT pending FROM privacy_maintenance
+            WHERE maintenance_name = 'structured_decision_reasons'
+            """
+        ).fetchone()
+        if row is None or int(row[0]) == 0:
+            return
+        if fault_injector is not None:
+            fault_injector("privacy-maintenance:before-vacuum")
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is None or int(checkpoint[0]) != 0:
+            raise MigrationIntegrityError("privacy maintenance could not checkpoint the database")
+        connection.execute("VACUUM")
+        if fault_injector is not None:
+            fault_injector("privacy-maintenance:after-vacuum")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                UPDATE privacy_maintenance SET pending = 0
+                WHERE maintenance_name = 'structured_decision_reasons' AND pending = 1
+                """
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is None or int(checkpoint[0]) != 0:
+            raise MigrationIntegrityError("privacy maintenance could not finalize its checkpoint")
+        if fault_injector is not None:
+            fault_injector("privacy-maintenance:complete")
 
     @contextmanager
     def _maintenance_lock(self) -> Iterator[None]:

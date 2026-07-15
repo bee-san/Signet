@@ -378,6 +378,7 @@ class BackupBundleManager:
                     "filename": record.filename,
                     "declared_mime": record.declared_mime,
                     "detected_mime": record.detected_mime,
+                    "detection_source": record.detection_source,
                     "size_bytes": record.size,
                     "sha256": record.sha256,
                     "envelope_format": record.envelope_format,
@@ -441,7 +442,10 @@ class BackupBundleManager:
                 _verify_metadata_file(
                     destination,
                     metadata_path,
-                    expected=StagingStore.metadata_document(restored_record),
+                    expected=StagingStore.metadata_document(
+                        restored_record,
+                        format_version=(3 if "detection_source" in item else 2),
+                    ),
                 )
                 relocations.append((record, path))
 
@@ -554,7 +558,10 @@ class BackupBundleManager:
             _verify_metadata_file(
                 destination,
                 metadata_path,
-                expected=StagingStore.metadata_document(record),
+                expected=StagingStore.metadata_document(
+                    record,
+                    format_version=(3 if "detection_source" in item else 2),
+                ),
             )
 
     def _verify_restored_file(
@@ -824,7 +831,7 @@ def _attachment_manifest(
         raise BackupError("backup attachment manifest is invalid")
     expected: dict[str, dict[str, Any]] = {}
     archive_paths: set[str] = set()
-    required_keys = {
+    legacy_required_keys = {
         "attachment_id",
         "adapter",
         "account",
@@ -842,8 +849,12 @@ def _attachment_manifest(
         "archive_path",
         "metadata_archive_path",
     }
+    required_keys = {*legacy_required_keys, "detection_source"}
     for item in attachments:
-        if not isinstance(item, dict) or set(item) != required_keys:
+        if not isinstance(item, dict) or set(item) not in (
+            legacy_required_keys,
+            required_keys,
+        ):
             raise BackupError("backup attachment manifest is invalid")
         attachment_id = item["attachment_id"]
         size_bytes = item["size_bytes"]
@@ -871,6 +882,8 @@ def _attachment_manifest(
                 item["consumed_request_id"] is not None
                 and not _valid_manifest_text(item["consumed_request_id"], maximum=512)
             )
+            or item.get("detection_source", "legacy_filename_unverified")
+            not in {"legacy_filename_unverified", "content_signature_v1"}
             or isinstance(size_bytes, bool)
             or not isinstance(size_bytes, int)
             or size_bytes < 0
@@ -911,6 +924,7 @@ def _record_from_catalog_row(
     *,
     root: Path | None = None,
 ) -> StagedFile:
+    available_columns = frozenset(row.keys())
     values = {
         "attachment_id": row["attachment_id"],
         "adapter": row["adapter"],
@@ -918,6 +932,11 @@ def _record_from_catalog_row(
         "filename": row["filename"],
         "declared_mime": row["declared_mime"],
         "detected_mime": row["detected_mime"],
+        "detection_source": (
+            row["detection_source"]
+            if "detection_source" in available_columns
+            else "legacy_filename_unverified"
+        ),
         "size_bytes": row["size_bytes"],
         "sha256": row["sha256"],
         "storage_path": row["storage_path"],
@@ -942,6 +961,7 @@ def _record_from_catalog_row(
                 ("encryption_key_ref", 512),
             )
         )
+        or values["detection_source"] not in {"legacy_filename_unverified", "content_signature_v1"}
         or isinstance(values["size_bytes"], bool)
         or not isinstance(values["size_bytes"], int)
         or values["size_bytes"] < 0
@@ -975,6 +995,7 @@ def _record_from_catalog_row(
         envelope_size=values["envelope_size"],
         envelope_sha256=values["envelope_sha256"],
         encryption_key_ref=values["encryption_key_ref"],
+        detection_source=values["detection_source"],
     )
 
 
@@ -994,6 +1015,7 @@ def _record_with_path(record: StagedFile, path: Path) -> StagedFile:
         envelope_size=record.envelope_size,
         envelope_sha256=record.envelope_sha256,
         encryption_key_ref=record.encryption_key_ref,
+        detection_source=record.detection_source,
     )
 
 
@@ -1006,6 +1028,7 @@ def _record_matches_manifest(record: StagedFile, item: dict[str, Any]) -> bool:
             record.filename == item["filename"],
             record.declared_mime == item["declared_mime"],
             record.detected_mime == item["detected_mime"],
+            record.detection_source == item.get("detection_source", "legacy_filename_unverified"),
             record.size == item["size_bytes"],
             record.sha256 == item["sha256"],
             record.envelope_format == item["envelope_format"],

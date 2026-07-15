@@ -37,10 +37,11 @@ from signet.auth import (
 )
 from signet.credential_broker import MemorySecretStore, Secret
 from signet.crypto import PayloadCipher
-from signet.db import Database
+from signet.db import Database, IntegrityError
 from signet.freezer import RequestFreezer
 from signet.models import ApprovalConfirmation, AttachmentReference
 from signet.notifications import NotificationKind, SQLitePushRepository
+from signet.policy_persistence import SQLiteActionDraftRepository
 from signet.staging import StagingStore
 from signet.state_machine import ApprovalStateMachine
 from signet.totp import (
@@ -49,6 +50,7 @@ from signet.totp import (
     TotpVerifier,
 )
 from signet.web import (
+    AttachmentDownload,
     PushSubscriptionInput,
     WebConflict,
     WebForbidden,
@@ -186,6 +188,21 @@ class ReviewerSpy:
             prospective_arguments_json=prospective_arguments_json,
         )
 
+    def read_attachment(
+        self,
+        request_id: str,
+        attachment_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+    ) -> AttachmentDownload:
+        return self.delegate.read_attachment(
+            request_id,
+            attachment_id,
+            version=version,
+            payload_hash=payload_hash,
+        )
+
 
 @dataclass
 class DraftBacking:
@@ -321,13 +338,34 @@ def password_verifier() -> Argon2PasswordVerifier:
     )
 
 
+def downgrade_schema_13(connection: Any) -> None:
+    """Restore the schema-12 shape after test-only schema-13 data injection."""
+
+    connection.execute("DROP TRIGGER IF EXISTS request_events_structured_reason_insert")
+    connection.execute("DROP TRIGGER IF EXISTS web_action_drafts_structured_reason_insert")
+    connection.execute("DROP TRIGGER staged_objects_immutable_context")
+    connection.execute("ALTER TABLE staged_objects DROP COLUMN detection_source")
+    connection.execute(
+        """
+        CREATE TRIGGER staged_objects_immutable_context
+        BEFORE UPDATE ON staged_objects
+        BEGIN SELECT RAISE(ABORT, 'staged object immutable context changed'); END
+        """
+    )
+    connection.execute("DROP TABLE privacy_maintenance")
+    connection.execute("DELETE FROM schema_meta WHERE migration_id = 13")
+    connection.execute("PRAGMA user_version = 12")
+
+
 def assemble(
     database: Database,
     *,
     drafts: DraftBacking | None = None,
     promotions: FakePolicyPromotionBoundary | None = None,
-    adapter: ReviewOnlyAdapter | None = None,
+    adapter: ApprovalAdapter | None = None,
     cipher: PayloadCipher | None = None,
+    staging: StagingStore | None = None,
+    durable_sqlite_drafts: bool = False,
 ) -> BackendBundle:
     database.initialize()
     selected_drafts = drafts or DraftBacking()
@@ -382,9 +420,16 @@ def assemble(
                 ApprovalAdapter, selected_adapter
             )
         },
+        staging=staging,
+    )
+    action_drafts: ActionDraftRepository = (
+        SQLiteActionDraftRepository(database)
+        if durable_sqlite_drafts
+        else cast(ActionDraftRepository, DurableFakeDraftRepository(selected_drafts))
     )
     backend = WebBackend(
         database,
+        authorized_user_id=USER_ID,
         sessions=sessions,
         passwords=passwords,
         totp=totp,
@@ -394,7 +439,7 @@ def assemble(
         authentication_transactions=transactions,
         state_machine=state_machine,
         payloads=payloads,
-        action_drafts=cast(ActionDraftRepository, DurableFakeDraftRepository(selected_drafts)),
+        action_drafts=action_drafts,
         policy_promotions=cast(PolicyPromotionBoundary, selected_promotions),
         pushes=SQLitePushRepository(database),
     )
@@ -404,7 +449,7 @@ def assemble(
         sessions,
         state_machine,
         webauthn,
-        selected_adapter,
+        cast(ReviewOnlyAdapter, selected_adapter),
         selected_cipher,
         selected_drafts,
         selected_promotions,
@@ -518,6 +563,142 @@ def test_preauth_sessions_are_never_ui_authority(
         bundle.backend.list_queue(preauth, now=NOW + 1)
 
 
+def test_completed_second_user_is_rejected_from_login_reads_actions_and_push(
+    bundle: BackendBundle,
+) -> None:
+    verifier = password_verifier()
+    SQLitePasswordCredentialRepository(bundle.database).replace_password(
+        PasswordCredential(
+            "password-second",
+            SECOND_USER_ID,
+            verifier._hasher.hash(PASSWORD),
+        ),
+        now=NOW - 20,
+    )
+    SQLiteTotpCredentialRepository(bundle.database).replace_totp(
+        TotpCredential("totp-second", SECOND_USER_ID, TOTP_REFERENCE),
+        now=NOW - 19,
+    )
+    second_credential = base64.urlsafe_b64encode(b"fake-second-credential").rstrip(b"=").decode()
+    bundle.webauthn.add_credential(
+        WebAuthnCredential(
+            second_credential,
+            SECOND_USER_ID,
+            b"fake-second-user-handle",
+            b"fake-second-public-key",
+            0,
+            "single_device",
+            False,
+        ),
+        now=NOW - 18,
+    )
+
+    with pytest.raises(WebUnauthorized):
+        bundle.backend.password_totp_login(
+            SECOND_USER_ID,
+            PASSWORD,
+            "fake:200",
+            source="second-user-login",
+            previous_token=None,
+            now=NOW,
+        )
+    with pytest.raises(WebUnauthorized):
+        bundle.backend.begin_passkey_login(
+            SECOND_USER_ID,
+            source="second-user-login",
+            http_method="POST",
+            now=NOW,
+        )
+
+    token = bundle.sessions.create_session(
+        SECOND_USER_ID,
+        auth_method="webauthn",
+        now=NOW,
+    )
+    principal = bundle.sessions.authenticate(token, now=NOW + 1)
+    with pytest.raises(InvalidSession):
+        bundle.backend.authenticate(token, now=NOW + 1)
+
+    request_id = bundle.enqueue()
+    request = bundle.state_machine.get_request(request_id)
+    for operation in (
+        lambda: bundle.backend.list_queue(principal, now=NOW + 1),
+        lambda: bundle.backend.get_detail(principal, request_id),
+        lambda: bundle.backend.get_attachment(
+            principal,
+            request_id,
+            "stg_" + "x" * 20,
+            expected_version=1,
+            expected_payload_hash=str(request["current_payload_hash"]),
+        ),
+        lambda: bundle.backend.list_audit(principal),
+        lambda: bundle.backend.list_decisions(principal),
+        lambda: bundle.backend.complete_passkey_action(
+            principal,
+            request_id,
+            "challenge-for-second-user",
+            {},
+            http_method="POST",
+            now=NOW + 1,
+        ),
+    ):
+        with pytest.raises(WebUnauthorized):
+            operation()
+
+    for action in (
+        "approve",
+        "deny",
+        "cancel",
+        "edit",
+        "promote_approval",
+        "promote_passthrough",
+    ):
+        with pytest.raises(WebUnauthorized):
+            bundle.backend.begin_passkey_action(
+                principal,
+                request_id,
+                cast(Any, action),
+                expected_version=1,
+                expected_payload_hash=request["current_payload_hash"],
+                prospective_arguments_json=None,
+                http_method="POST",
+                now=NOW + 1,
+                decision_note=None,
+            )
+        with pytest.raises(WebUnauthorized):
+            bundle.backend.complete_totp_action(
+                principal,
+                request_id,
+                cast(Any, action),
+                "fake:201",
+                expected_version=1,
+                expected_payload_hash=request["current_payload_hash"],
+                prospective_arguments_json=None,
+                now=NOW + 1,
+                decision_note=None,
+            )
+
+    subscription = PushSubscriptionInput(
+        endpoint="https://push.example.test/second-user",
+        p256dh=P256DH,
+        auth=PUSH_AUTH,
+        device_label="Second user's phone",
+        categories=("new_pending",),
+    )
+    with pytest.raises(WebUnauthorized):
+        bundle.backend.subscribe_push(principal, subscription, now=NOW + 1)
+    with pytest.raises(WebUnauthorized):
+        bundle.backend.unsubscribe_push(principal, subscription.endpoint, now=NOW + 1)
+    assert bundle.state_machine.get_request(request_id)["state"] == "pending_approval"
+    assert bundle.promotions.calls == [] and bundle.promotions.totp_calls == []
+    assert (
+        SQLitePushRepository(bundle.database).active_for(
+            SECOND_USER_ID, NotificationKind.NEW_PENDING
+        )
+        == ()
+    )
+
+
 def test_failed_passkey_login_revokes_its_durable_preauth_session(
     bundle: BackendBundle,
 ) -> None:
@@ -586,7 +767,27 @@ def test_unknown_passkey_accounts_create_no_users_sessions_or_challenges(
             ).fetchone()[0]
         )
     assert after == before
-    assert limiter_rows == 2
+    # Source lockout stops later transactions before they create per-account rows.
+    assert limiter_rows == 22
+
+
+def test_unknown_canonical_passkey_account_is_bounded_across_sources(
+    bundle: BackendBundle,
+) -> None:
+    outcomes: list[type[Exception]] = []
+    for index in range(12):
+        try:
+            bundle.backend.begin_passkey_login(
+                "unknown-repeat",
+                source=f"rotating-untrusted-source-{index}",
+                http_method="POST",
+                now=NOW + index,
+            )
+        except (WebUnauthorized, WebRateLimited) as exc:
+            outcomes.append(type(exc))
+
+    assert outcomes[:10] == [WebUnauthorized] * 10
+    assert outcomes[10:] == [WebRateLimited] * 2
 
 
 def test_passkey_limiter_prunes_expired_untrusted_source_scopes(
@@ -612,7 +813,8 @@ def test_passkey_limiter_prunes_expired_untrusted_source_scopes(
                 """
             ).fetchone()[0]
         )
-    assert limiter_rows <= 201
+    # One source and one account scope per untrusted attempt, plus the global scope.
+    assert limiter_rows <= 401
 
 
 def test_passkey_challenge_cap_is_checked_before_creating_an_extra_session(
@@ -802,6 +1004,7 @@ def test_wrong_payload_key_returns_non_actionable_metadata_without_private_data(
             expected_payload_hash=str(row["current_payload_hash"]),
             prospective_arguments_json=None,
             now=NOW + 1,
+            decision_note="exact_request_approved",
         )
     assert bundle.state_machine.get_request(request_id)["state"] == "pending_approval"
 
@@ -815,6 +1018,7 @@ def test_wrong_payload_key_returns_non_actionable_metadata_without_private_data(
             expected_payload_hash=str(row["current_payload_hash"]),
             prospective_arguments_json=None,
             now=NOW + 2,
+            decision_note="exact_request_approved",
         )
         == "approved"
     )
@@ -839,7 +1043,7 @@ def test_decision_history_is_metadata_only_until_exact_request_expansion(
             expected_payload_hash=approved_hash,
             prospective_arguments_json=None,
             now=NOW + 1,
-            decision_note="Release scope reviewed <script>alert(1)</script>",
+            decision_note="exact_request_approved",
         )
         == "approved"
     )
@@ -853,7 +1057,7 @@ def test_decision_history_is_metadata_only_until_exact_request_expansion(
             expected_payload_hash=denied_hash,
             prospective_arguments_json=None,
             now=NOW + 2,
-            decision_note="Recipient does not match the requested change.",
+            decision_note="wrong_destination",
         )
         == "denied"
     )
@@ -880,8 +1084,8 @@ def test_decision_history_is_metadata_only_until_exact_request_expansion(
         event for event in approved.events if event["action"] == "approved_via_web"
     )
     denied_event = next(event for event in denied.events if event["action"] == "denied")
-    assert approved_event["decision_note"] == "Release scope reviewed <script>alert(1)</script>"
-    assert denied_event["decision_note"] == "Recipient does not match the requested change."
+    assert approved_event["decision_note"] == "exact_request_approved"
+    assert denied_event["decision_note"] == "wrong_destination"
     assert (approved_event["confirmation_kind"], approved_event["confirmation_path"]) == (
         "totp",
         "web",
@@ -914,6 +1118,7 @@ def test_decision_history_is_bounded_and_keyset_paginated(
                 expected_payload_hash=payload_hash,
                 prospective_arguments_json=None,
                 now=NOW + index + 1,
+                decision_note="authenticated_denial",
             )
             == "denied"
         )
@@ -953,6 +1158,7 @@ def test_passkey_decision_provenance_is_safe_and_visible(
         prospective_arguments_json=None,
         http_method="POST",
         now=NOW + 1,
+        decision_note="wrong_destination",
     )
     assert (
         bundle.backend.complete_passkey_action(
@@ -978,7 +1184,7 @@ def test_passkey_decision_provenance_is_safe_and_visible(
     assert "credential" not in str(decision).lower()
 
 
-@pytest.mark.parametrize("invalid_note", ["x" * 1_001, "unsafe\x00control"])
+@pytest.mark.parametrize("invalid_note", ["not_a_reason", "unsafe\x00control"])
 def test_invalid_decision_note_fails_before_proof_consumption(
     bundle: BackendBundle,
     invalid_note: str,
@@ -1010,7 +1216,7 @@ def test_invalid_decision_note_fails_before_proof_consumption(
             expected_payload_hash=payload_hash,
             prospective_arguments_json=None,
             now=NOW + 2,
-            decision_note=None,
+            decision_note="authenticated_denial",
         )
         == "denied"
     )
@@ -1031,7 +1237,7 @@ def test_terminal_purged_request_retains_decision_metadata_and_timeline(
         expected_payload_hash=payload_hash,
         prospective_arguments_json=None,
         now=NOW + 1,
-        decision_note="Request is outside the approved scope.",
+        decision_note="unexpected_content_or_scope",
     )
     with bundle.database.transaction() as connection:
         connection.execute(
@@ -1055,9 +1261,618 @@ def test_terminal_purged_request_retains_decision_metadata_and_timeline(
     assert detail.detail_blocks == ()
     assert "purge this private body" not in str(detail)
     decision = next(event for event in detail.events if event["action"] == "denied")
-    assert decision["decision_note"] == "Request is outside the approved scope."
+    assert decision["decision_note"] == "unexpected_content_or_scope"
     assert bundle.backend.list_decisions(principal).items[0].request_id == request_id
     assert bundle.adapter.downstream_calls == []
+
+
+def test_schema_13_sanitizes_legacy_reasons_invalidates_drafts_and_vacuums(
+    bundle: BackendBundle,
+    tmp_path: Path,
+) -> None:
+    bundle = assemble(bundle.database, durable_sqlite_drafts=True)
+    decided_id = bundle.enqueue(body="legacy decided payload")
+    cross_denied_id = bundle.enqueue(body="legacy cross-action denied payload")
+    null_decision_id = bundle.enqueue(body="legacy null decision payload")
+    missing_decision_id = bundle.enqueue(body="legacy missing decision reason payload")
+    invalid_json_id = bundle.enqueue(body="legacy invalid event JSON payload")
+    duplicate_decision_id = bundle.enqueue(body="legacy duplicate decision reason payload")
+    nondecision_id = bundle.enqueue(body="legacy nondecision payload")
+    invalid_nondecision_id = bundle.enqueue(body="legacy invalid nondecision JSON payload")
+    duplicate_nondecision_id = bundle.enqueue(body="legacy duplicate nondecision payload")
+    draft_id = bundle.enqueue(body="legacy draft payload")
+    cross_draft_id = bundle.enqueue(body="legacy cross-action draft payload")
+    _, principal = bundle.session()
+    decided_hash = str(bundle.state_machine.get_request(decided_id)["current_payload_hash"])
+    draft_hash = str(bundle.state_machine.get_request(draft_id)["current_payload_hash"])
+    bundle.backend.complete_totp_action(
+        principal,
+        decided_id,
+        "approve",
+        "fake:590",
+        expected_version=1,
+        expected_payload_hash=decided_hash,
+        prospective_arguments_json=None,
+        now=NOW + 1,
+        decision_note="exact_request_approved",
+    )
+    for request_id, action, proof, reason in (
+        (cross_denied_id, "deny", "fake:591", "wrong_destination"),
+        (null_decision_id, "approve", "fake:592", "exact_request_approved"),
+        (missing_decision_id, "approve", "fake:593", "expected_and_authorized"),
+        (invalid_json_id, "approve", "fake:594", "exact_request_approved"),
+        (duplicate_decision_id, "approve", "fake:595", "exact_request_approved"),
+    ):
+        request_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            cast(Any, action),
+            proof,
+            expected_version=1,
+            expected_payload_hash=request_hash,
+            prospective_arguments_json=None,
+            now=NOW + int(proof.removeprefix("fake:")),
+            decision_note=reason,
+        )
+    options = bundle.backend.begin_passkey_action(
+        principal,
+        draft_id,
+        "approve",
+        expected_version=1,
+        expected_payload_hash=draft_hash,
+        prospective_arguments_json=None,
+        http_method="POST",
+        now=NOW + 2,
+        decision_note="expected_and_authorized",
+    )
+    cross_draft_hash = str(bundle.state_machine.get_request(cross_draft_id)["current_payload_hash"])
+    cross_options = bundle.backend.begin_passkey_action(
+        principal,
+        cross_draft_id,
+        "approve",
+        expected_version=1,
+        expected_payload_hash=cross_draft_hash,
+        prospective_arguments_json=None,
+        http_method="POST",
+        now=NOW + 3,
+        decision_note="exact_request_approved",
+    )
+    legacy_source_root = tmp_path / "legacy-mime-sources"
+    legacy_source_root.mkdir()
+    legacy_source = legacy_source_root / "legacy.png"
+    legacy_source.write_bytes(b"<html><body>legacy disguised content</body></html>")
+    legacy_source.chmod(0o600)
+    legacy_staging = StagingStore(
+        tmp_path / "legacy-mime-staging",
+        database=bundle.database,
+        cipher=attachment_cipher(),
+        allowed_source_roots=(legacy_source_root,),
+        minimum_free_bytes=0,
+    )
+    legacy_record = legacy_staging.stage_path(
+        legacy_source,
+        adapter="fake-service",
+        account="fake:legacy-account",
+        filename="legacy.png",
+        declared_mime="image/png",
+    )
+    nondecision_hash = str(bundle.state_machine.get_request(nondecision_id)["current_payload_hash"])
+    with bundle.database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO attachments(
+                attachment_id, request_id, version, payload_hash, filename,
+                mime_type, size_bytes, sha256, storage_path, created_at
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                legacy_record.opaque_id,
+                nondecision_id,
+                nondecision_hash,
+                legacy_record.filename,
+                legacy_record.declared_mime,
+                legacy_record.size,
+                legacy_record.sha256,
+                str(legacy_record.path),
+                NOW,
+            ),
+        )
+    canary = "LEGACY-PRIVATE-REASON-CANARY-DO-NOT-RETAIN"
+    duplicate_canary = "DUPLICATE-ESCAPED-PRIVATE-REASON-DO-NOT-RETAIN"
+    duplicate_nondecision_canary = "DUPLICATE-NONDECISION-PRIVATE-DO-NOT-RETAIN"
+    with bundle.database.transaction() as connection:
+        connection.execute("DROP TRIGGER request_events_structured_reason_insert")
+        connection.execute("DROP TRIGGER web_action_drafts_structured_reason_insert")
+        connection.execute("DROP TRIGGER request_events_no_update")
+        connection.execute("DROP TRIGGER web_action_drafts_no_update")
+        connection.execute(
+            """
+            UPDATE request_events
+            SET safe_details_json = json_object('decision_note', ?)
+            WHERE request_id = ? AND action = 'approved_via_web'
+            """,
+            (canary, decided_id),
+        )
+        connection.execute(
+            "UPDATE web_action_drafts SET decision_note = ? WHERE challenge_id = ?",
+            (canary, options.challenge_id),
+        )
+        connection.execute(
+            "UPDATE web_action_drafts SET decision_note = 'wrong_destination' "
+            "WHERE challenge_id = ?",
+            (cross_options.challenge_id,),
+        )
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = json_object(
+                'decision_note', 'exact_request_approved'
+            ) WHERE request_id = ? AND action = 'denied'
+            """,
+            (cross_denied_id,),
+        )
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = json_object('decision_note', NULL)
+            WHERE request_id = ? AND action = 'approved_via_web'
+            """,
+            (null_decision_id,),
+        )
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = json_object('retained', 'missing')
+            WHERE request_id = ? AND action = 'approved_via_web'
+            """,
+            (missing_decision_id,),
+        )
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = 'not-json'
+            WHERE request_id = ? AND action = 'approved_via_web'
+            """,
+            (invalid_json_id,),
+        )
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = ?
+            WHERE request_id = ? AND action = 'approved_via_web'
+            """,
+            (
+                '{"decision_note":"exact_request_approved",'
+                f'"\\u0064ecision_note":"{duplicate_canary}",'
+                '"retained":"must-be-removed"}',
+                duplicate_decision_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = json_object(
+                'decision_note', 'exact_request_approved', 'retained', 'nondecision'
+            ) WHERE request_id = ? AND action = 'pending_enqueued'
+            """,
+            (nondecision_id,),
+        )
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = 'not-json'
+            WHERE request_id = ? AND action = 'pending_enqueued'
+            """,
+            (invalid_nondecision_id,),
+        )
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = ?
+            WHERE request_id = ? AND action = 'pending_enqueued'
+            """,
+            (
+                '{"decision_note":"first-private",'
+                f'"\\u0064ecision_note":"{duplicate_nondecision_canary}"}}',
+                duplicate_nondecision_id,
+            ),
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER request_events_no_update
+            BEFORE UPDATE ON request_events
+            BEGIN SELECT RAISE(ABORT, 'request_events are append-only'); END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER web_action_drafts_no_update
+            BEFORE UPDATE ON web_action_drafts
+            BEGIN SELECT RAISE(ABORT, 'web action drafts are immutable'); END
+            """
+        )
+        connection.execute("DROP TRIGGER staged_objects_immutable_context")
+        connection.execute(
+            "UPDATE staged_objects SET detected_mime = 'image/png' WHERE attachment_id = ?",
+            (legacy_record.opaque_id,),
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER staged_objects_immutable_context
+            BEFORE UPDATE ON staged_objects
+            BEGIN SELECT RAISE(ABORT, 'staged object immutable context changed'); END
+            """
+        )
+        downgrade_schema_13(connection)
+
+    backed_up_versions: list[int] = []
+    Database(bundle.database.path).initialize(
+        pre_migration_backup=lambda _database, version: backed_up_versions.append(version)
+    )
+
+    assert backed_up_versions == [12]
+    with bundle.database.read() as connection:
+        approved = connection.execute(
+            """
+            SELECT safe_details_json FROM request_events
+            WHERE request_id = ? AND action = 'approved_via_web'
+            """,
+            (decided_id,),
+        ).fetchone()
+        sanitized = connection.execute(
+            """
+            SELECT count(*) FROM request_events
+            WHERE request_id = ? AND action = 'legacy_decision_reason_sanitized'
+            """,
+            (decided_id,),
+        ).fetchone()[0]
+        draft = connection.execute(
+            "SELECT 1 FROM web_action_drafts WHERE challenge_id = ?",
+            (options.challenge_id,),
+        ).fetchone()
+        challenge = connection.execute(
+            "SELECT invalidated_at FROM auth_challenges WHERE challenge_id = ?",
+            (options.challenge_id,),
+        ).fetchone()
+        cross_draft = connection.execute(
+            "SELECT 1 FROM web_action_drafts WHERE challenge_id = ?",
+            (cross_options.challenge_id,),
+        ).fetchone()
+        cross_challenge = connection.execute(
+            "SELECT invalidated_at FROM auth_challenges WHERE challenge_id = ?",
+            (cross_options.challenge_id,),
+        ).fetchone()
+        repaired_decisions = {
+            request_id: json.loads(
+                str(
+                    connection.execute(
+                        """
+                        SELECT safe_details_json FROM request_events
+                        WHERE request_id = ? AND (
+                            action IN ('denied', 'approved_via_web', 'approved_via_mcp')
+                        )
+                        """,
+                        (request_id,),
+                    ).fetchone()[0]
+                )
+            )
+            for request_id in (
+                cross_denied_id,
+                null_decision_id,
+                missing_decision_id,
+                invalid_json_id,
+                duplicate_decision_id,
+            )
+        }
+        nondecision = connection.execute(
+            "SELECT safe_details_json FROM request_events "
+            "WHERE request_id = ? AND action = 'pending_enqueued'",
+            (nondecision_id,),
+        ).fetchone()[0]
+        invalid_nondecision = connection.execute(
+            "SELECT safe_details_json FROM request_events "
+            "WHERE request_id = ? AND action = 'pending_enqueued'",
+            (invalid_nondecision_id,),
+        ).fetchone()[0]
+        duplicate_nondecision = connection.execute(
+            "SELECT safe_details_json FROM request_events "
+            "WHERE request_id = ? AND action = 'pending_enqueued'",
+            (duplicate_nondecision_id,),
+        ).fetchone()[0]
+        sanitation_counts = {
+            request_id: int(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM request_events
+                    WHERE request_id = ? AND action = 'legacy_decision_reason_sanitized'
+                    """,
+                    (request_id,),
+                ).fetchone()[0]
+            )
+            for request_id in (
+                decided_id,
+                cross_denied_id,
+                null_decision_id,
+                missing_decision_id,
+                invalid_json_id,
+                duplicate_decision_id,
+                nondecision_id,
+                invalid_nondecision_id,
+                duplicate_nondecision_id,
+            )
+        }
+        legacy_detection = connection.execute(
+            "SELECT detected_mime, detection_source FROM staged_objects WHERE attachment_id = ?",
+            (legacy_record.opaque_id,),
+        ).fetchone()
+        pending = connection.execute(
+            """
+            SELECT pending FROM privacy_maintenance
+            WHERE maintenance_name = 'structured_decision_reasons'
+            """
+        ).fetchone()[0]
+        logical_dump = "\n".join(connection.iterdump())
+    assert json.loads(str(approved["safe_details_json"])) == {
+        "decision_note": "legacy_unstructured_reason"
+    }
+    assert sanitized == 1
+    assert draft is None
+    assert challenge is not None and challenge["invalidated_at"] is not None
+    assert cross_draft is None
+    assert cross_challenge is not None and cross_challenge["invalidated_at"] is not None
+    assert all(
+        details == {"decision_note": "legacy_unstructured_reason"}
+        for details in repaired_decisions.values()
+    )
+    assert nondecision is None
+    assert invalid_nondecision is None
+    assert duplicate_nondecision is None
+    assert set(sanitation_counts.values()) == {1}
+    assert tuple(legacy_detection) == ("image/png", "legacy_filename_unverified")
+    assert pending == 0
+    assert canary not in logical_dump
+    assert duplicate_canary not in logical_dump
+    assert duplicate_nondecision_canary not in logical_dump
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{bundle.database.path}{suffix}")
+        if candidate.exists():
+            assert canary.encode() not in candidate.read_bytes()
+            assert duplicate_canary.encode() not in candidate.read_bytes()
+            assert duplicate_nondecision_canary.encode() not in candidate.read_bytes()
+
+    detail = bundle.backend.get_detail(principal, decided_id)
+    approved_event = next(event for event in detail.events if event["action"] == "approved_via_web")
+    assert approved_event["decision_note"] == "legacy_unstructured_reason"
+
+
+@pytest.mark.parametrize(
+    "fault_stage",
+    (
+        "privacy-maintenance:before-vacuum",
+        "privacy-maintenance:after-vacuum",
+        "privacy-maintenance:complete",
+    ),
+)
+def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
+    bundle: BackendBundle,
+    fault_stage: str,
+) -> None:
+    request_id = bundle.enqueue(body="private legacy fault canary")
+    _, principal = bundle.session()
+    request_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    bundle.backend.complete_totp_action(
+        principal,
+        request_id,
+        "approve",
+        "fake:596",
+        expected_version=1,
+        expected_payload_hash=request_hash,
+        prospective_arguments_json=None,
+        now=NOW + 1,
+        decision_note="exact_request_approved",
+    )
+    canary = f"PRIVATE-LEGACY-FAULT-{fault_stage}"
+    with bundle.database.transaction() as connection:
+        connection.execute("DROP TRIGGER request_events_no_update")
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = json_object('decision_note', ?)
+            WHERE request_id = ? AND action = 'approved_via_web'
+            """,
+            (canary, request_id),
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER request_events_no_update
+            BEFORE UPDATE ON request_events
+            BEGIN SELECT RAISE(ABORT, 'request_events are append-only'); END
+            """
+        )
+        downgrade_schema_13(connection)
+
+    backups: list[int] = []
+
+    def fail_at(stage: str) -> None:
+        if stage == fault_stage:
+            raise RuntimeError("injected privacy-maintenance fault")
+
+    with pytest.raises(RuntimeError, match="injected privacy-maintenance fault"):
+        Database(bundle.database.path).initialize(
+            pre_migration_backup=lambda _database, version: backups.append(version),
+            fault_injector=fail_at,
+        )
+    assert backups == [12]
+    with bundle.database.read() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM schema_meta WHERE migration_id = 13"
+            ).fetchone()[0]
+            == 1
+        )
+
+    # Schema 13 is already committed, so recovery must not require or repeat a backup.
+    Database(bundle.database.path).initialize()
+    with bundle.database.read() as connection:
+        pending = connection.execute(
+            """
+            SELECT pending FROM privacy_maintenance
+            WHERE maintenance_name = 'structured_decision_reasons'
+            """
+        ).fetchone()[0]
+        details = connection.execute(
+            """
+            SELECT safe_details_json FROM request_events
+            WHERE request_id = ? AND action = 'approved_via_web'
+            """,
+            (request_id,),
+        ).fetchone()[0]
+    assert pending == 0
+    assert json.loads(str(details))["decision_note"] == "legacy_unstructured_reason"
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{bundle.database.path}{suffix}")
+        if candidate.exists():
+            assert canary.encode() not in candidate.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("event_action", "bad_reason"),
+    (
+        ("approved_via_web", "wrong_destination"),
+        ("approved_via_web", None),
+        ("pending_enqueued", "exact_request_approved"),
+    ),
+)
+def test_event_expansion_fails_closed_on_mismatched_or_null_reason(
+    bundle: BackendBundle,
+    event_action: str,
+    bad_reason: str | None,
+) -> None:
+    request_id = bundle.enqueue(body="corrupt event reason")
+    _, principal = bundle.session()
+    if event_action == "approved_via_web":
+        request_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "approve",
+            "fake:595",
+            expected_version=1,
+            expected_payload_hash=request_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+            decision_note="exact_request_approved",
+        )
+    with bundle.database.transaction() as connection:
+        connection.execute("DROP TRIGGER request_events_structured_reason_insert")
+        connection.execute("DROP TRIGGER request_events_no_update")
+        connection.execute(
+            """
+            UPDATE request_events SET safe_details_json = ?
+            WHERE request_id = ? AND action = ?
+            """,
+            (json.dumps({"decision_note": bad_reason}), request_id, event_action),
+        )
+
+    with pytest.raises(WebConflict, match="decision reason"):
+        bundle.backend.get_detail(principal, request_id)
+
+
+@pytest.mark.parametrize(
+    ("event_action", "details"),
+    (
+        (
+            "approved_via_web",
+            r'{"decision_note":"exact_request_approved",'
+            r'"\u0064ecision_note":"PRIVATE"}',
+        ),
+        (
+            "denied",
+            r'{"decision_note":"wrong_destination","decision_note":"PRIVATE"}',
+        ),
+        (
+            "pending_enqueued",
+            r'{"retained":"one","\u0072etained":"two"}',
+        ),
+        (
+            "pending_enqueued",
+            r'{"nested":{"value":"one","\u0076alue":"two"}}',
+        ),
+    ),
+)
+def test_event_insert_rejects_duplicate_or_escaped_json_keys(
+    bundle: BackendBundle,
+    event_action: str,
+    details: str,
+) -> None:
+    request_id = bundle.enqueue(body="duplicate event keys")
+    request_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    with bundle.database.read() as connection:
+        counts = connection.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM json_tree(?) WHERE key IS NOT NULL),
+                (SELECT count(*) FROM (
+                    SELECT path, key FROM json_tree(?)
+                    WHERE key IS NOT NULL GROUP BY path, key
+                ))
+            """,
+            (details, details),
+        ).fetchone()
+    assert counts[0] > counts[1]
+
+    with (
+        pytest.raises(IntegrityError, match="structured request decision reason"),
+        bundle.database.transaction() as connection,
+    ):
+        connection.execute(
+            """
+            INSERT INTO request_events(
+                request_id, actor, action, occurred_at, version, payload_hash,
+                safe_details_json
+            ) VALUES (?, 'corrupt:test', ?, ?, 1, ?, ?)
+            """,
+            (request_id, event_action, NOW + 1, request_hash, details),
+        )
+
+
+def test_malformed_approval_like_action_is_never_treated_as_a_decision(
+    bundle: BackendBundle,
+) -> None:
+    request_id = bundle.enqueue(body="malformed decision action")
+    _, principal = bundle.session()
+    request_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    values = (
+        request_id,
+        "corrupt:test",
+        "approved_via_web_extra",
+        NOW + 1,
+        request_hash,
+    )
+    with bundle.database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO request_events(
+                request_id, actor, action, occurred_at, version, payload_hash
+            ) VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            values,
+        )
+    with (
+        pytest.raises(IntegrityError, match="structured request decision reason"),
+        bundle.database.transaction() as connection,
+    ):
+        connection.execute(
+            """
+            INSERT INTO request_events(
+                request_id, actor, action, occurred_at, version, payload_hash,
+                safe_details_json
+            ) VALUES (?, ?, ?, ?, 1, ?, ?)
+            """,
+            (*values, json.dumps({"decision_note": "exact_request_approved"})),
+        )
+
+    assert bundle.backend.list_decisions(principal).items == ()
+    malformed = next(
+        event
+        for event in bundle.backend.get_detail(principal, request_id).events
+        if event["action"] == "approved_via_web_extra"
+    )
+    assert malformed["decision_confirmation"] is False
+    assert malformed["decision_note"] is None
 
 
 def test_attachment_edit_and_review_are_bound_to_exact_catalog_snapshot(
@@ -1111,15 +1926,44 @@ def test_attachment_edit_and_review_are_bound_to_exact_catalog_snapshot(
         editor_actor="caller:web-attachment-test",
         attachments=adapter.freeze_attachments(arguments),
     )
-    machine = ApprovalStateMachine(database)
-    machine.enqueue(frozen.enqueue_request)
+    assembled = assemble(
+        database,
+        adapter=cast(ApprovalAdapter, adapter),
+        cipher=payload_cipher,
+        staging=staging,
+    )
+    assembled.state_machine.enqueue(frozen.enqueue_request)
     request_id = frozen.enqueue_request.request_id
     payload_hash = frozen.enqueue_request.payload_hash
-    reviewer = EncryptedPayloadReviewer(
-        machine,
-        payload_cipher,
-        {(adapter.downstream_alias, adapter.tool_name): adapter},
+    reviewer = cast(EncryptedPayloadReviewer, cast(Any, assembled.backend)._payloads)
+    principal = SessionPrincipal(
+        USER_ID,
+        "attachment-review-session",
+        "webauthn",
+        NOW,
+        NOW + 600,
     )
+
+    download = assembled.backend.get_attachment(
+        principal,
+        request_id,
+        str(original["staged_id"]),
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+    )
+    assert download.content == source.read_bytes()
+    assert download.size_bytes == len(download.content)
+    assert download.sha256 == original["sha256"]
+    assert "same bytes" not in repr(download)
+    for version, selected_hash in ((2, payload_hash), (1, "f" * 64)):
+        with pytest.raises(WebConflict, match="stale"):
+            assembled.backend.get_attachment(
+                principal,
+                request_id,
+                str(original["staged_id"]),
+                expected_version=version,
+                expected_payload_hash=selected_hash,
+            )
 
     retargeted = {**arguments, "body": "edited body", "attachments": [replacement]}
     with pytest.raises(WebPayloadError, match="adapter validation"):
@@ -1147,6 +1991,23 @@ def test_attachment_edit_and_review_are_bound_to_exact_catalog_snapshot(
     edited_envelope = json.loads(plaintext)
     assert edited_envelope["arguments"]["attachments"] == [original]
     assert edited_envelope["staged_file_hashes"] == [original["sha256"]]
+
+    staged_record = staging.resolve(
+        str(original["staged_id"]),
+        adapter=adapter.downstream_alias,
+        account=adapter.account,
+    )
+    encrypted_content = staged_record.path.read_bytes()
+    staged_record.path.write_bytes(b"tampered encrypted staged object")
+    with pytest.raises(WebConflict, match="unavailable"):
+        assembled.backend.get_attachment(
+            principal,
+            request_id,
+            str(original["staged_id"]),
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+        )
+    staged_record.path.write_bytes(encrypted_content)
 
     with database.transaction() as connection:
         connection.execute("DELETE FROM attachments WHERE request_id = ?", (request_id,))
@@ -1183,6 +2044,13 @@ def test_totp_request_actions_are_exact_and_make_no_downstream_call(
             else None
         ),
         now=NOW + 1,
+        decision_note=(
+            "exact_request_approved"
+            if action == "approve"
+            else "authenticated_denial"
+            if action == "deny"
+            else None
+        ),
     )
     assert result == expected_state
     row = bundle.state_machine.get_request(request_id)
@@ -1227,6 +2095,13 @@ def test_passkey_actions_use_durable_drafts_and_exact_options(
         ),
         http_method="POST",
         now=NOW + 1,
+        decision_note=(
+            "exact_request_approved"
+            if action == "approve"
+            else "authenticated_denial"
+            if action == "deny"
+            else None
+        ),
     )
     assert set(options.model_dump()) == {
         "challenge_id",
@@ -1342,6 +2217,7 @@ def test_passkey_completion_rejects_a_different_route_request_id(
         prospective_arguments_json=None,
         http_method="POST",
         now=NOW + 1,
+        decision_note="exact_request_approved",
     )
 
     with pytest.raises(WebConflict):
@@ -1397,6 +2273,7 @@ def test_stale_and_tampered_passkey_proofs_do_not_mutate_request(
         prospective_arguments_json=None,
         http_method="POST",
         now=NOW + 1,
+        decision_note="exact_request_approved",
     )
     with pytest.raises(WebForbidden):
         bundle.backend.complete_passkey_action(
@@ -1421,6 +2298,7 @@ def test_stale_and_tampered_passkey_proofs_do_not_mutate_request(
         expected_payload_hash=payload_hash,
         prospective_arguments_json=None,
         now=NOW + 3,
+        decision_note="authenticated_denial",
     )
     with pytest.raises(WebConflict):
         bundle.backend.complete_passkey_action(
@@ -1530,10 +2408,16 @@ def test_push_subscription_ownership_survives_restart(bundle: BackendBundle) -> 
     repository = SQLitePushRepository(Database(bundle.database.path))
     assert len(repository.active_for(USER_ID, NotificationKind.NEW_PENDING)) == 1
 
-    _, other = bundle.session(user_id=SECOND_USER_ID)
-    with pytest.raises(WebForbidden):
+    other_token = bundle.sessions.create_session(
+        SECOND_USER_ID,
+        auth_method="webauthn",
+        now=NOW,
+    )
+    other = bundle.sessions.authenticate(other_token, now=NOW + 1)
+    with pytest.raises(WebUnauthorized):
         bundle.backend.subscribe_push(other, subscription, now=NOW + 1)
-    bundle.backend.unsubscribe_push(other, endpoint, now=NOW + 2)
+    with pytest.raises(WebUnauthorized):
+        bundle.backend.unsubscribe_push(other, endpoint, now=NOW + 2)
     assert len(repository.active_for(USER_ID, NotificationKind.NEW_PENDING)) == 1
     bundle.backend.unsubscribe_push(owner, endpoint, now=NOW + 3)
     assert repository.active_for(USER_ID, NotificationKind.NEW_PENDING) == ()

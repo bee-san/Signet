@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import time
 from collections.abc import Callable
@@ -300,6 +301,79 @@ def test_staging_is_private_scoped_and_integrity_checked(tmp_path: Path) -> None
     record.path.write_bytes(b"changed")
     with pytest.raises(StagingError, match="integrity"):
         store.resolve(record.opaque_id, adapter="fastmail", account="primary")
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "expected_mime"),
+    [
+        ("deceptive.png", b"<!doctype html><html><script>alert(1)</script></html>", "text/html"),
+        ("renamed.txt", b"%PDF-1.7\n% fake-only fixture", "application/pdf"),
+        ("program.png", b"MZ" + b"0" * 64, "application/octet-stream"),
+        ("actual.png", b"\x89PNG\r\n\x1a\n" + b"0" * 64, "image/png"),
+    ],
+)
+def test_staging_detects_content_instead_of_trusting_filename_extension(
+    tmp_path: Path,
+    filename: str,
+    content: bytes,
+    expected_mime: str,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "source.bin"
+    source.write_bytes(content)
+    store = staging_store(
+        tmp_path / "staging",
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+
+    record = store.stage_path(
+        source,
+        adapter="fastmail",
+        account="primary",
+        filename=filename,
+        declared_mime="image/png",
+    )
+
+    assert record.detected_mime == expected_mime
+    assert record.detection_source == "content_signature_v1"
+
+
+def test_staging_rejects_valid_but_mismatched_sidecar_detection_source(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "document.bin"
+    source.write_bytes(b"content-signature-owned provenance")
+    store = staging_store(
+        tmp_path / "staging",
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    record = store.stage_path(
+        source,
+        adapter="fastmail",
+        account="primary",
+        filename="document.txt",
+        declared_mime="text/plain",
+    )
+    metadata_path = store.root / ".metadata" / f"{record.opaque_id}.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["format"] == 3
+    assert metadata["detection_source"] == "content_signature_v1"
+
+    metadata["detection_source"] = "legacy_filename_unverified"
+    metadata_path.write_text(
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(StagingError, match="catalog failed integrity"):
+        store.resolve(record.opaque_id, adapter="fastmail", account="primary")
+    with pytest.raises(StagingError, match="catalog failed integrity"):
+        store.read_verified(record.opaque_id, adapter="fastmail", account="primary")
 
 
 def stat_mode(path: Path) -> int:

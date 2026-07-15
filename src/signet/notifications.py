@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import re
 import secrets
@@ -14,12 +15,14 @@ from enum import StrEnum
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from pywebpush import WebPushException, webpush  # type: ignore[import-untyped]
+from pywebpush import webpush  # type: ignore[import-untyped]
+from requests import Session
 
 from signet.credential_broker import Secret
 from signet.db import Database
 
 _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-/]{0,63}$")
+_LEGACY_IPV4_RE = re.compile(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+)){0,3}\Z")
 _CATEGORY_VALUES = frozenset(
     {
         "new_pending",
@@ -31,6 +34,12 @@ _CATEGORY_VALUES = frozenset(
         "daily_digest",
     }
 )
+
+
+def _safe_event_label(value: object, fallback: str) -> str:
+    """Keep notification metadata bounded without blocking the state transition."""
+
+    return value if isinstance(value, str) and _LABEL_RE.fullmatch(value) else fallback
 
 
 class NotificationKind(StrEnum):
@@ -60,14 +69,10 @@ class PushMessage:
             ):
                 raise ValueError("daily digest requires only a non-negative count")
             return
-        if (
-            self.service is None
-            or self.action is None
-            or not _LABEL_RE.fullmatch(self.service)
-            or not _LABEL_RE.fullmatch(self.action)
-            or self.count is not None
-        ):
-            raise ValueError("event notifications require bounded service and action labels")
+        if self.count is not None:
+            raise ValueError("event notifications cannot contain a count")
+        object.__setattr__(self, "service", _safe_event_label(self.service, "Downstream service"))
+        object.__setattr__(self, "action", _safe_event_label(self.action, "requested action"))
 
     def payload(self) -> dict[str, str | int]:
         body_by_kind = {
@@ -361,37 +366,69 @@ class PushTransport(Protocol):
 class WebPushTransport:
     """Production pywebpush transport with injected VAPID private material."""
 
-    def __init__(self, vapid_private_key: Secret, *, subject: str) -> None:
+    def __init__(
+        self,
+        vapid_private_key: Secret,
+        *,
+        subject: str,
+        allowed_push_origins: frozenset[str],
+    ) -> None:
         parsed = urlsplit(subject)
         if not (
             subject.startswith("mailto:")
             or (parsed.scheme == "https" and parsed.netloc and not parsed.username)
         ):
             raise ValueError("VAPID subject must be mailto: or an HTTPS URL")
+        if (
+            not isinstance(allowed_push_origins, frozenset)
+            or not allowed_push_origins
+            or len(allowed_push_origins) > 32
+        ):
+            raise ValueError("at least one bounded push-service origin is required")
+        try:
+            normalized_origins = frozenset(
+                _normalized_push_origin(value, origin_only=True) for value in allowed_push_origins
+            )
+        except (TypeError, ValueError):
+            raise ValueError("push-service origin allowlist is invalid") from None
+        if len(normalized_origins) != len(allowed_push_origins):
+            raise ValueError("push-service origins must be unique after normalization")
         self._key = vapid_private_key
         self.subject = subject
+        self._allowed_push_origins = normalized_origins
 
     async def send(
         self,
         subscription: PushSubscription,
         payload: Mapping[str, str | int],
     ) -> None:
+        try:
+            _validate_subscription(subscription)
+            origin = _normalized_push_origin(subscription.endpoint, origin_only=False)
+        except ValueError:
+            raise PushDeliveryError("browser push delivery failed") from None
+        if origin not in self._allowed_push_origins:
+            raise PushDeliveryError("browser push delivery failed")
         serialized = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":"))
 
         def deliver() -> None:
             try:
-                webpush(
-                    subscription_info={
-                        "endpoint": subscription.endpoint,
-                        "keys": {"p256dh": subscription.p256dh, "auth": subscription.auth},
-                    },
-                    data=serialized,
-                    vapid_private_key=self._key.reveal(),
-                    vapid_claims={"sub": self.subject},
-                    timeout=10,
-                )
-            except WebPushException as exc:
-                raise PushDeliveryError("browser push delivery failed") from exc
+                with Session() as session:
+                    session.trust_env = False
+                    session.max_redirects = 0
+                    webpush(
+                        subscription_info={
+                            "endpoint": subscription.endpoint,
+                            "keys": {"p256dh": subscription.p256dh, "auth": subscription.auth},
+                        },
+                        data=serialized,
+                        vapid_private_key=self._key.reveal(),
+                        vapid_claims={"sub": self.subject},
+                        timeout=10,
+                        requests_session=session,
+                    )
+            except Exception:
+                raise PushDeliveryError("browser push delivery failed") from None
 
         await asyncio.to_thread(deliver)
 
@@ -500,6 +537,7 @@ def _validate_subscription(subscription: PushSubscription) -> None:
     parsed = urlsplit(subscription.endpoint)
     try:
         port = parsed.port
+        _normalized_push_origin(subscription.endpoint, origin_only=False)
     except ValueError:
         raise ValueError("invalid push subscription") from None
     if (
@@ -543,6 +581,58 @@ def _validate_subscription(subscription: PushSubscription) -> None:
             raise ValueError("invalid push subscription key")
     if _decode_subscription_key(subscription.p256dh)[0] != 0x04:
         raise ValueError("invalid push subscription key")
+
+
+def _normalized_push_origin(value: str, *, origin_only: bool) -> str:
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise ValueError("invalid push endpoint")
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid push endpoint") from None
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or (origin_only and (parsed.path not in {"", "/"} or parsed.query))
+    ):
+        raise ValueError("invalid push endpoint")
+    try:
+        hostname.encode("ascii", errors="strict")
+    except UnicodeError:
+        raise ValueError("invalid push endpoint") from None
+    host = hostname.lower()
+    if host != hostname or host.endswith(".") or "%" in host or _LEGACY_IPV4_RE.fullmatch(host):
+        raise ValueError("invalid push endpoint")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        labels = host.split(".")
+        if (
+            len(host) > 253
+            or len(labels) < 2
+            or any(
+                not label
+                or len(label) > 63
+                or label[0] == "-"
+                or label[-1] == "-"
+                or re.fullmatch(r"[a-z0-9-]+", label) is None
+                for label in labels
+            )
+            or host.endswith((".localhost", ".local", ".internal"))
+        ):
+            raise ValueError("invalid push endpoint") from None
+        rendered_host = host
+    else:
+        if not address.is_global:
+            raise ValueError("invalid push endpoint")
+        rendered_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    normalized_port = None if port in {None, 443} else port
+    return f"https://{rendered_host}{f':{normalized_port}' if normalized_port else ''}"
 
 
 def _decode_subscription_key(value: str) -> bytes:

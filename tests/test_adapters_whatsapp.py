@@ -156,6 +156,26 @@ async def test_whatsapp_text_reply_executes_exact_owned_tool_once() -> None:
     }
 
 
+def test_whatsapp_legacy_media_type_is_explicitly_unverified() -> None:
+    adapter = WhatsAppFileAdapter(account="personal")
+    arguments = {
+        "to": "+15550102030",
+        "media": {
+            "staged_id": "stg_LegacyMediaReference01",
+            "filename": "disguised.png",
+            "mime_type": "text/html",
+            "detected_mime": "image/png",
+            "size": 12,
+            "sha256": "a" * 64,
+        },
+    }
+
+    summary = adapter.summarize_for_web(arguments)
+
+    assert "Media content type was not byte-verified for this legacy request." in summary.warnings
+    assert "Declared and detected media MIME types differ." not in summary.warnings
+
+
 def test_whatsapp_jid_agent_summary_is_deterministic_and_never_full() -> None:
     adapter = WhatsAppTextAdapter(account="personal")
     arguments = {

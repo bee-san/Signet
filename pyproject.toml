@@ -28,9 +28,11 @@ dependencies = [
   "pydantic==2.13.4",
   "pydantic-settings>=2.7,<3",
   "pyotp>=2.9,<3",
+  "puremagic==2.2.0",
   "python-multipart>=0.0.20,<1",
   "pywebpush>=2.0,<3",
   "pyyaml>=6.0,<7",
+  "requests>=2.34,<3",
   "uvicorn[standard]>=0.34,<1",
   "webauthn>=2.2,<3",
 ]

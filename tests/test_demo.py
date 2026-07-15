@@ -11,8 +11,10 @@ import subprocess
 import sys
 import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Barrier, Event
 from typing import Any
 
 import httpx
@@ -210,6 +212,10 @@ async def web_action(
             f"/requests/{request_id}/actions/totp",
             data={
                 "action": action,
+                "decision_note": {
+                    "approve": "exact_request_approved",
+                    "deny": "request_no_longer_needed",
+                }.get(action, ""),
                 "expected_version": hidden_values(detail.text, "expected_version")[-1],
                 "expected_payload_hash": hidden_values(detail.text, "expected_payload_hash")[-1],
                 "totp_proof": DEMO_ACTION_PROOF,
@@ -388,6 +394,232 @@ def test_fake_unknown_purge_cli_help_and_required_acknowledgement(
     assert "request-secret-marker" not in failure.err
     assert "/private/path-marker" not in failure.err
     assert "Traceback" not in failure.err
+
+
+def test_abandoned_pin_release_cli_help_and_required_acknowledgement(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as help_exit:
+        main(["demo", "release-abandoned-pins", "--help"])
+    assert help_exit.value.code == 0
+    help_output = capsys.readouterr()
+    assert help_output.err == ""
+    normalized_help = " ".join(help_output.out.split())
+    for phrase in (
+        "FAKE-ONLY recovery",
+        "terminated demo backup",
+        "Stop the demo server",
+        "backup, restore, or snapshot process",
+        "inclusive cutoff",
+        "Unix timestamp",
+    ):
+        assert phrase in normalized_help
+
+    with pytest.raises(SystemExit) as missing_ack:
+        main(
+            [
+                "demo",
+                "release-abandoned-pins",
+                "--data-dir",
+                "/private/demo-marker",
+                "--created-at-or-before",
+                "1234",
+            ]
+        )
+    assert missing_ack.value.code == 2
+    failure = capsys.readouterr()
+    assert "--acknowledge-no-backup-active" in failure.err
+    assert "/private/demo-marker" not in failure.err
+    assert "Traceback" not in failure.err
+
+
+def test_abandoned_pin_release_cli_is_marker_lock_and_cutoff_guarded(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = new_demo(tmp_path, "abandoned-pin-cli")
+    assembly, request_id, payload_hash = exhausted_fake_unknown(root)
+    selected_now = int(time.time())
+    old = BackupPins(assembly.database).acquire(now=selected_now - 20)
+    recent = BackupPins(assembly.database).acquire(now=selected_now - 5)
+    args = [
+        "demo",
+        "release-abandoned-pins",
+        "--data-dir",
+        str(root),
+        "--created-at-or-before",
+        str(selected_now - 10),
+        "--acknowledge-no-backup-active",
+    ]
+
+    with pytest.raises(DemoError, match="explicit no-backup acknowledgement"):
+        demo_module.release_abandoned_demo_backup_pins(
+            root,
+            created_at_or_before=selected_now - 10,
+            acknowledge_no_backup_active=False,
+            now=selected_now,
+        )
+    with pytest.raises(DemoError, match="cutoff cannot be in the future"):
+        demo_module.release_abandoned_demo_backup_pins(
+            root,
+            created_at_or_before=selected_now + 1,
+            acknowledge_no_backup_active=True,
+            now=selected_now,
+        )
+
+    marker = root / "demo-state.json"
+    original_marker = marker.read_text(encoding="utf-8")
+    invalid_marker = json.loads(original_marker)
+    invalid_marker["mode"] = "not-fake"
+    marker.write_text(json.dumps(invalid_marker), encoding="utf-8")
+    with pytest.raises(SystemExit) as marker_exit:
+        main(args)
+    assert marker_exit.value.code == 2
+    marker_failure = capsys.readouterr()
+    assert "fake-only marker is invalid" in marker_failure.err
+    assert request_id not in marker_failure.err
+    assert payload_hash not in marker_failure.err
+    marker.write_text(original_marker, encoding="utf-8")
+
+    main(args)
+    released = json.loads(capsys.readouterr().out)
+    assert released == {
+        "created_at_or_before": selected_now - 10,
+        "released_pin_rows": len(old.purge_job_ids),
+        "remaining_active_pin_rows": len(recent.purge_job_ids),
+        "scope": "fake_only_downstream_disabled",
+        "status": "abandoned_backup_pins_released",
+    }
+    assert request_id not in json.dumps(released)
+    assert payload_hash not in json.dumps(released)
+    assert str(root) not in json.dumps(released)
+
+    recent_args = list(args)
+    recent_args[recent_args.index(str(selected_now - 10))] = str(selected_now - 5)
+    with demo_module._demo_server_lock(root), pytest.raises(SystemExit) as locked_exit:
+        main(recent_args)
+    assert locked_exit.value.code == 2
+    lock_failure = capsys.readouterr()
+    assert "already being served" in lock_failure.err
+    assert request_id not in lock_failure.err
+    assert payload_hash not in lock_failure.err
+
+    main(recent_args)
+    final_release = json.loads(capsys.readouterr().out)
+    assert final_release["released_pin_rows"] == len(recent.purge_job_ids)
+    assert final_release["remaining_active_pin_rows"] == 0
+
+    main(
+        [
+            "demo",
+            "purge-unknown",
+            "--data-dir",
+            str(root),
+            "--request-id",
+            request_id,
+            "--expected-version",
+            "1",
+            "--expected-payload-hash",
+            payload_hash,
+            "--acknowledge-possible-delivery",
+        ]
+    )
+    purged = json.loads(capsys.readouterr().out)
+    assert purged["status"] == "fake_only_content_purged"
+
+
+def test_fake_unknown_purge_reports_failure_backoff_and_due_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = new_demo(tmp_path, "purge-retry-report")
+    _assembly, request_id, payload_hash = exhausted_fake_unknown(root)
+    selected_now = 1_800_000_100
+    original_process = demo_module.RetentionManager.process
+    failed_once = False
+
+    def fail_first_attachment(
+        manager: Any,
+        claim: Any,
+        *,
+        now: int,
+    ) -> bool:
+        nonlocal failed_once
+        if claim.intent.value == "attachments" and not failed_once:
+            failed_once = True
+            manager._record_failure(claim, now=now, error_code="worker_failure")
+            return False
+        return bool(original_process(manager, claim, now=now))
+
+    monkeypatch.setattr(demo_module.RetentionManager, "process", fail_first_attachment)
+    call = {
+        "request_id": request_id,
+        "expected_version": 1,
+        "expected_payload_hash": payload_hash,
+        "acknowledge_possible_delivery": True,
+    }
+    with pytest.raises(DemoError) as failed:
+        demo_module.purge_fake_unknown_content(root, **call, now=selected_now)
+    assert json.loads(str(failed.value)) == {
+        "failed": 1,
+        "reason": "worker_failure",
+        "retry_after": 60,
+        "status": "fake_only_content_purge_incomplete",
+    }
+
+    with pytest.raises(DemoError) as early:
+        demo_module.purge_fake_unknown_content(root, **call, now=selected_now + 59)
+    assert json.loads(str(early.value)) == {
+        "failed": 0,
+        "reason": "worker_failure",
+        "retry_after": 1,
+        "status": "fake_only_content_purge_incomplete",
+    }
+
+    monkeypatch.setattr(demo_module.RetentionManager, "process", original_process)
+    replay = demo_module.purge_fake_unknown_content(root, **call, now=selected_now + 60)
+    assert replay["claimed"] == replay["completed"] == 1
+    assert replay["failed"] == 0
+    assert replay["status"] == "fake_only_content_purged"
+
+
+def test_fake_unknown_purge_reports_abandoned_claim_lease_boundary(tmp_path: Path) -> None:
+    root = new_demo(tmp_path, "purge-claim-report")
+    assembly, request_id, payload_hash = exhausted_fake_unknown(root)
+    selected_now = 1_800_000_100
+    retention = assembly.workers.retention
+    assert (
+        retention.authorize_fake_only_exhausted_unknown_purge(
+            request_id=request_id,
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            acknowledge_possible_external_effect=True,
+            now=selected_now,
+        )
+        == 2
+    )
+    assert retention.claim_due(now=selected_now, request_id=request_id) is not None
+    call = {
+        "request_id": request_id,
+        "expected_version": 1,
+        "expected_payload_hash": payload_hash,
+        "acknowledge_possible_delivery": True,
+    }
+
+    with pytest.raises(DemoError) as active:
+        demo_module.purge_fake_unknown_content(root, **call, now=selected_now)
+    assert json.loads(str(active.value)) == {
+        "failed": 0,
+        "reason": "claim_lease_active",
+        "retry_after": 301,
+        "status": "fake_only_content_purge_incomplete",
+    }
+    with pytest.raises(DemoError) as boundary:
+        demo_module.purge_fake_unknown_content(root, **call, now=selected_now + 300)
+    assert json.loads(str(boundary.value))["retry_after"] == 1
+    replay = demo_module.purge_fake_unknown_content(root, **call, now=selected_now + 301)
+    assert replay["claimed"] == replay["completed"] == 2
+    assert replay["status"] == "fake_only_content_purged"
 
 
 def test_fake_unknown_purge_cli_pin_lock_and_stale_binding_fail_without_authorizing(
@@ -977,6 +1209,143 @@ def test_demo_serve_lock_rejects_links_and_reuses_stale_regular_file(tmp_path: P
         pass
 
 
+def test_demo_backup_maintenance_lock_is_marker_guarded_safe_and_reusable(
+    tmp_path: Path,
+) -> None:
+    root = new_demo(tmp_path, "backup-maintenance-lock")
+    lock_path = root / ".backup-maintenance.lock"
+    outside = tmp_path / "outside-backup-lock"
+    outside.write_text("not a lock\n", encoding="utf-8")
+    os.chmod(outside, 0o600)
+
+    lock_path.symlink_to(outside)
+    with (
+        pytest.raises(DemoError, match="maintenance lock is unavailable or unsafe"),
+        demo_module._demo_backup_maintenance_lock(root),
+    ):
+        pass
+    lock_path.unlink()
+
+    os.link(outside, lock_path)
+    with (
+        pytest.raises(DemoError, match="maintenance lock is unavailable or unsafe"),
+        demo_module._demo_backup_maintenance_lock(root),
+    ):
+        pass
+    lock_path.unlink()
+
+    lock_path.write_text("stale owner metadata is ignored\n", encoding="utf-8")
+    os.chmod(lock_path, 0o600)
+    with (
+        demo_module._demo_backup_maintenance_lock(root),
+        demo_module._demo_server_lock(root),
+        pytest.raises(DemoError, match="backup maintenance is already active"),
+        demo_module._demo_backup_maintenance_lock(root),
+    ):
+        pass
+    with demo_module._demo_backup_maintenance_lock(root):
+        pass
+
+    private = tmp_path / "backup-lock-output"
+    private.mkdir(mode=0o700)
+    blocked_destination = private / "blocked.signet-backup"
+    with (
+        demo_module._demo_backup_maintenance_lock(root),
+        pytest.raises(DemoError, match="backup maintenance is already active"),
+    ):
+        backup_demo(root, blocked_destination)
+    assert not blocked_destination.exists()
+
+    assembly = build_demo(root)
+    pre_migration = assembly.backups.create_pre_migration_callback(private / "pre-migration")
+    with (
+        demo_module._demo_backup_maintenance_lock(root),
+        pytest.raises(DemoError, match="backup maintenance is already active"),
+    ):
+        pre_migration(assembly.database, 1)
+
+    marker = root / "demo-state.json"
+    original_marker = marker.read_text(encoding="utf-8")
+    invalid_marker = json.loads(original_marker)
+    invalid_marker["mode"] = "not-fake"
+    marker.write_text(json.dumps(invalid_marker), encoding="utf-8")
+    with (
+        pytest.raises(DemoError, match="fake-only marker is invalid"),
+        demo_module._demo_backup_maintenance_lock(root),
+    ):
+        pass
+    marker.write_text(original_marker, encoding="utf-8")
+    with demo_module._demo_backup_maintenance_lock(root):
+        pass
+
+
+def test_active_backup_lock_blocks_abandoned_pin_release_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = new_demo(tmp_path, "backup-release-race")
+    assembly, request_id, payload_hash = exhausted_fake_unknown(root)
+    private = tmp_path / "backup-release-race-output"
+    private.mkdir(mode=0o700)
+    destination = private / "concurrent.signet-backup"
+    backup_service = build_demo(root).backups
+    original_acquire = BackupPins.acquire
+    pin_created = Barrier(2)
+    allow_backup = Event()
+    pin_times: list[int] = []
+    leases: list[Any] = []
+
+    def acquire_then_pause(pins: BackupPins, *, now: int) -> Any:
+        lease = original_acquire(pins, now=now)
+        pin_times.append(now)
+        leases.append(lease)
+        pin_created.wait(timeout=10)
+        if not allow_backup.wait(timeout=10):
+            raise AssertionError("backup release race did not unblock")
+        return lease
+
+    monkeypatch.setattr(BackupPins, "acquire", acquire_then_pause)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        backup = pool.submit(backup_service.create, destination)
+        pin_created.wait(timeout=10)
+        try:
+            assert len(pin_times) == len(leases) == 1
+            pin_time = pin_times[0]
+            with pytest.raises(DemoError, match="backup maintenance is already active") as blocked:
+                demo_module.release_abandoned_demo_backup_pins(
+                    root,
+                    created_at_or_before=pin_time,
+                    acknowledge_no_backup_active=True,
+                    now=pin_time,
+                )
+            assert request_id not in str(blocked.value)
+            assert payload_hash not in str(blocked.value)
+            assert str(root) not in str(blocked.value)
+            with assembly.database.read() as connection:
+                active = connection.execute(
+                    """
+                    SELECT count(*) FROM purge_jobs
+                    WHERE intent = 'backup_pin' AND completed_at IS NULL
+                    """
+                ).fetchone()[0]
+            assert active == len(leases[0].purge_job_ids)
+            assert active > 0
+        finally:
+            allow_backup.set()
+        assert backup.result(timeout=10) == destination
+
+    assert destination.is_file()
+    assert stat.S_IMODE((root / ".backup-maintenance.lock").stat().st_mode) == 0o600
+    with assembly.database.read() as connection:
+        remaining = connection.execute(
+            """
+            SELECT count(*) FROM purge_jobs
+            WHERE intent = 'backup_pin' AND completed_at IS NULL
+            """
+        ).fetchone()[0]
+    assert remaining == 0
+
+
 @pytest.mark.asyncio
 async def test_direct_workers_serve_cannot_recover_while_lifespan_holds_lock(
     tmp_path: Path,
@@ -1047,6 +1416,7 @@ async def test_encrypted_backup_restore_preserves_pending_request_and_attachment
         "filename": staged.filename,
         "mime_type": staged.declared_mime,
         "detected_mime": staged.detected_mime,
+        "detection_source": staged.detection_source,
         "size": staged.size,
         "sha256": staged.sha256,
     }

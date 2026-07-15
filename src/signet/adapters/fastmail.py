@@ -131,6 +131,10 @@ FASTMAIL_SEND_SCHEMA: Mapping[str, Any] = MappingProxyType(
                             "minLength": 3,
                             "maxLength": 255,
                         },
+                        "detection_source": {
+                            "type": "string",
+                            "enum": ["content_signature_v1"],
+                        },
                         "size": {"type": "integer", "minimum": 0, "maximum": 25 * 1024 * 1024},
                         "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
                     },
@@ -625,7 +629,7 @@ class FastmailAdapter:
 
     @staticmethod
     def _attachment_reference(record: StagedFile) -> dict[str, Any]:
-        return {
+        reference = {
             "staged_id": record.opaque_id,
             "filename": record.filename,
             "mime_type": record.declared_mime,
@@ -633,6 +637,9 @@ class FastmailAdapter:
             "size": record.size,
             "sha256": record.sha256,
         }
+        if record.detection_source == "content_signature_v1":
+            reference["detection_source"] = record.detection_source
+        return reference
 
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> ApprovalSummary:
         canonical = self.canonicalize(arguments)
@@ -643,7 +650,13 @@ class FastmailAdapter:
         attachment_warnings = tuple(
             f"Declared and detected MIME differ for {attachment['filename']}"
             for attachment in attachments
-            if attachment["mime_type"] != attachment["detected_mime"]
+            if attachment.get("detection_source") == "content_signature_v1"
+            and attachment["mime_type"] != attachment["detected_mime"]
+        )
+        unverified_attachment_warnings = tuple(
+            f"Content type was not byte-verified for legacy attachment {attachment['filename']}"
+            for attachment in attachments
+            if attachment.get("detection_source") != "content_signature_v1"
         )
         blocks = (
             DetailBlock("From", "mailbox", canonical["from"]),
@@ -662,7 +675,11 @@ class FastmailAdapter:
             title=canonical["subject"] or "Email with no subject",
             destination_summary=_destination_summary(recipient_reviews),
             detail_blocks=blocks,
-            warnings=(*recipient_warnings, *attachment_warnings),
+            warnings=(
+                *recipient_warnings,
+                *attachment_warnings,
+                *unverified_attachment_warnings,
+            ),
         )
 
     def masked_destination_summary(self, arguments: Mapping[str, Any]) -> str:

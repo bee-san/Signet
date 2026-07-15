@@ -16,7 +16,7 @@ import shutil
 import signal
 import stat
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,7 +90,13 @@ from signet.policy_persistence import (
     SQLitePolicyPromotionBoundary,
 )
 from signet.reconcile import ReconciliationCoordinator
-from signet.retention import PurgeIntent, RetentionError, RetentionManager, RetentionMatrix
+from signet.retention import (
+    BackupPins,
+    PurgeIntent,
+    RetentionError,
+    RetentionManager,
+    RetentionMatrix,
+)
 from signet.retention_contract import fake_unknown_purge_job_key
 from signet.runtime import (
     APPROVALS_ALIAS,
@@ -131,6 +137,7 @@ _SECRETS_FILE = "demo-secrets.json"
 _POLICY_FILE = "policy.yaml"
 _DATABASE_FILE = "approvals.sqlite3"
 _SERVE_LOCK_FILE = ".serve.lock"
+_BACKUP_MAINTENANCE_LOCK_FILE = ".backup-maintenance.lock"
 _ATTACHMENTS_DIRECTORY = "attachments"
 _IMPORTS_DIRECTORY = "imports"
 _KEY_REFERENCE = "keychain://Signet/demo-payload-fake-only"
@@ -163,6 +170,37 @@ class DemoSecrets:
         return "DemoSecrets(<redacted>)"
 
 
+class DemoBackupService:
+    """Marker-guarded serialization around every exposed demo backup operation."""
+
+    def __init__(self, root: Path, manager: BackupBundleManager) -> None:
+        self.root = root
+        self._manager = manager
+
+    def __repr__(self) -> str:
+        return f"DemoBackupService(root={self.root!s})"
+
+    def create(self, destination: Path, *, created_at: int | None = None) -> Path:
+        with _demo_backup_maintenance_lock(self.root):
+            return self._manager.create(destination, created_at=created_at)
+
+    def restore(self, bundle: Path, destination_root: Path) -> RestoredBundle:
+        with _demo_backup_maintenance_lock(self.root):
+            return self._manager.restore(bundle, destination_root)
+
+    def create_pre_migration_callback(
+        self,
+        backup_directory: Path,
+    ) -> Callable[[Database, int], None]:
+        callback = self._manager.create_pre_migration_callback(backup_directory)
+
+        def locked_backup(database: Database, current_version: int) -> None:
+            with _demo_backup_maintenance_lock(self.root):
+                callback(database, current_version)
+
+        return locked_backup
+
+
 @dataclass(frozen=True, slots=True)
 class DemoAssembly:
     root: Path
@@ -173,7 +211,7 @@ class DemoAssembly:
     mirror: SchemaMirror
     token_registry: TokenRegistry
     staging: StagingStore
-    backups: BackupBundleManager
+    backups: DemoBackupService
     workers: DemoWorkers
     provider_clients: Mapping[str, FakeOnlyProviderClient]
 
@@ -631,11 +669,12 @@ def build_demo(
         max_total_bytes=50 * 1024 * 1024,
         minimum_free_bytes=1024 * 1024,
     )
-    backups = BackupBundleManager(
+    backup_manager = BackupBundleManager(
         database,
         staging=staging,
         encryption_key=demo_secrets.backup_key,
     )
+    backups = DemoBackupService(demo_root, backup_manager)
     database.initialize(
         pre_migration_backup=backups.create_pre_migration_callback(
             demo_root / "pre-migration-backups"
@@ -698,6 +737,7 @@ def build_demo(
         state_machine,
         payload_cipher,
         reviewer_adapters,
+        staging=staging,
     )
     surfaces: dict[str, AliasToolSurface] = {}
 
@@ -803,6 +843,7 @@ def build_demo(
     webauthn = SQLiteWebAuthnRepository(database)
     web_backend = PersistentWebBackend(
         database,
+        authorized_user_id=DEMO_USER_ID,
         sessions=sessions,
         passwords=passwords,
         totp=totp,
@@ -1058,7 +1099,23 @@ def purge_fake_unknown_content(
                 keys,
             ).fetchone()[0]
         if remaining or failed:
-            raise DemoError("fake-only unknown-content purge is incomplete; retry safely")
+            retry = retention.pending_retry_status(
+                idempotency_keys=keys,
+                now=selected_now,
+            )
+            raise DemoError(
+                json.dumps(
+                    {
+                        "failed": failed,
+                        "reason": retry.reason if retry is not None else "purge_incomplete",
+                        "retry_after": retry.retry_after if retry is not None else 1,
+                        "status": "fake_only_content_purge_incomplete",
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
     return {
         "claimed": claimed,
         "completed": completed,
@@ -1067,6 +1124,48 @@ def purge_fake_unknown_content(
         "state": RequestState.OUTCOME_UNKNOWN.value,
         "status": "fake_only_content_purged",
         "uncertainty_preserved": True,
+    }
+
+
+def release_abandoned_demo_backup_pins(
+    root: Path,
+    *,
+    created_at_or_before: int,
+    acknowledge_no_backup_active: bool,
+    now: int | None = None,
+) -> dict[str, int | str]:
+    """Release abandoned pin rows only in a stopped, marker-guarded fake demo."""
+
+    if acknowledge_no_backup_active is not True:
+        raise DemoError("abandoned pin release requires explicit no-backup acknowledgement")
+    demo_root, _state, _secrets = _load_demo(root)
+    selected_now = int(time.time()) if now is None else now
+    with _demo_server_lock(demo_root):
+        assembly = build_demo(demo_root)
+        with _demo_backup_maintenance_lock(demo_root):
+            pins = BackupPins(assembly.database)
+            try:
+                released = pins.release_abandoned(
+                    before=created_at_or_before,
+                    now=selected_now,
+                )
+            except (RetentionError, ValueError) as exc:
+                raise DemoError(str(exc)) from None
+            with assembly.database.read() as connection:
+                remaining = int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM purge_jobs
+                        WHERE intent = 'backup_pin' AND completed_at IS NULL
+                        """
+                    ).fetchone()[0]
+                )
+    return {
+        "created_at_or_before": created_at_or_before,
+        "released_pin_rows": released,
+        "remaining_active_pin_rows": remaining,
+        "scope": "fake_only_downstream_disabled",
+        "status": "abandoned_backup_pins_released",
     }
 
 
@@ -1324,6 +1423,29 @@ def add_demo_parser(subcommands: Any) -> None:
         help="confirm that delivery remains possible and uncertainty must be preserved",
     )
 
+    release_pins = commands.add_parser(
+        "release-abandoned-pins",
+        help="release abandoned fake-only backup pin rows",
+        description=(
+            "FAKE-ONLY recovery for backup pin rows left by a terminated demo backup. "
+            "Stop the demo server and every backup, restore, or snapshot process using this "
+            "data directory before running it. The inclusive cutoff is a Unix timestamp."
+        ),
+    )
+    _data_dir_argument(release_pins)
+    release_pins.add_argument(
+        "--created-at-or-before",
+        type=_retention_cutoff_type,
+        required=True,
+        help="inclusive creation-time cutoff as non-negative Unix seconds",
+    )
+    release_pins.add_argument(
+        "--acknowledge-no-backup-active",
+        action="store_true",
+        required=True,
+        help="confirm no backup, restore, or snapshot process is using the data directory",
+    )
+
     restore = commands.add_parser("restore", help="restore into a new rotated demo directory")
     _data_dir_argument(restore)
     restore.add_argument("--bundle", type=Path, required=True)
@@ -1395,6 +1517,14 @@ def _run_demo_command(args: argparse.Namespace) -> None:
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return
+    if command == "release-abandoned-pins":
+        result = release_abandoned_demo_backup_pins(
+            args.data_dir,
+            created_at_or_before=args.created_at_or_before,
+            acknowledge_no_backup_active=args.acknowledge_no_backup_active,
+        )
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        return
     if command == "restore":
         restored = restore_demo(args.data_dir, args.bundle, args.destination)
         print(f"Restored Signet fake-only demo at {restored.root}")
@@ -1428,6 +1558,16 @@ def _positive_version_type(value: str) -> int:
     if version <= 0:
         raise argparse.ArgumentTypeError("version must be a positive integer")
     return version
+
+
+def _retention_cutoff_type(value: str) -> int:
+    try:
+        cutoff = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("cutoff must be non-negative Unix seconds") from None
+    if cutoff < 0 or cutoff > 9_000_000_000_000:
+        raise argparse.ArgumentTypeError("cutoff must be non-negative Unix seconds")
+    return cutoff
 
 
 def _payload_hash_type(value: str) -> str:
@@ -2022,8 +2162,38 @@ def _fsync_directory(path: Path) -> None:
 
 @contextmanager
 def _demo_server_lock(root: Path) -> Iterator[None]:
-    path = root / _SERVE_LOCK_FILE
+    with _demo_named_lock(
+        root,
+        filename=_SERVE_LOCK_FILE,
+        unsafe_message="demo serve lock is unavailable or unsafe",
+        busy_message="this demo data directory is already being served",
+    ):
+        yield
+
+
+@contextmanager
+def _demo_backup_maintenance_lock(root: Path) -> Iterator[None]:
+    demo_root, _state, _secrets = _load_demo(root)
+    with _demo_named_lock(
+        demo_root,
+        filename=_BACKUP_MAINTENANCE_LOCK_FILE,
+        unsafe_message="demo backup maintenance lock is unavailable or unsafe",
+        busy_message="demo backup maintenance is already active",
+    ):
+        yield
+
+
+@contextmanager
+def _demo_named_lock(
+    root: Path,
+    *,
+    filename: str,
+    unsafe_message: str,
+    busy_message: str,
+) -> Iterator[None]:
+    path = root / filename
     flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
     try:
         descriptor = os.open(path, flags, 0o600)
         metadata = os.fstat(descriptor)
@@ -2033,11 +2203,11 @@ def _demo_server_lock(root: Path) -> Iterator[None]:
             or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_nlink != 1
         ):
-            raise DemoError("demo serve lock is unavailable or unsafe")
+            raise DemoError(unsafe_message)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise DemoError("this demo data directory is already being served") from None
+            raise DemoError(busy_message) from None
         locked = os.fstat(descriptor)
         current = path.stat(follow_symlinks=False)
         if (
@@ -2050,12 +2220,12 @@ def _demo_server_lock(root: Path) -> Iterator[None]:
             or locked.st_nlink != 1
             or current.st_nlink != 1
         ):
-            raise DemoError("demo serve lock is unavailable or unsafe")
+            raise DemoError(unsafe_message)
         yield
     except OSError as exc:
-        raise DemoError("demo serve lock is unavailable or unsafe") from exc
+        raise DemoError(unsafe_message) from exc
     finally:
-        if "descriptor" in locals():
+        if descriptor is not None:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:

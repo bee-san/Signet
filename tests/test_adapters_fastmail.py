@@ -141,6 +141,26 @@ def test_fastmail_fixture_validates_and_private_summary_is_complete() -> None:
     assert "recipient_count" in audit
 
 
+def test_fastmail_legacy_attachment_type_is_explicitly_unverified() -> None:
+    adapter = FastmailAdapter(account="primary")
+    arguments = fixture_arguments()
+    arguments["attachments"] = [
+        {
+            "staged_id": "stg_LegacyAttachment01",
+            "filename": "disguised.png",
+            "mime_type": "text/html",
+            "detected_mime": "image/png",
+            "size": 12,
+            "sha256": "a" * 64,
+        }
+    ]
+
+    summary = adapter.summarize_for_web(arguments)
+
+    assert any("not byte-verified" in warning for warning in summary.warnings)
+    assert not any("Declared and detected MIME differ" in warning for warning in summary.warnings)
+
+
 def test_fastmail_agent_summary_is_deterministic_bounded_and_never_full() -> None:
     adapter = FastmailAdapter(account="primary")
     arguments = fixture_arguments()

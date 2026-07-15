@@ -10,11 +10,11 @@ from typing import Any, cast
 import httpx
 import mcp.types as types
 import pytest
+from fastapi.testclient import TestClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
-from starlette.testclient import TestClient
 
 from signet.app import main
 from signet.credential_broker import IssuedToken, TokenRegistry

@@ -241,6 +241,14 @@ subject, body, recipient, phone number, attachment filename, and provider respon
 Push failure never rolls back an approval state transition; a transactional outbox
 retries delivery while the web queue remains authoritative.
 
+A provider-capable assembly must allow only exact, reviewed browser-vendor push
+origins. The transport rejects credentials, fragments, non-HTTPS endpoints,
+non-global IP literals (including legacy decimal/octal/hex IPv4 spellings), local
+suffixes, redirects, and environment proxies. DNS for an allowlisted hostname is a
+deployment trust boundary: never allow an operator- or requester-controlled domain,
+and use a resolver/network policy that cannot redirect that hostname to private
+infrastructure.
+
 Logs and metrics should expose bounded counts, ages, durations, state and error
 classes only. Debug logging of raw MCP requests/results is incompatible with this
 model. Health endpoints return static status only and do not report queue contents,
@@ -248,11 +256,34 @@ database paths, credentials, or downstream connectivity.
 
 ## Retention, purge, and backup
 
-The schema records one-way purge state for payloads and attachments and preserves
-`outcome_unknown` content for reconciliation. Gateway-owned staged bytes can be
-purged through descriptor-confined storage operations. Operators must use the
-release's explicit retention coordinator and verify its configured matrix; direct
-file deletion can break the database/manifest relationship.
+The schema records one-way purge state for payloads and attachments. Production
+preserves exhausted `outcome_unknown` content indefinitely because it may still be
+needed for investigation and no production manual-purge action consumes a fresh,
+request-bound human confirmation. Gateway-owned staged bytes can be purged through
+descriptor-confined storage operations. Operators must use the release's explicit
+retention coordinator and verify its configured matrix; direct file deletion can
+break the database/manifest relationship.
+
+The marker-guarded fake demo has one deliberate exception for fault-injection tests.
+After reconciliation is durably exhausted, `demo purge-unknown` requires the exact
+version/hash and an explicit possible-delivery acknowledgement, freezes further
+reconciliation, and logically redacts only fake content. The state remains
+`outcome_unknown`, and append-only authorization/completion events preserve that
+truth. This path is disabled by default in the retention manager, absent from the
+downstream-disabled assembly, and is not TOTP/WebAuthn-backed production
+authorization. Enabling its fake-only flag in a provider-capable assembly violates
+this security model.
+
+Schema 13 makes one bounded privacy exception to append-only event storage. During
+the locked migration transaction it rewrites only affected legacy
+`safe_details_json`: malformed decisions become a fresh one-key fixed-reason
+object, while malformed non-decisions or non-decisions containing a reason become
+`NULL`. Duplicate keys, including escaped duplicates and nested duplicates, are
+treated as malformed so hidden private text cannot survive sanitation. The
+migration preserves the original event ID and request/version/hash binding and
+appends a sanitation event referencing that ID before restoring the no-update
+trigger. The mandatory pre-migration snapshot is the sole retained source of the
+old free-form text and must follow the sensitive backup retention policy.
 
 Even after logical purge, old plaintext or keys may persist in SQLite WAL/free
 pages, APFS snapshots, swap, crash dumps, or backups. `VACUUM` and WAL checkpointing

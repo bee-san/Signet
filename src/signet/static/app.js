@@ -1,5 +1,7 @@
 "use strict";
 
+document.documentElement.classList.replace("no-js", "js");
+
 const toast = document.querySelector(".toast");
 
 function showMessage(message) {
@@ -47,6 +49,23 @@ function assertionJson(credential) {
   };
 }
 
+function isDecisionAction(action) {
+  return action === "approve" || action === "deny";
+}
+
+function selectedDecisionReason(root, action) {
+  if (action === "approve" && root.dataset.gatewayInternal !== "true") {
+    return root.querySelector("[data-approval-reason]")?.value || "";
+  }
+  if (action === "deny") return root.querySelector("[data-denial-reason]")?.value || "";
+  return "";
+}
+
+function decisionReasonRequired(root, action) {
+  if (action === "deny") return true;
+  return action === "approve" && root.dataset.gatewayInternal !== "true";
+}
+
 async function postJson(url, body, csrf) {
   const response = await fetch(url, {
     method: "POST",
@@ -90,7 +109,10 @@ document.addEventListener("click", async (event) => {
     const payloadHash = root.querySelector("input[name='expected_payload_hash']")?.value;
     const expectedVersion = Number(root.querySelector("input[name='expected_version']")?.value);
     const editArguments = action === "edit" ? root.querySelector("[data-edit-json]")?.value : null;
-    const decisionNote = root.querySelector("[data-decision-note]")?.value || null;
+    const decisionNote = selectedDecisionReason(root, action) || null;
+    if (decisionReasonRequired(root, action) && !decisionNote) {
+      throw new Error("Choose a reason before approving or denying");
+    }
     if (!payloadHash || !Number.isInteger(expectedVersion)) {
       throw new Error("Request binding is unavailable");
     }
@@ -109,6 +131,21 @@ document.addEventListener("click", async (event) => {
     window.location.assign(completed.redirect_url || `/requests/${requestId}`);
   } catch (error) {
     showMessage(error.message);
+  }
+});
+
+document.addEventListener("submit", (event) => {
+  const form = event.target.closest?.("[data-decision-form]");
+  if (!form) return;
+  const root = form.closest("[data-request-id]");
+  const action = event.submitter?.value;
+  if (!root) return;
+  const selectedReason = selectedDecisionReason(root, action);
+  if (decisionReasonRequired(root, action) && !selectedReason) {
+    event.preventDefault();
+    showMessage("Choose a reason before approving or denying");
+    root.querySelector(action === "approve" ? "[data-approval-reason]" : "[data-denial-reason]")?.focus();
+    return;
   }
 });
 

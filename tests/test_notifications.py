@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import base64
 import json
+import traceback
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import requests
 
+import signet.notifications as notifications_module
 from signet.credential_broker import Secret
 from signet.db import Database
 from signet.notifications import (
     InMemoryPushRepository,
     NotificationDispatcher,
     NotificationKind,
+    PushDeliveryError,
     PushMessage,
     PushSubscription,
     SQLitePushRepository,
@@ -82,6 +86,31 @@ def test_daily_digest_contains_only_count() -> None:
     assert "service" not in payload and "action" not in payload
     with pytest.raises(ValueError):
         PushMessage(NotificationKind.DAILY_DIGEST, service="Fastmail", count=1)
+
+
+@pytest.mark.parametrize(
+    ("service", "action"),
+    [
+        ("provider", "send:thing"),
+        ("provider", "x" * 65),
+        ("provider", "send\nthing"),
+        ("provider", "envoyer_é"),
+        (None, None),
+    ],
+)
+def test_invalid_event_labels_degrade_to_privacy_safe_fallbacks(
+    service: str | None,
+    action: str | None,
+) -> None:
+    payload = PushMessage(
+        NotificationKind.NEW_PENDING,
+        service=service,
+        action=action,
+    ).payload()
+
+    assert payload["service"] in {"provider", "Downstream service"}
+    assert payload["action"] == "requested action"
+    assert "send:thing" not in str(payload)
 
 
 def test_mcp_approval_copy_does_not_claim_delivery_before_dispatch() -> None:
@@ -182,8 +211,138 @@ def test_subscription_validation_and_representations_redact_endpoint_and_keys() 
     transport = WebPushTransport(
         Secret("vapid-private-material"),
         subject="mailto:test@example.test",
+        allowed_push_origins=frozenset({"https://push.example.test"}),
     )
     assert "vapid-private-material" not in repr(transport)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://127.0.0.1/device",
+        "https://10.0.0.1/device",
+        "https://172.16.0.1/device",
+        "https://192.168.1.1/device",
+        "https://169.254.169.254/latest/meta-data",
+        "https://127.1/device",
+        "https://127.0.1/device",
+        "https://127.000.000.001/device",
+        "https://0x7f.0.0.1/device",
+        "https://0177.0.0.1/device",
+        "https://0300.0250.0001.0001/device",
+        "https://[::1]/device",
+        "https://[fe80::1]/device",
+        "https://localhost/device",
+        "https://push.local/device",
+        "https://push.internal/device",
+        "https://push.example.test./device",
+        "https://user@push.example.test/device",
+        "https://other.example.test/device",
+    ],
+)
+@pytest.mark.asyncio
+async def test_web_push_rejects_nonpublic_or_nonallowlisted_endpoints_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(notifications_module, "webpush", lambda **kwargs: calls.append(kwargs))
+    transport = WebPushTransport(
+        Secret("vapid-private-material"),
+        subject="mailto:test@example.test",
+        allowed_push_origins=frozenset({"https://push.example.test"}),
+    )
+
+    with pytest.raises(PushDeliveryError, match="browser push delivery failed"):
+        await transport.send(
+            replace(subscription("blocked"), endpoint=endpoint),
+            {"title": "Signet"},
+        )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_web_push_uses_exact_allowlist_without_proxy_or_redirects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    def capture(**kwargs: object) -> None:
+        captured.append(dict(kwargs))
+
+    monkeypatch.setattr(notifications_module, "webpush", capture)
+    transport = WebPushTransport(
+        Secret("vapid-private-material"),
+        subject="mailto:test@example.test",
+        allowed_push_origins=frozenset({"https://push.example.test"}),
+    )
+    record = replace(
+        subscription("allowed"),
+        endpoint="https://push.example.test/send/device?provider_token=fake",
+    )
+
+    await transport.send(record, {"title": "Signet"})
+
+    assert len(captured) == 1
+    supplied_session = captured[0]["requests_session"]
+    assert isinstance(supplied_session, requests.Session)
+    assert supplied_session.trust_env is False
+    assert supplied_session.max_redirects == 0
+    assert captured[0]["timeout"] == 10
+    assert captured[0]["subscription_info"] == {
+        "endpoint": record.endpoint,
+        "keys": {"p256dh": record.p256dh, "auth": record.auth},
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_push_redirect_failure_is_generic_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def redirect(**kwargs: object) -> None:
+        raise requests.TooManyRedirects("secret redirect location")
+
+    monkeypatch.setattr(notifications_module, "webpush", redirect)
+    transport = WebPushTransport(
+        Secret("vapid-private-material"),
+        subject="mailto:test@example.test",
+        allowed_push_origins=frozenset({"https://push.example.test"}),
+    )
+
+    with pytest.raises(PushDeliveryError) as caught:
+        await transport.send(subscription("redirect"), {"title": "Signet"})
+
+    assert str(caught.value) == "browser push delivery failed"
+    assert "secret redirect" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "secret redirect location" not in rendered
+    assert "push.example.test/redirect" not in rendered
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        frozenset(),
+        frozenset({"https://127.0.0.1"}),
+        frozenset({"https://127.1"}),
+        frozenset({"https://127.000.000.001"}),
+        frozenset({"https://0x7f.0.0.1"}),
+        frozenset({"https://0177.0.0.1"}),
+        frozenset({"https://0300.0250.0001.0001"}),
+        frozenset({"https://push.example.test/path"}),
+        frozenset({"https://push.example.test?query=1"}),
+        frozenset({"https://user@push.example.test"}),
+    ],
+)
+def test_web_push_origin_allowlist_rejects_unsafe_configuration(origin: frozenset[str]) -> None:
+    with pytest.raises(ValueError, match="origin"):
+        WebPushTransport(
+            Secret("vapid-private-material"),
+            subject="mailto:test@example.test",
+            allowed_push_origins=origin,
+        )
 
 
 def test_sqlite_subscriptions_survive_restart_and_enforce_endpoint_ownership(
