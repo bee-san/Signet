@@ -35,6 +35,11 @@ dependencies = [
   "webauthn>=2.2,<3",
 ]
 
+[project.urls]
+Documentation = "https://github.com/bee-san/Signet/tree/main/docs"
+Issues = "https://github.com/bee-san/Signet/issues"
+Repository = "https://github.com/bee-san/Signet"
+
 [project.scripts]
 signet = "signet.app:main"
 
