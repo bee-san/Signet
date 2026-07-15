@@ -36,7 +36,10 @@ Follow the full state/start sequence in
 is running, create an isolated blank profile and locate its files:
 
 ```console
-hermes profile create signet-demo --no-alias --no-skills
+if ! hermes profile create signet-demo --no-alias --no-skills; then
+  printf 'refusing existing or failed Hermes profile: signet-demo\n' >&2
+  exit 1
+fi
 export SIGNET_DEMO_HERMES_CONFIG="$(hermes -p signet-demo config path)"
 export SIGNET_DEMO_HERMES_ENV="$(hermes -p signet-demo config env-path)"
 if test -e "$SIGNET_DEMO_HERMES_CONFIG" || test -L "$SIGNET_DEMO_HERMES_CONFIG"; then
@@ -126,7 +129,11 @@ export SIGNET_DISABLED_CONFIG="$HOME/.hermes/services/signet/config/disabled.jso
 hermes --version
 hermes mcp --help
 hermes profile list
-hermes profile create "$SIGNET_DISABLED_PROFILE" --no-alias --no-skills
+if ! hermes profile create "$SIGNET_DISABLED_PROFILE" --no-alias --no-skills; then
+  printf 'refusing existing or failed Hermes profile: %s\n' \
+    "$SIGNET_DISABLED_PROFILE" >&2
+  exit 1
+fi
 export SIGNET_DISABLED_HERMES_CONFIG="$(
   hermes -p "$SIGNET_DISABLED_PROFILE" config path
 )"

@@ -112,6 +112,7 @@ h4 { font-size: .86rem; line-height: 1.35; }
 .review-loading { display: none; color: var(--muted); min-height: 64px; padding: 24px 0 0; }
 .js .review-loading { display: block; }
 .js .review-fallback { display: none; }
+.js .review-fallback.review-fallback-visible { display: block; }
 .no-js [data-passkey-action],
 .no-js [data-enable-push],
 .no-js [data-passkey-login] { display: none; }

@@ -39,6 +39,7 @@ from signet.mcp_mirror import (
     discover_all_tools as _discover_all_tools,
 )
 from signet.reviewed_process import (
+    PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED,
     DirectoryIdentity,
     ReviewedProcessError,
     VerifiedPrivateDirectory,
@@ -80,6 +81,10 @@ class DownstreamError(RuntimeError):
 class DownstreamConfigurationError(DownstreamError, ValueError):
     """A downstream endpoint or process definition is not safely constrained."""
 
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class DownstreamLifecycleError(DownstreamError):
     """An operation was attempted outside an initialized client lifecycle."""
@@ -95,6 +100,14 @@ class DownstreamCallError(DownstreamError):
 
 class DownstreamProtocolError(AdapterProtocolError, DownstreamError):
     """The downstream returned an unsupported or malformed MCP value."""
+
+
+def _unsupported_stdio_boundary_error() -> DownstreamConfigurationError:
+    return DownstreamConfigurationError(
+        f"{PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED}: "
+        "reviewed stdio process boundary is unsupported on this platform",
+        code=PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED,
+    )
 
 
 class RedactedStdioServerParameters(StdioServerParameters):
@@ -251,20 +264,30 @@ async def _official_stdio_connector(
 ) -> AsyncIterator[TransportStreams]:
     if parameters.cwd is None:
         raise DownstreamConfigurationError("stdio working directory is unavailable")
-    working_directory = VerifiedPrivateDirectory.open(
-        Path(parameters.cwd),
-        expected_identity=parameters.working_directory_identity,
-    )
+    try:
+        working_directory = VerifiedPrivateDirectory.open(
+            Path(parameters.cwd),
+            expected_identity=parameters.working_directory_identity,
+        )
+    except ReviewedProcessError as exc:
+        if exc.code == PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED:
+            raise _unsupported_stdio_boundary_error() from None
+        raise DownstreamConfigurationError("stdio working directory is unavailable") from None
     executable_descriptor = -1
     try:
-        executable_descriptor = open_verified_executable(
-            Path(parameters.command),
-            expected_sha256=parameters.expected_sha256,
-            snapshot_root=parameters.execution_snapshot_root,
-            _test_capability=_test_capability,
-        )
-        executable = descriptor_path(executable_descriptor)
-        bound_working_directory = working_directory.reverify()
+        try:
+            executable_descriptor = open_verified_executable(
+                Path(parameters.command),
+                expected_sha256=parameters.expected_sha256,
+                snapshot_root=parameters.execution_snapshot_root,
+                _test_capability=_test_capability,
+            )
+            executable = descriptor_path(executable_descriptor)
+            bound_working_directory = working_directory.reverify()
+        except ReviewedProcessError as exc:
+            if exc.code == PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED:
+                raise _unsupported_stdio_boundary_error() from None
+            raise
         with Path(os.devnull).open("w", encoding="utf-8") as error_sink:
             process = await anyio.open_process(
                 [executable, *parameters.args],
@@ -913,6 +936,8 @@ class DownstreamClient:
             with VerifiedPrivateDirectory.open(config.working_directory) as working_directory:
                 return working_directory.identity
         except ReviewedProcessError as exc:
+            if exc.code == PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED:
+                raise _unsupported_stdio_boundary_error() from None
             raise DownstreamConfigurationError(
                 "stdio working directory must be an existing canonical owned mode-0700 directory"
             ) from exc

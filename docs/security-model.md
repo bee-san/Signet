@@ -76,6 +76,11 @@ routes. HTTP and stdio clients are created from reviewed non-secret configuratio
 stdio launchers use an argument vector rather than a shell, bounded environment,
 working directory, timeout, and captured output. Provider results are preserved for
 protocol behavior but only adapter-reviewed safe metadata enters status output.
+The current descriptor-bound local stdio launcher is supported only on Linux with
+`/proc/self/fd`. macOS and other hosts reject it before snapshot or process creation
+with `process_boundary_platform_unsupported`; `/dev/fd` is not treated as an
+equivalent security boundary. This restriction does not affect reviewed HTTPS
+downstreams or the downstream-disabled staging assembly.
 
 Reconciliation receives a structurally restricted read-only client with an exact
 allowlist. It cannot call an arbitrary mutation because an adapter labels the call

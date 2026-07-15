@@ -58,7 +58,8 @@ satisfy any live prerequisite in this guide.
 
 ## Platform requirements
 
-- macOS for the reference launchd/Keychain deployment;
+- macOS for the reference downstream-disabled launchd/Keychain deployment; local
+  stdio and `wacli` activation are explicitly unsupported there and fail closed;
 - Python `>=3.12,<3.13` and `uv` for a reproducible environment;
 - SQLite `3.51.3` or newer (or a specifically verified fixed backport); startup
   rejects older versions because WAL durability is a security boundary;
@@ -86,7 +87,10 @@ uv run ruff check .
 uv run mypy
 ```
 
-Record the reviewed commit and lockfile. Do not let launchd invoke `uv sync` or an
+The repository pins `uv`-managed Python `3.12.13` in `.python-version`; its bundled
+SQLite satisfies the required floor. A different Python 3.12 build is acceptable
+only when the version check below also passes. Record the reviewed commit and
+lockfile. Do not let launchd invoke `uv sync` or an
 unpinned package resolver. The staged plists execute the already-created
 `.venv/bin/signet` entry point directly.
 
@@ -330,10 +334,12 @@ The encrypted staging tree must be canonically disjoint from that child-visible
 runtime tree in both directions. Existing linked-device state therefore needs an
 explicit stopped-store migration or a human-authorized re-pair, never an implicit
 HOME change. The full layout, migration decision, inherited-descriptor boundary,
-and target-macOS characterization blocker are in
+and macOS local-process activation blocker are in
 [`wacli-process-boundary.md`](wacli-process-boundary.md). The repository and CI do
 not perform pairing, migration, provider contact, or sends, and the live assembly
-remains disabled.
+remains disabled. The reviewed Homebrew artifact is macOS-only while the current
+descriptor boundary is Linux-only, so this release has no valid `wacli`
+host/artifact pair and blocks `wacli` activation everywhere.
 
 The shipped persistent token CLI provisions only the `approvals` route in disabled
 mode. A later live assembly must explicitly migrate the same namespace to the exact

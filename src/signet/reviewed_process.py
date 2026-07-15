@@ -6,11 +6,14 @@ import hashlib
 import os
 import secrets
 import stat
+import sys
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 _MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
+_DESCRIPTOR_ROOT = Path("/proc/self/fd")
+PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED = "process_boundary_platform_unsupported"
 _NATIVE_EXECUTABLE_MAGICS = frozenset(
     {
         b"\x7fELF",
@@ -37,6 +40,22 @@ class ReviewedProcessError(RuntimeError):
 DirectoryIdentity = tuple[int, int]
 
 
+def descriptor_process_boundary_supported() -> bool:
+    """Return whether the reviewed exec/cwd descriptor boundary is available."""
+
+    return (
+        sys.platform == "linux"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and _DESCRIPTOR_ROOT.is_dir()
+    )
+
+
+def _require_descriptor_process_boundary() -> None:
+    if not descriptor_process_boundary_supported():
+        raise ReviewedProcessError(PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED)
+
+
 @dataclass(slots=True)
 class VerifiedPrivateDirectory:
     """An exact private directory held open across a process spawn."""
@@ -52,6 +71,7 @@ class VerifiedPrivateDirectory:
         *,
         expected_identity: DirectoryIdentity | None = None,
     ) -> VerifiedPrivateDirectory:
+        _require_descriptor_process_boundary()
         selected = Path(path)
         if (
             not selected.is_absolute()
@@ -88,7 +108,11 @@ class VerifiedPrivateDirectory:
             raise ReviewedProcessError("working_directory_unsafe")
 
         result = cls(path=selected, descriptor=descriptor, identity=identity)
-        result.reverify()
+        try:
+            result.reverify()
+        except BaseException:
+            result.close()
+            raise
         return result
 
     def reverify(self) -> str:
@@ -172,6 +196,7 @@ def _hash_descriptor(descriptor: int) -> str:
 def _open_private_root(root: Path) -> int:
     if not root.is_absolute() or not hasattr(os, "O_NOFOLLOW"):
         raise ReviewedProcessError("snapshot_root_unsafe")
+    descriptor = -1
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         before = root.lstat()
@@ -182,6 +207,8 @@ def _open_private_root(root: Path) -> int:
         descriptor = os.open(root, flags)
         opened = os.fstat(descriptor)
     except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
         raise ReviewedProcessError("snapshot_root_unavailable") from exc
     if (
         resolved != root
@@ -211,13 +238,15 @@ def open_verified_executable(
 ) -> int:
     """Copy, verify, unlink, and return a read-only descriptor for exact execution."""
 
-    if not hasattr(os, "O_NOFOLLOW"):
-        raise ReviewedProcessError("executable_platform_unsupported")
+    _require_descriptor_process_boundary()
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    source_descriptor = -1
     try:
         source_descriptor = os.open(source, flags)
         source_before = os.fstat(source_descriptor)
     except OSError as exc:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
         raise ReviewedProcessError("executable_unavailable") from exc
 
     root_descriptor = -1
@@ -305,9 +334,7 @@ def open_verified_executable(
 
 
 def descriptor_path(descriptor: int) -> str:
-    """Return an executable descriptor path supported by the current POSIX host."""
+    """Return the reviewed Linux descriptor path or fail closed."""
 
-    for root in ("/proc/self/fd", "/dev/fd"):
-        if Path(root).is_dir():
-            return f"{root}/{descriptor}"
-    raise ReviewedProcessError("executable_platform_unsupported")
+    _require_descriptor_process_boundary()
+    return f"{_DESCRIPTOR_ROOT}/{descriptor}"

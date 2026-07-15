@@ -13,9 +13,11 @@ are visibly fake and cannot be switched to a live provider through a demo flag.
 
 ## 1. Verify the checkout
 
-Python 3.12 and `uv` are required. The SQLite check must print `3.51.3` or newer.
+Python 3.12 and `uv` are required. Install the repository-pinned managed build; the
+SQLite check must print `3.51.3` or newer.
 
 ```console
+uv python install 3.12.13
 uv sync --frozen
 uv run python -c 'import sqlite3; print(sqlite3.sqlite_version)'
 uv run signet --help
@@ -121,7 +123,10 @@ Hermes version or installation method is not one you have reviewed.
 hermes --version
 hermes mcp --help
 hermes profile list
-hermes profile create signet-demo --no-alias --no-skills
+if ! hermes profile create signet-demo --no-alias --no-skills; then
+  printf 'refusing existing or failed Hermes profile: signet-demo\n' >&2
+  exit 1
+fi
 export SIGNET_DEMO_HERMES_CONFIG="$(hermes -p signet-demo config path)"
 export SIGNET_DEMO_HERMES_ENV="$(hermes -p signet-demo config env-path)"
 if test -e "$SIGNET_DEMO_HERMES_CONFIG" || test -L "$SIGNET_DEMO_HERMES_CONFIG"; then

@@ -28,9 +28,11 @@ from typing import Any, cast
 from signet.adapters.base import DispatchError, copy_json_object
 from signet.reviewed_process import (
     _TEST_ONLY_SCRIPT_CAPABILITY,
+    PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED,
     DirectoryIdentity,
     ReviewedProcessError,
     VerifiedPrivateDirectory,
+    descriptor_path,
 )
 from signet.staging import StagingError, StagingStore
 
@@ -207,6 +209,12 @@ def _hash_descriptor(descriptor: int) -> str:
     return digest.hexdigest()
 
 
+def _directory_error_code(error: ReviewedProcessError, fallback: str) -> str:
+    if error.code == PROCESS_BOUNDARY_PLATFORM_UNSUPPORTED:
+        return error.code
+    return fallback
+
+
 async def _read_bounded(stream: asyncio.StreamReader, limit: int) -> bytes:
     chunks: list[bytes] = []
     total = 0
@@ -284,10 +292,13 @@ class WacliWrapper:
         flags = os.O_RDONLY | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
+        source_descriptor = -1
         try:
             source_descriptor = os.open(self.config.executable, flags)
             source_before = os.fstat(source_descriptor)
         except OSError as exc:
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
             raise WacliError("executable_unavailable", dispatch_may_have_occurred=False) from exc
 
         root_descriptor = -1
@@ -406,7 +417,10 @@ class WacliWrapper:
         try:
             directory = VerifiedPrivateDirectory.open(root)
         except ReviewedProcessError as exc:
-            raise WacliError("snapshot_root_unsafe", dispatch_may_have_occurred=False) from exc
+            raise WacliError(
+                _directory_error_code(exc, "snapshot_root_unsafe"),
+                dispatch_may_have_occurred=False,
+            ) from exc
         return directory.detach()
 
     def _native_or_test_executable(self, leading: bytes) -> bool:
@@ -420,7 +434,10 @@ class WacliWrapper:
             with VerifiedPrivateDirectory.open(path) as directory:
                 return directory.identity
         except ReviewedProcessError as exc:
-            raise WacliError(f"{code}_unsafe", dispatch_may_have_occurred=False) from exc
+            raise WacliError(
+                _directory_error_code(exc, f"{code}_unsafe"),
+                dispatch_may_have_occurred=False,
+            ) from exc
 
     @staticmethod
     def _open_runtime_directory(
@@ -431,12 +448,17 @@ class WacliWrapper:
         try:
             return VerifiedPrivateDirectory.open(path, expected_identity=identity)
         except ReviewedProcessError as exc:
-            raise WacliError(f"{code}_changed", dispatch_may_have_occurred=False) from exc
+            raise WacliError(
+                _directory_error_code(exc, f"{code}_changed"),
+                dispatch_may_have_occurred=False,
+            ) from exc
 
     @staticmethod
     def _descriptor_path(descriptor: int) -> str:
-        proc_path = f"/proc/self/fd/{descriptor}"
-        return proc_path if Path("/proc/self/fd").is_dir() else f"/dev/fd/{descriptor}"
+        try:
+            return descriptor_path(descriptor)
+        except ReviewedProcessError as exc:
+            raise WacliError(exc.code, dispatch_may_have_occurred=False) from exc
 
     def _environment(self, bound_home: str) -> dict[str, str]:
         return {
@@ -749,7 +771,7 @@ class WacliWrapper:
                     "--to",
                     normalize_destination(to),
                     "--file",
-                    f"/dev/fd/{descriptor}",
+                    self._descriptor_path(descriptor),
                     "--filename",
                     filename,
                     "--mime",

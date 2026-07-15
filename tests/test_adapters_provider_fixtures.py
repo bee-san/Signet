@@ -51,6 +51,7 @@ def test_owned_wacli_contract_matches_pinned_wrapper_and_adapter_schemas() -> No
     assert fixture["runtime_activation_default"] == "disabled"
     assert WacliConfig(account="fixture").reviewed_dispatch_enabled is False
     assert executable["path"] == str(DEFAULT_WACLI_EXECUTABLE)
+    assert executable["artifact_platform"] == "macos_homebrew"
     assert executable["version"] == REVIEWED_WACLI_VERSION
     assert executable["shell"] is False
     assert executable["output"] == "single_json_object"
@@ -69,11 +70,17 @@ def test_owned_wacli_contract_matches_pinned_wrapper_and_adapter_schemas() -> No
     assert boundary["directory_identity_aliases_rejected"] is True
     assert boundary["inherited_directory_descriptors"] == ["home", "store"]
     assert boundary["never_inherited"] == ["encrypted_staging_root", "runtime_root"]
-    assert boundary["macos_pinned_binary_characterization_required_before_activation"] is True
+    assert boundary["supported_host_boundary"] == "linux_proc_self_fd_only"
+    assert boundary["unsupported_host_result"].startswith("process_boundary_platform_unsupported")
+    assert boundary["macos_local_process_execution"] == "unsupported_fail_closed"
+    assert boundary["macos_native_boundary_implementation_required_before_characterization"] is True
+    assert boundary["wacli_activation"] == ("blocked_all_hosts_no_reviewed_artifact_boundary_pair")
+    assert boundary["linux_artifact_review_required"] is True
     assert tools["send_text"]["input_schema"] == dict(WHATSAPP_TEXT_SCHEMA)
     assert tools["send_file"]["input_schema"] == dict(WHATSAPP_FILE_SCHEMA)
     assert fixture["media_boundary"]["size_and_sha256_reverified_after_open"] is True
     assert fixture["media_boundary"]["staging_root_descriptor_inherited"] is False
+    assert fixture["media_boundary"]["child_receives"].startswith("/proc/self/fd/")
     assert fixture["reconciliation"]["read_only_tools"] == []
     assert fixture["reconciliation"]["provider_idempotency_key"] is None
     assert fixture["reconciliation"]["decision"] == "inconclusive"

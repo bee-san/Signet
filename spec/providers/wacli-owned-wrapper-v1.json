@@ -8,6 +8,7 @@
   "contract": "signet.wacli.v1",
   "executable": {
     "path": "/opt/homebrew/Cellar/wacli/0.12.0/bin/wacli",
+    "artifact_platform": "macos_homebrew",
     "version": "0.12.0",
     "version_preflight_required": true,
     "sha256_preflight_required": true,
@@ -44,7 +45,12 @@
       "runtime_root"
     ],
     "test_script_capability": "in_memory_test_injection_only_not_serializable",
-    "macos_pinned_binary_characterization_required_before_activation": true
+    "supported_host_boundary": "linux_proc_self_fd_only",
+    "unsupported_host_result": "process_boundary_platform_unsupported_before_snapshot_or_spawn",
+    "macos_local_process_execution": "unsupported_fail_closed",
+    "macos_native_boundary_implementation_required_before_characterization": true,
+    "wacli_activation": "blocked_all_hosts_no_reviewed_artifact_boundary_pair",
+    "linux_artifact_review_required": true
   },
   "tools": {
     "send_text": {
@@ -138,7 +144,7 @@
     "size_and_sha256_reverified_after_open": true,
     "parent_reverifies_staging_root_before_spawn": true,
     "staging_root_descriptor_inherited": false,
-    "child_receives": "/dev/fd/<selected-decrypted-anonymous-fd>"
+    "child_receives": "/proc/self/fd/<selected-decrypted-anonymous-fd>"
   },
   "reconciliation": {
     "read_only_tools": [],

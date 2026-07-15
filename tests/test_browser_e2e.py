@@ -985,3 +985,63 @@ def test_fake_demo_browser_cancel_omits_shared_decision_rationale(tmp_path: Path
             pytest.fail(
                 "browser cancellation did not carry the exact same-origin Origin", pytrace=False
             )
+
+
+def test_expand_failure_preserves_dedicated_link_and_retries(tmp_path: Path) -> None:
+    with _served_demo(tmp_path) as demo:
+        request_id, _other_request_id, email_arguments = _enqueue_requests(demo)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                locale="en-US",
+                timezone_id="UTC",
+                service_workers="block",
+            )
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.set_default_navigation_timeout(15_000)
+            _login(page, demo)
+            attempts = 0
+
+            def fail_once(route: Route) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    route.fulfill(
+                        status=503,
+                        content_type="text/plain; charset=utf-8",
+                        body="temporary review failure",
+                    )
+                    return
+                route.continue_()
+
+            review_url = f"{demo.web_origin}/requests/{request_id}/review"
+            page.route(review_url, fail_once)
+            fragment = page.locator(f'[data-review-url="/requests/{request_id}/review"]')
+            expander = fragment.locator("..")
+            summary = expander.locator(":scope > summary")
+            summary.click()
+            fragment.get_by_text("Close and reopen to retry", exact=False).wait_for()
+            fallback = fragment.get_by_role("link", name="dedicated request view")
+            if fallback.get_attribute("href") != f"/requests/{request_id}":
+                pytest.fail("failed expansion lost its dedicated review route", pytrace=False)
+            if fragment.get_attribute("aria-busy") is not None:
+                pytest.fail("failed expansion remained marked busy", pytrace=False)
+
+            summary.click()
+            summary.click()
+            review = fragment.locator(".request-review")
+            review.wait_for(state="visible")
+            _assert_bound_context(
+                review,
+                request_id=request_id,
+                state="pending_approval",
+                alias="fastmail",
+                tool_name="send_email",
+                arguments=email_arguments,
+            )
+            if attempts != 2:
+                pytest.fail("failed expansion did not retry exactly once", pytrace=False)
+            context.close()
+            browser.close()

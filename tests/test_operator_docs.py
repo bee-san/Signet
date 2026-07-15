@@ -90,6 +90,7 @@ def test_operator_commands_use_shipped_entrypoints_and_exact_paths() -> None:
     assert "tailscale serve reset" not in runbook
     assert "kill -9" in runbook and "Do not use" in runbook
     assert "configure-demo-profile.py" in runbook
+    assert "if ! hermes profile create signet-demo --no-alias --no-skills; then" in runbook
     assert "refusing existing Hermes config" in runbook
     assert "refusing linked Hermes environment" in runbook
     assert "mcp.client.streamable_http" in runbook
@@ -130,6 +131,11 @@ def test_persistent_disabled_hermes_path_is_executable_and_single_profile() -> N
     assert "deployment.assembly:create_mcp_app" not in readme
     assert "deployment.assembly:create_web_app" not in readme
     assert (ROOT / "deploy" / "hermes" / "configure-disabled-profile.py").is_file()
+    assert "if ! hermes profile create signet-demo --no-alias --no-skills; then" in hermes
+    assert (
+        'if ! hermes profile create "$SIGNET_DISABLED_PROFILE" --no-alias --no-skills; then'
+        in hermes
+    )
 
 
 def test_launchd_guide_renders_then_lints_exact_private_outputs() -> None:
@@ -160,15 +166,16 @@ def test_wacli_boundary_documents_descriptor_store_and_disabled_migration_gate()
     assert "wacli-process-boundary.md" in deployment
     assert "wacli-process-boundary.md" in deploy_readme
     for expected in (
-        "--store /dev/fd/STORE_FD",
+        "--store /proc/self/fd/STORE_FD",
         "distinct direct children",
         "must be disjoint",
         "never inherited",
         "Re-pair",
         "no generic copy command",
-        "macOS characterization gate",
+        "macOS local-process activation blocker",
+        "process_boundary_platform_unsupported",
         "must_not_dispatch",
-        "live activation is blocked",
+        "live local-process activation is blocked",
     ):
         assert expected in normalized
     assert "cp -R" not in boundary
@@ -191,6 +198,7 @@ def test_operator_docs_do_not_claim_demo_or_live_readiness() -> None:
     assert "SIGNET_DEMO_BACKUP_CLI_TBD" not in combined
     assert "still being integrated" not in combined
     assert "still being assembled" not in combined
+    assert "changes a Hermes profile" not in (ROOT / "README.md").read_text(encoding="utf-8")
     assert re.search(r"(?<!\d)\d{6}(?!\d)", combined) is None
     assert "demo approvals server intentionally omits `approve_request`" in combined
 

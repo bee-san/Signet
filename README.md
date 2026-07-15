@@ -19,8 +19,10 @@ the authenticated web app presents the private review queue.
 
 This repository is in no-live implementation mode. Tests use explicit `fake:*`
 identities and fake downstreams. No repository command enrolls a passkey or TOTP,
-reads a live credential, sends a real message, changes a Hermes profile, installs
-a launchd job, changes Tailscale Serve, or performs cutover.
+reads a live provider credential, sends a real message, changes an existing Hermes
+profile, installs a launchd job, changes Tailscale Serve, or performs cutover. The
+documented helpers modify only a newly created blank fake or downstream-disabled
+profile and may ingest its Signet caller token through standard input.
 
 The files under `deploy/` are inert review templates. Their placeholders prevent
 installation without review. The installed `signet deployment` commands provide a
@@ -60,14 +62,24 @@ browser sessions, webhooks, or other paths that bypass Signet. See
 
 ## Development
 
-Signet requires Python 3.12 and uses `uv`.
+Signet requires Python 3.12 and uses `uv`. The repository pins `uv`-managed Python
+3.12.13 because its bundled SQLite satisfies Signet's 3.51.3 safety floor.
 
 ```console
+uv python install 3.12.13
 uv sync --frozen
 uv run pytest -q
 uv run ruff check .
 uv run mypy
 ```
+
+The generic reviewed local stdio boundary currently requires Linux with
+`/proc/self/fd`. macOS remains supported for the downstream-disabled launchd demo
+and separately reviewed HTTPS downstreams, but local process activation fails
+closed with `process_boundary_platform_unsupported`. The sole reviewed `wacli`
+fixture pins a macOS Homebrew artifact, so `wacli` activation is blocked on every
+host until either a Linux artifact is reviewed or a secure native macOS descriptor
+boundary is implemented and characterized.
 
 The generic package entry point serves only an explicitly supplied application
 factory. After creating the disabled state below, its two shipped factories can be

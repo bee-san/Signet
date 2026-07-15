@@ -153,6 +153,10 @@ document.querySelectorAll(".request-expander").forEach((expander) => {
   expander.addEventListener("toggle", async () => {
     const fragment = expander.querySelector("[data-review-fragment]");
     if (!expander.open || !fragment || fragment.dataset.reviewLoaded === "true") return;
+    const loading = fragment.querySelector(".review-loading");
+    const fallback = fragment.querySelector(".review-fallback");
+    if (loading) loading.textContent = "Loading request context";
+    fallback?.classList.remove("review-fallback-visible");
     fragment.setAttribute("aria-busy", "true");
     try {
       const response = await fetch(fragment.dataset.reviewUrl, {
@@ -163,7 +167,8 @@ document.querySelectorAll(".request-expander").forEach((expander) => {
       fragment.innerHTML = await response.text();
       fragment.dataset.reviewLoaded = "true";
     } catch (error) {
-      fragment.textContent = "Request context could not be loaded";
+      if (loading) loading.textContent = "Request context could not be loaded. Close and reopen to retry.";
+      fallback?.classList.add("review-fallback-visible");
       showMessage(error.message);
     } finally {
       fragment.removeAttribute("aria-busy");
