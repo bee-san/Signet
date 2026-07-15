@@ -572,9 +572,7 @@ class AliasToolSurface:
     def _remember_session(self) -> None:
         session = self.server.request_context.session
         now = self._session_clock()
-        self._prune_sessions(now, reserve_new=session not in self._sessions)
-        self._sessions.add(session)
-        self._session_invocation_scopes.setdefault(session, secrets.token_urlsafe(24))
+        self._admit_session(session, now)
         self._session_last_seen[session] = now
         request = self.server.request_context.request
         if request is not None:
@@ -584,6 +582,25 @@ class AliasToolSurface:
                 if previous is not None and previous is not session:
                     self._forget_session(previous)
                 self._session_ids[session_id] = session
+                self._session_invocation_scopes[session] = _stable_session_scope(
+                    self.alias, session_id
+                )
+
+    @property
+    def session_tracking_ttl_seconds(self) -> float:
+        return self._tracked_session_ttl_seconds
+
+    def _admit_session(self, session: Any, now: float) -> None:
+        self._prune_sessions(now)
+        if session not in self._sessions and len(self._sessions) >= self._tracked_session_limit:
+            raise McpError(
+                types.ErrorData(
+                    code=types.INVALID_REQUEST,
+                    message="The Signet MCP session limit is reached.",
+                )
+            )
+        self._sessions.add(session)
+        self._session_invocation_scopes.setdefault(session, secrets.token_urlsafe(24))
 
     @property
     def tracked_session_count(self) -> int:
@@ -598,7 +615,7 @@ class AliasToolSurface:
         self._forget_session(session)
         return True
 
-    def _prune_sessions(self, now: float, *, reserve_new: bool = False) -> None:
+    def _prune_sessions(self, now: float) -> None:
         stale = [
             session
             for session, last_seen in self._session_last_seen.items()
@@ -606,15 +623,6 @@ class AliasToolSurface:
         ]
         for session in stale:
             self._forget_session(session)
-        capacity = self._tracked_session_limit - int(reserve_new)
-        overflow = len(self._sessions) - capacity
-        if overflow > 0:
-            oldest = sorted(
-                self._sessions,
-                key=lambda session: self._session_last_seen.get(session, 0.0),
-            )[:overflow]
-            for session in oldest:
-                self._forget_session(session)
 
     def _forget_session(self, session: Any) -> None:
         self._sessions.discard(session)
@@ -717,3 +725,15 @@ def _scope_header(scope: Mapping[str, Any], name: bytes) -> str | None:
             except UnicodeDecodeError:
                 return None
     return None
+
+
+def _stable_session_scope(alias: str, session_id: str) -> str:
+    return sha256_hex(
+        canonical_json(
+            {
+                "alias": alias,
+                "domain": "signet/mcp-session-scope/v1",
+                "session_id": session_id,
+            }
+        )
+    )

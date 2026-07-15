@@ -22,6 +22,7 @@ from signet.mcp_mirror import (
     MirrorError,
     RawServerResult,
     SchemaMirror,
+    _stable_session_scope,
     derive_invocation_identity,
     discover_all_tools,
     domain_error_result,
@@ -391,13 +392,23 @@ async def test_surface_bounds_and_expires_tracked_sessions() -> None:
     surface._prune_sessions(now)
     assert surface.tracked_session_count == 2
 
-    surface._prune_sessions(now, reserve_new=True)
-    assert oldest not in surface._sessions
+    newcomer = AsyncMock()
+    with pytest.raises(McpError, match="session limit"):
+        surface._admit_session(newcomer, now)
+    assert oldest in surface._sessions
     assert current in surface._sessions
 
     now += 61
     assert await surface.notify_list_changed() == 0
     assert surface.tracked_session_count == 0
+
+
+def test_stable_transport_session_scope_does_not_rotate_under_tracking_churn() -> None:
+    first = _stable_session_scope("mail", "opaque-session-id")
+    assert first == _stable_session_scope("mail", "opaque-session-id")
+    assert first != _stable_session_scope("mail", "different-session-id")
+    assert first != _stable_session_scope("other", "opaque-session-id")
+    assert "opaque-session-id" not in first
 
 
 @pytest.mark.asyncio

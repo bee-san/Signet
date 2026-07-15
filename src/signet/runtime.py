@@ -215,8 +215,8 @@ def assemble_mcp_runtime(
     address = _loopback_address(bind_host)
     if bind_port < 1024 or bind_port > 65535:
         raise RuntimeAssemblyError("the MCP port must be between 1024 and 65535")
-    if session_idle_timeout <= 0:
-        raise RuntimeAssemblyError("the MCP session idle timeout must be positive")
+    if session_idle_timeout < 60 or session_idle_timeout > 30 * 60:
+        raise RuntimeAssemblyError("the MCP session idle timeout must be 60 to 1800 seconds")
     if APPROVALS_ALIAS in aliases:
         raise RuntimeAssemblyError("the approvals alias is reserved for gateway-owned tools")
 
@@ -226,6 +226,10 @@ def assemble_mcp_runtime(
             raise RuntimeAssemblyError("alias mappings must use exact safe surface aliases")
         if id(surface.server) in server_ids:
             raise RuntimeAssemblyError("each MCP path requires a distinct server instance")
+        if surface.session_tracking_ttl_seconds <= session_idle_timeout:
+            raise RuntimeAssemblyError(
+                "surface session tracking must outlive the transport idle timeout"
+            )
         server_ids.add(id(surface.server))
 
     allowed_hosts = _allowed_host_values(address, bind_port)
