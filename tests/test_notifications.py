@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Mapping
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from signet.credential_broker import Secret
+from signet.db import Database
 from signet.notifications import (
     InMemoryPushRepository,
     NotificationDispatcher,
     NotificationKind,
     PushMessage,
     PushSubscription,
+    SQLitePushRepository,
     WebPushTransport,
     new_subscription,
 )
@@ -42,12 +47,16 @@ def subscription(
         subscription_id=identifier,
         user_id=user_id,
         endpoint=f"https://push.example.test/{identifier}",
-        p256dh="ZmFrZS1wMjU2ZGg",
-        auth="ZmFrZS1hdXRo",
+        p256dh=_encoded(b"\x04" + b"p" * 64),
+        auth=_encoded(b"a" * 16),
         device_label="Test phone",
         categories=categories,
         created_at=1_800_000_000,
     )
+
+
+def _encoded(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
 @pytest.mark.parametrize("kind", tuple(NotificationKind)[:-1])
@@ -127,13 +136,13 @@ def test_subscription_validation_and_representations_redact_endpoint_and_keys() 
     created = new_subscription(
         user_id="autumn",
         endpoint="https://push.example.test/device-secret",
-        p256dh="ZmFrZS1wMjU2ZGg",
-        auth="ZmFrZS1hdXRo",
+        p256dh=_encoded(b"\x04" + b"p" * 64),
+        auth=_encoded(b"a" * 16),
         device_label="Phone",
         created_at=1_800_000_000,
     )
     assert "device-secret" not in repr(created)
-    assert "ZmFrZ" not in repr(created)
+    assert created.p256dh not in repr(created)
     with pytest.raises(ValueError):
         new_subscription(
             user_id="autumn",
@@ -143,9 +152,52 @@ def test_subscription_validation_and_representations_redact_endpoint_and_keys() 
             device_label="Phone",
             created_at=1_800_000_000,
         )
+    for changes in (
+        {"p256dh": _encoded(b"\x04" + b"p" * 63)},
+        {"p256dh": _encoded(b"\x03" + b"p" * 64)},
+        {"auth": _encoded(b"a" * 15)},
+        {"auth": "not+base64"},
+        {"endpoint": "https://user@push.example.test/device"},
+        {"device_label": "Phone\nInjected"},
+    ):
+        with pytest.raises(ValueError):
+            new_subscription(
+                user_id="autumn",
+                endpoint=str(changes.get("endpoint", "https://push.example.test/device")),
+                p256dh=str(changes.get("p256dh", _encoded(b"\x04" + b"p" * 64))),
+                auth=str(changes.get("auth", _encoded(b"a" * 16))),
+                device_label=str(changes.get("device_label", "Phone")),
+                created_at=1_800_000_000,
+            )
 
     transport = WebPushTransport(
         Secret("vapid-private-material"),
         subject="mailto:test@example.test",
     )
     assert "vapid-private-material" not in repr(transport)
+
+
+def test_sqlite_subscriptions_survive_restart_and_enforce_endpoint_ownership(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "approval.sqlite3")
+    database.initialize()
+    repository = SQLitePushRepository(database)
+    record = subscription(
+        "durable",
+        categories=frozenset({NotificationKind.NEW_PENDING}),
+    )
+    repository.save(record)
+
+    restarted = SQLitePushRepository(Database(database.path))
+    assert restarted.active_for("autumn", NotificationKind.NEW_PENDING) == (record,)
+    assert restarted.active_for("autumn", NotificationKind.DAILY_DIGEST) == ()
+    restarted.mark_failure("durable", now=1_800_000_001, disable_after=2)
+    assert len(restarted.active_for("autumn", NotificationKind.NEW_PENDING)) == 1
+    restarted.mark_failure("durable", now=1_800_000_002, disable_after=2)
+    assert restarted.active_for("autumn", NotificationKind.NEW_PENDING) == ()
+
+    hostile = subscription("other", user_id="other")
+    hostile = replace(hostile, endpoint=record.endpoint)
+    with pytest.raises(ValueError, match="another user"):
+        restarted.save(hostile)

@@ -11,12 +11,13 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from pywebpush import WebPushException, webpush  # type: ignore[import-untyped]
 
 from signet.credential_broker import Secret
+from signet.db import Database
 
 _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-/]{0,63}$")
 _CATEGORY_VALUES = frozenset(
@@ -200,6 +201,151 @@ class InMemoryPushRepository:
             return self._records.get(subscription_id)
 
 
+class SQLitePushRepository:
+    """Durable per-device subscription storage in the approval database."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def save(self, subscription: PushSubscription) -> None:
+        _validate_subscription(subscription)
+        categories_json = json.dumps(
+            sorted(kind.value for kind in subscription.categories),
+            separators=(",", ":"),
+        )
+        with self.database.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT subscription_id, user_id FROM push_subscriptions
+                WHERE endpoint = ? OR subscription_id = ?
+                """,
+                (subscription.endpoint, subscription.subscription_id),
+            ).fetchall()
+            if any(row["user_id"] != subscription.user_id for row in existing):
+                raise ValueError("push endpoint is already owned by another user")
+            identifiers = {str(row["subscription_id"]) for row in existing}
+            if len(identifiers) > 1:
+                raise ValueError("push subscription ID and endpoint identify different devices")
+            if existing:
+                identifier = next(iter(identifiers))
+                connection.execute(
+                    """
+                    UPDATE push_subscriptions
+                    SET endpoint = ?, p256dh_key = ?, auth_key = ?,
+                        device_label = ?, categories_json = ?, failure_count = 0,
+                        disabled_at = NULL
+                    WHERE subscription_id = ? AND user_id = ?
+                    """,
+                    (
+                        subscription.endpoint,
+                        subscription.p256dh.encode(),
+                        subscription.auth.encode(),
+                        subscription.device_label,
+                        categories_json,
+                        identifier,
+                        subscription.user_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO push_subscriptions(
+                        subscription_id, user_id, endpoint, p256dh_key, auth_key,
+                        device_label, categories_json, created_at, failure_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        subscription.subscription_id,
+                        subscription.user_id,
+                        subscription.endpoint,
+                        subscription.p256dh.encode(),
+                        subscription.auth.encode(),
+                        subscription.device_label,
+                        categories_json,
+                        subscription.created_at,
+                    ),
+                )
+
+    def active_for(self, user_id: str, kind: NotificationKind) -> tuple[PushSubscription, ...]:
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM push_subscriptions
+                WHERE user_id = ? AND disabled_at IS NULL
+                ORDER BY created_at, subscription_id
+                """,
+                (user_id,),
+            ).fetchall()
+        records = tuple(self._record(row) for row in rows)
+        return tuple(
+            record for record in records if not record.categories or kind in record.categories
+        )
+
+    def mark_success(self, subscription_id: str, *, now: int) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE push_subscriptions
+                SET last_success_at = ?, failure_count = 0
+                WHERE subscription_id = ? AND disabled_at IS NULL
+                """,
+                (now, subscription_id),
+            )
+
+    def mark_failure(self, subscription_id: str, *, now: int, disable_after: int) -> None:
+        if disable_after < 1:
+            raise ValueError("push disable threshold must be positive")
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE push_subscriptions
+                SET failure_count = failure_count + 1,
+                    disabled_at = CASE
+                        WHEN failure_count + 1 >= ? THEN ? ELSE NULL
+                    END
+                WHERE subscription_id = ? AND disabled_at IS NULL
+                """,
+                (disable_after, now, subscription_id),
+            )
+
+    def unsubscribe(self, user_id: str, endpoint: str, *, now: int) -> bool:
+        with self.database.transaction() as connection:
+            updated = int(connection.execute(
+                """
+                UPDATE push_subscriptions SET disabled_at = ?
+                WHERE user_id = ? AND endpoint = ? AND disabled_at IS NULL
+                """,
+                (now, user_id, endpoint),
+            ).rowcount)
+        return updated == 1
+
+    @staticmethod
+    def _record(row: Any) -> PushSubscription:
+        try:
+            raw_categories = json.loads(row["categories_json"])
+            if not isinstance(raw_categories, list) or not all(
+                isinstance(value, str) for value in raw_categories
+            ):
+                raise ValueError
+            categories = frozenset(NotificationKind(value) for value in raw_categories)
+            record = PushSubscription(
+                subscription_id=row["subscription_id"],
+                user_id=row["user_id"],
+                endpoint=row["endpoint"],
+                p256dh=bytes(row["p256dh_key"]).decode(),
+                auth=bytes(row["auth_key"]).decode(),
+                device_label=row["device_label"],
+                categories=categories,
+                created_at=row["created_at"],
+                failure_count=row["failure_count"],
+                disabled_at=row["disabled_at"],
+            )
+            _validate_subscription(record)
+        except (UnicodeError, ValueError):
+            raise ValueError("stored push subscription is invalid") from None
+        return record
+
+
 class PushTransport(Protocol):
     async def send(
         self,
@@ -325,24 +471,57 @@ def new_subscription(
 
 def _validate_subscription(subscription: PushSubscription) -> None:
     parsed = urlsplit(subscription.endpoint)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid push subscription") from None
     if (
         not subscription.subscription_id
         or not subscription.user_id
-        or len(subscription.user_id) > 256
+        or len(subscription.user_id.encode("utf-8")) > 256
+        or any(ord(character) < 32 or ord(character) == 127 for character in subscription.user_id)
         or parsed.scheme != "https"
-        or not parsed.netloc
+        or not parsed.hostname
         or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or port is not None
+        and not 1 <= port <= 65535
         or len(subscription.endpoint) > 4096
         or not subscription.device_label
-        or len(subscription.device_label) > 80
+        or len(subscription.device_label.encode("utf-8")) > 80
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in subscription.device_label
+        )
         or subscription.failure_count < 0
-        or any(kind.value not in _CATEGORY_VALUES for kind in subscription.categories)
+        or any(
+            not isinstance(kind, NotificationKind) or kind.value not in _CATEGORY_VALUES
+            for kind in subscription.categories
+        )
     ):
         raise ValueError("invalid push subscription")
-    for value in (subscription.p256dh, subscription.auth):
+    for value, expected_size in ((subscription.p256dh, 65), (subscription.auth, 16)):
         if not value or len(value) > 512:
             raise ValueError("invalid push subscription key")
         try:
-            base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-        except (ValueError, TypeError):
+            decoded = base64.b64decode(
+                value + "=" * (-len(value) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+        except (ValueError, TypeError, UnicodeError):
             raise ValueError("invalid push subscription key") from None
+        canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+        if canonical != value or len(decoded) != expected_size:
+            raise ValueError("invalid push subscription key")
+    if _decode_subscription_key(subscription.p256dh)[0] != 0x04:
+        raise ValueError("invalid push subscription key")
+
+
+def _decode_subscription_key(value: str) -> bytes:
+    return base64.b64decode(
+        value + "=" * (-len(value) % 4),
+        altchars=b"-_",
+        validate=True,
+    )
