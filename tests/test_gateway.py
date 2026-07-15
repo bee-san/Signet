@@ -160,6 +160,7 @@ class GatewayHarness:
                             "local": {
                                 "mode": "virtualize_local",
                                 "adapter": "fake.local.v1",
+                                "account_ref": "example-account",
                             },
                             "send": {
                                 "mode": "approval",

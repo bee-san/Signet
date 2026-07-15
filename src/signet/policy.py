@@ -92,6 +92,54 @@ _TOOL_FIELDS = frozenset(
         "reviewed_classification",
     }
 )
+_SCHEMA_REVIEW_FIELDS = frozenset(
+    {"source", "fixture_status", "fail_closed_on_digest_change"}
+)
+_WRAPPER_CONTRACT_FIELDS = frozenset(
+    {
+        "id",
+        "ownership",
+        "executable",
+        "executable_version",
+        "output",
+        "shell_interpolation",
+        "fixture_source",
+    }
+)
+_POLICY_CHANGE_FIELDS = frozenset(
+    {
+        "approval_channel",
+        "require_fresh_human_confirmation",
+        "passthrough_requires_reviewed_read_only",
+        "communication_sends_may_be_passthrough",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaReviewPolicy:
+    source: str
+    fixture_status: str
+    fail_closed_on_digest_change: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WrapperContract:
+    contract_id: str
+    ownership: str
+    executable: str
+    executable_version: str
+    output: str
+    shell_interpolation: str
+    fixture_source: str
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyChangeContract:
+    approval_channel: str
+    require_fresh_human_confirmation: bool
+    passthrough_requires_reviewed_read_only: bool
+    communication_sends_may_be_passthrough: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +152,8 @@ class ToolPolicy:
     communication_send: bool = False
     schema_digest: str | None = None
     limits: dict[str, int] = field(default_factory=dict)
+    account_ref: str | None = None
+    reviewed_classification: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +164,9 @@ class DownstreamPolicy:
     url: str | None = None
     command_ref: str | None = None
     credential_ref: str | None = None
+    schema_review: SchemaReviewPolicy | None = None
+    account_ref: str | None = None
+    wrapper_contract: WrapperContract | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +174,8 @@ class PolicySnapshot:
     version: int
     default_mode: PolicyMode
     downstreams: dict[str, DownstreamPolicy]
+    mode_contracts: dict[PolicyMode, dict[str, Any]] = field(default_factory=dict)
+    policy_changes: PolicyChangeContract | None = None
 
     def configured(self, alias: str, tool: str) -> ToolPolicy | None:
         downstream = self.downstreams.get(alias)
@@ -178,6 +233,130 @@ def _http_url(value: Any, label: str) -> str:
     return url
 
 
+def _mode_contracts(value: Any) -> dict[PolicyMode, dict[str, Any]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise PolicyError("mode_contracts must be an object")
+    expected: dict[str, dict[str, Any]] = {
+        "passthrough": {
+            "exposure": "reviewed_tools_only",
+            "downstream_calls": "immediate",
+            "result_contract": "downstream_verbatim",
+        },
+        "virtualize_local": {
+            "exposure": "reviewed_tools_only",
+            "downstream_calls": 0,
+            "standalone_approval": False,
+            "result_contract": "captured_downstream_output_schema",
+            "storage": "local_only",
+            "scope_fields": ["adapter", "account", "caller_namespace"],
+            "staging": {
+                "root": "var/staging",
+                "path_rule": "descendants_only",
+                "reject_absolute_paths": True,
+                "reject_parent_traversal": True,
+                "reject_symlinks": True,
+                "reject_hardlinks": True,
+            },
+        },
+        "approval": {
+            "exposure": "reviewed_tools_only",
+            "downstream_calls_before_approval": 0,
+            "result_contract": "gateway_pending_result",
+        },
+        "deny": {
+            "exposure": "explicit_reviewed_only",
+            "downstream_calls": 0,
+            "result_contract": "call_tool_error",
+        },
+    }
+    if set(value) != set(expected):
+        raise PolicyError("mode_contracts must declare exactly the four reviewed modes")
+    contracts: dict[PolicyMode, dict[str, Any]] = {}
+    for name, reviewed in expected.items():
+        candidate = value.get(name)
+        if candidate != reviewed:
+            raise PolicyError(f"mode_contracts.{name} does not match the runtime contract")
+        contracts[PolicyMode(name)] = dict(candidate)
+    return contracts
+
+
+def _schema_review(value: Any, label: str) -> SchemaReviewPolicy | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PolicyError(f"{label} must be an object")
+    _reject_unknown_fields(value, _SCHEMA_REVIEW_FIELDS, label)
+    if set(value) != _SCHEMA_REVIEW_FIELDS:
+        raise PolicyError(f"{label} must declare every schema review field")
+    source = _nonempty_string(value["source"], f"{label}.source")
+    fixture_status = _nonempty_string(
+        value["fixture_status"], f"{label}.fixture_status"
+    )
+    fail_closed = value["fail_closed_on_digest_change"]
+    if fail_closed is not True:
+        raise PolicyError(f"{label}.fail_closed_on_digest_change must be true")
+    return SchemaReviewPolicy(source, fixture_status, True)
+
+
+def _wrapper_contract(value: Any, label: str) -> WrapperContract | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PolicyError(f"{label} must be an object")
+    _reject_unknown_fields(value, _WRAPPER_CONTRACT_FIELDS, label)
+    if set(value) != _WRAPPER_CONTRACT_FIELDS:
+        raise PolicyError(f"{label} must declare every wrapper contract field")
+    contract_id = _nonempty_string(value["id"], f"{label}.id")
+    executable = _nonempty_string(value["executable"], f"{label}.executable")
+    if not Path(executable).is_absolute():
+        raise PolicyError(f"{label}.executable must be absolute")
+    exact_values = {
+        "ownership": "gateway",
+        "output": "json_only",
+        "shell_interpolation": "forbidden",
+    }
+    for field_name, expected in exact_values.items():
+        if value[field_name] != expected:
+            raise PolicyError(f"{label}.{field_name} must be {expected}")
+    return WrapperContract(
+        contract_id=contract_id,
+        ownership="gateway",
+        executable=executable,
+        executable_version=_nonempty_string(
+            value["executable_version"], f"{label}.executable_version"
+        ),
+        output="json_only",
+        shell_interpolation="forbidden",
+        fixture_source=_nonempty_string(
+            value["fixture_source"], f"{label}.fixture_source"
+        ),
+    )
+
+
+def _policy_changes(value: Any) -> PolicyChangeContract | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PolicyError("policy_changes must be an object")
+    _reject_unknown_fields(value, _POLICY_CHANGE_FIELDS, "policy_changes")
+    expected = {
+        "approval_channel": "web_only",
+        "require_fresh_human_confirmation": True,
+        "passthrough_requires_reviewed_read_only": True,
+        "communication_sends_may_be_passthrough": False,
+    }
+    if value != expected:
+        raise PolicyError("policy_changes must match the enforced promotion contract")
+    return PolicyChangeContract(
+        approval_channel="web_only",
+        require_fresh_human_confirmation=True,
+        passthrough_requires_reviewed_read_only=True,
+        communication_sends_may_be_passthrough=False,
+    )
+
+
 def parse_policy(data: Any) -> PolicySnapshot:
     if not isinstance(data, dict):
         raise PolicyError("policy root must be an object")
@@ -191,6 +370,8 @@ def parse_policy(data: Any) -> PolicySnapshot:
         raise PolicyError("default_mode is invalid") from exc
     if default_mode is not PolicyMode.DENY:
         raise PolicyError("default_mode must be deny")
+    mode_contracts = _mode_contracts(data.get("mode_contracts"))
+    policy_changes = _policy_changes(data.get("policy_changes"))
     raw_downstreams = data.get("downstreams", {})
     if not isinstance(raw_downstreams, dict):
         raise PolicyError("downstreams must be an object")
@@ -231,6 +412,22 @@ def parse_policy(data: Any) -> PolicySnapshot:
         )
         if credential_ref is not None and not credential_ref.startswith("keychain://"):
             raise PolicyError(f"downstreams.{alias}.credential_ref must use keychain://")
+        schema_review = _schema_review(
+            raw_downstream.get("schema_review"),
+            f"downstreams.{alias}.schema_review",
+        )
+        account_value = raw_downstream.get("account_ref")
+        account_ref = (
+            _nonempty_string(account_value, f"downstreams.{alias}.account_ref")
+            if account_value is not None
+            else None
+        )
+        wrapper_contract = _wrapper_contract(
+            raw_downstream.get("wrapper_contract"),
+            f"downstreams.{alias}.wrapper_contract",
+        )
+        if wrapper_contract is not None and transport != "stdio":
+            raise PolicyError(f"downstreams.{alias}.wrapper_contract is stdio-only")
         raw_tools = raw_downstream.get("tools", {})
         if not isinstance(raw_tools, dict):
             raise PolicyError(f"downstreams.{alias}.tools must be an object")
@@ -290,6 +487,27 @@ def parse_policy(data: Any) -> PolicySnapshot:
                 for key, value in limits.items()
             ):
                 raise PolicyError(f"limits for {alias}/{name} must be positive integers")
+            tool_account_value = raw_tool.get("account_ref")
+            tool_account_ref = (
+                _nonempty_string(tool_account_value, f"account reference for {alias}/{name}")
+                if tool_account_value is not None
+                else None
+            )
+            classification_value = raw_tool.get("reviewed_classification")
+            reviewed_classification = (
+                _nonempty_string(
+                    classification_value,
+                    f"reviewed classification for {alias}/{name}",
+                )
+                if classification_value is not None
+                else None
+            )
+            if reviewed_classification is not None and mode is not PolicyMode.DENY:
+                raise PolicyError(
+                    f"reviewed classification is only valid for denied tool {alias}/{name}"
+                )
+            if mode is PolicyMode.VIRTUALIZE_LOCAL and tool_account_ref is None:
+                raise PolicyError(f"virtualize_local requires account_ref for {alias}/{name}")
             tools[name] = ToolPolicy(
                 alias=alias,
                 tool=name,
@@ -299,6 +517,8 @@ def parse_policy(data: Any) -> PolicySnapshot:
                 communication_send=communication_send,
                 schema_digest=schema_digest,
                 limits=dict(limits),
+                account_ref=tool_account_ref,
+                reviewed_classification=reviewed_classification,
             )
         downstreams[alias] = DownstreamPolicy(
             alias=alias,
@@ -307,8 +527,17 @@ def parse_policy(data: Any) -> PolicySnapshot:
             url=url,
             command_ref=command_ref,
             credential_ref=credential_ref,
+            schema_review=schema_review,
+            account_ref=account_ref,
+            wrapper_contract=wrapper_contract,
         )
-    return PolicySnapshot(version=version, default_mode=default_mode, downstreams=downstreams)
+    return PolicySnapshot(
+        version=version,
+        default_mode=default_mode,
+        downstreams=downstreams,
+        mode_contracts=mode_contracts,
+        policy_changes=policy_changes,
+    )
 
 
 def load_policy(path: Path) -> PolicySnapshot:

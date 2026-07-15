@@ -42,7 +42,11 @@ def _policy() -> Any:
                     "url": "https://example.test/mcp",
                     "tools": {
                         "read": {"mode": "passthrough", "reviewed_read_only": True},
-                        "stage": {"mode": "virtualize_local", "adapter": "example.stage"},
+                        "stage": {
+                            "mode": "virtualize_local",
+                            "adapter": "example.stage",
+                            "account_ref": "example-account",
+                        },
                         "send": {
                             "mode": "approval",
                             "adapter": "example.send",

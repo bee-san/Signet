@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
 
 from signet.canonical import CanonicalizationError, canonical_json, payload_fingerprint
 from signet.policy import PolicyError, PolicyMode, load_policy, parse_policy
@@ -87,6 +90,62 @@ def test_checked_in_policy_is_accepted_by_the_runtime_parser() -> None:
     policy = load_policy(Path(__file__).parents[1] / "spec" / "policy-v1.yaml")
     assert policy.resolve("fastmail", "send_email") is PolicyMode.APPROVAL
     assert policy.resolve("whatsapp", "send_text") is PolicyMode.APPROVAL
+    assert policy.policy_changes is not None
+    assert policy.policy_changes.approval_channel == "web_only"
+    assert set(policy.mode_contracts) == set(PolicyMode)
+    fastmail = policy.downstreams["fastmail"]
+    assert fastmail.schema_review is not None
+    assert fastmail.schema_review.fail_closed_on_digest_change
+    assert fastmail.account_ref == "configured-account"
+    assert fastmail.tools["upload_attachment"].account_ref == "configured-account"
+    assert fastmail.tools["delete_email"].reviewed_classification == "destructive"
+    wrapper = policy.downstreams["whatsapp"].wrapper_contract
+    assert wrapper is not None
+    assert wrapper.contract_id == "signet.wacli.send-text.v1"
+    assert wrapper.shell_interpolation == "forbidden"
+
+
+@pytest.mark.parametrize(
+    ("mutator", "message"),
+    [
+        (
+            lambda document: document["mode_contracts"]["approval"].update(
+                {"downstream_calls_before_approval": 1}
+            ),
+            "runtime contract",
+        ),
+        (
+            lambda document: document["downstreams"]["fastmail"]["schema_review"].update(
+                {"fail_closed_on_digest_change": False}
+            ),
+            "must be true",
+        ),
+        (
+            lambda document: document["downstreams"]["whatsapp"][
+                "wrapper_contract"
+            ].update({"shell_interpolation": "allowed"}),
+            "must be forbidden",
+        ),
+        (
+            lambda document: document["policy_changes"].update(
+                {"communication_sends_may_be_passthrough": True}
+            ),
+            "enforced promotion contract",
+        ),
+    ],
+)
+def test_security_contract_fields_cannot_be_silently_weakened(
+    mutator: Callable[[dict[str, Any]], None],
+    message: str,
+) -> None:
+    document = yaml.safe_load(
+        (Path(__file__).parents[1] / "spec" / "policy-v1.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    mutator(document)
+    with pytest.raises(PolicyError, match=message):
+        parse_policy(document)
 
 
 def test_policy_never_trusts_annotations_or_wildcards() -> None:
