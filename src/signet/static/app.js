@@ -79,33 +79,55 @@ if (login) {
   });
 }
 
-document.querySelectorAll("[data-passkey-action]").forEach((button) => {
-  button.addEventListener("click", async () => {
-    const root = button.closest("[data-request-id]");
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest?.("[data-passkey-action]");
+  if (!button) return;
+  const root = button.closest("[data-request-id]");
+  try {
+    if (!root) throw new Error("Request context is unavailable");
+    const action = button.dataset.passkeyAction;
+    const requestId = root.dataset.requestId;
+    const payloadHash = root.querySelector("input[name='expected_payload_hash']")?.value;
+    const expectedVersion = Number(root.querySelector("input[name='expected_version']")?.value);
+    const editArguments = action === "edit" ? root.querySelector("[data-edit-json]")?.value : null;
+    if (!payloadHash || !Number.isInteger(expectedVersion)) {
+      throw new Error("Request binding is unavailable");
+    }
+    const options = await postJson(`/requests/${requestId}/actions/passkey/options`, {
+      action,
+      expected_version: expectedVersion,
+      expected_payload_hash: payloadHash,
+      prospective_arguments_json: editArguments
+    }, root.dataset.csrf);
+    const credential = await navigator.credentials.get({ publicKey: preparePublicKey(options.public_key) });
+    await postJson(`/requests/${requestId}/actions/passkey/complete`, {
+      challenge_id: options.challenge_id,
+      assertion: assertionJson(credential)
+    }, root.dataset.csrf);
+    window.location.reload();
+  } catch (error) {
+    showMessage(error.message);
+  }
+});
+
+document.querySelectorAll(".request-expander").forEach((expander) => {
+  expander.addEventListener("toggle", async () => {
+    const fragment = expander.querySelector("[data-review-fragment]");
+    if (!expander.open || !fragment || fragment.dataset.reviewLoaded === "true") return;
+    fragment.setAttribute("aria-busy", "true");
     try {
-      if (!root) throw new Error("Request context is unavailable");
-      const action = button.dataset.passkeyAction;
-      const requestId = root.dataset.requestId;
-      const payloadHash = root.querySelector("input[name='expected_payload_hash']")?.value;
-      const expectedVersion = Number(root.querySelector("input[name='expected_version']")?.value);
-      const editArguments = action === "edit" ? root.querySelector("[data-edit-json]")?.value : null;
-      if (!payloadHash || !Number.isInteger(expectedVersion)) {
-        throw new Error("Request binding is unavailable");
-      }
-      const options = await postJson(`/requests/${requestId}/actions/passkey/options`, {
-        action,
-        expected_version: expectedVersion,
-        expected_payload_hash: payloadHash,
-        prospective_arguments_json: editArguments
-      }, root.dataset.csrf);
-      const credential = await navigator.credentials.get({ publicKey: preparePublicKey(options.public_key) });
-      await postJson(`/requests/${requestId}/actions/passkey/complete`, {
-        challenge_id: options.challenge_id,
-        assertion: assertionJson(credential)
-      }, root.dataset.csrf);
-      window.location.reload();
+      const response = await fetch(fragment.dataset.reviewUrl, {
+        credentials: "same-origin",
+        headers: { "Accept": "text/html" }
+      });
+      if (!response.ok) throw new Error("Request context could not be loaded");
+      fragment.innerHTML = await response.text();
+      fragment.dataset.reviewLoaded = "true";
     } catch (error) {
+      fragment.textContent = "Request context could not be loaded";
       showMessage(error.message);
+    } finally {
+      fragment.removeAttribute("aria-busy");
     }
   });
 });

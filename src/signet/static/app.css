@@ -67,13 +67,17 @@ h4 { font-size: .86rem; line-height: 1.35; }
 
 .queue-heading, .detail-heading { align-items: flex-start; display: flex; justify-content: space-between; gap: 24px; }
 .request-list { display: grid; gap: 10px; list-style: none; margin: 24px 0 0; padding: 0; }
+.request-list > li, .request-expansion, .request-review { max-width: 100%; min-width: 0; }
 .request-expander {
   background: var(--surface);
   border: 1px solid var(--line);
   border-left: 4px solid var(--gold);
   border-radius: 6px;
   margin: 0;
+  max-width: 100%;
+  min-width: 0;
   overflow: clip;
+  width: 100%;
 }
 .request-expander > summary {
   align-items: center;
@@ -91,6 +95,7 @@ h4 { font-size: .86rem; line-height: 1.35; }
 .request-summary-main strong { font-size: 1.05rem; }
 .request-summary-meta { color: var(--muted); font-size: .82rem; justify-items: end; }
 .request-expansion { padding: 0 18px 10px; }
+.review-loading { color: var(--muted); min-height: 64px; padding: 24px 0 0; }
 .service-label { color: var(--green-2); font-size: .76rem; font-weight: 760; text-transform: uppercase; }
 .destination { overflow-wrap: anywhere; }
 .state { border-radius: 4px; font-weight: 760; padding: 3px 6px; }
@@ -155,7 +160,7 @@ textarea { line-height: 1.5; resize: vertical; }
 .login-shell h1 { font-size: 2.4rem; }
 .login-form { display: grid; gap: 9px; }
 .fallback-login { border-top: 1px solid var(--line); margin-top: 24px; padding-top: 18px; }
-.table-scroll { overflow-x: auto; }
+.table-scroll { max-width: 100%; overflow-x: auto; }
 table { border-collapse: collapse; min-width: 760px; width: 100%; }
 th, td { border-bottom: 1px solid var(--line); padding: 12px 10px; text-align: left; }
 th { color: var(--muted); font-size: .78rem; }

@@ -326,13 +326,14 @@ def test_oversized_passkey_login_is_rejected_before_backend(
 
 def test_queue_and_detail_require_session_and_ignore_mcp_bearer(client: TestClient) -> None:
     assert client.get("/").status_code == 401
-    response = client.get(
-        "/requests/req_test",
-        headers={"Authorization": "Bearer valid-agent-token"},
-    )
-    assert response.status_code == 401
-    assert "person@example.test" not in response.text
-    assert "Viewing on Tuesday" not in response.text
+    for path in ("/requests/req_test", "/requests/req_test/review"):
+        response = client.get(
+            path,
+            headers={"Authorization": "Bearer valid-agent-token"},
+        )
+        assert response.status_code == 401
+        assert "person@example.test" not in response.text
+        assert "Viewing on Tuesday" not in response.text
 
 
 def test_authenticated_queue_has_security_headers_and_no_sensitive_title(
@@ -346,7 +347,26 @@ def test_authenticated_queue_has_security_headers_and_no_sensitive_title(
     assert "person@example.test" not in collapsed_summary
     assert "Viewing on Tuesday" not in collapsed_summary
     assert "blind@example.test" not in collapsed_summary
+    assert "person@example.test" not in response.text
+    assert "Viewing on Tuesday" not in response.text
+    assert "blind@example.test" not in response.text
+    assert 'data-review-url="/requests/req_test/review"' in response.text
+    assert "no-store" in response.headers["cache-control"]
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert "form-action 'self'" in response.headers["content-security-policy"]
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert "<title>Signet</title>" in response.text
+
+
+def test_expanded_review_fragment_contains_complete_bound_context(client: TestClient) -> None:
+    authenticate(client)
+    response = client.get("/requests/req_test/review")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, max-age=0"
     assert "Viewing on Tuesday" in response.text
+    assert "person@example.test" in response.text
     assert "blind@example.test" in response.text
     assert "Requested for the Tuesday release" in response.text
     assert "Frozen execution arguments" in response.text
@@ -354,12 +374,10 @@ def test_authenticated_queue_has_security_headers_and_no_sensitive_title(
     assert "profile:web-test" in response.text
     assert "agenda&lt;script&gt;.pdf" in response.text
     assert "b" * 64 in response.text
-    assert "no-store" in response.headers["cache-control"]
-    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
-    assert "form-action 'self'" in response.headers["content-security-policy"]
-    assert response.headers["x-frame-options"] == "DENY"
-    assert response.headers["referrer-policy"] == "no-referrer"
-    assert "<title>Signet</title>" in response.text
+    assert f'name="expected_payload_hash" value="{HASH}"' in response.text
+    assert 'name="expected_version" value="1"' in response.text
+    assert '<script src="https://evil.test' not in response.text
+    assert "&lt;script" in response.text
 
 
 def test_host_origin_preflight_and_csrf_fail_before_mutation(

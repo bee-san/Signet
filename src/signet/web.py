@@ -566,16 +566,6 @@ def create_web_app(
     async def queue(request: Request) -> Response:
         selected = principal(request)
         items = backend.list_queue(selected, now=now_fn())
-        reviews = tuple(
-            {
-                "item": backend.get_detail(selected, item.request_id),
-                "csrf_token": csrf.session_token(
-                    selected.session_id,
-                    f"request:{item.request_id}",
-                ),
-            }
-            for item in items
-        )
         return cast(
             Response,
             templates.TemplateResponse(
@@ -583,7 +573,7 @@ def create_web_app(
                 "queue.html",
                 {
                     **context(request, selected),
-                    "reviews": reviews,
+                    "items": items,
                     "now": now_fn(),
                     "logout_csrf": csrf.session_token(selected.session_id, "logout"),
                     "push_csrf": csrf.session_token(selected.session_id, "push"),
@@ -606,6 +596,27 @@ def create_web_app(
                     "item": value,
                     "csrf_token": csrf.session_token(selected.session_id, purpose),
                     "logout_csrf": csrf.session_token(selected.session_id, "logout"),
+                },
+            ),
+        )
+
+    @app.get("/requests/{request_id}/review", response_class=HTMLResponse)
+    async def review_fragment(request: Request, request_id: str) -> Response:
+        selected = principal(request)
+        value = backend.get_detail(selected, request_id)
+        return cast(
+            Response,
+            templates.TemplateResponse(
+                request,
+                "review_fragment.html",
+                {
+                    **context(request, selected),
+                    "item": value,
+                    "id_suffix": hashlib.sha256(request_id.encode()).hexdigest()[:12],
+                    "csrf_token": csrf.session_token(
+                        selected.session_id,
+                        f"request:{request_id}",
+                    ),
                 },
             ),
         )
