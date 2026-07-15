@@ -1,0 +1,1 @@
+"""Reviewed downstream adapters."""
