@@ -188,6 +188,33 @@ def test_policy_rejects_unknown_or_mistyped_security_fields() -> None:
     with pytest.raises(PolicyError, match="keychain"):
         parse_policy(policy)
 
+    policy = _policy()
+    policy["downstreams"]["mail"]["tools"]["search"]["limits"] = {"queue": 10}
+    with pytest.raises(PolicyError, match="unsupported keys"):
+        parse_policy(policy)
+
+    policy = _policy()
+    policy["downstreams"]["mail"]["tools"]["search"]["limits"] = {
+        "payload_bytes": 16 * 1024 * 1024 + 1
+    }
+    with pytest.raises(PolicyError, match="safe maximum"):
+        parse_policy(policy)
+
+
+def test_policy_retains_only_supported_enforceable_tool_limits() -> None:
+    policy = _policy()
+    policy["downstreams"]["mail"]["tools"]["send"]["limits"] = {
+        "payload_bytes": 1_024,
+        "pending_requests": 3,
+        "requests_per_minute": 5,
+    }
+    parsed = parse_policy(policy)
+    assert parsed.downstreams["mail"].tools["send"].limits == {
+        "payload_bytes": 1_024,
+        "pending_requests": 3,
+        "requests_per_minute": 5,
+    }
+
 
 @pytest.mark.parametrize(
     "document",

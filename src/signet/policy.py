@@ -114,6 +114,11 @@ _POLICY_CHANGE_FIELDS = frozenset(
         "communication_sends_may_be_passthrough",
     }
 )
+_LIMIT_MAXIMUMS = {
+    "payload_bytes": 16 * 1024 * 1024,
+    "pending_requests": 100_000,
+    "requests_per_minute": 10_000,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,6 +492,17 @@ def parse_policy(data: Any) -> PolicySnapshot:
                 for key, value in limits.items()
             ):
                 raise PolicyError(f"limits for {alias}/{name} must be positive integers")
+            unknown_limits = set(limits) - set(_LIMIT_MAXIMUMS)
+            if unknown_limits:
+                raise PolicyError(
+                    f"limits for {alias}/{name} contain unsupported keys: "
+                    + ", ".join(sorted(unknown_limits))
+                )
+            for limit_name, limit_value in limits.items():
+                if limit_value > _LIMIT_MAXIMUMS[limit_name]:
+                    raise PolicyError(
+                        f"limit {limit_name} for {alias}/{name} exceeds its safe maximum"
+                    )
             tool_account_value = raw_tool.get("account_ref")
             tool_account_ref = (
                 _nonempty_string(tool_account_value, f"account reference for {alias}/{name}")
