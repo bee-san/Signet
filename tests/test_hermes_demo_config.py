@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import runpy
 import stat
 import subprocess  # nosec B404
 import sys
@@ -86,6 +87,11 @@ def test_helper_structurally_merges_blank_profile_without_disclosing_token(
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     assert not list(config.parent.glob(".*.signet-demo-*"))
+
+    repeated = invoke(config, env_file, fragment)
+    assert repeated.returncode == 0, repeated.stderr
+    assert load(config)["mcp_servers"] == load(fragment)["mcp_servers"]
+    assert env_file.read_text(encoding="utf-8").count("SIGNET_DEMO_MCP_CALLER_TOKEN=") == 1
 
 
 @pytest.mark.parametrize(
@@ -175,6 +181,101 @@ def test_helper_refuses_unsafe_mode_symlink_and_duplicate_yaml(tmp_path: Path) -
     duplicate = invoke(config, env_file, fragment)
     assert duplicate.returncode == 1
     assert "valid unique-key YAML" in duplicate.stderr
+
+
+@pytest.mark.parametrize(
+    "malicious_yaml",
+    [
+        "model: &shared value\ncopy: *shared\n",
+        "model:\n  <<: {nested: value}\n",
+        "model: &" + ("a" * 257) + " value\n",
+        "model: " + ("x" * (16 * 1024 + 1)) + "\n",
+        "model:\n"
+        + "".join(("  " * (index + 1)) + "-\n" for index in range(40))
+        + ("  " * 41)
+        + "value\n",
+        "model:\n" + "".join(f"  - item-{index}\n" for index in range(50_001)),
+    ],
+    ids=["alias", "merge", "anchor", "scalar", "depth", "nodes"],
+)
+def test_helper_bounds_untrusted_yaml_composition(
+    tmp_path: Path,
+    malicious_yaml: str,
+) -> None:
+    config, env_file, fragment = profile_files(tmp_path)
+    private_write(config, malicious_yaml)
+    before_env = env_file.read_bytes()
+
+    result = invoke(config, env_file, fragment)
+
+    assert result.returncode == 1
+    assert "not valid unique-key YAML" in result.stderr
+    assert env_file.read_bytes() == before_env
+
+
+def test_helper_recovers_exact_partial_commits_but_rejects_mismatches(
+    tmp_path: Path,
+) -> None:
+    config, env_file, fragment = profile_files(tmp_path)
+    private_write(env_file, f"SIGNET_DEMO_MCP_CALLER_TOKEN={FAKE_TOKEN}\n")
+
+    env_first = invoke(config, env_file, fragment)
+
+    assert env_first.returncode == 0, env_first.stderr
+    assert load(config)["mcp_servers"] == load(fragment)["mcp_servers"]
+
+    second = tmp_path / "second"
+    second.mkdir()
+    config, env_file, fragment = profile_files(second)
+    configured = load(config)
+    configured["mcp_servers"] = load(fragment)["mcp_servers"]
+    private_write(config, yaml.safe_dump(configured, sort_keys=False))
+
+    config_first = invoke(config, env_file, fragment)
+
+    assert config_first.returncode == 0, config_first.stderr
+    assert env_file.read_text(encoding="utf-8").endswith(
+        f"SIGNET_DEMO_MCP_CALLER_TOKEN={FAKE_TOKEN}\n"
+    )
+
+    private_write(
+        env_file,
+        "SIGNET_DEMO_MCP_CALLER_TOKEN=fake:sgt_ponmlkjihgfedcba."
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq\n",
+    )
+    mismatch = invoke(config, env_file, fragment)
+    assert mismatch.returncode == 1
+    assert "different value or form" in mismatch.stderr
+    assert FAKE_TOKEN not in mismatch.stderr
+
+
+def test_helper_compare_before_replace_refuses_a_concurrent_change(tmp_path: Path) -> None:
+    config, env_file, _ = profile_files(tmp_path)
+    namespace = runpy.run_path(str(HELPER))
+    read_private_file = namespace["_read_private_file"]
+    commit_profile_files = namespace["_commit_profile_files"]
+    configuration_error = namespace["ConfigurationError"]
+    config_snapshot = read_private_file(
+        config,
+        label="profile config",
+        maximum=namespace["MAX_CONFIG_BYTES"],
+    )
+    env_snapshot = read_private_file(
+        env_file,
+        label="profile environment",
+        maximum=namespace["MAX_ENV_BYTES"],
+    )
+    private_write(config, "model: concurrent-update\nmcp_servers: {}\n")
+
+    with pytest.raises(configuration_error, match="changed during configuration"):
+        commit_profile_files(
+            config_file=config_snapshot,
+            config_content=b"model: replacement\nmcp_servers: {}\n",
+            env_file=env_snapshot,
+            env_content=env_snapshot.value,
+        )
+
+    assert load(config)["model"] == "concurrent-update"
 
 
 def test_helper_refuses_multiply_linked_profile_file(tmp_path: Path) -> None:
