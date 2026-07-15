@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -20,6 +22,35 @@ class PolicyMode(StrEnum):
     VIRTUALIZE_LOCAL = "virtualize_local"
     APPROVAL = "approval"
     DENY = "deny"
+
+
+_ROOT_FIELDS = frozenset(
+    {"version", "default_mode", "mode_contracts", "downstreams", "policy_changes"}
+)
+_DOWNSTREAM_FIELDS = frozenset(
+    {
+        "transport",
+        "url",
+        "command_ref",
+        "credential_ref",
+        "schema_review",
+        "account_ref",
+        "wrapper_contract",
+        "tools",
+    }
+)
+_TOOL_FIELDS = frozenset(
+    {
+        "mode",
+        "adapter",
+        "reviewed_read_only",
+        "communication_send",
+        "schema_digest",
+        "limits",
+        "account_ref",
+        "reviewed_classification",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,9 +103,44 @@ def _nonempty_string(value: Any, label: str) -> str:
     return value
 
 
+def _reject_unknown_fields(value: dict[Any, Any], allowed: frozenset[str], label: str) -> None:
+    unknown = set(value) - allowed
+    if unknown:
+        names = ", ".join(sorted(repr(item) for item in unknown))
+        raise PolicyError(f"{label} contains unknown fields: {names}")
+
+
+def _http_url(value: Any, label: str) -> str:
+    url = _nonempty_string(value, label)
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise PolicyError(f"{label} must be an HTTPS or loopback HTTP URL") from None
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or port is not None
+        and not 1 <= port <= 65535
+    ):
+        raise PolicyError(f"{label} must be an HTTPS or loopback HTTP URL")
+    loopback = parsed.hostname == "localhost"
+    try:
+        loopback = loopback or ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        loopback = parsed.hostname == "localhost"
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
+        raise PolicyError(f"{label} must be an HTTPS or loopback HTTP URL")
+    return url
+
+
 def parse_policy(data: Any) -> PolicySnapshot:
     if not isinstance(data, dict):
         raise PolicyError("policy root must be an object")
+    _reject_unknown_fields(data, _ROOT_FIELDS, "policy root")
     version = data.get("version")
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
         raise PolicyError("version must be a positive integer")
@@ -93,13 +159,37 @@ def parse_policy(data: Any) -> PolicySnapshot:
         alias = _nonempty_string(raw_alias, "downstream alias")
         if not isinstance(raw_downstream, dict):
             raise PolicyError(f"downstreams.{alias} must be an object")
+        _reject_unknown_fields(
+            raw_downstream,
+            _DOWNSTREAM_FIELDS,
+            f"downstreams.{alias}",
+        )
         transport = raw_downstream.get("transport")
         if transport not in {"http", "stdio"}:
             raise PolicyError(f"downstreams.{alias}.transport must be http or stdio")
-        if transport == "http" and not raw_downstream.get("url"):
-            raise PolicyError(f"downstreams.{alias}.url is required for HTTP")
-        if transport == "stdio" and not raw_downstream.get("command_ref"):
-            raise PolicyError(f"downstreams.{alias}.command_ref is required for stdio")
+        raw_url = raw_downstream.get("url")
+        raw_command_ref = raw_downstream.get("command_ref")
+        if transport == "http":
+            url = _http_url(raw_url, f"downstreams.{alias}.url")
+            if raw_command_ref is not None:
+                raise PolicyError(f"downstreams.{alias}.command_ref is stdio-only")
+            command_ref = None
+        else:
+            command_ref = _nonempty_string(
+                raw_command_ref,
+                f"downstreams.{alias}.command_ref",
+            )
+            if raw_url is not None:
+                raise PolicyError(f"downstreams.{alias}.url is HTTP-only")
+            url = None
+        raw_credential_ref = raw_downstream.get("credential_ref")
+        credential_ref = (
+            _nonempty_string(raw_credential_ref, f"downstreams.{alias}.credential_ref")
+            if raw_credential_ref is not None
+            else None
+        )
+        if credential_ref is not None and not credential_ref.startswith("keychain://"):
+            raise PolicyError(f"downstreams.{alias}.credential_ref must use keychain://")
         raw_tools = raw_downstream.get("tools", {})
         if not isinstance(raw_tools, dict):
             raise PolicyError(f"downstreams.{alias}.tools must be an object")
@@ -108,9 +198,17 @@ def parse_policy(data: Any) -> PolicySnapshot:
             name = _nonempty_string(raw_name, f"downstreams.{alias} tool")
             if not isinstance(raw_tool, dict):
                 raise PolicyError(f"downstreams.{alias}.tools.{name} must be an object")
+            _reject_unknown_fields(
+                raw_tool,
+                _TOOL_FIELDS,
+                f"downstreams.{alias}.tools.{name}",
+            )
+            raw_mode = raw_tool.get("mode")
+            if not isinstance(raw_mode, str):
+                raise PolicyError(f"invalid mode for {alias}/{name}")
             try:
-                mode = PolicyMode(raw_tool.get("mode"))
-            except (TypeError, ValueError) as exc:
+                mode = PolicyMode(raw_mode)
+            except ValueError as exc:
                 raise PolicyError(f"invalid mode for {alias}/{name}") from exc
             reviewed_read_only = raw_tool.get("reviewed_read_only", False)
             communication_send = raw_tool.get("communication_send", False)
@@ -122,32 +220,52 @@ def parse_policy(data: Any) -> PolicySnapshot:
                 raise PolicyError(
                     f"passthrough requires reviewed read-only classification for {alias}/{name}"
                 )
-            if mode in {PolicyMode.APPROVAL, PolicyMode.VIRTUALIZE_LOCAL} and not raw_tool.get(
-                "adapter"
-            ):
+            adapter_value = raw_tool.get("adapter")
+            adapter = (
+                _nonempty_string(adapter_value, f"adapter for {alias}/{name}")
+                if adapter_value is not None
+                else None
+            )
+            if mode in {PolicyMode.APPROVAL, PolicyMode.VIRTUALIZE_LOCAL} and adapter is None:
                 raise PolicyError(f"{mode.value} requires an adapter for {alias}/{name}")
+            schema_digest_value = raw_tool.get("schema_digest")
+            schema_digest = (
+                _nonempty_string(schema_digest_value, f"schema digest for {alias}/{name}")
+                if schema_digest_value is not None
+                else None
+            )
+            if schema_digest is not None and (
+                len(schema_digest) != 64
+                or any(character not in "0123456789abcdef" for character in schema_digest)
+            ):
+                raise PolicyError(f"schema digest for {alias}/{name} must be lowercase SHA-256")
             limits = raw_tool.get("limits", {})
             if not isinstance(limits, dict) or any(
-                not isinstance(v, int) or isinstance(v, bool) or v <= 0 for v in limits.values()
+                not isinstance(key, str)
+                or not key
+                or not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+                for key, value in limits.items()
             ):
                 raise PolicyError(f"limits for {alias}/{name} must be positive integers")
             tools[name] = ToolPolicy(
                 alias=alias,
                 tool=name,
                 mode=mode,
-                adapter=raw_tool.get("adapter"),
+                adapter=adapter,
                 reviewed_read_only=reviewed_read_only,
                 communication_send=communication_send,
-                schema_digest=raw_tool.get("schema_digest"),
+                schema_digest=schema_digest,
                 limits=dict(limits),
             )
         downstreams[alias] = DownstreamPolicy(
             alias=alias,
             transport=transport,
             tools=tools,
-            url=raw_downstream.get("url"),
-            command_ref=raw_downstream.get("command_ref"),
-            credential_ref=raw_downstream.get("credential_ref"),
+            url=url,
+            command_ref=command_ref,
+            credential_ref=credential_ref,
         )
     return PolicySnapshot(version=version, default_mode=default_mode, downstreams=downstreams)
 

@@ -8,7 +8,8 @@ import pytest
 import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 
-from signet.policy import PolicyMode, load_policy as load_policy_snapshot
+from signet.policy import PolicyMode
+from signet.policy import load_policy as load_policy_snapshot
 from signet.staging import StagingPathError, confined_staging_path
 
 ROOT = Path(__file__).resolve().parents[1]

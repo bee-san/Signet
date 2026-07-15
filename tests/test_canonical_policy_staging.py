@@ -95,11 +95,38 @@ def test_policy_never_trusts_annotations_or_wildcards() -> None:
         "mode": "passthrough",
         "annotations": {"readOnlyHint": True},
     }
-    with pytest.raises(PolicyError, match="reviewed read-only"):
+    with pytest.raises(PolicyError, match="unknown fields"):
         parse_policy(policy)
     policy = _policy()
     policy["downstreams"]["mail"]["tools"]["*"] = {"mode": "deny"}
     with pytest.raises(PolicyError, match="wildcards"):
+        parse_policy(policy)
+
+
+def test_policy_rejects_unknown_or_mistyped_security_fields() -> None:
+    policy = _policy()
+    policy["downstreams"]["mail"]["tools"]["search"]["reviewed_readonly"] = True
+    with pytest.raises(PolicyError, match="unknown fields"):
+        parse_policy(policy)
+
+    policy = _policy()
+    policy["downstreams"]["mail"]["tools"]["search"]["schema_digest"] = "A" * 64
+    with pytest.raises(PolicyError, match="lowercase SHA-256"):
+        parse_policy(policy)
+
+    policy = _policy()
+    policy["downstreams"]["mail"]["tools"]["send"]["adapter"] = {"name": "mail.send"}
+    with pytest.raises(PolicyError, match="non-empty"):
+        parse_policy(policy)
+
+    policy = _policy()
+    policy["downstreams"]["mail"]["url"] = "http://provider.example.test/mcp"
+    with pytest.raises(PolicyError, match="HTTPS"):
+        parse_policy(policy)
+
+    policy = _policy()
+    policy["downstreams"]["mail"]["credential_ref"] = "plaintext-secret"
+    with pytest.raises(PolicyError, match="keychain"):
         parse_policy(policy)
 
 
