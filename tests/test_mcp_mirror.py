@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +19,7 @@ from signet.mcp_mirror import (
     PENDING_RESULT_SCHEMA,
     SIGNET_INVOCATION_ID_META,
     AliasToolSurface,
+    DomainToolError,
     InvocationIdentity,
     MirrorError,
     RawServerResult,
@@ -174,6 +176,41 @@ def test_virtual_result_validates_against_captured_output_schema() -> None:
     mirror.validate_virtual_result("example", "stage", {"id": "stg_123"})
     with pytest.raises(ValidationError):
         mirror.validate_virtual_result("example", "stage", {"wrong": True})
+
+
+def test_schema_capture_rejects_remote_refs_without_network_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted: list[str] = []
+
+    def network_attempt(*args: Any, **kwargs: Any) -> None:
+        del kwargs
+        attempted.append(repr(args))
+        raise AssertionError("schema validation attempted network access")
+
+    monkeypatch.setattr(urllib.request, "urlopen", network_attempt)
+    raw = _raw_tool("read")
+    raw["inputSchema"] = {"$ref": "http://127.0.0.1:9/private-schema"}
+    with pytest.raises(MirrorError, match="in-document references"):
+        SchemaMirror(_policy()).capture("example", [raw])
+    assert attempted == []
+
+
+def test_schema_validation_permits_only_closed_in_document_refs() -> None:
+    raw = _raw_tool("read")
+    raw["inputSchema"] = {
+        "$defs": {"query": {"type": "string", "maxLength": 8}},
+        "type": "object",
+        "properties": {"query": {"$ref": "#/$defs/query"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [raw])
+    mirror.approve_schema("example", "read", mirror.captured_digest("example", "read"))
+    mirror.validate_input("example", "read", {"query": "local"})
+    with pytest.raises(DomainToolError, match="arguments"):
+        mirror.validate_input("example", "read", {"query": "too-long-query"})
 
 
 class _PagedSession:

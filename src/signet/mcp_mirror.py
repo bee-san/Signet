@@ -19,6 +19,8 @@ from mcp.server.lowlevel import Server
 from mcp.server.models import InitializationOptions
 from mcp.shared.exceptions import McpError
 from pydantic import PrivateAttr, model_serializer
+from referencing import Registry
+from referencing.exceptions import NoSuchResource
 
 from signet.canonical import canonical_json, sha256_hex
 from signet.policy import PolicyMode, PolicySnapshot
@@ -39,6 +41,7 @@ SIGNET_INVOCATION_ID_META = "io.signet/invocation-id"
 _EXPLICIT_INVOCATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _MAX_IDENTITY_COMPONENT_BYTES = 512
+_SCHEMA_REFERENCE_KEYS = frozenset({"$dynamicRef", "$recursiveRef", "$ref"})
 
 
 class MirrorError(RuntimeError):
@@ -59,6 +62,39 @@ class DomainToolError(MirrorError):
         self.code = code
         self.message = message
         self.details = dict(details or {})
+
+
+def _reject_schema_retrieval(uri: str) -> Any:
+    raise NoSuchResource(uri)
+
+
+_CLOSED_SCHEMA_REGISTRY: Registry[Any] = Registry(  # type: ignore[call-arg]
+    retrieve=_reject_schema_retrieval
+)
+
+
+def _closed_schema_validator(schema: Mapping[str, Any]) -> Draft202012Validator:
+    _reject_external_schema_references(schema)
+    try:
+        Draft202012Validator.check_schema(schema)
+    except Exception:
+        raise SchemaDriftError("the reviewed JSON schema is invalid") from None
+    return Draft202012Validator(dict(schema), registry=_CLOSED_SCHEMA_REGISTRY)
+
+
+def _reject_external_schema_references(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if key in _SCHEMA_REFERENCE_KEYS and (
+                not isinstance(child, str) or not child.startswith("#")
+            ):
+                raise SchemaDriftError(
+                    "reviewed JSON schemas may only use in-document references"
+                )
+            _reject_external_schema_references(child)
+    elif isinstance(value, list):
+        for child in value:
+            _reject_external_schema_references(child)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -180,7 +216,7 @@ def tool_schema_digest(raw: Mapping[str, Any]) -> str:
 
 def pending_call_result(pending: Mapping[str, Any]) -> dict[str, Any]:
     pending_value = copy.deepcopy(dict(pending))
-    Draft202012Validator(PENDING_RESULT_SCHEMA).validate(pending_value)
+    _closed_schema_validator(PENDING_RESULT_SCHEMA).validate(pending_value)
     serialized = json.dumps(pending_value, ensure_ascii=False, separators=(",", ":"))
     return {
         "content": [{"type": "text", "text": serialized}],
@@ -243,6 +279,12 @@ class SchemaMirror:
         for tool in tools:
             raw = raw_model(tool) if isinstance(tool, types.Tool) else dict(tool)
             raw = validate_lossless_tool(raw)
+            for schema_field in ("inputSchema", "outputSchema"):
+                schema = raw.get(schema_field)
+                if schema is not None:
+                    if not isinstance(schema, Mapping):
+                        raise SchemaDriftError("the reviewed JSON schema is invalid")
+                    _closed_schema_validator(schema)
             name = raw.get("name")
             if not isinstance(name, str) or not name or name in seen:
                 raise MirrorError("downstream tools/list contained a missing or duplicate name")
@@ -350,8 +392,7 @@ class SchemaMirror:
                 "The reviewed downstream input schema is invalid.",
             )
         try:
-            validator = Draft202012Validator(schema)
-            validator.check_schema(schema)
+            validator = _closed_schema_validator(schema)
             valid = validator.is_valid(copy.deepcopy(dict(arguments)))
         except Exception:
             raise DomainToolError(
@@ -368,7 +409,7 @@ class SchemaMirror:
         raw = self._captured[(alias, tool)].raw
         schema = raw.get("outputSchema")
         if isinstance(schema, dict):
-            Draft202012Validator(schema).validate(result)
+            _closed_schema_validator(schema).validate(result)
 
     def validate_downstream_result(
         self,
@@ -390,8 +431,7 @@ class SchemaMirror:
         if not isinstance(structured, Mapping):
             raise SchemaDriftError("a successful result omitted structured content")
         try:
-            validator = Draft202012Validator(schema)
-            validator.check_schema(schema)
+            validator = _closed_schema_validator(schema)
             validator.validate(copy.deepcopy(dict(structured)))
         except Exception:
             raise SchemaDriftError(
