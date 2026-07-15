@@ -17,6 +17,7 @@ import hashlib
 import re
 import unicodedata
 from collections.abc import Mapping
+from dataclasses import dataclass
 from email import policy
 from email.headerregistry import Address
 from email.parser import Parser
@@ -67,6 +68,18 @@ _OPAQUE_PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~:@/+=-]{0,255}$")
 _FASTMAIL_RESULT_FIELDS = frozenset({"messageId", "submissionId", "threadId", "status", "isError"})
 _FASTMAIL_PROVIDER_STATUSES = frozenset({"sent", "submitted"})
 _FASTMAIL_AMBIGUOUS_STATUSES = frozenset({"ambiguous", "pending", "queued", "unknown"})
+_RECIPIENT_FIELDS = ("to", "cc", "bcc")
+_DESTINATION_SUMMARY_LIMIT = 240
+_NORMALIZATION_CHANGE_LABELS = MappingProxyType(
+    {
+        "display_name_nfc": "display-name NFC normalization",
+        "display_name_whitespace": "display-name whitespace normalization",
+        "local_part_nfc": "local-part NFC normalization",
+        "domain_nfc": "domain NFC normalization",
+        "domain_case": "domain case normalization",
+        "domain_idna_punycode": "domain IDNA/punycode conversion",
+    }
+)
 FASTMAIL_SEND_SCHEMA: Mapping[str, Any] = MappingProxyType(
     {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -132,7 +145,7 @@ def _contains_forbidden_header_character(value: str) -> bool:
     return any(character in value for character in _HEADER_FORBIDDEN)
 
 
-def _parse_mailbox(value: str) -> Address:
+def _parsed_mailbox(value: str) -> Address:
     if _contains_forbidden_header_character(value):
         raise AdapterValidationError("email address contains a forbidden header character")
     message = Parser(policy=policy.default).parsestr(f"To: {value}\n\n")
@@ -142,9 +155,13 @@ def _parse_mailbox(value: str) -> Address:
     addresses = tuple(header.addresses)
     if len(addresses) != 1 or any(group.display_name is not None for group in header.groups):
         raise AdapterValidationError("each recipient entry must contain exactly one mailbox")
-    address = addresses[0]
+    address = cast(Address, addresses[0])
     if not address.username or not address.domain:
         raise AdapterValidationError("email address must include a local part and domain")
+    return address
+
+
+def _normalized_mailbox(address: Address) -> Address:
     try:
         domain = address.domain.encode("idna").decode("ascii").lower()
     except UnicodeError as exc:
@@ -154,6 +171,94 @@ def _parse_mailbox(value: str) -> Address:
         username=unicodedata.normalize("NFC", address.username),
         domain=domain,
     )
+
+
+def _parse_mailbox(value: str) -> Address:
+    return _normalized_mailbox(_parsed_mailbox(value))
+
+
+@dataclass(frozen=True, slots=True)
+class _MailboxReview:
+    original_executable_mailbox: str
+    parsed_display_name: str
+    normalized_display_name: str
+    parsed_local_part: str
+    normalized_local_part: str
+    parsed_domain: str
+    normalized_unicode_domain: str
+    ascii_idna_punycode_domain: str
+    normalized_addr_spec: str
+    unicode_fields: tuple[str, ...]
+    normalization_changes: tuple[str, ...]
+
+    @classmethod
+    def from_value(cls, value: str) -> _MailboxReview:
+        parsed = _parsed_mailbox(value)
+        normalized = _normalized_mailbox(parsed)
+        normalized_display_name = unicodedata.normalize("NFC", parsed.display_name).strip()
+        normalized_local_part = unicodedata.normalize("NFC", parsed.username)
+        nfc_domain = unicodedata.normalize("NFC", parsed.domain)
+        normalized_unicode_domain = nfc_domain.lower()
+
+        unicode_fields = tuple(
+            field
+            for field, component in (
+                ("display_name", parsed.display_name),
+                ("local_part", parsed.username),
+                ("domain", parsed.domain),
+            )
+            if not component.isascii()
+        )
+        normalization_changes: list[str] = []
+        if parsed.display_name != unicodedata.normalize("NFC", parsed.display_name):
+            normalization_changes.append("display_name_nfc")
+        if unicodedata.normalize("NFC", parsed.display_name) != normalized_display_name:
+            normalization_changes.append("display_name_whitespace")
+        if parsed.username != normalized_local_part:
+            normalization_changes.append("local_part_nfc")
+        if parsed.domain != nfc_domain:
+            normalization_changes.append("domain_nfc")
+        if nfc_domain != normalized_unicode_domain:
+            normalization_changes.append("domain_case")
+        if normalized_unicode_domain != normalized.domain:
+            normalization_changes.append("domain_idna_punycode")
+
+        return cls(
+            original_executable_mailbox=value,
+            parsed_display_name=parsed.display_name,
+            normalized_display_name=normalized_display_name,
+            parsed_local_part=parsed.username,
+            normalized_local_part=normalized_local_part,
+            parsed_domain=parsed.domain,
+            normalized_unicode_domain=normalized_unicode_domain,
+            ascii_idna_punycode_domain=normalized.domain,
+            normalized_addr_spec=normalized.addr_spec,
+            unicode_fields=unicode_fields,
+            normalization_changes=tuple(normalization_changes),
+        )
+
+    def as_detail(self) -> dict[str, Any]:
+        return {
+            "original_executable_mailbox": self.original_executable_mailbox,
+            "display_name": {
+                "present": bool(self.parsed_display_name),
+                "parsed_label": self.parsed_display_name or None,
+                "normalized_label": self.normalized_display_name or None,
+                "delivery_target": False,
+            },
+            "delivery_target": {
+                "normalized_addr_spec": self.normalized_addr_spec,
+                "parsed_local_part": self.parsed_local_part,
+                "normalized_local_part": self.normalized_local_part,
+                "parsed_domain": self.parsed_domain,
+                "normalized_unicode_domain": self.normalized_unicode_domain,
+                "ascii_idna_punycode_domain": self.ascii_idna_punycode_domain,
+            },
+            "review_flags": {
+                "unicode_fields": list(self.unicode_fields),
+                "normalization_changes": list(self.normalization_changes),
+            },
+        }
 
 
 def _mailbox_key(value: str) -> str:
@@ -177,6 +282,77 @@ def _normalize_header(value: str, *, name: str) -> str:
     if _contains_forbidden_header_character(normalized):
         raise AdapterValidationError(f"{name} contains a forbidden header character")
     return normalized
+
+
+def _recipient_detail_and_warnings(
+    arguments: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...], dict[str, list[_MailboxReview]]]:
+    reviews: dict[str, list[_MailboxReview]] = {}
+    warnings: list[str] = []
+    has_display_name = False
+    for field in _RECIPIENT_FIELDS:
+        field_reviews: list[_MailboxReview] = []
+        for index, value in enumerate(cast(list[str], arguments.get(field, [])), start=1):
+            review = _MailboxReview.from_value(value)
+            field_reviews.append(review)
+            has_display_name = has_display_name or bool(review.parsed_display_name)
+
+            unicode_fields = set(review.unicode_fields)
+            context = f"{field.title()} recipient {index}"
+            if "domain" in unicode_fields:
+                warnings.append(
+                    f"{context} uses Unicode in its domain. Compare the normalized Unicode "
+                    "domain with the ASCII IDNA/punycode domain; visually similar domains can "
+                    "identify a different mailbox."
+                )
+            label_fields = unicode_fields & {"display_name", "local_part"}
+            if label_fields:
+                fields = " and ".join(field.replace("_", " ") for field in sorted(label_fields))
+                warnings.append(
+                    f"{context} uses non-ASCII Unicode in its {fields}. Visually similar "
+                    "characters can identify or suggest a different recipient; verify the "
+                    "normalized addr-spec."
+                )
+            if review.normalization_changes:
+                changes = ", ".join(
+                    _NORMALIZATION_CHANGE_LABELS[change] for change in review.normalization_changes
+                )
+                warnings.append(
+                    f"{context} changes in the normalized review representation ({changes}). "
+                    "Compare it with the original executable mailbox before deciding."
+                )
+        reviews[field] = field_reviews
+
+    if has_display_name:
+        warnings.insert(
+            0,
+            (
+                "Display names are labels only, not delivery targets. Verify the normalized "
+                "addr-spec for every named recipient."
+            ),
+        )
+    detail = {
+        field: {
+            "count": len(reviews[field]),
+            "mailboxes": [review.as_detail() for review in reviews[field]],
+        }
+        for field in _RECIPIENT_FIELDS
+    }
+    return detail, tuple(warnings), reviews
+
+
+def _destination_summary(reviews: Mapping[str, list[_MailboxReview]]) -> str:
+    populated = [(field, values) for field, values in reviews.items() if values]
+    total = sum(len(values) for _, values in populated)
+    if total == 1:
+        field, values = populated[0]
+        candidate = f"{field.title()}: {values[0].normalized_addr_spec}"
+        if len(candidate) <= _DESTINATION_SUMMARY_LIMIT:
+            return candidate
+    return "; ".join(
+        f"{field.title()}: {len(values)} recipient{'s' if len(values) != 1 else ''}"
+        for field, values in populated
+    )
 
 
 def _opaque_provider_id(value: object) -> str | None:
@@ -460,9 +636,11 @@ class FastmailAdapter:
 
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> ApprovalSummary:
         canonical = self.canonicalize(arguments)
-        recipients = [*canonical["to"], *canonical["cc"], *canonical["bcc"]]
+        recipient_detail, recipient_warnings, recipient_reviews = _recipient_detail_and_warnings(
+            canonical
+        )
         attachments = cast(list[dict[str, Any]], canonical["attachments"])
-        warnings = tuple(
+        attachment_warnings = tuple(
             f"Declared and detected MIME differ for {attachment['filename']}"
             for attachment in attachments
             if attachment["mime_type"] != attachment["detected_mime"]
@@ -472,7 +650,7 @@ class FastmailAdapter:
             DetailBlock(
                 "Recipients",
                 "recipient_groups",
-                {"to": canonical["to"], "cc": canonical["cc"], "bcc": canonical["bcc"]},
+                recipient_detail,
             ),
             DetailBlock("Subject", "text", canonical["subject"]),
             DetailBlock("Message", "plain_text", canonical["body"]),
@@ -482,16 +660,20 @@ class FastmailAdapter:
             service="Fastmail",
             action="send_email",
             title=canonical["subject"] or "Email with no subject",
-            destination_summary=", ".join(cast(list[str], recipients)),
+            destination_summary=_destination_summary(recipient_reviews),
             detail_blocks=blocks,
-            warnings=warnings,
+            warnings=(*recipient_warnings, *attachment_warnings),
         )
 
     def masked_destination_summary(self, arguments: Mapping[str, Any]) -> str:
         """Return a bounded recipient hint without exposing complete mailboxes."""
 
         canonical = self.canonicalize(arguments)
-        recipients = [*canonical["to"], *canonical["cc"], *canonical["bcc"]]
+        recipients = [
+            *canonical["to"],
+            *canonical["cc"],
+            *canonical["bcc"],
+        ]
         visible = [_masked_mailbox(value) for value in cast(list[str], recipients[:3])]
         if len(recipients) > len(visible):
             visible.append(f"(+{len(recipients) - len(visible)} more)")

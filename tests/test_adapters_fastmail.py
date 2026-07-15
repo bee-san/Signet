@@ -5,7 +5,7 @@ import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -48,7 +48,7 @@ class FakeFastmailClient:
 def fixture_arguments() -> dict[str, Any]:
     with (ROOT / "spec/fixtures/fastmail-send-input.json").open(encoding="utf-8") as handle:
         fixture = json.load(handle)
-    return fixture["arguments"]
+    return cast(dict[str, Any], fixture["arguments"])
 
 
 def adapter_request(arguments: Mapping[str, Any]) -> AdapterRequest:
@@ -98,10 +98,43 @@ def test_fastmail_fixture_validates_and_private_summary_is_complete() -> None:
     summary = adapter.summarize_for_web(arguments)
     masked = adapter.masked_destination_summary(arguments)
 
-    assert summary.destination_summary == "recipient@example.test"
+    assert summary.destination_summary == "To: recipient@example.test"
     assert masked == "r*** at example.test"
     assert summary.destination_summary not in masked
     assert any(block.value == arguments["body"] for block in summary.detail_blocks)
+    recipient_block = next(block for block in summary.detail_blocks if block.label == "Recipients")
+    recipient_groups = cast(dict[str, Any], recipient_block.value)
+    assert recipient_groups == {
+        "to": {
+            "count": 1,
+            "mailboxes": [
+                {
+                    "original_executable_mailbox": "recipient@example.test",
+                    "display_name": {
+                        "present": False,
+                        "parsed_label": None,
+                        "normalized_label": None,
+                        "delivery_target": False,
+                    },
+                    "delivery_target": {
+                        "normalized_addr_spec": "recipient@example.test",
+                        "parsed_local_part": "recipient",
+                        "normalized_local_part": "recipient",
+                        "parsed_domain": "example.test",
+                        "normalized_unicode_domain": "example.test",
+                        "ascii_idna_punycode_domain": "example.test",
+                    },
+                    "review_flags": {
+                        "unicode_fields": [],
+                        "normalization_changes": [],
+                    },
+                }
+            ],
+        },
+        "cc": {"count": 0, "mailboxes": []},
+        "bcc": {"count": 0, "mailboxes": []},
+    }
+    assert summary.warnings == ()
     audit = repr(adapter.redact_for_audit(arguments))
     assert arguments["body"] not in audit
     assert arguments["subject"] not in audit
@@ -145,13 +178,124 @@ def test_fastmail_rejects_ambiguous_or_injected_inputs(change: dict[str, Any]) -
         FastmailAdapter(account="primary").validate(arguments)
 
 
-def test_fastmail_preserves_exact_executable_address_values() -> None:
+@pytest.mark.asyncio
+async def test_fastmail_preserves_exact_executable_address_values() -> None:
     arguments = fixture_arguments()
     arguments["to"] = ["Autumn Example <autumn@ex\u00e4mple.test>"]
     arguments["body"] = "Cafe\u0301\r\nsecond line"
     arguments["subject"] = "  exact subject  "
-    canonical = FastmailAdapter(account="primary").canonicalize(arguments)
+    adapter = FastmailAdapter(account="primary", reviewed_dispatch_enabled=True)
+    downstream = FakeFastmailClient()
+
+    canonical = adapter.canonicalize(arguments)
+    prepared = adapter.prepare_for_execution(adapter_request(arguments))
+    await adapter.execute(downstream, prepared)
+
     assert canonical == arguments
+    assert downstream.calls == [("send_email", arguments)]
+
+
+def test_fastmail_recipient_review_exposes_idn_display_name_nfc_and_bcc_context() -> None:
+    arguments = fixture_arguments()
+    arguments.update(
+        {
+            "to": ['"Pаypal, Review" <billing@pаypal.test>'],
+            "cc": ["Plain Name <plain@example.test>"],
+            "bcc": ['"Cafe\u0301, Blind" <blind@exa\u0308mple.test>'],
+        }
+    )
+    adapter = FastmailAdapter(account="primary")
+
+    summary = adapter.summarize_for_web(arguments)
+    prepared = adapter.prepare_for_execution(adapter_request(arguments))
+
+    assert summary.destination_summary == "To: 1 recipient; Cc: 1 recipient; Bcc: 1 recipient"
+    assert prepared == {**arguments, "_signet_resolved_attachments": []}
+    recipient_block = next(block for block in summary.detail_blocks if block.label == "Recipients")
+    groups = cast(dict[str, Any], recipient_block.value)
+
+    to_mailbox = groups["to"]["mailboxes"][0]
+    assert to_mailbox["original_executable_mailbox"] == arguments["to"][0]
+    assert to_mailbox["display_name"] == {
+        "present": True,
+        "parsed_label": "Pаypal, Review",
+        "normalized_label": "Pаypal, Review",
+        "delivery_target": False,
+    }
+    assert to_mailbox["delivery_target"] == {
+        "normalized_addr_spec": "billing@xn--pypal-4ve.test",
+        "parsed_local_part": "billing",
+        "normalized_local_part": "billing",
+        "parsed_domain": "pаypal.test",
+        "normalized_unicode_domain": "pаypal.test",
+        "ascii_idna_punycode_domain": "xn--pypal-4ve.test",
+    }
+    assert to_mailbox["review_flags"] == {
+        "unicode_fields": ["display_name", "domain"],
+        "normalization_changes": ["domain_idna_punycode"],
+    }
+
+    assert groups["cc"]["count"] == 1
+    assert groups["cc"]["mailboxes"][0]["display_name"]["parsed_label"] == "Plain Name"
+    bcc_mailbox = groups["bcc"]["mailboxes"][0]
+    assert bcc_mailbox["original_executable_mailbox"] == arguments["bcc"][0]
+    assert bcc_mailbox["display_name"]["parsed_label"] == "Cafe\u0301, Blind"
+    assert bcc_mailbox["display_name"]["normalized_label"] == "Café, Blind"
+    assert bcc_mailbox["delivery_target"]["parsed_domain"] == "exa\u0308mple.test"
+    assert bcc_mailbox["delivery_target"]["normalized_unicode_domain"] == "exämple.test"
+    assert bcc_mailbox["delivery_target"]["ascii_idna_punycode_domain"] == "xn--exmple-cua.test"
+    assert bcc_mailbox["delivery_target"]["normalized_addr_spec"] == ("blind@xn--exmple-cua.test")
+    assert bcc_mailbox["review_flags"]["normalization_changes"] == [
+        "display_name_nfc",
+        "domain_nfc",
+        "domain_idna_punycode",
+    ]
+
+    warnings = "\n".join(summary.warnings)
+    assert "Display names are labels only, not delivery targets" in warnings
+    assert "To recipient 1 uses Unicode in its domain" in warnings
+    assert "visually similar domains can identify a different mailbox" in warnings
+    assert "ASCII IDNA/punycode domain" in warnings
+    assert "To recipient 1 uses non-ASCII Unicode in its display name" in warnings
+    assert "Bcc recipient 1" in warnings
+    assert (
+        "display-name NFC normalization, domain NFC normalization, domain IDNA/punycode conversion"
+        in warnings
+    )
+    assert "original executable mailbox" in warnings
+
+
+def test_fastmail_recipient_review_is_complete_and_bounded_at_schema_limit() -> None:
+    arguments = fixture_arguments()
+    recipients = [
+        f'"Person {index:03}" <person{index:03}@example{index:03}.test>' for index in range(100)
+    ]
+    arguments.update(
+        {
+            "to": recipients[:34],
+            "cc": recipients[34:67],
+            "bcc": recipients[67:],
+        }
+    )
+
+    summary = FastmailAdapter(account="primary").summarize_for_web(arguments)
+
+    assert summary.destination_summary == "To: 34 recipients; Cc: 33 recipients; Bcc: 33 recipients"
+    assert len(summary.destination_summary) <= 240
+    recipient_block = next(block for block in summary.detail_blocks if block.label == "Recipients")
+    groups = cast(dict[str, Any], recipient_block.value)
+    assert [groups[field]["count"] for field in ("to", "cc", "bcc")] == [34, 33, 33]
+    reviewed_originals = [
+        mailbox["original_executable_mailbox"]
+        for field in ("to", "cc", "bcc")
+        for mailbox in groups[field]["mailboxes"]
+    ]
+    assert reviewed_originals == recipients
+    assert len(json.dumps(groups, ensure_ascii=False)) < 150_000
+    assert summary.warnings == (
+        "Display names are labels only, not delivery targets. Verify the normalized "
+        "addr-spec for every named recipient.",
+    )
 
 
 @pytest.mark.asyncio
