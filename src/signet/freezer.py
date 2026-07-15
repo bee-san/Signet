@@ -159,6 +159,7 @@ class RequestFreezer:
         attachments: Sequence[AttachmentReference] = (),
         staged_file_hashes: Sequence[str] | None = None,
         gateway_internal: bool = False,
+        created_at: int | None = None,
     ) -> FrozenRequest:
         """Return immutable enqueue data; the caller remains responsible for commit."""
 
@@ -205,8 +206,15 @@ class RequestFreezer:
         if len(canonical_payload) > self.max_canonical_bytes:
             raise ValueError("canonical payload exceeds the freezer limit")
 
-        created_at = _utc_timestamp(self._clock())
-        expires_at = created_at + self.pending_ttl_seconds
+        frozen_at = _utc_timestamp(self._clock()) if created_at is None else created_at
+        if (
+            not isinstance(frozen_at, int)
+            or isinstance(frozen_at, bool)
+            or frozen_at < 0
+            or frozen_at > (2**63 - 1) - self.pending_ttl_seconds
+        ):
+            raise ValueError("request creation time is invalid")
+        expires_at = frozen_at + self.pending_ttl_seconds
         request_id = _new_request_id()
         pending = {
             "status": "pending_approval",
@@ -235,7 +243,7 @@ class RequestFreezer:
             payload_hash=fingerprint,
             payload_fingerprint=fingerprint,
             pending_result=canonical_json(pending),
-            created_at=created_at,
+            created_at=frozen_at,
             expires_at=expires_at,
             policy_version=str(policy_version),
             adapter_version=adapter_version,
