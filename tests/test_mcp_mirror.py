@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -145,6 +147,14 @@ def test_pending_and_domain_error_wire_shapes() -> None:
     error = domain_error_result("stale_version", "Review the current version.")
     assert error["isError"] is True
     assert error["structuredContent"]["error"]["code"] == "stale_version"
+
+
+def test_runtime_pending_schema_matches_the_normative_fixture() -> None:
+    fixture_path = (
+        Path(__file__).parents[1] / "spec" / "fixtures" / "gateway-tools-schemas.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert fixture["pending_result_schema"] == PENDING_RESULT_SCHEMA
 
 
 def test_virtual_result_validates_against_captured_output_schema() -> None:

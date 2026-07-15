@@ -163,7 +163,7 @@ class TokenRegistry:
         try:
             self._hasher.verify(record.verifier, raw_token)
         except (VerifyMismatchError, InvalidHashError):
-            raise CredentialError("invalid bearer token")
+            raise CredentialError("invalid bearer token") from None
         return CallerPrincipal(
             namespace=record.namespace,
             allowed_aliases=record.allowed_aliases,

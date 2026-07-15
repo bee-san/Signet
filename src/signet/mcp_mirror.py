@@ -20,13 +20,13 @@ from signet.canonical import canonical_json, sha256_hex
 from signet.policy import PolicyMode, PolicySnapshot
 
 PENDING_RESULT_SCHEMA: dict[str, Any] = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://signet.local/schemas/pending-result-v1.json",
     "type": "object",
     "additionalProperties": False,
     "required": ["status", "request_id", "expires_at", "message"],
     "properties": {
         "status": {"const": "pending_approval"},
-        "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9_-]{10,}$"},
+        "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
         "expires_at": {"type": "string", "format": "date-time"},
         "message": {"type": "string", "minLength": 1},
     },
