@@ -103,13 +103,12 @@ def test_settings_bind_to_conservative_scoped_defaults() -> None:
 
 
 def test_schema_has_admission_indexes(database: Database) -> None:
-    assert LATEST_SCHEMA_VERSION == 8
     with database.read() as connection:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         indexes = {
             str(row[1]) for row in connection.execute("PRAGMA index_list(approval_requests)")
         }
-    assert version == 8
+    assert version == LATEST_SCHEMA_VERSION
     assert {
         "approval_requests_tool_admission_idx",
         "approval_requests_tool_rate_idx",

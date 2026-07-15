@@ -9,7 +9,8 @@ import json
 import re
 import secrets
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -56,12 +57,57 @@ class InvocationIdentityError(MirrorError):
     pass
 
 
+class ListChangedNotificationError(MirrorError):
+    pass
+
+
 class DomainToolError(MirrorError):
     def __init__(self, code: str, message: str, *, details: Mapping[str, Any] | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.details = dict(details or {})
+
+
+class _AsyncReadWriteLock:
+    """Allow concurrent calls while schema publication takes exclusive ownership."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @asynccontextmanager
+    async def read(self) -> AsyncIterator[None]:
+        async with self._condition:
+            while self._writer or self._waiting_writers:
+                await self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @asynccontextmanager
+    async def write(self) -> AsyncIterator[None]:
+        async with self._condition:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    await self._condition.wait()
+                self._writer = True
+            finally:
+                self._waiting_writers -= 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._writer = False
+                self._condition.notify_all()
 
 
 def _reject_schema_retrieval(uri: str) -> Any:
@@ -315,6 +361,11 @@ class SchemaMirror:
             raise SchemaDriftError("only the currently captured schema digest can be reviewed")
         self._reviewed_digests[key] = digest
         self._drifted.discard(key)
+
+    def disable_schema(self, alias: str, tool: str) -> None:
+        """Fail one captured tool closed without discarding its review material."""
+
+        self._drifted.add((alias, tool))
 
     def captured_digest(self, alias: str, tool: str) -> str:
         try:
@@ -590,6 +641,7 @@ class AliasToolSurface:
         self._tracked_session_limit = tracked_session_limit
         self._tracked_session_ttl_seconds = tracked_session_ttl_seconds
         self._session_clock = session_clock
+        self._schema_change_lock = _AsyncReadWriteLock()
         self.server.request_handlers[types.ListToolsRequest] = self._list_tools
         self.server.request_handlers[types.CallToolRequest] = self._call_tool
 
@@ -705,48 +757,59 @@ class AliasToolSurface:
 
     async def _list_tools(self, request: types.ListToolsRequest) -> types.ServerResult:
         del request
-        self._namespace()
-        self._remember_session()
-        return RawServerResult({"tools": self.mirror.list_tools(self.alias)})
+        async with self._schema_change_lock.read():
+            self._namespace()
+            self._remember_session()
+            return RawServerResult({"tools": self.mirror.list_tools(self.alias)})
 
     async def _call_tool(self, request: types.CallToolRequest) -> types.ServerResult:
-        namespace = self._namespace()
-        self._remember_session()
-        name = request.params.name
-        arguments = request.params.arguments or {}
-        try:
-            mode = self.mirror.require_callable(self.alias, name)
-            if request.params.task is not None:
-                raise DomainToolError(
-                    "task_execution_unsupported",
-                    "Task-augmented tool execution is not supported.",
-                )
-            invocation_identity = self._invocation_identity(namespace, name)
-            self.mirror.validate_input(self.alias, name, arguments)
-            if mode is PolicyMode.DENY:
-                if self.denied_event_handler:
-                    result = self.denied_event_handler(namespace, self.alias, name)
-                    if inspect.isawaitable(result):
-                        await result
-                return RawServerResult(
-                    domain_error_result(
-                        "policy_denied",
-                        "This reviewed tool is denied by Signet policy.",
+        async with self._schema_change_lock.read():
+            namespace = self._namespace()
+            self._remember_session()
+            name = request.params.name
+            arguments = request.params.arguments or {}
+            try:
+                mode = self.mirror.require_callable(self.alias, name)
+                if request.params.task is not None:
+                    raise DomainToolError(
+                        "task_execution_unsupported",
+                        "Task-augmented tool execution is not supported.",
                     )
+                invocation_identity = self._invocation_identity(namespace, name)
+                self.mirror.validate_input(self.alias, name, arguments)
+                if mode is PolicyMode.DENY:
+                    if self.denied_event_handler:
+                        result = self.denied_event_handler(namespace, self.alias, name)
+                        if inspect.isawaitable(result):
+                            await result
+                    return RawServerResult(
+                        domain_error_result(
+                            "policy_denied",
+                            "This reviewed tool is denied by Signet policy.",
+                        )
+                    )
+                raw_result = await self.call_handler(
+                    self.alias,
+                    name,
+                    arguments,
+                    namespace,
+                    invocation_identity,
                 )
-            raw_result = await self.call_handler(
-                self.alias,
-                name,
-                arguments,
-                namespace,
-                invocation_identity,
-            )
-            types.CallToolResult.model_validate(raw_result)
-            return RawServerResult(raw_result)
-        except DomainToolError as exc:
-            return RawServerResult(domain_error_result(exc.code, exc.message, details=exc.details))
+                types.CallToolResult.model_validate(raw_result)
+                return RawServerResult(raw_result)
+            except DomainToolError as exc:
+                return RawServerResult(
+                    domain_error_result(exc.code, exc.message, details=exc.details)
+                )
 
-    async def notify_list_changed(self) -> int:
+    @asynccontextmanager
+    async def schema_change_guard(self) -> AsyncIterator[None]:
+        """Exclude calls and list reads while a reviewed schema is published."""
+
+        async with self._schema_change_lock.write():
+            yield
+
+    async def notify_list_changed(self, *, strict: bool = False) -> int:
         self._prune_sessions(self._session_clock())
         sent = 0
         stale: list[Any] = []
@@ -758,6 +821,10 @@ class AliasToolSurface:
                 stale.append(session)
         for session in stale:
             self._forget_session(session)
+        if strict and stale:
+            raise ListChangedNotificationError(
+                "one or more upstream tool-list notifications failed"
+            )
         return sent
 
 
