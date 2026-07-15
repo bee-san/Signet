@@ -119,20 +119,41 @@ class EnqueueResult:
     created: bool
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class ApprovalConfirmation:
     kind: ConfirmationKind
     use_id: str
     path: Literal["web", "mcp"]
+    capability: str
+    user_id: str | None = None
+    action: str | None = None
+    bound_request_id: str | None = None
+    bound_version: int | None = None
+    bound_payload_hash: str | None = None
+    prospective_payload_hash: str | None = None
+    session_id: str | None = None
+    http_method: str | None = None
+    attempt_id: str | None = None
+    attempt_scope_keys: tuple[str, ...] = ()
+    rate_limit_key: str | None = None
     challenge_id: str | None = None
     credential_id: str | None = None
     credential_user_id: str | None = None
     expected_counter: int | None = None
     new_counter: int | None = None
+    device_type: Literal["single_device", "multi_device"] | None = None
     expected_backup_eligible: bool | None = None
     new_backup_eligible: bool | None = None
     previous_backed_up: bool | None = None
     new_backed_up: bool | None = None
+
+    def __repr__(self) -> str:
+        return (
+            "ApprovalConfirmation("
+            f"kind={self.kind!r}, path={self.path!r}, "
+            "use_id=<redacted>, capability=<redacted>, binding=<redacted>, "
+            "session_id=<redacted>, credential_id=<redacted>)"
+        )
 
 
 @dataclass(frozen=True, slots=True)

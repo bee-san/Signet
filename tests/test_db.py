@@ -8,6 +8,14 @@ from threading import Barrier
 
 import pytest
 
+from signet.auth import (
+    TOTP_PROOF_DOMAIN,
+    ActionBinding,
+    ProofCapability,
+    source_rate_limit_key,
+    totp_proof_claims,
+    totp_rate_limit_key,
+)
 from signet.db import (
     Database,
     DatabaseError,
@@ -22,6 +30,8 @@ from signet.models import (
     ResultAlias,
 )
 from signet.state_machine import ApprovalStateMachine
+
+TEST_CAPABILITIES = ProofCapability(b"test-only-proof-capability-key-0001")
 
 CORE_TABLES = {
     "approval_requests",
@@ -39,6 +49,54 @@ CORE_TABLES = {
     "purge_jobs",
     "schema_meta",
 }
+
+
+def totp_confirmation(
+    request_id: str,
+    *,
+    action: str,
+    payload_hash: str,
+    use_id: str,
+    session_id: str,
+) -> ApprovalConfirmation:
+    binding = ActionBinding(action, request_id, 1, payload_hash)
+    rate_key = totp_rate_limit_key("owner")
+    source_key = source_rate_limit_key("database-test")
+    attempt_id = "database-test-attempt-opaque"
+    capability = TEST_CAPABILITIES.seal(
+        TOTP_PROOF_DOMAIN,
+        totp_proof_claims(
+            credential_id="database-test-totp",
+            credential_user_id="owner",
+            user_id="owner",
+            use_id=use_id,
+            binding=binding,
+            path="web",
+            session_id=session_id,
+            http_method="POST",
+            rate_limit_key=rate_key,
+            attempt_id=attempt_id,
+            attempt_scope_keys=(rate_key, source_key),
+        ),
+    )
+    return ApprovalConfirmation(
+        kind=ConfirmationKind.TOTP,
+        use_id=use_id,
+        path="web",
+        capability=capability,
+        user_id="owner",
+        action=action,
+        bound_request_id=request_id,
+        bound_version=1,
+        bound_payload_hash=payload_hash,
+        session_id=session_id,
+        http_method="POST",
+        attempt_id=attempt_id,
+        attempt_scope_keys=(rate_key, source_key),
+        rate_limit_key=rate_key,
+        credential_id="database-test-totp",
+        credential_user_id="owner",
+    )
 
 
 def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Path) -> None:
@@ -60,10 +118,12 @@ def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Pat
             row["name"]
             for row in connection.execute("SELECT name FROM sqlite_schema WHERE type = 'table'")
         }
-        migration = connection.execute("SELECT * FROM schema_meta").fetchone()
+        migrations = connection.execute(
+            "SELECT * FROM schema_meta ORDER BY migration_id"
+        ).fetchall()
     assert tables >= CORE_TABLES
-    assert migration["migration_id"] == 1
-    assert len(migration["checksum"]) == 64
+    assert [migration["migration_id"] for migration in migrations] == [1, 2]
+    assert all(len(migration["checksum"]) == 64 for migration in migrations)
 
 
 def test_runtime_refuses_an_unverified_sqlite_version(
@@ -188,7 +248,6 @@ def test_upgrade_requires_and_runs_a_verified_pre_migration_backup(
     import signet.db as db_module
 
     path = tmp_path / "approvals.sqlite3"
-    Database(path).initialize()
     migrations = tmp_path / "migrations"
     migrations.mkdir()
     shutil.copy2(
@@ -205,6 +264,8 @@ def test_upgrade_requires_and_runs_a_verified_pre_migration_backup(
         def migrations_path(self) -> Path:
             return migrations
 
+    monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 1)
+    UpgradeDatabase(path).initialize()
     monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 2)
     upgrading = UpgradeDatabase(path)
     with pytest.raises(MigrationIntegrityError, match="backup callback"):
@@ -259,7 +320,7 @@ def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None
     database = Database(tmp_path / "approvals.sqlite3")
     database.initialize()
     payload_hash = "a" * 64
-    machine = ApprovalStateMachine(database)
+    machine = ApprovalStateMachine(database, capabilities=TEST_CAPABILITIES)
     machine.enqueue(
         EnqueueRequest(
             request_id="row-fixture",
@@ -311,10 +372,42 @@ def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None
             editor_actor="caller:profile:test",
         )
     )
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO auth_users(user_id, created_at) VALUES ('owner', 100)"
+        )
+        connection.execute(
+            """
+            INSERT INTO auth_credentials(
+                credential_id, user_id, kind, secret_reference, enrolled_at
+            ) VALUES (
+                'database-test-totp', 'owner', 'totp',
+                'keychain://Signet/database-test', 100
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO web_sessions(
+                session_id, user_id, auth_method, auth_generation,
+                created_at, last_seen_at, absolute_expires_at
+            ) VALUES (
+                'terminal-web-session-opaque-00000001',
+                'owner', 'totp', 0, 100, 100, 200
+            )
+            """
+        )
     machine.deny(
         "terminal-fixture",
         expected_version=1,
         expected_payload_hash="d" * 64,
+        confirmation=totp_confirmation(
+            "terminal-fixture",
+            action="deny",
+            payload_hash="d" * 64,
+            use_id="terminal-fixture-deny-proof",
+            session_id="terminal-web-session-opaque-00000001",
+        ),
         actor="human:web",
         now=102,
     )
@@ -341,7 +434,13 @@ def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None
         "execution-fixture",
         expected_version=1,
         expected_payload_hash="e" * 64,
-        confirmation=ApprovalConfirmation(ConfirmationKind.TOTP, "fixture-proof", "web"),
+        confirmation=totp_confirmation(
+            "execution-fixture",
+            action="approve",
+            payload_hash="e" * 64,
+            use_id="fixture-proof",
+            session_id="terminal-web-session-opaque-00000001",
+        ),
         actor="human:web",
         now=101,
     )
@@ -435,7 +534,7 @@ def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None
         }
         assert connection.execute("SELECT count(*) FROM execution_attempts").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM result_aliases").fetchone()[0] == 1
-        assert connection.execute("SELECT count(*) FROM auth_credentials").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM auth_credentials").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM schema_cache").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM caller_tokens").fetchone()[0] == 1
     assert states["row-fixture"] == "pending_approval"

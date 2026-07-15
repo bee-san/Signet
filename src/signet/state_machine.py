@@ -10,6 +10,15 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from .auth import (
+    TOTP_PROOF_DOMAIN,
+    WEBAUTHN_PROOF_DOMAIN,
+    ActionBinding,
+    ProofCapability,
+    totp_proof_claims,
+    totp_rate_limit_key,
+    webauthn_proof_claims,
+)
 from .db import Database, IntegrityError
 from .models import (
     ApprovalConfirmation,
@@ -65,10 +74,16 @@ class ApprovalStateMachine:
         *,
         fault_injector: FaultInjector | None = None,
         token_factory: TokenFactory | None = None,
+        web_session_idle_timeout: int = 30 * 60,
+        capabilities: ProofCapability | None = None,
     ) -> None:
+        if web_session_idle_timeout <= 0:
+            raise ValueError("web session idle timeout must be positive")
         self.database = database
         self._fault_injector = fault_injector
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
+        self._web_session_idle_timeout = web_session_idle_timeout
+        self._capabilities = capabilities
 
     def enqueue(self, request: EnqueueRequest) -> EnqueueResult:
         """Durably enqueue or replay a caller-scoped invocation.
@@ -288,6 +303,7 @@ class ApprovalStateMachine:
         adapter_version: str,
         schema_version: str,
         editor_actor: str,
+        confirmation: ApprovalConfirmation,
         now: int,
         encryption_key_ref: str | None = None,
         attachments: tuple[AttachmentReference, ...] | None = None,
@@ -303,6 +319,16 @@ class ApprovalStateMachine:
                 raise InvalidTransition(f"cannot edit a request in state {request['state']}")
             if hmac.compare_digest(request["current_payload_hash"], payload_hash):
                 raise InvalidTransition("an edit must create a different payload hash")
+            self._consume_confirmation(
+                connection,
+                confirmation,
+                action="edit",
+                request_id=request_id,
+                expected_version=expected_version,
+                expected_payload_hash=expected_payload_hash,
+                prospective_payload_hash=payload_hash,
+                now=now,
+            )
 
             new_version = expected_version + 1
             connection.execute(
@@ -386,6 +412,14 @@ class ApprovalStateMachine:
             )
             connection.execute(
                 """
+                UPDATE auth_challenges SET invalidated_at = ?
+                WHERE request_id = ? AND invalidated_at IS NULL
+                  AND consumed_at IS NULL
+                """,
+                (now, request_id),
+            )
+            connection.execute(
+                """
                 UPDATE browser_views SET invalidated_at = ?
                 WHERE request_id = ? AND invalidated_at IS NULL
                 """,
@@ -409,13 +443,31 @@ class ApprovalStateMachine:
         request_id: str,
         *,
         kind: ConfirmationKind,
+        user_id: str,
+        action: str,
+        challenge: bytes,
+        session_id: str,
+        http_method: str,
+        offered_credential_ids: tuple[str, ...],
         expected_version: int,
         expected_payload_hash: str,
+        prospective_payload_hash: str | None = None,
         created_at: int,
         expires_at: int,
     ) -> None:
         if expires_at <= created_at:
             raise ValueError("challenge expiry must be after creation")
+        if kind != ConfirmationKind.WEBAUTHN:
+            raise ValueError("only WebAuthn uses a server challenge")
+        if (
+            len(challenge) != 32
+            or http_method != "POST"
+            or not offered_credential_ids
+            or len(offered_credential_ids) > 32
+        ):
+            raise ValueError("invalid WebAuthn challenge binding")
+        if (prospective_payload_hash is not None) != (action == "edit"):
+            raise ValueError("prospective hashes are edit-only")
         with self.database.transaction() as connection:
             request = self._request_for_update(connection, request_id)
             self._require_current(request, expected_version, expected_payload_hash)
@@ -423,17 +475,29 @@ class ApprovalStateMachine:
                 raise InvalidTransition("challenges require a pending request")
             connection.execute(
                 """
-                INSERT INTO approval_challenges(
-                    challenge_id, kind, request_id, version, payload_hash,
+                INSERT INTO auth_challenges(
+                    challenge_id, challenge, user_id, action, request_id,
+                    version, current_payload_hash, prospective_payload_hash,
+                    session_id, http_method, offered_credential_ids_json,
                     created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     challenge_id,
-                    kind.value,
+                    challenge,
+                    user_id,
+                    action,
                     request_id,
                     expected_version,
                     expected_payload_hash,
+                    prospective_payload_hash,
+                    session_id,
+                    http_method,
+                    json.dumps(
+                        list(offered_credential_ids),
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
                     created_at,
                     expires_at,
                 ),
@@ -506,66 +570,16 @@ class ApprovalStateMachine:
             if request["gateway_internal"] and confirmation.path == "mcp":
                 raise InvalidConfirmation("gateway-internal policy changes are web-approval-only")
 
-            if confirmation.kind == ConfirmationKind.WEBAUTHN:
-                if confirmation.challenge_id is None:
-                    raise InvalidConfirmation("WebAuthn approval requires a challenge")
-                self._consume_webauthn_credential(connection, confirmation, now=now)
-                consumed = connection.execute(
-                    """
-                    UPDATE approval_challenges
-                    SET consumed_at = ?
-                    WHERE challenge_id = ? AND kind = 'webauthn'
-                      AND request_id = ? AND version = ? AND payload_hash = ?
-                      AND consumed_at IS NULL AND invalidated_at IS NULL
-                      AND expires_at > ?
-                    """,
-                    (
-                        now,
-                        confirmation.challenge_id,
-                        request_id,
-                        expected_version,
-                        expected_payload_hash,
-                        now,
-                    ),
-                ).rowcount
-                if consumed != 1:
-                    raise InvalidConfirmation("challenge is stale, expired, or consumed")
-            elif any(
-                value is not None
-                for value in (
-                    confirmation.challenge_id,
-                    confirmation.credential_id,
-                    confirmation.credential_user_id,
-                    confirmation.expected_counter,
-                    confirmation.new_counter,
-                    confirmation.expected_backup_eligible,
-                    confirmation.new_backup_eligible,
-                    confirmation.previous_backed_up,
-                    confirmation.new_backed_up,
-                )
-            ):
-                raise InvalidConfirmation("TOTP confirmation contains WebAuthn state")
-
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO confirmation_consumptions(
-                        kind, use_id, request_id, version, payload_hash,
-                        path, consumed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        confirmation.kind.value,
-                        confirmation.use_id,
-                        request_id,
-                        expected_version,
-                        expected_payload_hash,
-                        confirmation.path,
-                        now,
-                    ),
-                )
-            except IntegrityError as exc:
-                raise ConfirmationReplay("confirmation was already consumed") from exc
+            self._consume_confirmation(
+                connection,
+                confirmation,
+                action="approve",
+                request_id=request_id,
+                expected_version=expected_version,
+                expected_payload_hash=expected_payload_hash,
+                prospective_payload_hash=None,
+                now=now,
+            )
 
             updated = connection.execute(
                 """
@@ -581,6 +595,14 @@ class ApprovalStateMachine:
             connection.execute(
                 """
                 UPDATE approval_challenges SET invalidated_at = ?
+                WHERE request_id = ? AND consumed_at IS NULL
+                  AND invalidated_at IS NULL
+                """,
+                (now, request_id),
+            )
+            connection.execute(
+                """
+                UPDATE auth_challenges SET invalidated_at = ?
                 WHERE request_id = ? AND consumed_at IS NULL
                   AND invalidated_at IS NULL
                 """,
@@ -604,6 +626,281 @@ class ApprovalStateMachine:
             )
             self._fault("approve:before_commit")
 
+    def _consume_confirmation(
+        self,
+        connection: Any,
+        confirmation: ApprovalConfirmation,
+        *,
+        action: str,
+        request_id: str,
+        expected_version: int,
+        expected_payload_hash: str,
+        prospective_payload_hash: str | None,
+        now: int,
+    ) -> None:
+        if (
+            confirmation.user_id is None
+            or confirmation.action != action
+            or confirmation.bound_request_id != request_id
+            or confirmation.bound_version != expected_version
+            or confirmation.bound_payload_hash != expected_payload_hash
+            or confirmation.prospective_payload_hash != prospective_payload_hash
+        ):
+            raise InvalidConfirmation("confirmation action binding does not match")
+        self._verify_confirmation_capability(confirmation)
+        if confirmation.path == "web":
+            if confirmation.session_id is None or confirmation.http_method != "POST":
+                raise InvalidConfirmation("web confirmation requires a bound POST session")
+            session = connection.execute(
+                """
+                SELECT 1 FROM web_sessions AS session
+                JOIN auth_users AS user ON user.user_id = session.user_id
+                WHERE session.session_id = ? AND session.user_id = ?
+                  AND session.revoked_at IS NULL AND session.created_at <= ?
+                  AND session.last_seen_at + ? > ?
+                  AND session.absolute_expires_at > ?
+                  AND session.auth_generation = user.auth_generation
+                """,
+                (
+                    confirmation.session_id,
+                    confirmation.user_id,
+                    now,
+                    self._web_session_idle_timeout,
+                    now,
+                    now,
+                ),
+            ).fetchone()
+            if session is None:
+                raise InvalidConfirmation("web session is stale or unavailable")
+        elif (
+            confirmation.path != "mcp"
+            or confirmation.session_id is not None
+            or confirmation.http_method != "MCP"
+            or action != "approve"
+        ):
+            raise InvalidConfirmation("MCP confirmation context is invalid")
+
+        if confirmation.kind == ConfirmationKind.WEBAUTHN:
+            if confirmation.path != "web" or confirmation.challenge_id is None:
+                raise InvalidConfirmation("WebAuthn confirmation requires a web challenge")
+            self._consume_webauthn_credential(connection, confirmation, now=now)
+            consumed = connection.execute(
+                """
+                UPDATE auth_challenges SET consumed_at = ?
+                WHERE challenge_id = ? AND user_id = ? AND action = ?
+                  AND request_id = ? AND version = ?
+                  AND current_payload_hash = ?
+                  AND prospective_payload_hash IS ?
+                  AND session_id = ? AND http_method = 'POST'
+                  AND created_at <= ? AND expires_at > ?
+                  AND consumed_at IS NULL AND invalidated_at IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(offered_credential_ids_json)
+                      WHERE value = ?
+                  )
+                """,
+                (
+                    now,
+                    confirmation.challenge_id,
+                    confirmation.user_id,
+                    action,
+                    request_id,
+                    expected_version,
+                    expected_payload_hash,
+                    prospective_payload_hash,
+                    confirmation.session_id,
+                    now,
+                    now,
+                    confirmation.credential_id,
+                ),
+            ).rowcount
+            if consumed != 1:
+                raise InvalidConfirmation("challenge is stale, expired, consumed, or misbound")
+            if (
+                confirmation.attempt_id is not None
+                or confirmation.attempt_scope_keys
+                or confirmation.rate_limit_key is not None
+            ):
+                raise InvalidConfirmation("WebAuthn confirmation contains TOTP attempt state")
+        elif any(
+            value is not None
+            for value in (
+                confirmation.challenge_id,
+                confirmation.expected_counter,
+                confirmation.new_counter,
+                confirmation.device_type,
+                confirmation.expected_backup_eligible,
+                confirmation.new_backup_eligible,
+                confirmation.previous_backed_up,
+                confirmation.new_backed_up,
+            )
+        ):
+            raise InvalidConfirmation("TOTP confirmation contains WebAuthn state")
+
+        if confirmation.kind == ConfirmationKind.TOTP:
+            rate_key = totp_rate_limit_key(confirmation.user_id or "")
+            if (
+                confirmation.credential_id is None
+                or confirmation.credential_user_id != confirmation.user_id
+                or confirmation.rate_limit_key != rate_key
+                or confirmation.attempt_id is None
+                or len(confirmation.attempt_scope_keys) != 2
+                or confirmation.attempt_scope_keys[0] != rate_key
+                or not confirmation.attempt_scope_keys[1].startswith("auth-source:")
+            ):
+                raise InvalidConfirmation("TOTP proof state is invalid")
+            credential = connection.execute(
+                """
+                UPDATE auth_credentials SET last_used_at = ?
+                WHERE credential_id = ? AND user_id = ? AND kind = 'totp'
+                  AND disabled_at IS NULL
+                RETURNING credential_id
+                """,
+                (
+                    now,
+                    confirmation.credential_id,
+                    confirmation.user_id,
+                ),
+            ).fetchone()
+            if credential is None:
+                raise InvalidConfirmation("TOTP credential is stale or unavailable")
+
+        try:
+            connection.execute(
+                """
+                INSERT INTO auth_proof_consumptions(
+                    kind, use_id, purpose, consumed_at
+                ) VALUES (?, ?, 'mutation', ?)
+                """,
+                (confirmation.kind.value, confirmation.use_id, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO confirmation_consumptions(
+                    kind, use_id, request_id, version, payload_hash,
+                    path, consumed_at, action, user_id, session_id,
+                    http_method, prospective_payload_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    confirmation.kind.value,
+                    confirmation.use_id,
+                    request_id,
+                    expected_version,
+                    expected_payload_hash,
+                    confirmation.path,
+                    now,
+                    action,
+                    confirmation.user_id,
+                    confirmation.session_id,
+                    confirmation.http_method,
+                    prospective_payload_hash,
+                ),
+            )
+        except IntegrityError as exc:
+            raise ConfirmationReplay("confirmation was already consumed") from exc
+
+        if confirmation.kind == ConfirmationKind.TOTP:
+            assert confirmation.attempt_id is not None
+            for scope in confirmation.attempt_scope_keys:
+                connection.execute(
+                    """
+                    DELETE FROM auth_attempts
+                    WHERE scope_key = ? AND last_attempt_id = ?
+                    """,
+                    (scope, confirmation.attempt_id),
+                )
+
+    def _verify_confirmation_capability(
+        self,
+        confirmation: ApprovalConfirmation,
+    ) -> None:
+        if self._capabilities is None:
+            raise InvalidConfirmation("proof capability verification is unavailable")
+        try:
+            assert confirmation.action is not None
+            binding = ActionBinding(
+                confirmation.action,
+                confirmation.bound_request_id,
+                confirmation.bound_version,
+                confirmation.bound_payload_hash,
+                confirmation.prospective_payload_hash,
+            )
+            if confirmation.kind == ConfirmationKind.TOTP:
+                if (
+                    confirmation.credential_id is None
+                    or confirmation.credential_user_id != confirmation.user_id
+                    or confirmation.rate_limit_key is None
+                    or confirmation.attempt_id is None
+                    or not confirmation.attempt_scope_keys
+                ):
+                    raise ValueError
+                claims = totp_proof_claims(
+                    credential_id=confirmation.credential_id,
+                    credential_user_id=confirmation.credential_user_id or "",
+                    user_id=confirmation.user_id or "",
+                    use_id=confirmation.use_id,
+                    binding=binding,
+                    path=confirmation.path,
+                    session_id=confirmation.session_id,
+                    http_method=confirmation.http_method or "",
+                    rate_limit_key=confirmation.rate_limit_key,
+                    attempt_id=confirmation.attempt_id,
+                    attempt_scope_keys=confirmation.attempt_scope_keys,
+                )
+                domain = TOTP_PROOF_DOMAIN
+            else:
+                required = (
+                    confirmation.credential_id,
+                    confirmation.credential_user_id,
+                    confirmation.challenge_id,
+                    confirmation.expected_counter,
+                    confirmation.new_counter,
+                    confirmation.device_type,
+                    confirmation.expected_backup_eligible,
+                    confirmation.new_backup_eligible,
+                    confirmation.previous_backed_up,
+                    confirmation.new_backed_up,
+                )
+                if any(value is None for value in required):
+                    raise ValueError
+                assert confirmation.credential_id is not None
+                assert confirmation.challenge_id is not None
+                assert confirmation.expected_counter is not None
+                assert confirmation.new_counter is not None
+                assert confirmation.device_type is not None
+                assert confirmation.expected_backup_eligible is not None
+                assert confirmation.new_backup_eligible is not None
+                assert confirmation.previous_backed_up is not None
+                assert confirmation.new_backed_up is not None
+                claims = webauthn_proof_claims(
+                    credential_id=confirmation.credential_id,
+                    credential_user_id=confirmation.credential_user_id or "",
+                    user_id=confirmation.user_id or "",
+                    challenge_id=confirmation.challenge_id,
+                    use_id=confirmation.use_id,
+                    binding=binding,
+                    path=confirmation.path,
+                    session_id=confirmation.session_id or "",
+                    http_method=confirmation.http_method or "",
+                    expected_counter=confirmation.expected_counter,
+                    new_counter=confirmation.new_counter,
+                    device_type=confirmation.device_type,
+                    expected_backup_eligible=confirmation.expected_backup_eligible,
+                    new_backup_eligible=confirmation.new_backup_eligible,
+                    previous_backed_up=confirmation.previous_backed_up,
+                    new_backed_up=confirmation.new_backed_up,
+                )
+                domain = WEBAUTHN_PROOF_DOMAIN
+        except (AssertionError, TypeError, ValueError):
+            raise InvalidConfirmation("proof capability claims are invalid") from None
+        if not self._capabilities.verify(
+            confirmation.capability,
+            domain=domain,
+            claims=claims,
+        ):
+            raise InvalidConfirmation("proof capability is invalid")
+
     @staticmethod
     def _consume_webauthn_credential(
         connection: Any,
@@ -623,6 +920,8 @@ class ApprovalStateMachine:
         )
         if any(value is None for value in required):
             raise InvalidConfirmation("WebAuthn confirmation is missing credential state")
+        if confirmation.credential_user_id != confirmation.user_id:
+            raise InvalidConfirmation("WebAuthn credential ownership does not match")
 
         expected_counter = confirmation.expected_counter
         new_counter = confirmation.new_counter
@@ -642,6 +941,8 @@ class ApprovalStateMachine:
             raise InvalidConfirmation("WebAuthn signature counter transition is invalid")
         if (
             expected_eligible != new_eligible
+            or confirmation.device_type
+            != ("multi_device" if new_eligible else "single_device")
             or (not new_eligible and new_backed_up)
             or (previous_backed_up and not new_backed_up)
         ):
@@ -677,6 +978,7 @@ class ApprovalStateMachine:
         *,
         expected_version: int,
         expected_payload_hash: str,
+        confirmation: ApprovalConfirmation,
         actor: str,
         now: int,
     ) -> None:
@@ -687,6 +989,8 @@ class ApprovalStateMachine:
             state=RequestState.DENIED,
             actor=actor,
             now=now,
+            confirmation=confirmation,
+            confirmation_action="deny",
         )
 
     def cancel(
@@ -695,10 +999,33 @@ class ApprovalStateMachine:
         *,
         expected_version: int,
         expected_payload_hash: str,
+        confirmation: ApprovalConfirmation,
         actor: str,
         now: int,
-        origin_namespace: str | None = None,
     ) -> None:
+        self._finish_pending(
+            request_id,
+            expected_version=expected_version,
+            expected_payload_hash=expected_payload_hash,
+            state=RequestState.CANCELLED,
+            actor=actor,
+            now=now,
+            confirmation=confirmation,
+            confirmation_action="human_cancel",
+        )
+
+    def cancel_by_caller(
+        self,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        actor: str,
+        now: int,
+        origin_namespace: str,
+    ) -> None:
+        if not origin_namespace:
+            raise ValueError("caller cancellation requires an origin namespace")
         self._finish_pending(
             request_id,
             expected_version=expected_version,
@@ -943,6 +1270,82 @@ class ApprovalStateMachine:
                 {"worker_generation": lease.worker_generation},
             )
             self._fault("dispatch_started:before_commit")
+
+    def record_pre_dispatch_failure(
+        self,
+        lease: ExecutionLease,
+        *,
+        now: int,
+        failure_reason: str,
+    ) -> None:
+        """Terminalize a deterministic failure before any downstream socket write."""
+
+        if (
+            not failure_reason
+            or len(failure_reason) > 128
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789_.-"
+                for character in failure_reason
+            )
+        ):
+            raise ValueError("pre-dispatch failure requires a bounded safe reason code")
+        with self.database.transaction() as connection:
+            attempt = self._attempt_for_fence(connection, lease, now=now)
+            if attempt["phase"] not in {
+                ExecutionPhase.PREPARING.value,
+                ExecutionPhase.REDISPATCH_PREPARING.value,
+            }:
+                raise FenceRejected("pre-dispatch failure requires a preparing lease")
+            updated_request = connection.execute(
+                """
+                UPDATE approval_requests
+                SET state = 'failed', completed_at = ?, failure_reason = ?,
+                    manual_retry_allowed = 1, duplicate_warning_required = 0,
+                    revision = revision + 1
+                WHERE request_id = ? AND state = 'executing'
+                  AND current_version = ? AND current_payload_hash = ?
+                """,
+                (
+                    now,
+                    failure_reason,
+                    lease.request_id,
+                    lease.version,
+                    lease.payload_hash,
+                ),
+            ).rowcount
+            if updated_request != 1:
+                raise FenceRejected("request is no longer executing the fenced payload")
+            updated_attempt = connection.execute(
+                """
+                UPDATE execution_attempts
+                SET phase = 'failed', lease_expires_at = NULL,
+                    completed_at = ?, outcome_classification = 'definite_failure',
+                    failure_reason = ?
+                WHERE attempt_id = ? AND fencing_token = ?
+                  AND worker_generation = ? AND phase = ?
+                """,
+                (
+                    now,
+                    failure_reason,
+                    lease.attempt_id,
+                    lease.fencing_token,
+                    lease.worker_generation,
+                    attempt["phase"],
+                ),
+            ).rowcount
+            if updated_attempt != 1:
+                raise FenceRejected("pre-dispatch failure lost its execution fence")
+            self._event(
+                connection,
+                lease.request_id,
+                f"gateway:{attempt['worker_id']}",
+                "execution_failed_before_dispatch",
+                now,
+                lease.version,
+                lease.payload_hash,
+                {"classification": "definite_failure", "reason": failure_reason},
+            )
+            self._fault("pre_dispatch_failure:before_commit")
 
     def record_outcome(
         self,
@@ -1414,6 +1817,8 @@ class ApprovalStateMachine:
         now: int,
         origin_namespace: str | None = None,
         require_expired: bool = False,
+        confirmation: ApprovalConfirmation | None = None,
+        confirmation_action: str | None = None,
     ) -> None:
         if state not in {
             RequestState.DENIED,
@@ -1434,7 +1839,25 @@ class ApprovalStateMachine:
                 raise RequestNotFound(request_id)
             if require_expired and now < request["expires_at"]:
                 raise InvalidTransition("request has not reached its expiry")
-            connection.execute(
+            if confirmation is not None:
+                if confirmation_action is None:
+                    raise ValueError("confirmed mutations require an action")
+                self._consume_confirmation(
+                    connection,
+                    confirmation,
+                    action=confirmation_action,
+                    request_id=request_id,
+                    expected_version=expected_version,
+                    expected_payload_hash=expected_payload_hash,
+                    prospective_payload_hash=None,
+                    now=now,
+                )
+            elif (
+                state in {RequestState.DENIED, RequestState.CANCELLED}
+                and origin_namespace is None
+            ):
+                raise InvalidConfirmation("human deny and cancel require confirmation")
+            updated = connection.execute(
                 """
                 UPDATE approval_requests
                 SET state = ?, completed_at = ?, revision = revision + 1
@@ -1448,10 +1871,20 @@ class ApprovalStateMachine:
                     expected_version,
                     expected_payload_hash,
                 ),
-            )
+            ).rowcount
+            if updated != 1:
+                raise StaleVersion(request_id)
             connection.execute(
                 """
                 UPDATE approval_challenges SET invalidated_at = ?
+                WHERE request_id = ? AND consumed_at IS NULL
+                  AND invalidated_at IS NULL
+                """,
+                (now, request_id),
+            )
+            connection.execute(
+                """
+                UPDATE auth_challenges SET invalidated_at = ?
                 WHERE request_id = ? AND consumed_at IS NULL
                   AND invalidated_at IS NULL
                 """,
@@ -1473,6 +1906,7 @@ class ApprovalStateMachine:
                 expected_version,
                 expected_payload_hash,
             )
+            self._fault(f"{state.value}:before_commit")
 
     def _attempt_for_fence(
         self,

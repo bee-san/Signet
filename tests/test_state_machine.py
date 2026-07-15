@@ -10,6 +10,16 @@ from threading import Barrier
 
 import pytest
 
+from signet.auth import (
+    TOTP_PROOF_DOMAIN,
+    WEBAUTHN_PROOF_DOMAIN,
+    ActionBinding,
+    ProofCapability,
+    source_rate_limit_key,
+    totp_proof_claims,
+    totp_rate_limit_key,
+    webauthn_proof_claims,
+)
 from signet.db import Database, IntegrityError
 from signet.models import (
     ApprovalConfirmation,
@@ -33,6 +43,12 @@ from signet.models import (
 from signet.state_machine import ApprovalStateMachine, ReadOnlyMCPClient
 
 NOW = 1_800_000_000
+HUMAN_USER = "owner"
+WEB_SESSION_ID = "web-session-for-tests-0000000001"
+TEST_CAPABILITIES = ProofCapability(b"test-only-proof-capability-key-0001")
+TOTP_CREDENTIAL_ID = "totp-owner-tests"
+TOTP_ATTEMPT_ID = "state-test-attempt-opaque"
+TOTP_SOURCE_KEY = source_rate_limit_key("state-machine-tests")
 
 
 def digest(value: str) -> str:
@@ -48,7 +64,7 @@ def database(tmp_path: Path) -> Database:
 
 @pytest.fixture
 def machine(database: Database) -> ApprovalStateMachine:
-    return ApprovalStateMachine(database)
+    return ApprovalStateMachine(database, capabilities=TEST_CAPABILITIES)
 
 
 def request(
@@ -93,18 +109,163 @@ def approve(
     use_id: str | None = None,
     path: str = "web",
 ) -> None:
+    confirmation = totp_confirmation(
+        machine,
+        request_id,
+        action="approve",
+        version=1,
+        payload_hash=digest(payload),
+        use_id=use_id or f"totp:{request_id}",
+        path=path,
+    )
     machine.approve(
         request_id,
         expected_version=1,
         expected_payload_hash=digest(payload),
-        confirmation=ApprovalConfirmation(
-            kind=ConfirmationKind.TOTP,
-            use_id=use_id or f"totp:{request_id}",
-            path=path,  # type: ignore[arg-type]
-        ),
+        confirmation=confirmation,
         actor=f"human:{path}",
         now=NOW + 1,
     )
+
+
+def ensure_web_session(machine: ApprovalStateMachine, *, now: int = NOW) -> None:
+    with machine.database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO auth_users(user_id, created_at) VALUES (?, ?)
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+            (HUMAN_USER, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO web_sessions(
+                session_id, user_id, auth_method, auth_generation,
+                created_at, last_seen_at, absolute_expires_at
+            ) VALUES (?, ?, 'test-auth', 0, ?, ?, ?)
+            ON CONFLICT(session_id) DO NOTHING
+            """,
+            (WEB_SESSION_ID, HUMAN_USER, now, now, now + 10_000),
+        )
+
+
+def totp_confirmation(
+    machine: ApprovalStateMachine,
+    request_id: str,
+    *,
+    action: str,
+    version: int,
+    payload_hash: str,
+    use_id: str,
+    path: str = "web",
+    prospective_payload_hash: str | None = None,
+) -> ApprovalConfirmation:
+    if path == "web":
+        ensure_web_session(machine)
+    with machine.database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO auth_credentials(
+                credential_id, user_id, kind, secret_reference, enrolled_at
+            ) VALUES (?, ?, 'totp', 'keychain://Signet/state-test', ?)
+            ON CONFLICT(credential_id) DO NOTHING
+            """,
+            (TOTP_CREDENTIAL_ID, HUMAN_USER, NOW),
+        )
+    rate_key = totp_rate_limit_key(HUMAN_USER)
+    binding = ActionBinding(
+        action,
+        request_id,
+        version,
+        payload_hash,
+        prospective_payload_hash,
+    )
+    http_method = "POST" if path == "web" else "MCP"
+    session_id = WEB_SESSION_ID if path == "web" else None
+    capability = TEST_CAPABILITIES.seal(
+        TOTP_PROOF_DOMAIN,
+        totp_proof_claims(
+            credential_id=TOTP_CREDENTIAL_ID,
+            credential_user_id=HUMAN_USER,
+            user_id=HUMAN_USER,
+            use_id=use_id,
+            binding=binding,
+            path=path,
+            session_id=session_id,
+            http_method=http_method,
+            rate_limit_key=rate_key,
+            attempt_id=TOTP_ATTEMPT_ID,
+            attempt_scope_keys=(rate_key, TOTP_SOURCE_KEY),
+        ),
+    )
+    return ApprovalConfirmation(
+        kind=ConfirmationKind.TOTP,
+        use_id=use_id,
+        path=path,  # type: ignore[arg-type]
+        capability=capability,
+        user_id=HUMAN_USER,
+        action=action,
+        bound_request_id=request_id,
+        bound_version=version,
+        bound_payload_hash=payload_hash,
+        prospective_payload_hash=prospective_payload_hash,
+        session_id=session_id,
+        http_method=http_method,
+        attempt_id=TOTP_ATTEMPT_ID,
+        attempt_scope_keys=(rate_key, TOTP_SOURCE_KEY),
+        rate_limit_key=rate_key,
+        credential_id=TOTP_CREDENTIAL_ID,
+        credential_user_id=HUMAN_USER,
+    )
+
+
+def signed_webauthn_confirmation(
+    confirmation: ApprovalConfirmation,
+) -> ApprovalConfirmation:
+    assert confirmation.kind is ConfirmationKind.WEBAUTHN
+    assert confirmation.user_id is not None
+    assert confirmation.action is not None
+    assert confirmation.credential_id is not None
+    assert confirmation.credential_user_id is not None
+    assert confirmation.challenge_id is not None
+    assert confirmation.session_id is not None
+    assert confirmation.http_method is not None
+    assert confirmation.expected_counter is not None
+    assert confirmation.new_counter is not None
+    assert confirmation.device_type is not None
+    assert confirmation.expected_backup_eligible is not None
+    assert confirmation.new_backup_eligible is not None
+    assert confirmation.previous_backed_up is not None
+    assert confirmation.new_backed_up is not None
+    binding = ActionBinding(
+        confirmation.action,
+        confirmation.bound_request_id,
+        confirmation.bound_version,
+        confirmation.bound_payload_hash,
+        confirmation.prospective_payload_hash,
+    )
+    capability = TEST_CAPABILITIES.seal(
+        WEBAUTHN_PROOF_DOMAIN,
+        webauthn_proof_claims(
+            credential_id=confirmation.credential_id,
+            credential_user_id=confirmation.credential_user_id,
+            user_id=confirmation.user_id,
+            challenge_id=confirmation.challenge_id,
+            use_id=confirmation.use_id,
+            binding=binding,
+            path=confirmation.path,
+            session_id=confirmation.session_id,
+            http_method=confirmation.http_method,
+            expected_counter=confirmation.expected_counter,
+            new_counter=confirmation.new_counter,
+            device_type=confirmation.device_type,
+            expected_backup_eligible=confirmation.expected_backup_eligible,
+            new_backup_eligible=confirmation.new_backup_eligible,
+            previous_backed_up=confirmation.previous_backed_up,
+            new_backed_up=confirmation.new_backed_up,
+        ),
+    )
+    return replace(confirmation, capability=capability)
 
 
 def make_unknown(
@@ -203,6 +364,15 @@ def test_body_edit_preserves_attachment_snapshot_and_explicit_empty_removes_it(
         adapter_version="adapter-1",
         schema_version="schema-1",
         editor_actor="human:web",
+        confirmation=totp_confirmation(
+            machine,
+            "edit-attachment",
+            action="edit",
+            version=1,
+            payload_hash=digest("body-one"),
+            prospective_payload_hash=second_hash,
+            use_id="edit-attachment-v1",
+        ),
         now=NOW + 1,
     )
     with database.read() as connection:
@@ -229,6 +399,15 @@ def test_body_edit_preserves_attachment_snapshot_and_explicit_empty_removes_it(
         adapter_version="adapter-1",
         schema_version="schema-1",
         editor_actor="human:web",
+        confirmation=totp_confirmation(
+            machine,
+            "edit-attachment",
+            action="edit",
+            version=2,
+            payload_hash=second_hash,
+            prospective_payload_hash=digest("body-three"),
+            use_id="edit-attachment-v2",
+        ),
         now=NOW + 2,
         attachments=(),
     )
@@ -314,6 +493,15 @@ def test_denied_expired_and_cancelled_requests_never_execute(
         "actor": "human:web",
         "now": NOW + (601 if terminal == "expire" else 1),
     }
+    if terminal in {"deny", "cancel"}:
+        kwargs["confirmation"] = totp_confirmation(
+            machine,
+            request_id,
+            action="deny" if terminal == "deny" else "human_cancel",
+            version=1,
+            payload_hash=digest("body-one"),
+            use_id=f"terminal-proof:{terminal}",
+        )
     getattr(machine, terminal)(request_id, **kwargs)
     with pytest.raises(InvalidTransition):
         machine.claim_execution(request_id, worker_id="worker", now=NOW + 700, lease_seconds=30)
@@ -339,7 +527,7 @@ def test_double_approval_has_one_cas_winner(
     barrier = Barrier(2)
 
     def contender(index: int) -> str:
-        contender_machine = ApprovalStateMachine(database)
+        contender_machine = ApprovalStateMachine(database, capabilities=TEST_CAPABILITIES)
         barrier.wait()
         try:
             approve(
@@ -375,6 +563,389 @@ def test_totp_consumption_is_atomic_and_replay_fails_across_paths(
     assert machine.get_request("second")["state"] == "pending_approval"
 
 
+def test_confirmation_action_method_and_prospective_hash_are_exact(
+    machine: ApprovalStateMachine,
+) -> None:
+    machine.enqueue(request("exact-binding"))
+    payload_hash = digest("body-one")
+    deny_proof = totp_confirmation(
+        machine,
+        "exact-binding",
+        action="deny",
+        version=1,
+        payload_hash=payload_hash,
+        use_id="exact-binding-proof",
+    )
+    with pytest.raises(InvalidConfirmation, match="action binding"):
+        machine.approve(
+            "exact-binding",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            confirmation=deny_proof,
+            actor="human:web",
+            now=NOW + 1,
+        )
+    with pytest.raises(InvalidConfirmation, match="capability"):
+        machine.approve(
+            "exact-binding",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            confirmation=replace(
+                deny_proof,
+                action="approve",
+                http_method="GET",
+            ),
+            actor="human:web",
+            now=NOW + 1,
+        )
+    assert machine.get_request("exact-binding")["state"] == "pending_approval"
+
+    edited_hash = digest("edited-body")
+    wrong_hash = digest("different-edit")
+    wrong_edit = totp_confirmation(
+        machine,
+        "exact-binding",
+        action="edit",
+        version=1,
+        payload_hash=payload_hash,
+        prospective_payload_hash=wrong_hash,
+        use_id="exact-edit-proof",
+    )
+    with pytest.raises(InvalidConfirmation, match="action binding"):
+        machine.edit(
+            "exact-binding",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            encrypted_payload=b"encrypted:edited-body",
+            payload_hash=edited_hash,
+            canonical_size=11,
+            policy_version="policy-1",
+            adapter_version="adapter-1",
+            schema_version="schema-1",
+            editor_actor="human:web",
+            confirmation=wrong_edit,
+            now=NOW + 2,
+        )
+    assert machine.get_request("exact-binding")["current_version"] == 1
+
+
+def test_state_machine_without_capability_verifier_fails_closed(database: Database) -> None:
+    unsigned_consumer = ApprovalStateMachine(database)
+    unsigned_consumer.enqueue(request("missing-capability-verifier"))
+    proof = totp_confirmation(
+        unsigned_consumer,
+        "missing-capability-verifier",
+        action="approve",
+        version=1,
+        payload_hash=digest("body-one"),
+        use_id="missing-capability-verifier-proof",
+    )
+
+    with pytest.raises(InvalidConfirmation, match="unavailable"):
+        unsigned_consumer.approve(
+            "missing-capability-verifier",
+            expected_version=1,
+            expected_payload_hash=digest("body-one"),
+            confirmation=proof,
+            actor="human:web",
+            now=NOW + 1,
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"capability": "pc1.forged"},
+        {"use_id": "tampered-use-id"},
+        {"user_id": "other-user"},
+        {"action": "deny"},
+        {"bound_request_id": "other-request"},
+        {"bound_version": 2},
+        {"bound_payload_hash": "b" * 64},
+        {"prospective_payload_hash": "b" * 64},
+        {"path": "mcp"},
+        {"session_id": "other-session-identifier-00000000001"},
+        {"http_method": "GET"},
+        {"attempt_id": "different-attempt-opaque"},
+        {"attempt_scope_keys": (TOTP_SOURCE_KEY, totp_rate_limit_key(HUMAN_USER))},
+        {"rate_limit_key": totp_rate_limit_key("other-user")},
+        {"credential_id": "other-totp-credential"},
+        {"credential_user_id": "other-user"},
+    ],
+)
+def test_tampered_totp_confirmation_claims_fail_before_mutation(
+    machine: ApprovalStateMachine,
+    database: Database,
+    changes: dict[str, object],
+) -> None:
+    machine.enqueue(request("tampered-capability"))
+    proof = totp_confirmation(
+        machine,
+        "tampered-capability",
+        action="approve",
+        version=1,
+        payload_hash=digest("body-one"),
+        use_id="tampered-capability-proof",
+    )
+
+    with pytest.raises(InvalidConfirmation):
+        machine.approve(
+            "tampered-capability",
+            expected_version=1,
+            expected_payload_hash=digest("body-one"),
+            confirmation=replace(proof, **changes),  # type: ignore[arg-type]
+            actor="human:web",
+            now=NOW + 1,
+        )
+    assert machine.get_request("tampered-capability")["state"] == "pending_approval"
+    with database.read() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM auth_proof_consumptions"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """
+            SELECT last_used_at FROM auth_credentials
+            WHERE credential_id = ?
+            """,
+            (TOTP_CREDENTIAL_ID,),
+        ).fetchone()[0] is None
+
+
+def test_webauthn_challenge_cannot_cross_sessions_and_cas_rolls_back(
+    machine: ApprovalStateMachine,
+    database: Database,
+) -> None:
+    machine.enqueue(request("cross-session"))
+    payload_hash = digest("body-one")
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO auth_credentials(
+                credential_id, user_id, kind, public_material, enrolled_at,
+                sign_count, backup_eligible, backup_state
+            ) VALUES ('cross-session-credential', 'owner', 'webauthn', X'01', ?, 3, 0, 0)
+            """,
+            (NOW,),
+        )
+    ensure_web_session(machine)
+    other_session = "other-web-session-for-tests-00000001"
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO web_sessions(
+                session_id, user_id, auth_method, auth_generation,
+                created_at, last_seen_at, absolute_expires_at
+            ) VALUES (?, 'owner', 'test-auth', 0, ?, ?, ?)
+            """,
+            (other_session, NOW, NOW, NOW + 10_000),
+        )
+    machine.create_challenge(
+        "cross-session-challenge-opaque",
+        "cross-session",
+        kind=ConfirmationKind.WEBAUTHN,
+        user_id=HUMAN_USER,
+        action="approve",
+        challenge=b"s" * 32,
+        session_id=WEB_SESSION_ID,
+        http_method="POST",
+        offered_credential_ids=("cross-session-credential",),
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+        created_at=NOW,
+        expires_at=NOW + 100,
+    )
+
+    with pytest.raises(InvalidConfirmation, match="misbound"):
+        machine.approve(
+            "cross-session",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            confirmation=signed_webauthn_confirmation(ApprovalConfirmation(
+                kind=ConfirmationKind.WEBAUTHN,
+                use_id="cross-session-assertion-proof",
+                path="web",
+                capability="",
+                user_id=HUMAN_USER,
+                action="approve",
+                bound_request_id="cross-session",
+                bound_version=1,
+                bound_payload_hash=payload_hash,
+                session_id=other_session,
+                http_method="POST",
+                challenge_id="cross-session-challenge-opaque",
+                credential_id="cross-session-credential",
+                credential_user_id=HUMAN_USER,
+                expected_counter=3,
+                new_counter=4,
+                device_type="single_device",
+                expected_backup_eligible=False,
+                new_backup_eligible=False,
+                previous_backed_up=False,
+                new_backed_up=False,
+            )),
+            actor="human:web",
+            now=NOW + 1,
+        )
+
+    with database.read() as connection:
+        assert connection.execute(
+            """
+            SELECT sign_count FROM auth_credentials
+            WHERE credential_id = 'cross-session-credential'
+            """
+        ).fetchone()[0] == 3
+        assert connection.execute(
+            """
+            SELECT consumed_at FROM auth_challenges
+            WHERE challenge_id = 'cross-session-challenge-opaque'
+            """
+        ).fetchone()[0] is None
+    assert machine.get_request("cross-session")["state"] == "pending_approval"
+
+
+@pytest.mark.parametrize(
+    ("terminal", "action", "fault_stage", "expected_state"),
+    [
+        ("deny", "deny", "denied:before_commit", "denied"),
+        ("cancel", "human_cancel", "cancelled:before_commit", "cancelled"),
+    ],
+)
+def test_confirmed_terminal_fault_rolls_back_proof_and_transition(
+    database: Database,
+    terminal: str,
+    action: str,
+    fault_stage: str,
+    expected_state: str,
+) -> None:
+    request_id = f"rollback-{terminal}"
+    machine = ApprovalStateMachine(database, capabilities=TEST_CAPABILITIES)
+    machine.enqueue(request(request_id))
+    proof = totp_confirmation(
+        machine,
+        request_id,
+        action=action,
+        version=1,
+        payload_hash=digest("body-one"),
+        use_id=f"rollback-proof-{terminal}",
+    )
+
+    def fail(stage: str) -> None:
+        if stage == fault_stage:
+            raise RuntimeError("injected terminal failure")
+
+    crashing = ApprovalStateMachine(
+        database,
+        fault_injector=fail,
+        capabilities=TEST_CAPABILITIES,
+    )
+    with pytest.raises(RuntimeError, match="injected terminal failure"):
+        getattr(crashing, terminal)(
+            request_id,
+            expected_version=1,
+            expected_payload_hash=digest("body-one"),
+            confirmation=proof,
+            actor="human:web",
+            now=NOW + 1,
+        )
+    assert machine.get_request(request_id)["state"] == "pending_approval"
+    with database.read() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM confirmation_consumptions WHERE use_id = ?",
+            (proof.use_id,),
+        ).fetchone()[0] == 0
+
+    getattr(machine, terminal)(
+        request_id,
+        expected_version=1,
+        expected_payload_hash=digest("body-one"),
+        confirmation=proof,
+        actor="human:web",
+        now=NOW + 2,
+    )
+    assert machine.get_request(request_id)["state"] == expected_state
+
+
+def test_edit_fault_rolls_back_proof_and_new_revision(database: Database) -> None:
+    machine = ApprovalStateMachine(database, capabilities=TEST_CAPABILITIES)
+    machine.enqueue(request("rollback-edit"))
+    old_hash = digest("body-one")
+    new_hash = digest("edited-body")
+    proof = totp_confirmation(
+        machine,
+        "rollback-edit",
+        action="edit",
+        version=1,
+        payload_hash=old_hash,
+        prospective_payload_hash=new_hash,
+        use_id="rollback-edit-proof",
+    )
+
+    def fail(stage: str) -> None:
+        if stage == "edit:before_commit":
+            raise RuntimeError("injected edit failure")
+
+    arguments = {
+        "expected_version": 1,
+        "expected_payload_hash": old_hash,
+        "encrypted_payload": b"encrypted:edited-body",
+        "payload_hash": new_hash,
+        "canonical_size": 11,
+        "policy_version": "policy-1",
+        "adapter_version": "adapter-1",
+        "schema_version": "schema-1",
+        "editor_actor": "human:web",
+        "confirmation": proof,
+    }
+    with pytest.raises(RuntimeError, match="injected edit failure"):
+        ApprovalStateMachine(
+            database,
+            fault_injector=fail,
+            capabilities=TEST_CAPABILITIES,
+        ).edit(
+            "rollback-edit",
+            now=NOW + 1,
+            **arguments,  # type: ignore[arg-type]
+        )
+    assert machine.get_request("rollback-edit")["current_version"] == 1
+    with database.read() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM confirmation_consumptions WHERE use_id = ?",
+            (proof.use_id,),
+        ).fetchone()[0] == 0
+
+    assert machine.edit(
+        "rollback-edit",
+        now=NOW + 2,
+        **arguments,  # type: ignore[arg-type]
+    ) == 2
+
+
+def test_caller_cancel_is_code_free_but_exactly_namespace_scoped(
+    machine: ApprovalStateMachine,
+) -> None:
+    machine.enqueue(request("caller-cancel", namespace="profile:owner"))
+    with pytest.raises(RequestNotFound):
+        machine.cancel_by_caller(
+            "caller-cancel",
+            expected_version=1,
+            expected_payload_hash=digest("body-one"),
+            actor="caller:profile:other",
+            origin_namespace="profile:other",
+            now=NOW + 1,
+        )
+    assert machine.get_request("caller-cancel")["state"] == "pending_approval"
+
+    machine.cancel_by_caller(
+        "caller-cancel",
+        expected_version=1,
+        expected_payload_hash=digest("body-one"),
+        actor="caller:profile:owner",
+        origin_namespace="profile:owner",
+        now=NOW + 2,
+    )
+    assert machine.get_request("caller-cancel")["state"] == "cancelled"
+
+
 def test_webauthn_credential_state_and_approval_commit_atomically(
     machine: ApprovalStateMachine,
     database: Database,
@@ -391,10 +962,17 @@ def test_webauthn_credential_state_and_approval_commit_atomically(
             """,
             (NOW,),
         )
+    ensure_web_session(machine)
     machine.create_challenge(
-        "challenge-one",
+        "challenge-one-opaque",
         "webauthn-approval",
         kind=ConfirmationKind.WEBAUTHN,
+        user_id=HUMAN_USER,
+        action="approve",
+        challenge=b"w" * 32,
+        session_id=WEB_SESSION_ID,
+        http_method="POST",
+        offered_credential_ids=("credential-one",),
         expected_version=1,
         expected_payload_hash=payload_hash,
         created_at=NOW,
@@ -405,20 +983,29 @@ def test_webauthn_credential_state_and_approval_commit_atomically(
         "webauthn-approval",
         expected_version=1,
         expected_payload_hash=payload_hash,
-        confirmation=ApprovalConfirmation(
+        confirmation=signed_webauthn_confirmation(ApprovalConfirmation(
             kind=ConfirmationKind.WEBAUTHN,
             use_id="assertion-one",
             path="web",
-            challenge_id="challenge-one",
+            capability="",
+            user_id=HUMAN_USER,
+            action="approve",
+            bound_request_id="webauthn-approval",
+            bound_version=1,
+            bound_payload_hash=payload_hash,
+            session_id=WEB_SESSION_ID,
+            http_method="POST",
+            challenge_id="challenge-one-opaque",
             credential_id="credential-one",
             credential_user_id="owner",
             expected_counter=7,
             new_counter=8,
+            device_type="multi_device",
             expected_backup_eligible=True,
             new_backup_eligible=True,
             previous_backed_up=False,
             new_backed_up=True,
-        ),
+        )),
         actor="human:web",
         now=NOW + 1,
     )
@@ -461,10 +1048,17 @@ def test_invalid_webauthn_state_rolls_back_challenge_and_approval(
             """,
             (NOW,),
         )
+    ensure_web_session(machine)
     machine.create_challenge(
-        "challenge-bad",
+        "challenge-bad-opaque",
         "bad-webauthn",
         kind=ConfirmationKind.WEBAUTHN,
+        user_id=HUMAN_USER,
+        action="approve",
+        challenge=b"b" * 32,
+        session_id=WEB_SESSION_ID,
+        http_method="POST",
+        offered_credential_ids=("credential-bad",),
         expected_version=1,
         expected_payload_hash=payload_hash,
         created_at=NOW,
@@ -474,11 +1068,20 @@ def test_invalid_webauthn_state_rolls_back_challenge_and_approval(
         "kind": ConfirmationKind.WEBAUTHN,
         "use_id": "assertion-bad",
         "path": "web",
-        "challenge_id": "challenge-bad",
+        "capability": "",
+        "user_id": HUMAN_USER,
+        "action": "approve",
+        "bound_request_id": "bad-webauthn",
+        "bound_version": 1,
+        "bound_payload_hash": payload_hash,
+        "session_id": WEB_SESSION_ID,
+        "http_method": "POST",
+        "challenge_id": "challenge-bad-opaque",
         "credential_id": "credential-bad",
         "credential_user_id": "owner",
         "expected_counter": 7,
         "new_counter": 8,
+        "device_type": "single_device",
         "expected_backup_eligible": False,
         "new_backup_eligible": False,
         "previous_backed_up": False,
@@ -490,14 +1093,17 @@ def test_invalid_webauthn_state_rolls_back_challenge_and_approval(
             "bad-webauthn",
             expected_version=1,
             expected_payload_hash=payload_hash,
-            confirmation=ApprovalConfirmation(**values),  # type: ignore[arg-type]
+            confirmation=signed_webauthn_confirmation(
+                ApprovalConfirmation(**values)  # type: ignore[arg-type]
+            ),
             actor="human:web",
             now=NOW + 1,
         )
 
     with database.read() as connection:
         challenge = connection.execute(
-            "SELECT consumed_at FROM approval_challenges WHERE challenge_id = 'challenge-bad'"
+            "SELECT consumed_at FROM auth_challenges "
+            "WHERE challenge_id = 'challenge-bad-opaque'"
         ).fetchone()
         credential = connection.execute(
             """
@@ -516,10 +1122,17 @@ def test_edit_is_immutable_and_invalidates_challenge_totp_binding_and_view(
 ) -> None:
     machine.enqueue(request("edit"))
     old_hash = digest("body-one")
+    ensure_web_session(machine)
     machine.create_challenge(
-        "old-challenge",
+        "old-challenge-opaque",
         "edit",
         kind=ConfirmationKind.WEBAUTHN,
+        user_id=HUMAN_USER,
+        action="approve",
+        challenge=b"o" * 32,
+        session_id=WEB_SESSION_ID,
+        http_method="POST",
+        offered_credential_ids=("old-credential",),
         expected_version=1,
         expected_payload_hash=old_hash,
         created_at=NOW + 1,
@@ -545,6 +1158,15 @@ def test_edit_is_immutable_and_invalidates_challenge_totp_binding_and_view(
             adapter_version="adapter-1",
             schema_version="schema-1",
             editor_actor="human:web",
+            confirmation=totp_confirmation(
+                machine,
+                "edit",
+                action="edit",
+                version=1,
+                payload_hash=old_hash,
+                prospective_payload_hash=new_hash,
+                use_id="edit-proof",
+            ),
             now=NOW + 2,
         )
         == 2
@@ -555,7 +1177,12 @@ def test_edit_is_immutable_and_invalidates_challenge_totp_binding_and_view(
             "edit",
             expected_version=1,
             expected_payload_hash=old_hash,
-            confirmation=ApprovalConfirmation(ConfirmationKind.TOTP, "old-totp-binding", "mcp"),
+            confirmation=ApprovalConfirmation(
+                ConfirmationKind.TOTP,
+                "old-totp-binding",
+                "mcp",
+                "",
+            ),
             actor="human:mcp",
             now=NOW + 3,
         )
@@ -609,6 +1236,14 @@ def test_idempotency_survives_terminal_states_and_is_caller_scoped(
         "denied-original",
         expected_version=1,
         expected_payload_hash=digest("body-one"),
+        confirmation=totp_confirmation(
+            machine,
+            "denied-original",
+            action="deny",
+            version=1,
+            payload_hash=digest("body-one"),
+            use_id="deny-original-proof",
+        ),
         actor="human:web",
         now=NOW + 1,
     )
@@ -624,7 +1259,7 @@ def test_idempotency_survives_terminal_states_and_is_caller_scoped(
 
 
 def test_fencing_recovery_and_crash_boundaries(database: Database) -> None:
-    machine = ApprovalStateMachine(database)
+    machine = ApprovalStateMachine(database, capabilities=TEST_CAPABILITIES)
     machine.enqueue(request("fenced"))
     approve(machine, "fenced")
 
