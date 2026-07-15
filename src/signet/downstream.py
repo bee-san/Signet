@@ -24,7 +24,6 @@ from urllib.parse import urlsplit
 import anyio
 import httpx
 import mcp.types as types
-from anyio.streams.text import TextReceiveStream
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
@@ -110,6 +109,7 @@ class ReviewedStdioServerParameters(RedactedStdioServerParameters):
 
     expected_sha256: str
     execution_snapshot_root: Path
+    output_limit_bytes: int
     test_only_allow_script: bool = False
 
 
@@ -190,25 +190,37 @@ async def _official_stdio_connector(
 
     async def stdout_reader() -> None:
         assert process.stdout is not None
-        buffer = ""
+        buffer = bytearray()
         try:
             async with read_sender:
-                async for chunk in TextReceiveStream(
-                    process.stdout,
-                    encoding=parameters.encoding,
-                    errors=parameters.encoding_error_handler,
-                ):
-                    lines = (buffer + chunk).split("\n")
-                    buffer = lines.pop()
-                    for line in lines:
+                while True:
+                    remaining = parameters.output_limit_bytes + 1 - len(buffer)
+                    try:
+                        chunk = await process.stdout.receive(min(65_536, remaining))
+                    except anyio.EndOfStream:
+                        return
+                    buffer.extend(chunk)
+                    while (newline := buffer.find(b"\n")) >= 0:
+                        line = bytes(buffer[:newline])
+                        del buffer[: newline + 1]
+                        if len(line) > parameters.output_limit_bytes:
+                            await _reject_oversized_stdio_frame(process, read_sender)
+                            return
                         try:
-                            message = types.JSONRPCMessage.model_validate_json(line)
-                        except Exception:
+                            decoded = line.decode(
+                                encoding=parameters.encoding,
+                                errors=parameters.encoding_error_handler,
+                            )
+                            message = types.JSONRPCMessage.model_validate_json(decoded)
+                        except (UnicodeDecodeError, ValueError):
                             await read_sender.send(
                                 DownstreamProtocolError("downstream emitted invalid JSON-RPC")
                             )
                             continue
                         await read_sender.send(SessionMessage(message))
+                    if len(buffer) > parameters.output_limit_bytes:
+                        await _reject_oversized_stdio_frame(process, read_sender)
+                        return
         except anyio.ClosedResourceError:
             await anyio.lowlevel.checkpoint()
 
@@ -266,6 +278,12 @@ async def _terminate_stdio_process(process: Any) -> None:
         os.killpg(process.pid, signal.SIGKILL)
     with suppress(ProcessLookupError):
         await process.wait()
+
+
+async def _reject_oversized_stdio_frame(process: Any, sender: Any) -> None:
+    await _terminate_stdio_process(process)
+    with suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
+        await sender.send(DownstreamProtocolError("downstream JSON-RPC frame exceeds its limit"))
 
 
 def _official_session_factory(
@@ -510,7 +528,11 @@ class DownstreamClient:
         protocol_failed = False
         try:
             try:
-                tools = await _discover_all_tools(session)
+                tools = await _discover_all_tools(
+                    session,
+                    max_aggregate_bytes=self._config.output_limit_bytes,
+                    timeout_seconds=self._config.timeout_seconds,
+                )
             except asyncio.CancelledError:
                 raise
             except MirrorError:
@@ -675,6 +697,7 @@ class DownstreamClient:
             cwd=self._config.working_directory,
             expected_sha256=self._config.executable_sha256,
             execution_snapshot_root=self._config.execution_snapshot_root,
+            output_limit_bytes=self._config.output_limit_bytes,
             test_only_allow_script=self._config.test_only_allow_script,
         )
         return await stack.enter_async_context(self._stdio_connector(parameters))

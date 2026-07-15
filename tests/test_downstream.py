@@ -95,6 +95,35 @@ for line in sys.stdin:
     path.chmod(0o700)
 
 
+def _write_oversized_stdio_server(path: Path) -> None:
+    path.write_text(
+        """#!/usr/bin/python3
+import json
+import sys
+import time
+
+if sys.argv[1] == "partial":
+    sys.stdout.write("x" * 2048)
+    sys.stdout.flush()
+    time.sleep(30)
+else:
+    for line in sys.stdin:
+        request = json.loads(line)
+        if request.get("method") != "initialize":
+            continue
+        result = {
+            "protocolVersion": request["params"]["protocolVersion"],
+            "capabilities": {},
+            "serverInfo": {"name": "oversized", "version": "1.0.0"},
+            "padding": "x" * 2048,
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
 def _tool(name: str) -> types.Tool:
     return types.Tool(name=name, inputSchema={"type": "object", "x-provider": None})
 
@@ -303,6 +332,33 @@ async def test_discovery_rejects_a_repeated_pagination_cursor_at_client_boundary
 
 
 @pytest.mark.asyncio
+async def test_discovery_passes_configured_byte_and_time_bounds_to_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    async def bounded_discovery(session: Any, **bounds: Any) -> list[dict[str, Any]]:
+        del session
+        observed.update(bounds)
+        return []
+
+    monkeypatch.setattr("signet.downstream._discover_all_tools", bounded_discovery)
+    events: list[str] = []
+    factories = FakeFactories(FakeSession(events))
+    client = DownstreamClient(
+        "example",
+        _http_config(timeout_seconds=1.25, output_limit_bytes=1234),
+        _store(),
+        http_connector=factories.http,
+        stdio_connector=factories.stdio,
+        session_factory=factories.session_factory,
+    )
+    async with client:
+        assert await client.discover_all_tools() == []
+    assert observed == {"max_aggregate_bytes": 1234, "timeout_seconds": 1.25}
+
+
+@pytest.mark.asyncio
 async def test_stdio_uses_pinned_direct_argv_and_minimal_redacted_alias_environment() -> None:
     events: list[str] = []
     factories = FakeFactories(FakeSession(events))
@@ -395,6 +451,31 @@ async def test_official_stdio_launcher_rejects_symlinked_executable(tmp_path: Pa
     with pytest.raises(DownstreamConnectionError, match="initialization failed"):
         await client.start()
     await client.close()
+
+
+@pytest.mark.parametrize("mode", ["partial", "json"])
+@pytest.mark.asyncio
+async def test_official_stdio_launcher_rejects_oversized_frames_before_parsing(
+    tmp_path: Path, mode: str
+) -> None:
+    executable = tmp_path / "provider-mcp"
+    _write_oversized_stdio_server(executable)
+    client = DownstreamClient(
+        "example",
+        _stdio_config(
+            command=(str(executable), mode),
+            working_directory=tmp_path,
+            executable_sha256=_executable_digest(executable),
+            execution_snapshot_root=tmp_path / "snapshots",
+            test_only_allow_script=True,
+            output_limit_bytes=1024,
+        ),
+        _store(),
+    )
+    with pytest.raises(DownstreamConnectionError, match="initialization failed"):
+        await client.start()
+    await client.close()
+    assert list((tmp_path / "snapshots").iterdir()) == []
 
 
 @pytest.mark.asyncio
