@@ -106,6 +106,23 @@ class FakeSummaries:
         return self.values[request_id]
 
 
+@pytest.mark.parametrize(
+    ("service", "tool", "destination"),
+    (
+        ("Fastmail\nforged", "send_email", "masked"),
+        ("Fastmail", "send_email\x7fforged", "masked"),
+        ("Fastmail", "send_email", "masked\tforged"),
+    ),
+)
+def test_safe_request_summary_rejects_control_characters(
+    service: str,
+    tool: str,
+    destination: str,
+) -> None:
+    with pytest.raises(ValueError, match="public bounds"):
+        SafeRequestSummary(service, tool, destination)
+
+
 class FakeTotpVerifier:
     def __init__(
         self,

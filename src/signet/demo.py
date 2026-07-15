@@ -350,8 +350,10 @@ class ReviewedSummaryProvider:
         adapter = reviewed.adapter
         if isinstance(adapter, (FastmailAdapter, WhatsAppAdapter)):
             destination_summary = adapter.masked_destination_summary(reviewed.arguments)
-        else:
+        elif isinstance(adapter, ToolAccessAdapter):
             destination_summary = reviewed.summary.destination_summary
+        else:
+            destination_summary = "Private details available in the web app"
         return SafeRequestSummary(
             service=reviewed.summary.service,
             tool=adapter.tool_name,

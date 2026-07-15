@@ -347,7 +347,11 @@ class SafeRequestSummary:
             len(self.service) > 128
             or len(self.tool) > 128
             or len(self.destination_summary) > _MAX_SUMMARY_LENGTH
-            or any(ord(character) < 32 for character in self.destination_summary)
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for value in (self.service, self.tool, self.destination_summary)
+                for character in value
+            )
         ):
             raise ValueError("safe request summary fields exceed their public bounds")
 
