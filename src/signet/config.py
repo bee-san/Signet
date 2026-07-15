@@ -22,7 +22,6 @@ class DownstreamConfig(BaseModel):
     working_directory: Path | None = None
     executable_sha256: str | None = None
     execution_snapshot_root: Path | None = None
-    test_only_allow_script: bool = False
     timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     output_limit_bytes: int = Field(default=1_048_576, gt=0, le=16_777_216)
 

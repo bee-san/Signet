@@ -26,6 +26,12 @@ from pathlib import Path
 from typing import Any, cast
 
 from signet.adapters.base import DispatchError, copy_json_object
+from signet.reviewed_process import (
+    _TEST_ONLY_SCRIPT_CAPABILITY,
+    DirectoryIdentity,
+    ReviewedProcessError,
+    VerifiedPrivateDirectory,
+)
 from signet.staging import StagingError, StagingStore
 
 REVIEWED_WACLI_VERSION = "0.12.0"
@@ -73,13 +79,13 @@ class WacliConfig:
     expected_version: str = REVIEWED_WACLI_VERSION
     expected_sha256: str | None = None
     staging_root: Path | None = None
-    home: Path = Path.home()
+    home: Path | None = None
+    store: Path | None = None
     timeout_seconds: float = 20.0
     cli_timeout: str = "15s"
     max_output_bytes: int = 256 * 1024
     reviewed_dispatch_enabled: bool = False
     execution_snapshot_root: Path | None = None
-    test_only_allow_script: bool = False
 
     def __post_init__(self) -> None:
         executable = Path(self.executable)
@@ -98,9 +104,23 @@ class WacliConfig:
         if self.max_output_bytes < 1024 or self.max_output_bytes > 4 * 1024 * 1024:
             raise ValueError("wacli output bound must be between 1 KiB and 4 MiB")
         object.__setattr__(self, "executable", executable)
-        object.__setattr__(self, "home", Path(self.home))
+        if self.home is not None:
+            home = Path(self.home)
+            if not home.is_absolute():
+                raise ValueError("wacli home must be an absolute canonical private directory")
+            object.__setattr__(self, "home", home)
+        if self.store is not None:
+            store = Path(self.store)
+            if not store.is_absolute():
+                raise ValueError("wacli store must be an absolute canonical private directory")
+            object.__setattr__(self, "store", store)
         if self.staging_root is not None:
-            object.__setattr__(self, "staging_root", Path(self.staging_root).resolve())
+            staging_root = Path(self.staging_root)
+            if not staging_root.is_absolute():
+                raise ValueError(
+                    "wacli staging root must be an absolute canonical private directory"
+                )
+            object.__setattr__(self, "staging_root", staging_root)
         if self.execution_snapshot_root is not None:
             snapshot_root = Path(self.execution_snapshot_root)
             if not snapshot_root.is_absolute():
@@ -110,8 +130,18 @@ class WacliConfig:
             raise ValueError("active wacli dispatch requires a private execution snapshot root")
         if self.reviewed_dispatch_enabled and self.expected_sha256 is None:
             raise ValueError("active wacli dispatch requires a reviewed executable digest")
-        if not isinstance(self.test_only_allow_script, bool):
-            raise TypeError("wacli test script flag must be a boolean")
+        if self.reviewed_dispatch_enabled:
+            active_home = self.home
+            active_store = self.store
+            if active_home is None or active_store is None:
+                raise ValueError(
+                    "active wacli dispatch requires a dedicated private home and store"
+                )
+            if active_home == active_store or active_home.parent != active_store.parent:
+                raise ValueError(
+                    "active wacli home and store must be distinct children of one "
+                    "private runtime root"
+                )
 
 
 def normalize_destination(value: str) -> str:
@@ -176,8 +206,30 @@ class WacliWrapper:
         config: WacliConfig,
         *,
         staging_store: StagingStore | None = None,
+        _test_capability: object | None = None,
     ) -> None:
         self.config = config
+        self._test_capability = _test_capability
+        self._home_identity: DirectoryIdentity | None = None
+        if config.home is not None:
+            self._home_identity = self._verify_runtime_directory(config.home, "home")
+        self._store_identity: DirectoryIdentity | None = None
+        if config.store is not None:
+            self._store_identity = self._verify_runtime_directory(config.store, "store")
+        self._runtime_root_identity: DirectoryIdentity | None = None
+        self._runtime_root: Path | None = None
+        if config.reviewed_dispatch_enabled and config.home is not None:
+            self._runtime_root = config.home.parent
+            self._runtime_root_identity = self._verify_runtime_directory(
+                self._runtime_root,
+                "runtime_root",
+            )
+        self._staging_root_identity: DirectoryIdentity | None = None
+        if config.staging_root is not None:
+            self._staging_root_identity = self._verify_runtime_directory(
+                config.staging_root,
+                "staging_root",
+            )
         if staging_store is not None and not isinstance(staging_store, StagingStore):
             raise TypeError("wacli staging store is invalid")
         if staging_store is not None and (
@@ -213,13 +265,7 @@ class WacliWrapper:
                     "executable_permissions_unsafe",
                     dispatch_may_have_occurred=False,
                 )
-            self._prepare_snapshot_root(snapshot_root)
-            root_flags = os.O_RDONLY | os.O_CLOEXEC
-            if hasattr(os, "O_DIRECTORY"):
-                root_flags |= os.O_DIRECTORY
-            if hasattr(os, "O_NOFOLLOW"):
-                root_flags |= os.O_NOFOLLOW
-            root_descriptor = os.open(snapshot_root, root_flags)
+            root_descriptor = self._open_snapshot_root(snapshot_root)
 
             for _ in range(4):
                 candidate = f".wacli-exec-{secrets.token_hex(18)}"
@@ -315,34 +361,49 @@ class WacliWrapper:
             os.close(source_descriptor)
 
     @staticmethod
-    def _prepare_snapshot_root(root: Path) -> None:
+    def _open_snapshot_root(root: Path) -> int:
         try:
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            metadata = root.lstat()
-            resolved = root.resolve(strict=True)
         except OSError as exc:
             raise WacliError("snapshot_root_unavailable", dispatch_may_have_occurred=False) from exc
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or resolved != root
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_mode & 0o077
-        ):
-            raise WacliError("snapshot_root_unsafe", dispatch_may_have_occurred=False)
+        try:
+            directory = VerifiedPrivateDirectory.open(root)
+        except ReviewedProcessError as exc:
+            raise WacliError("snapshot_root_unsafe", dispatch_may_have_occurred=False) from exc
+        return directory.detach()
 
     def _native_or_test_executable(self, leading: bytes) -> bool:
         if leading in _NATIVE_EXECUTABLE_MAGICS:
             return True
-        return self.config.test_only_allow_script and leading.startswith(b"#!")
+        return self._test_capability is _TEST_ONLY_SCRIPT_CAPABILITY and leading.startswith(b"#!")
+
+    @staticmethod
+    def _verify_runtime_directory(path: Path, code: str) -> DirectoryIdentity:
+        try:
+            with VerifiedPrivateDirectory.open(path) as directory:
+                return directory.identity
+        except ReviewedProcessError as exc:
+            raise WacliError(f"{code}_unsafe", dispatch_may_have_occurred=False) from exc
+
+    @staticmethod
+    def _open_runtime_directory(
+        path: Path,
+        identity: DirectoryIdentity,
+        code: str,
+    ) -> VerifiedPrivateDirectory:
+        try:
+            return VerifiedPrivateDirectory.open(path, expected_identity=identity)
+        except ReviewedProcessError as exc:
+            raise WacliError(f"{code}_changed", dispatch_may_have_occurred=False) from exc
 
     @staticmethod
     def _descriptor_path(descriptor: int) -> str:
         proc_path = f"/proc/self/fd/{descriptor}"
         return proc_path if Path("/proc/self/fd").is_dir() else f"/dev/fd/{descriptor}"
 
-    def _environment(self) -> dict[str, str]:
+    def _environment(self, bound_home: str) -> dict[str, str]:
         return {
-            "HOME": str(self.config.home),
+            "HOME": bound_home,
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "PATH": "/opt/homebrew/bin:/usr/bin:/bin",
@@ -368,33 +429,85 @@ class WacliWrapper:
     ) -> tuple[dict[str, Any], tuple[int, int, int, int, str]]:
         if any("\x00" in argument for argument in command_arguments):
             raise WacliError("invalid_argument", dispatch_may_have_occurred=False)
-        executable_fd, signature = self._open_verified_executable()
-        if required_signature is not None and signature != required_signature:
-            os.close(executable_fd)
-            raise WacliError("executable_changed", dispatch_may_have_occurred=False)
-        argv = (
-            self._descriptor_path(executable_fd),
-            "--account",
-            self.config.account,
-            "--json",
-            "--timeout",
-            self.config.cli_timeout,
-            *command_arguments,
-        )
+        if (
+            self.config.home is None
+            or self._home_identity is None
+            or self.config.store is None
+            or self._store_identity is None
+        ):
+            raise WacliError("runtime_directories_unavailable", dispatch_may_have_occurred=False)
+        home = self._open_runtime_directory(self.config.home, self._home_identity, "home")
+        store: VerifiedPrivateDirectory | None = None
+        runtime_root: VerifiedPrivateDirectory | None = None
+        staging_root: VerifiedPrivateDirectory | None = None
+        executable_fd = -1
         try:
+            if self._runtime_root is None or self._runtime_root_identity is None:
+                raise WacliError("runtime_root_changed", dispatch_may_have_occurred=False)
+            runtime_root = self._open_runtime_directory(
+                self._runtime_root,
+                self._runtime_root_identity,
+                "runtime_root",
+            )
+            store = self._open_runtime_directory(
+                self.config.store,
+                self._store_identity,
+                "store",
+            )
+            if self.config.staging_root is not None:
+                staging_identity = self._staging_root_identity
+                if staging_identity is None:
+                    raise WacliError("staging_root_changed", dispatch_may_have_occurred=False)
+                staging_root = self._open_runtime_directory(
+                    self.config.staging_root,
+                    staging_identity,
+                    "staging_root",
+                )
+            executable_fd, signature = self._open_verified_executable()
+            if required_signature is not None and signature != required_signature:
+                raise WacliError("executable_changed", dispatch_may_have_occurred=False)
+            argv = (
+                self._descriptor_path(executable_fd),
+                "--store",
+                store.reverify(),
+                "--json",
+                "--timeout",
+                self.config.cli_timeout,
+                *command_arguments,
+            )
+            bound_home = home.reverify()
+            inherited_descriptors = [
+                *pass_fds,
+                executable_fd,
+                home.descriptor,
+                store.descriptor,
+            ]
+            if staging_root is not None:
+                staging_root.reverify()
+            runtime_root.reverify()
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=self._environment(),
+                env=self._environment(bound_home),
+                cwd=bound_home,
                 start_new_session=True,
-                pass_fds=tuple(dict.fromkeys((*pass_fds, executable_fd))),
+                pass_fds=tuple(dict.fromkeys(inherited_descriptors)),
+                umask=0o077,
             )
         except OSError as exc:
             raise WacliError("process_start_failed", dispatch_may_have_occurred=False) from exc
         finally:
-            os.close(executable_fd)
+            if executable_fd >= 0:
+                os.close(executable_fd)
+            if staging_root is not None:
+                staging_root.close()
+            if store is not None:
+                store.close()
+            if runtime_root is not None:
+                runtime_root.close()
+            home.close()
         if process.stdout is None or process.stderr is None:
             await self._terminate(process)
             raise WacliError(

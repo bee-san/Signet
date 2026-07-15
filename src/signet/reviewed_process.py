@@ -7,6 +7,7 @@ import os
 import secrets
 import stat
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 _MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
@@ -31,6 +32,113 @@ class ReviewedProcessError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+DirectoryIdentity = tuple[int, int]
+
+
+@dataclass(slots=True)
+class VerifiedPrivateDirectory:
+    """An exact private directory held open across a process spawn."""
+
+    path: Path
+    descriptor: int
+    identity: DirectoryIdentity
+
+    @classmethod
+    def open(
+        cls,
+        path: Path,
+        *,
+        expected_identity: DirectoryIdentity | None = None,
+    ) -> VerifiedPrivateDirectory:
+        selected = Path(path)
+        if (
+            not selected.is_absolute()
+            or not hasattr(os, "O_DIRECTORY")
+            or not hasattr(os, "O_NOFOLLOW")
+        ):
+            raise ReviewedProcessError("working_directory_unsafe")
+        descriptor = -1
+        try:
+            before = selected.lstat()
+            resolved = selected.resolve(strict=True)
+            descriptor = os.open(
+                selected,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            opened = os.fstat(descriptor)
+        except (OSError, RuntimeError) as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise ReviewedProcessError("working_directory_unavailable") from exc
+
+        identity = (opened.st_dev, opened.st_ino)
+        if (
+            resolved != selected
+            or not stat.S_ISDIR(before.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or (before.st_dev, before.st_ino) != identity
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or expected_identity is not None
+            and identity != expected_identity
+        ):
+            os.close(descriptor)
+            raise ReviewedProcessError("working_directory_unsafe")
+
+        result = cls(path=selected, descriptor=descriptor, identity=identity)
+        result.reverify()
+        return result
+
+    def reverify(self) -> str:
+        """Recheck the pathname and descriptor, then return the bound fd path."""
+
+        try:
+            current = self.path.lstat()
+            resolved = self.path.resolve(strict=True)
+            opened = os.fstat(self.descriptor)
+        except (OSError, RuntimeError) as exc:
+            raise ReviewedProcessError("working_directory_changed") from exc
+        if (
+            resolved != self.path
+            or not stat.S_ISDIR(current.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or (current.st_dev, current.st_ino) != self.identity
+            or (opened.st_dev, opened.st_ino) != self.identity
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise ReviewedProcessError("working_directory_changed")
+        return descriptor_path(self.descriptor)
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+    def detach(self) -> int:
+        descriptor = self.descriptor
+        if descriptor < 0:
+            raise ReviewedProcessError("working_directory_unavailable")
+        self.descriptor = -1
+        return descriptor
+
+    def __enter__(self) -> VerifiedPrivateDirectory:
+        return self
+
+    def __exit__(self, *ignored: object) -> None:
+        del ignored
+        self.close()
+
+
+class _TestOnlyScriptCapability:
+    __slots__ = ()
+
+
+# Tests inject this opaque in-memory capability directly. It is intentionally
+# absent from every serializable runtime configuration model.
+_TEST_ONLY_SCRIPT_CAPABILITY = _TestOnlyScriptCapability()
 
 
 def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -88,9 +196,9 @@ def _open_private_root(root: Path) -> int:
     return descriptor
 
 
-def _is_reviewed_format(leading: bytes, *, test_only_allow_script: bool) -> bool:
+def _is_reviewed_format(leading: bytes, *, test_capability: object | None) -> bool:
     return leading in _NATIVE_EXECUTABLE_MAGICS or (
-        test_only_allow_script and leading.startswith(b"#!")
+        test_capability is _TEST_ONLY_SCRIPT_CAPABILITY and leading.startswith(b"#!")
     )
 
 
@@ -99,7 +207,7 @@ def open_verified_executable(
     *,
     expected_sha256: str,
     snapshot_root: Path,
-    test_only_allow_script: bool = False,
+    _test_capability: object | None = None,
 ) -> int:
     """Copy, verify, unlink, and return a read-only descriptor for exact execution."""
 
@@ -119,6 +227,8 @@ def open_verified_executable(
     try:
         if not stat.S_ISREG(source_before.st_mode) or source_before.st_mode & 0o111 == 0:
             raise ReviewedProcessError("executable_not_runnable")
+        if source_before.st_uid not in {0, os.geteuid()} or source_before.st_mode & 0o022:
+            raise ReviewedProcessError("executable_permissions_unsafe")
         root_descriptor = _open_private_root(snapshot_root)
         for _ in range(4):
             candidate = f".signet-exec-{secrets.token_hex(18)}"
@@ -153,7 +263,7 @@ def open_verified_executable(
         source_after = os.fstat(source_descriptor)
         if _identity(source_before) != _identity(source_after) or copied != source_before.st_size:
             raise ReviewedProcessError("executable_changed")
-        if not _is_reviewed_format(leading, test_only_allow_script=test_only_allow_script):
+        if not _is_reviewed_format(leading, test_capability=_test_capability):
             raise ReviewedProcessError("executable_format_unreviewed")
         actual_sha256 = digest.hexdigest()
         if actual_sha256 != expected_sha256:

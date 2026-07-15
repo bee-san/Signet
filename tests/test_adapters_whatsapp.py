@@ -7,7 +7,7 @@ import os
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -22,6 +22,7 @@ from signet.adapters import (
     WhatsAppTextAdapter,
 )
 from signet.delivery import standardize_safe_metadata
+from signet.reviewed_process import _TEST_ONLY_SCRIPT_CAPABILITY
 from signet.wacli_wrapper import WacliConfig, WacliError, WacliWrapper
 from tests.attachment_fixtures import staging_store as make_staging_store
 
@@ -40,7 +41,7 @@ class FakeOwnedClient:
 def text_arguments() -> dict[str, Any]:
     with (ROOT / "spec/fixtures/whatsapp-send-input.json").open(encoding="utf-8") as handle:
         fixture = json.load(handle)
-    return fixture["arguments"]
+    return cast(dict[str, Any], fixture["arguments"])
 
 
 def adapter_request(tool: str, arguments: Mapping[str, Any]) -> AdapterRequest:
@@ -60,13 +61,28 @@ def make_fake_wacli(
     version: str = "0.12.0",
     send_body: str = '{"sent":true,"message_id":"wa-safe-id"}',
     send_prelude: str = "",
+    fd_report: Path | None = None,
 ) -> tuple[Path, Path]:
     executable = tmp_path / "fake-wacli"
     log = tmp_path / "argv.log"
+    fd_probe = ""
+    if fd_report is not None:
+        fd_probe = f"""
+fd_root=/proc/self/fd
+if [ ! -d "$fd_root" ]; then fd_root=/dev/fd; fi
+for fd in "$fd_root"/*; do
+  case "${{fd##*/}}" in 0|1|2) continue ;; esac
+  target=$(/usr/bin/readlink "$fd") || continue
+  printf '%s=%s\\n' "$fd" "$target"
+done > {str(fd_report)!r}
+"""
     script = f"""#!/bin/sh
 printf '%s\\n' CALL >> {str(log)!r}
 printf '%s\\n' "$@" >> {str(log)!r}
 /usr/bin/env >> {str(log)!r}
+printf '%s' cwd > .fake-wacli-cwd
+if [ "$1" = "--store" ]; then printf '%s' store > "$2/.fake-wacli-store"; fi
+{fd_probe}
 case " $* " in
   *" version "*) printf '%s' '{json.dumps({"version": version})}' ;;
   *" send "*) {send_prelude} printf '%s' '{send_body}' ;;
@@ -79,21 +95,39 @@ esac
 
 
 def wrapper_config(executable: Path, tmp_path: Path, **changes: Any) -> WacliConfig:
+    home = tmp_path / "home"
+    store = tmp_path / "wacli-store"
+    staging_root = tmp_path / "staging"
+    for directory in (home, store, staging_root):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        directory.chmod(0o700)
     values: dict[str, Any] = {
         "account": "personal",
         "executable": executable,
         "expected_version": "0.12.0",
         "expected_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-        "staging_root": tmp_path / "staging",
-        "home": tmp_path / "home",
+        "staging_root": staging_root,
+        "home": home,
+        "store": store,
         "timeout_seconds": 2,
         "max_output_bytes": 16 * 1024,
         "reviewed_dispatch_enabled": True,
         "execution_snapshot_root": tmp_path / "exec-snapshots",
-        "test_only_allow_script": True,
     }
     values.update(changes)
     return WacliConfig(**values)
+
+
+def _make_test_wrapper(
+    config: WacliConfig,
+    *,
+    staging_store: Any = None,
+) -> WacliWrapper:
+    return WacliWrapper(
+        config,
+        staging_store=staging_store,
+        _test_capability=_TEST_ONLY_SCRIPT_CAPABILITY,
+    )
 
 
 @pytest.mark.asyncio
@@ -221,7 +255,7 @@ async def test_wacli_wrapper_is_pinned_no_shell_minimal_env_and_json_only(
     marker = tmp_path / "shell-injection"
     hostile_message = f"literal $(touch {marker}) ; echo not-a-command"
     monkeypatch.setenv("WACLI_MUST_NOT_INHERIT", "secret-environment-marker")
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path))
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path))
 
     result = await wrapper.send_text({"to": "+15550102030", "message": hostile_message})
     logged = log.read_text(encoding="utf-8")
@@ -230,7 +264,8 @@ async def test_wacli_wrapper_is_pinned_no_shell_minimal_env_and_json_only(
     assert not marker.exists()
     assert "secret-environment-marker" not in logged
     assert logged.count("CALL") == 2  # version preflight and the send
-    assert "--account\npersonal\n--json\n--timeout\n15s" in logged
+    assert "--store\n/proc/self/fd/" in logged or "--store\n/dev/fd/" in logged
+    assert "--json\n--timeout\n15s" in logged
     assert "send\ntext\n--to\n+15550102030" in logged
     assert f"--message\n{hostile_message}\n--no-preview" in logged
 
@@ -238,7 +273,7 @@ async def test_wacli_wrapper_is_pinned_no_shell_minimal_env_and_json_only(
 @pytest.mark.asyncio
 async def test_wacli_wrapper_fails_closed_on_version_drift_before_send(tmp_path: Path) -> None:
     executable, log = make_fake_wacli(tmp_path, version="0.13.0")
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path))
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path))
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_text(text_arguments())
@@ -260,7 +295,10 @@ async def test_wacli_wrapper_rejects_binary_change_after_version_preflight(tmp_p
                 encoding="utf-8",
             )
 
-    wrapper = SwappingWrapper(wrapper_config(executable, tmp_path))
+    wrapper = SwappingWrapper(
+        wrapper_config(executable, tmp_path),
+        _test_capability=_TEST_ONLY_SCRIPT_CAPABILITY,
+    )
     with pytest.raises(WacliError) as caught:
         await wrapper.send_text(text_arguments())
 
@@ -296,7 +334,10 @@ async def test_wacli_wrapper_executes_verified_descriptor_not_swapped_path(
                 os.replace(replacement, executable)
             return descriptor, signature
 
-    wrapper = SwapAfterOpenWrapper(wrapper_config(executable, tmp_path))
+    wrapper = SwapAfterOpenWrapper(
+        wrapper_config(executable, tmp_path),
+        _test_capability=_TEST_ONLY_SCRIPT_CAPABILITY,
+    )
     result = await wrapper.send_text(text_arguments())
 
     assert result == {"sent": True, "message_id": "wa-safe-id"}
@@ -307,7 +348,7 @@ async def test_wacli_wrapper_executes_verified_descriptor_not_swapped_path(
 @pytest.mark.asyncio
 async def test_wacli_wrapper_rejects_non_json_success_as_ambiguous(tmp_path: Path) -> None:
     executable, _ = make_fake_wacli(tmp_path, send_body="human output is forbidden")
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path))
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path))
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_text(text_arguments())
@@ -319,7 +360,7 @@ async def test_wacli_wrapper_rejects_non_json_success_as_ambiguous(tmp_path: Pat
 @pytest.mark.asyncio
 async def test_wacli_wrapper_timeout_is_ambiguous_and_bounded(tmp_path: Path) -> None:
     executable, _ = make_fake_wacli(tmp_path, send_prelude="sleep 2;")
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path, timeout_seconds=0.05))
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path, timeout_seconds=0.05))
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_text(text_arguments())
@@ -335,7 +376,7 @@ async def test_wacli_wrapper_kills_process_group_when_cancelled(tmp_path: Path) 
         tmp_path,
         send_prelude=f"echo $$ > {str(pid_file)!r}; sleep 30;",
     )
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path))
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path))
     task = asyncio.create_task(wrapper.send_text(text_arguments()))
     for _ in range(100):
         if pid_file.exists():
@@ -363,7 +404,7 @@ async def test_wacli_wrapper_rejects_oversized_output_as_ambiguous(tmp_path: Pat
         tmp_path,
         send_prelude="/usr/bin/head -c 4096 /dev/zero | /usr/bin/tr '\\000' x; exit 0;",
     )
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path, max_output_bytes=1024))
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path, max_output_bytes=1024))
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_text(text_arguments())
@@ -397,14 +438,23 @@ async def test_whatsapp_media_is_decrypted_only_to_an_inherited_anonymous_descri
     assert payload["expected_size"] == len(b"inert jpeg fixture")
     assert len(payload["expected_sha256"]) == 64
 
-    executable, log = make_fake_wacli(tmp_path)
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path), staging_store=store)
+    fd_report = tmp_path / "inherited-fds.log"
+    executable, log = make_fake_wacli(tmp_path, fd_report=fd_report)
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path), staging_store=store)
     result = await adapter.execute(wrapper, payload)
 
     assert result["sent"] is True
     logged = log.read_text(encoding="utf-8")
     assert "send\nfile\n--to\n+15550102030\n--file\n/dev/fd/" in logged
     assert "--filename\nphoto.jpg\n--mime\nimage/jpeg" in logged
+    inherited_targets = [line.split("=", 1)[1] for line in fd_report.read_text().splitlines()]
+    assert str(store.root) not in inherited_targets
+    assert any(
+        target.startswith(f"{store.root}/") and target.endswith(" (deleted)")
+        for target in inherited_targets
+    )
+    assert str(tmp_path / "home") in inherited_targets
+    assert str(tmp_path / "wacli-store") in inherited_targets
 
 
 @pytest.mark.asyncio
@@ -435,7 +485,7 @@ async def test_wacli_wrapper_rehashes_open_descriptor_after_adapter_prepare(
     payload = adapter.prepare_for_execution(adapter_request("send_file", arguments))
     (store.root / reference["staged_id"]).write_bytes(b"changed--bytes")
     executable, log = make_fake_wacli(tmp_path)
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path), staging_store=store)
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path), staging_store=store)
 
     with pytest.raises(WacliError) as caught:
         await adapter.execute(wrapper, payload)
@@ -450,7 +500,7 @@ async def test_wacli_wrapper_rejects_media_outside_staging_before_process(tmp_pa
     executable, log = make_fake_wacli(tmp_path)
     outside = tmp_path / "outside.txt"
     outside.write_text("not staged", encoding="utf-8")
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path))
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path))
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_file(
@@ -493,7 +543,7 @@ async def test_wacli_wrapper_rejects_symlinked_media_directory_before_process(
     outside.write_bytes(record.path.read_bytes())
     record.path.unlink()
     record.path.symlink_to(outside)
-    wrapper = WacliWrapper(wrapper_config(executable, tmp_path), staging_store=store)
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path), staging_store=store)
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_file(
@@ -524,6 +574,146 @@ def test_wacli_config_requires_absolute_pinned_executable() -> None:
             execution_snapshot_root=Path("/private/snapshots"),
         )
 
+    with pytest.raises(ValueError, match="dedicated private home and store"):
+        WacliConfig(
+            account="personal",
+            executable=Path("/opt/reviewed/wacli"),
+            expected_sha256="a" * 64,
+            reviewed_dispatch_enabled=True,
+            execution_snapshot_root=Path("/private/snapshots"),
+        )
+
+    with pytest.raises(ValueError, match="home must be an absolute"):
+        WacliConfig(account="personal", home=Path("relative-home"))
+    with pytest.raises(ValueError, match="store must be an absolute"):
+        WacliConfig(account="personal", store=Path("relative-store"))
+
+    with pytest.raises(ValueError, match="distinct children"):
+        WacliConfig(
+            account="personal",
+            executable=Path("/opt/reviewed/wacli"),
+            expected_sha256="a" * 64,
+            home=Path("/Users/operator"),
+            store=Path("/Users/operator/.wacli"),
+            reviewed_dispatch_enabled=True,
+            execution_snapshot_root=Path("/private/snapshots"),
+        )
+
+
+@pytest.mark.parametrize("directory_name", ["home", "store", "staging_root"])
+@pytest.mark.parametrize("kind", ["symlink", "group_writable"])
+def test_wacli_wrapper_rejects_unsafe_runtime_directories(
+    tmp_path: Path,
+    directory_name: str,
+    kind: str,
+) -> None:
+    executable, _ = make_fake_wacli(tmp_path)
+    config = wrapper_config(executable, tmp_path)
+    selected = cast(Path, getattr(config, directory_name))
+    if kind == "symlink":
+        original = selected.with_name(f"{selected.name}-original")
+        selected.rename(original)
+        selected.symlink_to(original, target_is_directory=True)
+    else:
+        selected.chmod(0o770)
+
+    with pytest.raises(WacliError, match=f"{directory_name}_unsafe"):
+        _make_test_wrapper(config)
+
+
+def test_wacli_wrapper_rejects_foreign_owned_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, _ = make_fake_wacli(tmp_path)
+    config = wrapper_config(executable, tmp_path)
+    home = cast(Path, config.home)
+    monkeypatch.setattr("signet.reviewed_process.os.geteuid", lambda: home.stat().st_uid + 1)
+
+    with pytest.raises(WacliError, match="home_unsafe"):
+        _make_test_wrapper(config)
+
+
+def test_wacli_wrapper_rejects_unsafe_shared_runtime_root(tmp_path: Path) -> None:
+    executable, _ = make_fake_wacli(tmp_path)
+    config = wrapper_config(executable, tmp_path)
+    tmp_path.chmod(0o750)
+    try:
+        with pytest.raises(WacliError, match="runtime_root_unsafe"):
+            _make_test_wrapper(config)
+    finally:
+        tmp_path.chmod(0o700)
+
+
+@pytest.mark.asyncio
+async def test_wacli_wrapper_rejects_home_or_store_replacement_before_each_spawn(
+    tmp_path: Path,
+) -> None:
+    for directory_name in ("home", "store"):
+        case_root = tmp_path / directory_name
+        case_root.mkdir(mode=0o700)
+        executable, log = make_fake_wacli(case_root)
+        config = wrapper_config(executable, case_root)
+        wrapper = _make_test_wrapper(config)
+        selected = cast(Path, getattr(config, directory_name))
+        original = selected.with_name(f"{selected.name}-original")
+        selected.rename(original)
+        selected.mkdir(mode=0o700)
+
+        with pytest.raises(WacliError, match=f"{directory_name}_changed"):
+            await wrapper.send_text(text_arguments())
+        assert not log.exists()
+
+
+@pytest.mark.asyncio
+async def test_wacli_wrapper_binds_home_and_store_across_last_moment_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, _ = make_fake_wacli(tmp_path)
+    config = wrapper_config(executable, tmp_path)
+    home = cast(Path, config.home)
+    store = cast(Path, config.store)
+    original_home = tmp_path / "original-home"
+    original_store = tmp_path / "original-store"
+    real_create = asyncio.create_subprocess_exec
+    swapped = False
+
+    async def swap_then_create(*args: Any, **kwargs: Any) -> Any:
+        nonlocal swapped
+        if not swapped:
+            home.rename(original_home)
+            home.mkdir(mode=0o700)
+            store.rename(original_store)
+            store.mkdir(mode=0o700)
+            swapped = True
+        return await real_create(*args, **kwargs)
+
+    monkeypatch.setattr("signet.wacli_wrapper.asyncio.create_subprocess_exec", swap_then_create)
+    await _make_test_wrapper(config).verify_version()
+
+    assert (original_home / ".fake-wacli-cwd").read_text() == "cwd"
+    assert (original_store / ".fake-wacli-store").read_text() == "store"
+    assert not (home / ".fake-wacli-cwd").exists()
+    assert not (store / ".fake-wacli-store").exists()
+
+
+@pytest.mark.asyncio
+async def test_wacli_text_child_never_inherits_encrypted_staging_root(
+    tmp_path: Path,
+) -> None:
+    fd_report = tmp_path / "inherited-fds.log"
+    executable, _ = make_fake_wacli(tmp_path, fd_report=fd_report)
+    config = wrapper_config(executable, tmp_path)
+
+    await _make_test_wrapper(config).send_text(text_arguments())
+
+    inherited_targets = [line.split("=", 1)[1] for line in fd_report.read_text().splitlines()]
+    assert str(config.staging_root) not in inherited_targets
+    assert not any(target.startswith(f"{config.staging_root}/") for target in inherited_targets)
+    assert str(config.home) in inherited_targets
+    assert str(config.store) in inherited_targets
+
 
 @pytest.mark.asyncio
 async def test_wacli_wrapper_rejects_group_writable_reviewed_executable(
@@ -532,7 +722,7 @@ async def test_wacli_wrapper_rejects_group_writable_reviewed_executable(
     executable, log = make_fake_wacli(tmp_path)
     config = wrapper_config(executable, tmp_path)
     executable.chmod(0o720)
-    wrapper = WacliWrapper(config)
+    wrapper = _make_test_wrapper(config)
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_text(text_arguments())
@@ -547,7 +737,7 @@ async def test_wacli_dispatch_defaults_to_inactive(tmp_path: Path) -> None:
     executable, log = make_fake_wacli(tmp_path)
     config = wrapper_config(executable, tmp_path, reviewed_dispatch_enabled=False)
     with pytest.raises(WacliError) as caught:
-        await WacliWrapper(config).send_text(text_arguments())
+        await _make_test_wrapper(config).send_text(text_arguments())
     assert caught.value.code == "provider_contract_inactive"
     assert not log.exists()
 

@@ -10,7 +10,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import anyio
 import httpx
@@ -30,10 +30,12 @@ from signet.downstream import (
     DownstreamProtocolError,
     _bounded_response_hook,
     _BoundedHTTPResponseStream,
+    _official_stdio_connector,
     structured_adapter_result,
     validate_call_tool_result,
 )
 from signet.mcp_mirror import raw_model
+from signet.reviewed_process import _TEST_ONLY_SCRIPT_CAPABILITY
 
 SECRET = "credential-material-that-must-not-leak"
 
@@ -54,13 +56,22 @@ def _stdio_config(**changes: Any) -> DownstreamConfig:
         "transport": "stdio",
         "credential_ref": "keychain://Signet/example",
         "command": ("/opt/signet/bin/provider-mcp", "--mode", "json"),
-        "working_directory": Path("/var/empty"),
+        "working_directory": Path.home().resolve(),
         "executable_sha256": "a" * 64,
         "execution_snapshot_root": Path("/var/empty/signet-exec"),
         "timeout_seconds": 2,
     }
     values.update(changes)
     return DownstreamConfig(**values)
+
+
+@asynccontextmanager
+async def _test_script_stdio_connector(parameters: Any) -> AsyncIterator[tuple[Any, ...]]:
+    async with _official_stdio_connector(
+        parameters,
+        _test_capability=_TEST_ONLY_SCRIPT_CAPABILITY,
+    ) as streams:
+        yield streams
 
 
 def _store() -> MemorySecretStore:
@@ -367,16 +378,26 @@ async def test_discovery_passes_configured_byte_and_time_bounds_to_mirror(
 
 
 @pytest.mark.asyncio
-async def test_stdio_uses_pinned_direct_argv_and_minimal_redacted_alias_environment() -> None:
+async def test_stdio_uses_pinned_direct_argv_and_minimal_redacted_alias_environment(
+    tmp_path: Path,
+) -> None:
     events: list[str] = []
     factories = FakeFactories(FakeSession(events))
-    client = factories.client(alias="whatsapp-local", stdio=True)
+    tmp_path.chmod(0o700)
+    client = DownstreamClient(
+        "whatsapp-local",
+        _stdio_config(working_directory=tmp_path),
+        _store(),
+        http_connector=factories.http,
+        stdio_connector=factories.stdio,
+        session_factory=factories.session_factory,
+    )
 
     async with client:
         parameters = factories.stdio_parameters[0]
         assert parameters.command == "/opt/signet/bin/provider-mcp"
         assert parameters.args == ["--mode", "json"]
-        assert parameters.cwd == Path("/var/empty")
+        assert parameters.cwd == tmp_path
         assert parameters.env == {
             "LANG": "C",
             "LC_ALL": "C",
@@ -419,9 +440,9 @@ async def test_official_stdio_launcher_uses_verified_snapshot_and_exact_clean_en
             working_directory=tmp_path,
             executable_sha256=_executable_digest(executable),
             execution_snapshot_root=tmp_path / "snapshots",
-            test_only_allow_script=True,
         ),
         _store(),
+        stdio_connector=_test_script_stdio_connector,
     )
     async with client:
         assert client.is_running
@@ -452,9 +473,9 @@ async def test_official_stdio_launcher_rejects_symlinked_executable(tmp_path: Pa
             working_directory=tmp_path,
             executable_sha256=_executable_digest(executable),
             execution_snapshot_root=tmp_path / "snapshots",
-            test_only_allow_script=True,
         ),
         _store(),
+        stdio_connector=_test_script_stdio_connector,
     )
     with pytest.raises(DownstreamConnectionError, match="initialization failed"):
         await client.start()
@@ -475,10 +496,10 @@ async def test_official_stdio_launcher_rejects_oversized_frames_before_parsing(
             working_directory=tmp_path,
             executable_sha256=_executable_digest(executable),
             execution_snapshot_root=tmp_path / "snapshots",
-            test_only_allow_script=True,
             output_limit_bytes=1024,
         ),
         _store(),
+        stdio_connector=_test_script_stdio_connector,
     )
     with pytest.raises(DownstreamConnectionError, match="initialization failed"):
         await client.start()
@@ -626,13 +647,16 @@ async def test_clients_have_independent_sessions_and_lifecycles() -> None:
 
 
 def test_complete_raw_result_validation_is_lossless_and_detached() -> None:
-    raw = {
-        "content": [{"type": "text", "text": '{"id":"one"}'}],
-        "structuredContent": {"id": "one"},
-        "isError": False,
-        "_meta": {"x-provider": None},
-        "x-result-extension": [1, None, {"kept": True}],
-    }
+    raw = cast(
+        dict[str, Any],
+        {
+            "content": [{"type": "text", "text": '{"id":"one"}'}],
+            "structuredContent": {"id": "one"},
+            "isError": False,
+            "_meta": {"x-provider": None},
+            "x-result-extension": [1, None, {"kept": True}],
+        },
+    )
     captured = validate_call_tool_result(raw)
     assert captured == raw
     captured["x-result-extension"][2]["kept"] = False
@@ -698,6 +722,127 @@ def test_stdio_configuration_rejects_shells_relative_paths_and_unbounded_argv() 
     ):
         with pytest.raises(DownstreamConfigurationError):
             DownstreamClient("example", _stdio_config(command=command), _store())
+
+
+def test_serialized_downstream_config_cannot_enable_script_execution() -> None:
+    values = _stdio_config().model_dump()
+    values["test_only_allow_script"] = True
+
+    with pytest.raises(ValueError, match="test_only_allow_script"):
+        DownstreamConfig(**values)
+
+
+def test_stdio_configuration_requires_explicit_existing_private_canonical_working_directory(
+    tmp_path: Path,
+) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    symlink = tmp_path / "linked"
+    symlink.symlink_to(private, target_is_directory=True)
+    noncanonical = private / ".." / "private"
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o770)
+    unsafe.chmod(0o770)
+
+    for working_directory in (
+        None,
+        Path("relative"),
+        tmp_path / "missing",
+        symlink,
+        noncanonical,
+        unsafe,
+    ):
+        with pytest.raises(DownstreamConfigurationError, match="stdio"):
+            DownstreamClient(
+                "example",
+                _stdio_config(working_directory=working_directory),
+                _store(),
+            )
+
+
+def test_stdio_configuration_rejects_foreign_owned_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    monkeypatch.setattr("signet.reviewed_process.os.geteuid", lambda: private.stat().st_uid + 1)
+
+    with pytest.raises(DownstreamConfigurationError, match="mode-0700"):
+        DownstreamClient(
+            "example",
+            _stdio_config(working_directory=private),
+            _store(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_stdio_launcher_rejects_working_directory_replaced_after_configuration(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "provider-mcp"
+    _write_fake_stdio_server(executable)
+    working_directory = tmp_path / "working"
+    working_directory.mkdir(mode=0o700)
+    original = tmp_path / "original"
+    client = DownstreamClient(
+        "example",
+        _stdio_config(
+            command=(str(executable), str(tmp_path / "unused.json")),
+            working_directory=working_directory,
+            executable_sha256=_executable_digest(executable),
+            execution_snapshot_root=tmp_path / "snapshots",
+        ),
+        _store(),
+        stdio_connector=_test_script_stdio_connector,
+    )
+    working_directory.rename(original)
+    working_directory.mkdir(mode=0o700)
+
+    with pytest.raises(DownstreamConnectionError, match="initialization failed"):
+        await client.start()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_launcher_binds_checked_working_directory_across_last_moment_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "provider-mcp"
+    _write_fake_stdio_server(executable)
+    working_directory = tmp_path / "working"
+    working_directory.mkdir(mode=0o700)
+    original = tmp_path / "original"
+    real_open_process = anyio.open_process
+    swapped = False
+
+    async def swap_then_open(*args: Any, **kwargs: Any) -> Any:
+        nonlocal swapped
+        if not swapped:
+            working_directory.rename(original)
+            working_directory.mkdir(mode=0o700)
+            swapped = True
+        return await real_open_process(*args, **kwargs)
+
+    monkeypatch.setattr("signet.downstream.anyio.open_process", swap_then_open)
+    client = DownstreamClient(
+        "example",
+        _stdio_config(
+            command=(str(executable), "environment.json"),
+            working_directory=working_directory,
+            executable_sha256=_executable_digest(executable),
+            execution_snapshot_root=tmp_path / "snapshots",
+        ),
+        _store(),
+        stdio_connector=_test_script_stdio_connector,
+    )
+
+    async with client:
+        assert client.is_running
+
+    assert (original / "environment.json").is_file()
+    assert not (working_directory / "environment.json").exists()
 
 
 @pytest.mark.parametrize(

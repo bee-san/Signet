@@ -38,7 +38,13 @@ from signet.mcp_mirror import (
 from signet.mcp_mirror import (
     discover_all_tools as _discover_all_tools,
 )
-from signet.reviewed_process import descriptor_path, open_verified_executable
+from signet.reviewed_process import (
+    DirectoryIdentity,
+    ReviewedProcessError,
+    VerifiedPrivateDirectory,
+    descriptor_path,
+    open_verified_executable,
+)
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _MAX_TOOL_NAME_LENGTH = 256
@@ -109,8 +115,8 @@ class ReviewedStdioServerParameters(RedactedStdioServerParameters):
 
     expected_sha256: str
     execution_snapshot_root: Path
+    working_directory_identity: DirectoryIdentity
     output_limit_bytes: int
-    test_only_allow_script: bool = False
 
 
 class _Lifecycle(StrEnum):
@@ -240,27 +246,39 @@ async def _official_http_connector(
 @asynccontextmanager
 async def _official_stdio_connector(
     parameters: ReviewedStdioServerParameters,
+    *,
+    _test_capability: object | None = None,
 ) -> AsyncIterator[TransportStreams]:
-    executable_descriptor = open_verified_executable(
-        Path(parameters.command),
-        expected_sha256=parameters.expected_sha256,
-        snapshot_root=parameters.execution_snapshot_root,
-        test_only_allow_script=parameters.test_only_allow_script,
+    if parameters.cwd is None:
+        raise DownstreamConfigurationError("stdio working directory is unavailable")
+    working_directory = VerifiedPrivateDirectory.open(
+        Path(parameters.cwd),
+        expected_identity=parameters.working_directory_identity,
     )
+    executable_descriptor = -1
     try:
+        executable_descriptor = open_verified_executable(
+            Path(parameters.command),
+            expected_sha256=parameters.expected_sha256,
+            snapshot_root=parameters.execution_snapshot_root,
+            _test_capability=_test_capability,
+        )
         executable = descriptor_path(executable_descriptor)
+        bound_working_directory = working_directory.reverify()
         with Path(os.devnull).open("w", encoding="utf-8") as error_sink:
             process = await anyio.open_process(
                 [executable, *parameters.args],
                 env=dict(parameters.env or {}),
                 stderr=error_sink,
-                cwd=parameters.cwd,
+                cwd=bound_working_directory,
                 start_new_session=True,
-                pass_fds=(executable_descriptor,),
+                pass_fds=(executable_descriptor, working_directory.descriptor),
                 umask=0o077,
             )
     finally:
-        os.close(executable_descriptor)
+        if executable_descriptor >= 0:
+            os.close(executable_descriptor)
+        working_directory.close()
 
     stdout = process.stdout
     stdin = process.stdin
@@ -479,7 +497,7 @@ class DownstreamClient:
         stdio_connector: StdioConnector = _official_stdio_connector,
         session_factory: SessionFactory = _official_session_factory,
     ) -> None:
-        self._validate_config(alias, config)
+        self._working_directory_identity = self._validate_config(alias, config)
         self._alias = alias
         self._config = config
         self._credential_reference = SecretReference.parse(config.credential_ref)
@@ -770,6 +788,9 @@ class DownstreamClient:
         snapshot_root = self._config.execution_snapshot_root
         if executable_sha256 is None or snapshot_root is None:
             raise DownstreamConfigurationError("stdio executable review is unavailable")
+        working_directory_identity = self._working_directory_identity
+        if working_directory_identity is None:
+            raise DownstreamConfigurationError("stdio working directory review is unavailable")
         parameters = ReviewedStdioServerParameters(
             command=executable,
             args=list(arguments),
@@ -782,8 +803,8 @@ class DownstreamClient:
             cwd=self._config.working_directory,
             expected_sha256=executable_sha256,
             execution_snapshot_root=snapshot_root,
+            working_directory_identity=working_directory_identity,
             output_limit_bytes=self._config.output_limit_bytes,
-            test_only_allow_script=self._config.test_only_allow_script,
         )
         return await stack.enter_async_context(self._stdio_connector(parameters))
 
@@ -816,7 +837,7 @@ class DownstreamClient:
             raise DownstreamConfigurationError("downstream tool name is invalid")
 
     @staticmethod
-    def _validate_config(alias: str, config: DownstreamConfig) -> None:
+    def _validate_config(alias: str, config: DownstreamConfig) -> DirectoryIdentity | None:
         if not isinstance(alias, str) or not _ALIAS_RE.fullmatch(alias):
             raise DownstreamConfigurationError("downstream alias is invalid")
         if not isinstance(config, DownstreamConfig):
@@ -829,7 +850,6 @@ class DownstreamClient:
                 or config.working_directory is not None
                 or config.executable_sha256 is not None
                 or config.execution_snapshot_root is not None
-                or config.test_only_allow_script
             ):
                 raise DownstreamConfigurationError("HTTP downstream configuration is invalid")
             parsed = urlsplit(config.url)
@@ -857,11 +877,12 @@ class DownstreamClient:
                 raise DownstreamConfigurationError(
                     "cleartext HTTP downstream endpoints must be loopback"
                 )
-            return
+            return None
 
         if (
             config.url is not None
             or not config.command
+            or config.working_directory is None
             or config.executable_sha256 is None
             or config.execution_snapshot_root is None
             or not config.execution_snapshot_root.is_absolute()
@@ -888,5 +909,10 @@ class DownstreamClient:
             or sum(len(argument.encode("utf-8")) for argument in arguments) > _MAX_ARGUMENT_BYTES
         ):
             raise DownstreamConfigurationError("stdio process arguments exceed safe bounds")
-        if config.working_directory is not None and not config.working_directory.is_absolute():
-            raise DownstreamConfigurationError("stdio working directory must be absolute")
+        try:
+            with VerifiedPrivateDirectory.open(config.working_directory) as working_directory:
+                return working_directory.identity
+        except ReviewedProcessError as exc:
+            raise DownstreamConfigurationError(
+                "stdio working directory must be an existing canonical owned mode-0700 directory"
+            ) from exc
