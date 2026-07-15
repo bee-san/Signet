@@ -169,7 +169,25 @@ class SQLiteNotificationOutbox:
                 claimed.append(_intent(values))
         return tuple(claimed)
 
-    def mark_delivered(self, intent: NotificationIntent, *, now: int) -> bool:
+    def delivered_subscription_ids(self, outbox_id: str) -> frozenset[str]:
+        _validate_identity(outbox_id, "notification outbox ID")
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """
+                SELECT subscription_id FROM notification_outbox_deliveries
+                WHERE outbox_id = ?
+                """,
+                (outbox_id,),
+            ).fetchall()
+        return frozenset(str(row["subscription_id"]) for row in rows)
+
+    def mark_delivered(
+        self,
+        intent: NotificationIntent,
+        *,
+        now: int,
+        delivered_subscription_ids: tuple[str, ...] = (),
+    ) -> bool:
         if now < intent.created_at:
             raise ValueError("notification delivery time is invalid")
         with self.database.transaction() as connection:
@@ -182,6 +200,13 @@ class SQLiteNotificationOutbox:
                 """,
                 (now, intent.outbox_id, intent.claim_token),
             ).rowcount
+            if updated == 1:
+                self._record_deliveries(
+                    connection,
+                    intent,
+                    delivered_subscription_ids,
+                    now=now,
+                )
         return int(updated) == 1
 
     def defer(
@@ -191,6 +216,7 @@ class SQLiteNotificationOutbox:
         now: int,
         error_code: str,
         retry_delay: int,
+        delivered_subscription_ids: tuple[str, ...] = (),
     ) -> bool:
         if _SAFE_ERROR_RE.fullmatch(error_code) is None:
             raise ValueError("notification failure requires a safe error code")
@@ -211,7 +237,37 @@ class SQLiteNotificationOutbox:
                     intent.claim_token,
                 ),
             ).rowcount
+            if updated == 1:
+                self._record_deliveries(
+                    connection,
+                    intent,
+                    delivered_subscription_ids,
+                    now=now,
+                )
         return int(updated) == 1
+
+    @staticmethod
+    def _record_deliveries(
+        connection: Any,
+        intent: NotificationIntent,
+        subscription_ids: tuple[str, ...],
+        *,
+        now: int,
+    ) -> None:
+        if len(set(subscription_ids)) != len(subscription_ids) or any(
+            not identifier or len(identifier) > 256 for identifier in subscription_ids
+        ):
+            raise ValueError("notification delivery identifiers are invalid")
+        for subscription_id in subscription_ids:
+            connection.execute(
+                """
+                INSERT INTO notification_outbox_deliveries(
+                    outbox_id, subscription_id, delivered_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(outbox_id, subscription_id) DO NOTHING
+                """,
+                (intent.outbox_id, subscription_id, now),
+            )
 
     def schedule_approaching_expiry(
         self,
@@ -313,7 +369,14 @@ class NotificationOutboxWorker:
         deferred = 0
         for intent in intents:
             try:
-                await self.dispatcher.notify(intent.user_id, intent.message, now=now)
+                report = await self.dispatcher.notify(
+                    intent.user_id,
+                    intent.message,
+                    now=now,
+                    skip_subscription_ids=self.outbox.delivered_subscription_ids(
+                        intent.outbox_id
+                    ),
+                )
             except asyncio.CancelledError:
                 self.outbox.defer(
                     intent,
@@ -331,9 +394,24 @@ class NotificationOutboxWorker:
                 )
                 deferred += 1
             else:
-                if not self.outbox.mark_delivered(intent, now=now):
-                    raise NotificationOutboxError("notification delivery claim was lost")
-                delivered += 1
+                if report.failed:
+                    if not self.outbox.defer(
+                        intent,
+                        now=now,
+                        error_code="push_delivery_incomplete",
+                        retry_delay=self._retry_delay(intent.attempts),
+                        delivered_subscription_ids=report.delivered_subscription_ids,
+                    ):
+                        raise NotificationOutboxError("notification delivery claim was lost")
+                    deferred += 1
+                else:
+                    if not self.outbox.mark_delivered(
+                        intent,
+                        now=now,
+                        delivered_subscription_ids=report.delivered_subscription_ids,
+                    ):
+                        raise NotificationOutboxError("notification delivery claim was lost")
+                    delivered += 1
         return OutboxRunReport(
             claimed=len(intents),
             delivered=delivered,

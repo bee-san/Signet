@@ -17,6 +17,7 @@ from signet.auth import (
     totp_rate_limit_key,
 )
 from signet.db import (
+    LATEST_SCHEMA_VERSION,
     Database,
     DatabaseError,
     IncompatibleSchemaError,
@@ -48,6 +49,7 @@ CORE_TABLES = {
     "schema_cache",
     "purge_jobs",
     "schema_meta",
+    "notification_outbox_deliveries",
 }
 
 
@@ -122,7 +124,9 @@ def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Pat
             "SELECT * FROM schema_meta ORDER BY migration_id"
         ).fetchall()
     assert tables >= CORE_TABLES
-    assert [migration["migration_id"] for migration in migrations] == [1, 2, 3, 4]
+    assert [migration["migration_id"] for migration in migrations] == list(
+        range(1, LATEST_SCHEMA_VERSION + 1)
+    )
     assert all(len(migration["checksum"]) == 64 for migration in migrations)
 
 
@@ -260,7 +264,10 @@ def test_retention_trigger_migration_is_atomic_and_restartable(tmp_path: Path) -
     )
     assert backed_up_versions == [3]
     with database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == LATEST_SCHEMA_VERSION
+        )
         trigger = connection.execute(
             """
             SELECT sql FROM sqlite_schema

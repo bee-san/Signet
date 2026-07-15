@@ -404,6 +404,9 @@ class NotificationReport:
     attempted: int
     delivered: int
     failed: int
+    attempted_subscription_ids: tuple[str, ...] = ()
+    delivered_subscription_ids: tuple[str, ...] = ()
+    failed_subscription_ids: tuple[str, ...] = ()
 
 
 class NotificationDispatcher:
@@ -422,26 +425,46 @@ class NotificationDispatcher:
         self._transport = transport
         self.disable_after = disable_after
 
-    async def notify(self, user_id: str, message: PushMessage, *, now: int) -> NotificationReport:
-        subscriptions = self._repository.active_for(user_id, message.kind)
+    async def notify(
+        self,
+        user_id: str,
+        message: PushMessage,
+        *,
+        now: int,
+        skip_subscription_ids: frozenset[str] = frozenset(),
+    ) -> NotificationReport:
+        if any(not identifier or len(identifier) > 256 for identifier in skip_subscription_ids):
+            raise ValueError("notification skip identifiers are invalid")
+        subscriptions = tuple(
+            subscription
+            for subscription in self._repository.active_for(user_id, message.kind)
+            if subscription.subscription_id not in skip_subscription_ids
+        )
         payload = message.payload()
-        delivered = 0
+        delivered_ids: list[str] = []
+        failed_ids: list[str] = []
         for subscription in subscriptions:
             try:
                 await self._transport.send(subscription, payload)
             except Exception:
+                failed_ids.append(subscription.subscription_id)
                 self._repository.mark_failure(
                     subscription.subscription_id,
                     now=now,
                     disable_after=self.disable_after,
                 )
             else:
-                delivered += 1
+                delivered_ids.append(subscription.subscription_id)
                 self._repository.mark_success(subscription.subscription_id, now=now)
         return NotificationReport(
             attempted=len(subscriptions),
-            delivered=delivered,
-            failed=len(subscriptions) - delivered,
+            delivered=len(delivered_ids),
+            failed=len(failed_ids),
+            attempted_subscription_ids=tuple(
+                subscription.subscription_id for subscription in subscriptions
+            ),
+            delivered_subscription_ids=tuple(delivered_ids),
+            failed_subscription_ids=tuple(failed_ids),
         )
 
 

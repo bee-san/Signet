@@ -135,6 +135,23 @@ class RecordingTransport:
         self.payloads.append(dict(payload))
 
 
+class SelectiveTransport(RecordingTransport):
+    def __init__(self, failing: set[str]) -> None:
+        super().__init__()
+        self.failing = failing
+        self.subscription_calls: list[str] = []
+
+    async def send(
+        self,
+        subscription: PushSubscription,
+        payload: Mapping[str, str | int],
+    ) -> None:
+        self.subscription_calls.append(subscription.subscription_id)
+        await super().send(subscription, payload)
+        if subscription.subscription_id in self.failing:
+            raise RuntimeError("explicit fake transient push failure")
+
+
 @pytest.mark.asyncio
 async def test_worker_delivers_privacy_safe_payload_and_settles_intent(
     database: Database,
@@ -213,6 +230,71 @@ async def test_worker_defers_system_failure_with_bounded_backoff(database: Datab
         assert connection.execute(
             "SELECT last_error FROM notification_outbox"
         ).fetchone()[0] is None
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_only_failed_devices_and_never_loses_total_outage(
+    database: Database,
+) -> None:
+    repository = InMemoryPushRepository()
+    for identifier in ("push_ok", "push_retry"):
+        repository.save(
+            PushSubscription(
+                subscription_id=identifier,
+                user_id="human",
+                endpoint=f"https://push.example.test/{identifier}",
+                p256dh=_encoded(b"\x04" + b"p" * 64),
+                auth=_encoded(b"a" * 16),
+                device_label=identifier,
+                categories=frozenset(),
+                created_at=NOW,
+            )
+        )
+    transport = SelectiveTransport({"push_retry"})
+    outbox = SQLiteNotificationOutbox(database)
+    outbox.enqueue(
+        dedupe_key="new_pending:retry-devices",
+        user_id="human",
+        message=PushMessage(
+            NotificationKind.NEW_PENDING,
+            service="Fastmail",
+            action="send_email",
+        ),
+        created_at=NOW,
+    )
+    worker = NotificationOutboxWorker(
+        outbox,
+        NotificationDispatcher(repository, transport, disable_after=5),
+        worker_id="retry-worker",
+        retry_base_seconds=5,
+    )
+
+    first = await worker.run_due(now=NOW)
+    assert (first.delivered, first.deferred) == (0, 1)
+    assert transport.subscription_calls == ["push_ok", "push_retry"]
+    with database.read() as connection:
+        outbox_id = str(
+            connection.execute("SELECT outbox_id FROM notification_outbox").fetchone()[0]
+        )
+    assert outbox.delivered_subscription_ids(outbox_id) == frozenset({"push_ok"})
+
+    transport.failing.clear()
+    second = await worker.run_due(now=NOW + 5)
+    assert (second.delivered, second.deferred) == (1, 0)
+    assert transport.subscription_calls == ["push_ok", "push_retry", "push_retry"]
+    with database.read() as connection:
+        row = connection.execute(
+            "SELECT outbox_id, delivered_at FROM notification_outbox"
+        ).fetchone()
+        deliveries = connection.execute(
+            """
+            SELECT subscription_id FROM notification_outbox_deliveries
+            WHERE outbox_id = ? ORDER BY subscription_id
+            """,
+            (row["outbox_id"],),
+        ).fetchall()
+    assert row["delivered_at"] == NOW + 5
+    assert [item[0] for item in deliveries] == ["push_ok", "push_retry"]
 
 
 def test_expiry_and_daily_schedulers_are_idempotent(database: Database) -> None:
