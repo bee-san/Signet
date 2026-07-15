@@ -1,0 +1,6 @@
+{
+  "status": "pending_approval",
+  "request_id": "req_01J00000000000000000000000",
+  "expires_at": "2026-07-22T09:00:00Z",
+  "message": "This action requires human approval. Check status with check_approval_status."
+}

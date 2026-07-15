@@ -1,0 +1,17 @@
+{
+  "fixture": {
+    "kind": "synthetic_provider_input",
+    "schema_status": "live_tools_list_capture_required_before_enablement",
+    "must_not_dispatch": true
+  },
+  "tool": "send_email",
+  "arguments": {
+    "from": "sender@example.test",
+    "to": ["recipient@example.test"],
+    "cc": [],
+    "bcc": [],
+    "subject": "Signet fixture message",
+    "body": "This is inert test data and must never be delivered.",
+    "attachments": []
+  }
+}

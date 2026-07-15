@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "fixture_version": 1,
+  "pending_result_schema": {
+    "$id": "https://signet.local/schemas/pending-result-v1.json",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["status", "request_id", "expires_at", "message"],
+    "properties": {
+      "status": {"const": "pending_approval"},
+      "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
+      "expires_at": {"type": "string", "format": "date-time"},
+      "message": {"type": "string", "minLength": 1}
+    }
+  },
+  "tools": [
+    {
+      "name": "check_approval_status",
+      "description": "Return the authoritative state and safe result metadata for one caller-owned request.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["request_id"],
+        "properties": {
+          "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"}
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["request_id", "status", "version", "expires_at"],
+        "properties": {
+          "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
+          "status": {
+            "enum": [
+              "pending_approval",
+              "approved",
+              "executing",
+              "succeeded",
+              "failed",
+              "outcome_unknown",
+              "denied",
+              "expired",
+              "cancelled"
+            ]
+          },
+          "version": {"type": "integer", "minimum": 1},
+          "expires_at": {"type": "string", "format": "date-time"},
+          "safe_result_metadata": {"type": "object"},
+          "failure_code": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    {
+      "name": "list_pending_approvals",
+      "description": "List caller-owned pending requests using masked summaries only.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "maxProperties": 0
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["requests"],
+        "properties": {
+          "requests": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "request_id",
+                "service",
+                "tool",
+                "destination_summary",
+                "age_seconds",
+                "expires_at",
+                "version_hash_prefix"
+              ],
+              "properties": {
+                "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
+                "service": {"type": "string", "minLength": 1},
+                "tool": {"type": "string", "minLength": 1},
+                "destination_summary": {"type": "string", "minLength": 1},
+                "age_seconds": {"type": "integer", "minimum": 0},
+                "expires_at": {"type": "string", "format": "date-time"},
+                "version_hash_prefix": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{8,64}$"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "approve_request",
+      "description": "Approve one exact caller-owned frozen request version with a fresh single-use TOTP code.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["request_id", "totp_code", "expected_version_hash"],
+        "properties": {
+          "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
+          "totp_code": {"type": "string", "pattern": "^[0-9]{6}$"},
+          "expected_version_hash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{8,64}$"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "request_id",
+          "tool",
+          "destination_summary",
+          "version",
+          "version_hash_prefix",
+          "approval_notification_queued"
+        ],
+        "properties": {
+          "status": {"const": "approved"},
+          "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
+          "tool": {"type": "string", "minLength": 1},
+          "destination_summary": {"type": "string", "minLength": 1},
+          "version": {"type": "integer", "minimum": 1},
+          "version_hash_prefix": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{8,64}$"
+          },
+          "approval_notification_queued": {"const": true}
+        }
+      }
+    },
+    {
+      "name": "cancel_request",
+      "description": "Cancel one pending request created by the authenticated caller namespace.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["request_id"],
+        "properties": {
+          "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"}
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "request_id"],
+        "properties": {
+          "status": {"const": "cancelled"},
+          "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"}
+        }
+      }
+    },
+    {
+      "name": "request_tool_access",
+      "description": "Create a web-approval-only request for a versioned policy change.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["alias", "tool", "reason"],
+        "properties": {
+          "alias": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+          "tool": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$"},
+          "reason": {"type": "string", "minLength": 1, "maxLength": 1000}
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "request_id",
+          "expires_at",
+          "message",
+          "approval_channel"
+        ],
+        "properties": {
+          "status": {"const": "pending_approval"},
+          "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"},
+          "expires_at": {"type": "string", "format": "date-time"},
+          "message": {"type": "string", "minLength": 1},
+          "approval_channel": {"const": "web_only"}
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+version: 1
+default_mode: deny
+
+mode_contracts:
+  passthrough:
+    exposure: reviewed_tools_only
+    downstream_calls: immediate
+    result_contract: downstream_verbatim
+  virtualize_local:
+    exposure: reviewed_tools_only
+    downstream_calls: 0
+    standalone_approval: false
+    result_contract: captured_downstream_output_schema
+    storage: local_only
+    scope_fields:
+      - adapter
+      - account
+      - caller_namespace
+    staging:
+      root: var/staging
+      path_rule: descendants_only
+      reject_absolute_paths: true
+      reject_parent_traversal: true
+      reject_symlinks: true
+      reject_hardlinks: true
+  approval:
+    exposure: reviewed_tools_only
+    downstream_calls_before_approval: 0
+    result_contract: gateway_pending_result
+  deny:
+    exposure: explicit_reviewed_only
+    downstream_calls: 0
+    result_contract: call_tool_error
+
+downstreams:
+  fastmail:
+    transport: http
+    url: https://api.fastmail.com/mcp
+    credential_ref: keychain://Signet/fastmail
+    schema_review:
+      source: live_tools_list
+      fixture_status: synthetic_until_live_capture
+      fail_closed_on_digest_change: true
+    account_ref: configured-account
+    tools:
+      search_email:
+        mode: passthrough
+        reviewed_read_only: true
+      read_email:
+        mode: passthrough
+        reviewed_read_only: true
+      read_thread:
+        mode: passthrough
+        reviewed_read_only: true
+      list_folders:
+        mode: passthrough
+        reviewed_read_only: true
+      list_identities:
+        mode: passthrough
+        reviewed_read_only: true
+      upload_attachment:
+        mode: virtualize_local
+        adapter: fastmail.stage_attachment
+        account_ref: configured-account
+      draft_email:
+        mode: virtualize_local
+        adapter: fastmail.local_draft
+        account_ref: configured-account
+      send_email:
+        mode: approval
+        adapter: fastmail.send
+        communication_send: true
+      delete_email:
+        mode: deny
+        reviewed_classification: destructive
+
+  whatsapp:
+    transport: stdio
+    command_ref: configured-wacli-launcher
+    credential_ref: keychain://Signet/whatsapp
+    account_ref: configured-account
+    wrapper_contract:
+      id: signet.wacli.send-text.v1
+      ownership: gateway
+      executable: /opt/homebrew/bin/wacli
+      executable_version: preflight_required
+      output: json_only
+      shell_interpolation: forbidden
+      fixture_source: documented_wacli_send_text_cli
+    tools:
+      send_text:
+        mode: approval
+        adapter: whatsapp.send_text
+        communication_send: true
+
+policy_changes:
+  approval_channel: web_only
+  require_fresh_human_confirmation: true
+  passthrough_requires_reviewed_read_only: true
+  communication_sends_may_be_passthrough: false

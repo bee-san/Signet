@@ -1,0 +1,13 @@
+{
+  "fixture": {
+    "kind": "owned_wrapper_input",
+    "contract": "signet.wacli.send-text.v1",
+    "source": "documented_wacli_send_text_cli",
+    "must_not_dispatch": true
+  },
+  "tool": "send_text",
+  "arguments": {
+    "to": "15550102030",
+    "message": "This is inert Signet fixture data and must never be delivered."
+  }
+}
