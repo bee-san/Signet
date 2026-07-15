@@ -61,7 +61,7 @@ class AttachmentDecryptionError(AttachmentEnvelopeError):
     """An attachment envelope or its immutable context did not authenticate."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class AttachmentContext:
     """Immutable metadata authenticated with one staged object's bytes."""
 
@@ -74,6 +74,9 @@ class AttachmentContext:
     size: int
     sha256: str
     created_at: int
+
+    def __repr__(self) -> str:
+        return "AttachmentContext(<redacted>)"
 
 
 @dataclass(frozen=True, slots=True, repr=False)

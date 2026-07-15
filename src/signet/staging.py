@@ -61,7 +61,7 @@ class StagingError(ValueError):
     """Raised when a file cannot be staged or resolved safely."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class StagedFile:
     opaque_id: str
     adapter: str
@@ -77,6 +77,12 @@ class StagedFile:
     envelope_size: int = 0
     envelope_sha256: str = ""
     encryption_key_ref: str = ""
+
+    def __repr__(self) -> str:
+        return (
+            "StagedFile(opaque_id=<redacted>, adapter=<redacted>, account=<redacted>, "
+            "filename=<redacted>, content=<redacted>, encryption_key_ref=<redacted>)"
+        )
 
 
 _OPAQUE_ID_RE = re.compile(r"stg_[A-Za-z0-9_]{20,64}\Z")

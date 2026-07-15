@@ -281,6 +281,8 @@ def test_staging_is_private_scoped_and_integrity_checked(tmp_path: Path) -> None
         ).fetchone()
     assert catalog["storage_path"] == str(record.path)
     assert catalog["encryption_key_ref"] == record.encryption_key_ref
+    assert "note.txt" not in repr(record)
+    assert record.encryption_key_ref not in repr(record)
     with store.plaintext_descriptor(
         record.opaque_id,
         adapter="fastmail",

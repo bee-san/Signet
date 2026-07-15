@@ -48,6 +48,7 @@ def test_attachment_envelopes_are_random_authenticated_and_plaintext_free() -> N
     assert selected.decrypt(first, context=context(), key_reference=KEY_REF) == PLAINTEXT
     assert selected.decrypt(second, context=context(), key_reference=KEY_REF) == PLAINTEXT
     assert "fake-attachment" not in repr(selected)
+    assert "private.txt" not in repr(context())
 
 
 @pytest.mark.parametrize(

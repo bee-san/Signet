@@ -69,7 +69,7 @@ class ReconciliationAction(StrEnum):
     EXHAUSTED = "exhausted"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class AttachmentReference:
     attachment_id: str
     filename: str
@@ -78,6 +78,9 @@ class AttachmentReference:
     sha256: str
     storage_path: str
     purge_after: int | None = None
+
+    def __repr__(self) -> str:
+        return "AttachmentReference(<redacted>)"
 
 
 @dataclass(frozen=True, slots=True)
