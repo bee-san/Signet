@@ -386,7 +386,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                     "camera=(), microphone=(), geolocation=(), payment=(), usb=(), "
                     "publickey-credentials-get=(self)"
                 ),
-                "Referrer-Policy": "no-referrer",
+                # Chromium serializes same-origin form POSTs with Origin: null
+                # under no-referrer, which correctly fails our strict Origin
+                # check. same-origin keeps cross-origin referrers suppressed
+                # while preserving an exact Origin on authenticated actions.
+                "Referrer-Policy": "same-origin",
                 "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
                 "X-Content-Type-Options": "nosniff",
                 "X-Frame-Options": "DENY",

@@ -433,7 +433,7 @@ def test_authenticated_queue_has_security_headers_and_no_sensitive_title(
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
     assert "form-action 'self'" in response.headers["content-security-policy"]
     assert response.headers["x-frame-options"] == "DENY"
-    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["referrer-policy"] == "same-origin"
     assert "<title>Signet</title>" in response.text
 
 
