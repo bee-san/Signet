@@ -29,9 +29,7 @@ from signet.adapters.base import DispatchError, copy_json_object
 from signet.staging import StagingError, StagingStore
 
 REVIEWED_WACLI_VERSION = "0.12.0"
-DEFAULT_WACLI_EXECUTABLE = Path(
-    f"/opt/homebrew/Cellar/wacli/{REVIEWED_WACLI_VERSION}/bin/wacli"
-)
+DEFAULT_WACLI_EXECUTABLE = Path(f"/opt/homebrew/Cellar/wacli/{REVIEWED_WACLI_VERSION}/bin/wacli")
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
@@ -210,10 +208,7 @@ class WacliWrapper:
         try:
             if not stat.S_ISREG(source_before.st_mode) or source_before.st_mode & 0o111 == 0:
                 raise WacliError("executable_not_runnable", dispatch_may_have_occurred=False)
-            if (
-                source_before.st_uid not in {0, os.geteuid()}
-                or source_before.st_mode & 0o022
-            ):
+            if source_before.st_uid not in {0, os.geteuid()} or source_before.st_mode & 0o022:
                 raise WacliError(
                     "executable_permissions_unsafe",
                     dispatch_may_have_occurred=False,
@@ -249,9 +244,7 @@ class WacliWrapper:
                 while chunk := os.read(source_descriptor, 1024 * 1024):
                     copied += len(chunk)
                     if copied > _MAX_EXECUTABLE_BYTES:
-                        raise WacliError(
-                            "executable_too_large", dispatch_may_have_occurred=False
-                        )
+                        raise WacliError("executable_too_large", dispatch_may_have_occurred=False)
                     if len(leading) < 4:
                         leading = (leading + chunk)[:4]
                     digest.update(chunk)
@@ -469,16 +462,12 @@ class WacliWrapper:
     async def verify_version(self) -> None:
         """Preflight the exact binary version, caching only an unchanged inode."""
         async with self._version_lock:
-            result, signature = await self._run_json(
-                ("version",), dispatch_may_have_occurred=False
-            )
+            result, signature = await self._run_json(("version",), dispatch_may_have_occurred=False)
             if self._reported_version(result) != self.config.expected_version:
                 raise WacliError("version_mismatch", dispatch_may_have_occurred=False)
             self._verified_signature = signature
 
-    async def call_tool(
-        self, tool_name: str, arguments: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
+    async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         detached = copy_json_object(arguments)
         if tool_name == "send_text":
             return await self.send_text(detached)
@@ -621,9 +610,7 @@ class WacliWrapper:
                 if reply_to is not None:
                     command.extend(("--reply-to", reply_to))
                 if reply_sender is not None:
-                    command.extend(
-                        ("--reply-to-sender", normalize_destination(reply_sender))
-                    )
+                    command.extend(("--reply-to-sender", normalize_destination(reply_sender)))
                 result, _ = await self._run_json(
                     tuple(command),
                     dispatch_may_have_occurred=True,
@@ -632,6 +619,4 @@ class WacliWrapper:
                 )
                 return result
         except StagingError as exc:
-            raise WacliError(
-                "media_integrity_mismatch", dispatch_may_have_occurred=False
-            ) from exc
+            raise WacliError("media_integrity_mismatch", dispatch_may_have_occurred=False) from exc

@@ -104,9 +104,7 @@ class GenericJSONAdapter:
             raise AdapterValidationError("arguments must be a JSON object")
         return value
 
-    def freeze_attachments(
-        self, arguments: Mapping[str, Any]
-    ) -> tuple[AttachmentReference, ...]:
+    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
         self.validate(arguments)
         return ()
 
@@ -130,9 +128,7 @@ class GenericJSONAdapter:
             raise AdapterValidationError("request does not match this adapter")
         return self.canonicalize(request.arguments)
 
-    async def execute(
-        self, downstream: MCPClient, payload: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    async def execute(self, downstream: MCPClient, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not self.reviewed_dispatch_enabled:
             raise DispatchError(
                 "generic adapter dispatch is not activated",

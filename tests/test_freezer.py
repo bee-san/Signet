@@ -133,8 +133,7 @@ def test_freezer_builds_complete_encrypted_enqueue_data_and_valid_pending_result
         "request_id": request.request_id,
         "expires_at": "2026-07-15T12:10:00Z",
         "message": (
-            "This action requires human approval. "
-            "Check status with check_approval_status."
+            "This action requires human approval. Check status with check_approval_status."
         ),
     }
     assert frozen.call_result == frozen.pending_result

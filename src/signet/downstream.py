@@ -202,9 +202,7 @@ def _bounded_response_hook(
         content_encoding = response.headers.get("content-encoding", "identity").lower()
         if content_encoding != "identity":
             await response.aclose()
-            raise DownstreamProtocolError(
-                "compressed downstream HTTP responses are not accepted"
-            )
+            raise DownstreamProtocolError("compressed downstream HTTP responses are not accepted")
         media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         response.stream = _BoundedHTTPResponseStream(
             response.stream,
@@ -838,9 +836,7 @@ class DownstreamClient:
             try:
                 port = parsed.port
             except ValueError:
-                raise DownstreamConfigurationError(
-                    "HTTP downstream endpoint is invalid"
-                ) from None
+                raise DownstreamConfigurationError("HTTP downstream endpoint is invalid") from None
             if (
                 len(config.url) > _MAX_EXECUTABLE_LENGTH
                 or parsed.scheme not in {"http", "https"}

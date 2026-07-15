@@ -165,9 +165,7 @@ def test_pending_and_domain_error_wire_shapes() -> None:
 
 
 def test_runtime_pending_schema_matches_the_normative_fixture() -> None:
-    fixture_path = (
-        Path(__file__).parents[1] / "spec" / "fixtures" / "gateway-tools-schemas.json"
-    )
+    fixture_path = Path(__file__).parents[1] / "spec" / "fixtures" / "gateway-tools-schemas.json"
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     assert fixture["pending_result_schema"] == PENDING_RESULT_SCHEMA
 
@@ -399,9 +397,7 @@ def test_capture_aggregate_pattern_budget_fails_atomically(
     for index, tool in enumerate((changed, staged)):
         tool["inputSchema"] = {
             "type": "object",
-            "properties": {
-                "value": {"type": "string", "pattern": f"^value_{index}[0-9]+$"}
-            },
+            "properties": {"value": {"type": "string", "pattern": f"^value_{index}[0-9]+$"}},
         }
 
     monkeypatch.setattr(mcp_mirror_module, "_MAX_CAPTURE_SCHEMA_PATTERNS", 1)
@@ -593,8 +589,7 @@ def test_invocation_identity_digest_is_scoped_by_caller_alias_and_tool() -> None
 async def test_low_level_server_preserves_raw_list_and_error_channels() -> None:
     mirror = SchemaMirror(_policy())
     raw_tools = [
-        _raw_tool(name, explicit_null=True)
-        for name in ("read", "stage", "send", "delete")
+        _raw_tool(name, explicit_null=True) for name in ("read", "stage", "send", "delete")
     ]
     mirror.capture("example", raw_tools)
     _review_all(mirror)

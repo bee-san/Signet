@@ -24,9 +24,7 @@ _MAX_TEXT_BYTES = 512
 _DEFAULT_PENDING_TTL_SECONDS = 7 * 24 * 60 * 60
 _MAX_PENDING_TTL_SECONDS = 30 * 24 * 60 * 60
 _DEFAULT_MAX_CANONICAL_BYTES = 16 * 1024 * 1024
-_PENDING_MESSAGE = (
-    "This action requires human approval. Check status with check_approval_status."
-)
+_PENDING_MESSAGE = "This action requires human approval. Check status with check_approval_status."
 
 
 class PayloadEncryptor(Protocol):

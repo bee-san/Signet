@@ -289,9 +289,7 @@ class GatewayCallPipeline:
             canonical_arguments = copy_json_object(canonical)
             attachment_freezer = getattr(adapter, "freeze_attachments", None)
             attachments = (
-                attachment_freezer(canonical_arguments)
-                if callable(attachment_freezer)
-                else ()
+                attachment_freezer(canonical_arguments) if callable(attachment_freezer) else ()
             )
         except (TypeError, ValueError):
             raise DomainToolError(

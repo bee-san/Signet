@@ -227,9 +227,9 @@ async def test_worker_defers_system_failure_with_bounded_backoff(database: Datab
     retried = outbox.claim_due(worker_id="retry", now=NOW + 7)
     assert len(retried) == 1 and retried[0].attempts == 2
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT last_error FROM notification_outbox"
-        ).fetchone()[0] is None
+        assert (
+            connection.execute("SELECT last_error FROM notification_outbox").fetchone()[0] is None
+        )
 
 
 @pytest.mark.asyncio
@@ -303,16 +303,22 @@ def test_expiry_and_daily_schedulers_are_idempotent(database: Database) -> None:
     machine.enqueue(_request("req_Later", expires_at=NOW + 10_000))
     outbox = SQLiteNotificationOutbox(database)
 
-    assert outbox.schedule_approaching_expiry(
-        user_id="human@example.test",
-        now=NOW,
-        horizon_seconds=60,
-    ) == 1
-    assert outbox.schedule_approaching_expiry(
-        user_id="human@example.test",
-        now=NOW,
-        horizon_seconds=60,
-    ) == 0
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="human@example.test",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 1
+    )
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="human@example.test",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 0
+    )
     assert outbox.schedule_daily_digest(user_id="human@example.test", now=NOW)
     assert not outbox.schedule_daily_digest(user_id="human@example.test", now=NOW + 1)
 

@@ -56,16 +56,19 @@ class FrozenAccessRequestFactory:
             actor=actor,
             created_at=created_at,
         )
-        invocation_key = "denied_" + hashlib.sha256(
-            canonical_json(
-                {
-                    "alias": alias,
-                    "namespace": origin_namespace,
-                    "policy_version": version,
-                    "tool": tool,
-                }
-            )
-        ).hexdigest()
+        invocation_key = (
+            "denied_"
+            + hashlib.sha256(
+                canonical_json(
+                    {
+                        "alias": alias,
+                        "namespace": origin_namespace,
+                        "policy_version": version,
+                        "tool": tool,
+                    }
+                )
+            ).hexdigest()
+        )
         return self._freeze(
             draft,
             policy_version=version,

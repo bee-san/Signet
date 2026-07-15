@@ -392,9 +392,7 @@ class SQLiteWebAuthnRepository:
             offered_credential_ids=tuple(offered),
             created_at=int(row["created_at"]),
             expires_at=int(row["expires_at"]),
-            consumed_at=(
-                int(row["consumed_at"]) if row["consumed_at"] is not None else None
-            ),
+            consumed_at=(int(row["consumed_at"]) if row["consumed_at"] is not None else None),
             invalidated_at=(
                 int(row["invalidated_at"]) if row["invalidated_at"] is not None else None
             ),
@@ -537,9 +535,7 @@ class WebAuthnChallengeIssuer:
             binding=binding,
             session_id=session_id,
             http_method=http_method,
-            offered_credential_ids=tuple(
-                credential.credential_id for credential in credentials
-            ),
+            offered_credential_ids=tuple(credential.credential_id for credential in credentials),
             created_at=now,
             expires_at=now + self.lifetime,
         )
@@ -555,8 +551,7 @@ class WebAuthnChallengeIssuer:
             challenge=challenge_bytes,
             timeout=self.lifetime * 1_000,
             allow_credentials=[
-                PublicKeyCredentialDescriptor(id=credential.raw_id)
-                for credential in credentials
+                PublicKeyCredentialDescriptor(id=credential.raw_id) for credential in credentials
             ],
             user_verification=UserVerificationRequirement.REQUIRED,
         )

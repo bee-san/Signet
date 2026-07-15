@@ -64,9 +64,7 @@ _HEADER_FORBIDDEN = frozenset(
 )
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _OPAQUE_PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~:@/+=-]{0,255}$")
-_FASTMAIL_RESULT_FIELDS = frozenset(
-    {"messageId", "submissionId", "threadId", "status", "isError"}
-)
+_FASTMAIL_RESULT_FIELDS = frozenset({"messageId", "submissionId", "threadId", "status", "isError"})
 _FASTMAIL_PROVIDER_STATUSES = frozenset({"sent", "submitted"})
 _FASTMAIL_AMBIGUOUS_STATUSES = frozenset({"ambiguous", "pending", "queued", "unknown"})
 FASTMAIL_SEND_SCHEMA: Mapping[str, Any] = MappingProxyType(
@@ -401,9 +399,7 @@ class FastmailAdapter:
         self.validate(arguments)
         return copy_json_object(arguments)
 
-    def freeze_attachments(
-        self, arguments: Mapping[str, Any]
-    ) -> tuple[AttachmentReference, ...]:
+    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
         canonical = self.canonicalize(arguments)
         references = cast(list[dict[str, Any]], canonical["attachments"])
         if references and self.staging_store is None:
@@ -550,9 +546,7 @@ class FastmailAdapter:
         payload["_signet_resolved_attachments"] = resolved
         return payload
 
-    async def execute(
-        self, downstream: MCPClient, payload: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    async def execute(self, downstream: MCPClient, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not self.reviewed_dispatch_enabled:
             raise DispatchError(
                 "Fastmail provider contract is not activated",

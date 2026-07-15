@@ -367,6 +367,8 @@ def _valid_key_reference(value: object) -> bool:
         encoded = value.encode("utf-8", errors="strict")
     except UnicodeError:
         return False
-    return encoded.isascii() and len(encoded) <= _MAX_CONTEXT_TEXT_BYTES and not any(
-        character < 0x20 or character == 0x7F for character in encoded
+    return (
+        encoded.isascii()
+        and len(encoded) <= _MAX_CONTEXT_TEXT_BYTES
+        and not any(character < 0x20 or character == 0x7F for character in encoded)
     )

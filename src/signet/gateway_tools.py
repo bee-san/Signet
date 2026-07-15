@@ -61,16 +61,13 @@ GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "check_approval_status",
         "description": (
-            "Return the authoritative state and safe result metadata for one "
-            "caller-owned request."
+            "Return the authoritative state and safe result metadata for one caller-owned request."
         ),
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "required": ["request_id"],
-            "properties": {
-                "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"}
-            },
+            "properties": {"request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"}},
         },
         "outputSchema": {
             "type": "object",
@@ -246,9 +243,7 @@ GATEWAY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "type": "object",
             "additionalProperties": False,
             "required": ["request_id"],
-            "properties": {
-                "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"}
-            },
+            "properties": {"request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9]+$"}},
         },
         "outputSchema": {
             "type": "object",
@@ -380,9 +375,7 @@ class AccessRequestDraft:
 
 
 class AccessRequestFactory(Protocol):
-    def freeze(
-        self, draft: AccessRequestDraft
-    ) -> EnqueueRequest | Awaitable[EnqueueRequest]:
+    def freeze(self, draft: AccessRequestDraft) -> EnqueueRequest | Awaitable[EnqueueRequest]:
         """Build an encrypted, pending EnqueueRequest for the gateway queue."""
 
         ...
@@ -509,9 +502,7 @@ class GatewayTools:
             ) from exc
         return values
 
-    async def _check_status(
-        self, request_id: str, principal: GatewayPrincipal
-    ) -> dict[str, Any]:
+    async def _check_status(self, request_id: str, principal: GatewayPrincipal) -> dict[str, Any]:
         try:
             request = self._owned_request(request_id, principal.namespace)
         except RequestNotFound:
@@ -567,9 +558,7 @@ class GatewayTools:
                         request.payload_hash, self._hash_prefix_length
                     ),
                 }
-                for request, (summary, summary_available) in zip(
-                    requests, summaries, strict=True
-                )
+                for request, (summary, summary_available) in zip(requests, summaries, strict=True)
             ],
             "next_cursor": (
                 _encode_pending_cursor(requests[-1]) if has_more and requests else None
@@ -889,9 +878,7 @@ class GatewayTools:
         _require_safe_summary(request, summary)
         return summary
 
-    async def _public_summary(
-        self, request: _RequestSnapshot
-    ) -> tuple[SafeRequestSummary, bool]:
+    async def _public_summary(self, request: _RequestSnapshot) -> tuple[SafeRequestSummary, bool]:
         try:
             return await self._review_summary(request), True
         except Exception:
@@ -968,9 +955,7 @@ def _require_safe_summary(request: _RequestSnapshot, summary: SafeRequestSummary
         raise RuntimeError("safe request summary does not match the frozen request tool")
     destination = summary.destination_summary
     if request.service == "fastmail":
-        if summary.service.casefold() != "fastmail" or not _is_masked_email_summary(
-            destination
-        ):
+        if summary.service.casefold() != "fastmail" or not _is_masked_email_summary(destination):
             raise RuntimeError("Fastmail agent summary is not safely masked")
     elif request.service == "whatsapp" and (
         summary.service.casefold() != "whatsapp"
@@ -1042,9 +1027,7 @@ def _decode_pending_cursor(value: str) -> tuple[int, str]:
     ):
         _raise_invalid_cursor()
     created_at, request_id = cast(tuple[int, str], tuple(parsed))
-    if not hmac.compare_digest(
-        _encode_pending_cursor_values(created_at, request_id), value
-    ):
+    if not hmac.compare_digest(_encode_pending_cursor_values(created_at, request_id), value):
         _raise_invalid_cursor()
     return created_at, request_id
 
@@ -1065,8 +1048,8 @@ async def _resolve[T](value: T | Awaitable[T]) -> T:
 
 
 def _timestamp(value: int) -> str:
-    return datetime.fromtimestamp(value, tz=UTC).isoformat(timespec="seconds").replace(
-        "+00:00", "Z"
+    return (
+        datetime.fromtimestamp(value, tz=UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     )
 
 

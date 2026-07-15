@@ -27,9 +27,7 @@ class FakeClient:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.result = dict(result or {"status": "ok", "id": "provider-safe-id"})
 
-    async def call_tool(
-        self, tool_name: str, arguments: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
+    async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         self.calls.append((tool_name, dict(arguments)))
         return self.result
 
@@ -141,10 +139,7 @@ async def test_reusable_adapter_harness_exercises_review_execution_and_reconcile
 
     assert summary.action == "create_item"
     assert await harness.execute(downstream) == {"status": "ok"}
-    assert (
-        await harness.reconcile(downstream, attempt())
-        is Reconciliation.INCONCLUSIVE
-    )
+    assert await harness.reconcile(downstream, attempt()) is Reconciliation.INCONCLUSIVE
     assert downstream.calls == [("create_item", {"name": "fixture"})]
 
 

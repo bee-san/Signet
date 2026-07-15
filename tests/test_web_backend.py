@@ -747,16 +747,20 @@ def test_queue_is_hard_capped_keyset_paginated_and_never_reviews_payloads(
 
 def test_queue_cursor_rejects_sqlite_integer_overflow(bundle: BackendBundle) -> None:
     _, principal = bundle.session()
-    encoded = base64.urlsafe_b64encode(
-        json.dumps(
-            {
-                "priority": 0,
-                "created_at": 2**63,
-                "request_id": "req_overflow",
-            },
-            separators=(",", ":"),
-        ).encode()
-    ).decode().rstrip("=")
+    encoded = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "priority": 0,
+                    "created_at": 2**63,
+                    "request_id": "req_overflow",
+                },
+                separators=(",", ":"),
+            ).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
 
     with pytest.raises(WebConflict, match="cursor is invalid"):
         bundle.backend.list_queue(principal, now=NOW, cursor=encoded)

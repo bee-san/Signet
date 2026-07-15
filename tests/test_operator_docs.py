@@ -38,9 +38,7 @@ def test_demo_hermes_profile_is_loopback_fake_scoped_and_restrictive() -> None:
         server = servers[name]
         assert server == {
             "url": f"http://127.0.0.1:8789/mcp/{alias}",
-            "headers": {
-                "Authorization": "Bearer ${SIGNET_DEMO_MCP_CALLER_TOKEN}"
-            },
+            "headers": {"Authorization": "Bearer ${SIGNET_DEMO_MCP_CALLER_TOKEN}"},
             "enabled": True,
             "connect_timeout": 10,
             "timeout": 120,

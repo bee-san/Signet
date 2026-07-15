@@ -121,9 +121,7 @@ async def test_push_failure_never_escapes_and_disables_only_failing_device() -> 
 @pytest.mark.asyncio
 async def test_categories_users_and_unsubscribe_are_enforced_before_transport() -> None:
     repository = InMemoryPushRepository()
-    repository.save(
-        subscription("digest", categories=frozenset({NotificationKind.DAILY_DIGEST}))
-    )
+    repository.save(subscription("digest", categories=frozenset({NotificationKind.DAILY_DIGEST})))
     repository.save(subscription("other-user", user_id="other"))
     repository.save(subscription("all"))
     assert repository.unsubscribe(

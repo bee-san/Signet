@@ -126,9 +126,9 @@ def test_checked_in_policy_is_accepted_by_the_runtime_parser() -> None:
             "must be true",
         ),
         (
-            lambda document: document["downstreams"]["whatsapp"][
-                "wrapper_contract"
-            ].update({"shell_interpolation": "allowed"}),
+            lambda document: document["downstreams"]["whatsapp"]["wrapper_contract"].update(
+                {"shell_interpolation": "allowed"}
+            ),
             "must be forbidden",
         ),
         (
@@ -144,9 +144,7 @@ def test_security_contract_fields_cannot_be_silently_weakened(
     message: str,
 ) -> None:
     document = yaml.safe_load(
-        (Path(__file__).parents[1] / "spec" / "policy-v1.yaml").read_text(
-            encoding="utf-8"
-        )
+        (Path(__file__).parents[1] / "spec" / "policy-v1.yaml").read_text(encoding="utf-8")
     )
     mutator(document)
     with pytest.raises(PolicyError, match=message):

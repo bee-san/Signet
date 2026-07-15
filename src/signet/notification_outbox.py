@@ -298,8 +298,7 @@ class SQLiteNotificationOutbox:
                     enqueue_notification(
                         connection,
                         dedupe_key=(
-                            "approaching_expiry:"
-                            f"{row['request_id']}:{row['current_version']}"
+                            f"approaching_expiry:{row['request_id']}:{row['current_version']}"
                         ),
                         user_id=user_id,
                         message=PushMessage(
@@ -328,10 +327,7 @@ class SQLiteNotificationOutbox:
             )
             return enqueue_notification(
                 connection,
-                dedupe_key=(
-                    "daily_digest:"
-                    f"{hashlib.sha256(user_id.encode()).hexdigest()}:{day}"
-                ),
+                dedupe_key=(f"daily_digest:{hashlib.sha256(user_id.encode()).hexdigest()}:{day}"),
                 user_id=user_id,
                 message=PushMessage(NotificationKind.DAILY_DIGEST, count=count),
                 created_at=now,
@@ -373,9 +369,7 @@ class NotificationOutboxWorker:
                     intent.user_id,
                     intent.message,
                     now=now,
-                    skip_subscription_ids=self.outbox.delivered_subscription_ids(
-                        intent.outbox_id
-                    ),
+                    skip_subscription_ids=self.outbox.delivered_subscription_ids(intent.outbox_id),
                 )
             except asyncio.CancelledError:
                 self.outbox.defer(

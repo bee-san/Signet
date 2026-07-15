@@ -175,9 +175,7 @@ async def test_manual_review_rolls_back_if_any_connected_session_cannot_be_notif
 
     assert mirror.list_tools("example") == []
     with database.read() as connection:
-        row = connection.execute(
-            "SELECT review_state, reviewed_at FROM schema_cache"
-        ).fetchone()
+        row = connection.execute("SELECT review_state, reviewed_at FROM schema_cache").fetchone()
     assert tuple(row) == ("unreviewed", None)
 
 

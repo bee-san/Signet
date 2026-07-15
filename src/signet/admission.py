@@ -12,9 +12,7 @@ _MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 _MAX_REQUESTS_PER_MINUTE = 10_000
 _DEFAULT_ORIGIN_PENDING_LIMIT = 100
 _DEFAULT_TOOL_PENDING_LIMIT = 250
-_SUPPORTED_TOOL_LIMITS = frozenset(
-    {"payload_bytes", "requests_per_minute", "pending_requests"}
-)
+_SUPPORTED_TOOL_LIMITS = frozenset({"payload_bytes", "requests_per_minute", "pending_requests"})
 
 
 @dataclass(frozen=True, slots=True)

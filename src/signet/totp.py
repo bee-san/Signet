@@ -260,11 +260,7 @@ class TotpVerifier:
             now=now,
         )
         credential = self._credentials.find_totp(user_id)
-        if (
-            credential is None
-            or credential.user_id != user_id
-            or credential.disabled
-        ):
+        if credential is None or credential.user_id != user_id or credential.disabled:
             raise TotpNotEnrolled("TOTP is not enrolled; use the authenticated web app")
         if not proof or len(proof) > 128:
             self._limiter.record_failure(reservation, now=now)

@@ -104,18 +104,14 @@ class AttachmentCipher:
                 "attachment master key must be supplied as Secret"
             )
         if not _valid_bounded_text(key_reference, maximum=512):
-            raise AttachmentEnvelopeConfigurationError(
-                "attachment key reference is invalid"
-            )
+            raise AttachmentEnvelopeConfigurationError("attachment key reference is invalid")
         if (
             isinstance(max_plaintext_bytes, bool)
             or not isinstance(max_plaintext_bytes, int)
             or max_plaintext_bytes <= 0
             or max_plaintext_bytes > 100 * 1024 * 1024
         ):
-            raise AttachmentEnvelopeConfigurationError(
-                "attachment plaintext size limit is invalid"
-            )
+            raise AttachmentEnvelopeConfigurationError("attachment plaintext size limit is invalid")
         try:
             raw_secret = master_secret.reveal().encode("utf-8", errors="strict")
         except (AttributeError, UnicodeError):
@@ -153,13 +149,7 @@ class AttachmentCipher:
             raise ValueError("attachment plaintext size is invalid")
         if plaintext_size < 0:
             raise ValueError("attachment plaintext size is invalid")
-        return (
-            _HEADER.size
-            + (2 * _NONCE_SIZE)
-            + _WRAPPED_KEY_SIZE
-            + plaintext_size
-            + _GCM_TAG_SIZE
-        )
+        return _HEADER.size + (2 * _NONCE_SIZE) + _WRAPPED_KEY_SIZE + plaintext_size + _GCM_TAG_SIZE
 
     def __repr__(self) -> str:
         return (
@@ -231,9 +221,8 @@ class AttachmentCipher:
         failure = "encrypted attachment is invalid or does not match its context"
         if not isinstance(envelope, bytes):
             raise AttachmentDecryptionError(failure)
-        if (
-            not isinstance(key_reference, str)
-            or not hmac.compare_digest(key_reference, self.__key_reference)
+        if not isinstance(key_reference, str) or not hmac.compare_digest(
+            key_reference, self.__key_reference
         ):
             raise AttachmentDecryptionError(failure)
         try:

@@ -201,9 +201,7 @@ class ReadOnlyMCPClient:
     def reviewed_tools(self) -> frozenset[str]:
         return self.__reviewed_tools
 
-    async def call_tool(
-        self, tool_name: str, arguments: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
+    async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         if tool_name not in self.__reviewed_tools:
             raise ReadOnlyToolViolation(
                 f"downstream tool {tool_name!r} is not approved for reconciliation"

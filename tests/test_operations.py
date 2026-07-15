@@ -307,9 +307,7 @@ def test_bypass_audit_requires_complete_scope_and_metadata_only_records() -> Non
 
 
 def test_unknown_bypass_coverage_and_records_fail_closed() -> None:
-    inventory = complete_inventory(
-        record(status="unknown", capability="unknown", route="unknown")
-    )
+    inventory = complete_inventory(record(status="unknown", capability="unknown", route="unknown"))
     inventory["coverage"]["browser_session"] = "unknown"
     report = audit_bypass_inventory(inventory)
     assert report["clean"] is False
@@ -347,8 +345,7 @@ def test_readiness_without_live_evidence_lists_every_human_blocker() -> None:
 def test_readiness_rejects_handwritten_underspecified_reports() -> None:
     fixture = capture(raw_tool("send_message"))
     evidence = {
-        name: {"present": True, "reference": f"test-only:{name}"}
-        for name in LIVE_PREREQUISITES
+        name: {"present": True, "reference": f"test-only:{name}"} for name in LIVE_PREREQUISITES
     }
     result = assess_cutover_readiness(
         capture=fixture,
@@ -366,8 +363,7 @@ def test_readiness_rejects_digest_drift_even_with_schema_only_evidence() -> None
     fixture = capture(raw_tool("send_message"))
     # This is shape-only test data, not a human authorization or authenticator assertion.
     evidence = {
-        name: {"present": True, "reference": f"test-only:{name}"}
-        for name in LIVE_PREREQUISITES
+        name: {"present": True, "reference": f"test-only:{name}"} for name in LIVE_PREREQUISITES
     }
     result = assess_cutover_readiness(
         capture=fixture,
@@ -387,8 +383,7 @@ def test_complete_readiness_packet_still_requires_human_review() -> None:
     fixture = capture(raw_tool("send_message"))
     # These are schema-only markers and do not simulate a credential or human ceremony.
     evidence = {
-        name: {"present": True, "reference": f"test-only:{name}"}
-        for name in LIVE_PREREQUISITES
+        name: {"present": True, "reference": f"test-only:{name}"} for name in LIVE_PREREQUISITES
     }
     result = assess_cutover_readiness(
         capture=fixture,
@@ -412,8 +407,7 @@ def test_readiness_requires_fake_contract_for_every_approval_tool() -> None:
         fake_contract_results=[passing_fake_result(fixture, tool="send_one")],
         bypass_report=audit_bypass_inventory(complete_inventory()),
         live_evidence={
-            name: {"present": True, "reference": f"test-only:{name}"}
-            for name in LIVE_PREREQUISITES
+            name: {"present": True, "reference": f"test-only:{name}"} for name in LIVE_PREREQUISITES
         },
     )
     assert result.inputs_complete is False

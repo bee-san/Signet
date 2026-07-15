@@ -161,7 +161,7 @@ def approval_request(request_id: str, *, now: int) -> EnqueueRequest:
         encrypted_payload=b"encrypted",
         payload_hash=payload_hash,
         payload_fingerprint=hashlib.sha256(b"fingerprint").hexdigest(),
-        pending_result=b'{}',
+        pending_result=b"{}",
         created_at=now,
         expires_at=now + 600,
         policy_version="policy-1",
@@ -220,12 +220,15 @@ def test_password_and_sessions_survive_restart_and_password_change_revokes(
         capabilities=TEST_CAPABILITIES,
         verifier=verifier,
     )
-    assert authenticator.authenticate(
-        USER_ID,
-        "correct horse",
-        source_id="restart-test",
-        now=31,
-    ).credential_id == "password-one"
+    assert (
+        authenticator.authenticate(
+            USER_ID,
+            "correct horse",
+            source_id="restart-test",
+            now=31,
+        ).credential_id
+        == "password-one"
+    )
 
     SQLitePasswordCredentialRepository(after_restart).replace_password(
         PasswordCredential("password-two", USER_ID, verifier._hasher.hash("new password")),
@@ -240,12 +243,15 @@ def test_password_and_sessions_survive_restart_and_password_change_revokes(
             source_id="restart-test",
             now=42,
         )
-    assert authenticator.authenticate(
-        USER_ID,
-        "new password",
-        source_id="restart-test",
-        now=43,
-    ).credential_id == "password-two"
+    assert (
+        authenticator.authenticate(
+            USER_ID,
+            "new password",
+            source_id="restart-test",
+            now=43,
+        ).credential_id
+        == "password-two"
+    )
 
 
 def test_persistent_session_clock_rollback_fails_closed(database: Database) -> None:
@@ -254,10 +260,13 @@ def test_persistent_session_clock_rollback_fails_closed(database: Database) -> N
     with pytest.raises(InvalidSession):
         manager.authenticate(token, now=99)
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT revoked_at FROM web_sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 100
+        assert (
+            connection.execute(
+                "SELECT revoked_at FROM web_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 100
+        )
 
 
 def test_totp_and_webauthn_credential_changes_revoke_user_sessions(
@@ -268,9 +277,7 @@ def test_totp_and_webauthn_credential_changes_revoke_user_sessions(
     manager, first_token, _ = preauth_session(database, now=20)
 
     restarted_totp = SQLiteTotpCredentialRepository(restarted(database))
-    assert restarted_totp.find_totp(USER_ID) == TotpCredential(
-        "totp-one", USER_ID, TOTP_REFERENCE
-    )
+    assert restarted_totp.find_totp(USER_ID) == TotpCredential("totp-one", USER_ID, TOTP_REFERENCE)
     restarted_totp.replace_totp(
         TotpCredential("totp-two", USER_ID, TOTP_REFERENCE),
         now=30,
@@ -547,9 +554,7 @@ def test_webauthn_login_fault_rolls_back_every_auth_record(database: Database) -
     assert credential is not None and credential.sign_count == 7
     with database.read() as connection:
         assert connection.execute("SELECT count(*) FROM web_sessions").fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT count(*) FROM auth_login_consumptions"
-        ).fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM auth_login_consumptions").fetchone()[0] == 0
 
     token = SQLiteAuthenticationTransactions(
         restarted(database),
@@ -697,12 +702,15 @@ def test_totp_login_completion_is_durable_single_use_and_clears_attempts(
     assert machine.get_request(candidate.request_id)["state"] == "pending_approval"
     with database.read() as connection:
         assert connection.execute("SELECT count(*) FROM auth_attempts").fetchone()[0] == 2
-        assert connection.execute(
-            """
+        assert (
+            connection.execute(
+                """
             SELECT last_used_at FROM auth_credentials
             WHERE credential_id = 'totp-main'
             """
-        ).fetchone()[0] == 23
+            ).fetchone()[0]
+            == 23
+        )
 
     _, replay_token, replay_session_id = preauth_session(database, now=30)
     replay = totp.verify(
@@ -841,6 +849,4 @@ def test_totp_replacement_invalidates_verified_mutation_proof(database: Database
         )
     assert machine.get_request(candidate.request_id)["state"] == "pending_approval"
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM auth_proof_consumptions"
-        ).fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM auth_proof_consumptions").fetchone()[0] == 0

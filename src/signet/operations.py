@@ -399,8 +399,7 @@ def verify_fake_adapter_report(contract_input: Any, report: Any) -> dict[str, An
     ):
         raise OperationsError("fake contract input does not forbid pre-approval dispatch")
     if (
-        set(report)
-        != {"fixture_identity", "provider", "network_used", "downstream_call_counts"}
+        set(report) != {"fixture_identity", "provider", "network_used", "downstream_call_counts"}
         or report.get("fixture_identity") != identity
         or report.get("provider") != "fake"
     ):
@@ -532,18 +531,14 @@ def assess_cutover_readiness(
         actual_digests=actual,
         required_tools=required_fake_tools,
     )
-    bypass_shape = (
-        isinstance(bypass_report, dict)
-        and set(bypass_report)
-        == {
-            "clean",
-            "metadata_only",
-            "coverage_complete",
-            "unresolved_coverage",
-            "findings",
-            "record_count",
-        }
-    )
+    bypass_shape = isinstance(bypass_report, dict) and set(bypass_report) == {
+        "clean",
+        "metadata_only",
+        "coverage_complete",
+        "unresolved_coverage",
+        "findings",
+        "record_count",
+    }
     checks["bypass_audit_clean"] = (
         bypass_shape
         and bypass_report.get("clean") is True
@@ -756,9 +751,7 @@ def _classify(definition: Mapping[str, Any]) -> tuple[Classification, list[str]]
     words = _name_words(name)
     annotations = definition.get("annotations")
     read_hint = isinstance(annotations, dict) and annotations.get("readOnlyHint") is True
-    destructive_hint = (
-        isinstance(annotations, dict) and annotations.get("destructiveHint") is True
-    )
+    destructive_hint = isinstance(annotations, dict) and annotations.get("destructiveHint") is True
     signals: list[str] = []
     if read_hint:
         signals.append("annotation:readOnlyHint=true")

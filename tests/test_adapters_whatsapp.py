@@ -32,9 +32,7 @@ class FakeOwnedClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def call_tool(
-        self, tool_name: str, arguments: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
+    async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         self.calls.append((tool_name, dict(arguments)))
         return {"data": {"sent": True, "message_id": "wa-safe-id"}}
 
@@ -321,9 +319,7 @@ async def test_wacli_wrapper_rejects_non_json_success_as_ambiguous(tmp_path: Pat
 @pytest.mark.asyncio
 async def test_wacli_wrapper_timeout_is_ambiguous_and_bounded(tmp_path: Path) -> None:
     executable, _ = make_fake_wacli(tmp_path, send_prelude="sleep 2;")
-    wrapper = WacliWrapper(
-        wrapper_config(executable, tmp_path, timeout_seconds=0.05)
-    )
+    wrapper = WacliWrapper(wrapper_config(executable, tmp_path, timeout_seconds=0.05))
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_text(text_arguments())
@@ -497,9 +493,7 @@ async def test_wacli_wrapper_rejects_symlinked_media_directory_before_process(
     outside.write_bytes(record.path.read_bytes())
     record.path.unlink()
     record.path.symlink_to(outside)
-    wrapper = WacliWrapper(
-        wrapper_config(executable, tmp_path), staging_store=store
-    )
+    wrapper = WacliWrapper(wrapper_config(executable, tmp_path), staging_store=store)
 
     with pytest.raises(WacliError) as caught:
         await wrapper.send_file(
@@ -562,9 +556,11 @@ def test_whatsapp_ambiguous_wrapper_failure_remains_unknown() -> None:
     adapter = WhatsAppTextAdapter(account="personal")
     error = WacliError("process_timeout", dispatch_may_have_occurred=True)
     assert adapter.classify_outcome(error) is Outcome.OUTCOME_UNKNOWN
-    assert adapter.classify_outcome(
-        {"isError": True, "status": "ok", "sent": True}
-    ) is Outcome.OUTCOME_UNKNOWN
-    assert adapter.classify_outcome(
-        {"data": {"isError": True, "sent": True}}
-    ) is Outcome.OUTCOME_UNKNOWN
+    assert (
+        adapter.classify_outcome({"isError": True, "status": "ok", "sent": True})
+        is Outcome.OUTCOME_UNKNOWN
+    )
+    assert (
+        adapter.classify_outcome({"data": {"isError": True, "sent": True}})
+        is Outcome.OUTCOME_UNKNOWN
+    )

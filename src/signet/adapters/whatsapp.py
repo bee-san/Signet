@@ -97,6 +97,7 @@ WHATSAPP_FILE_SCHEMA: Mapping[str, Any] = MappingProxyType(
     }
 )
 
+
 def _reviewed_send_result(result: Mapping[str, Any]) -> Mapping[str, Any] | None:
     """Validate the exact owned-wrapper result, with one optional data envelope."""
 
@@ -192,9 +193,7 @@ class WhatsAppAdapter:
         self.validate(arguments)
         return copy_json_object(arguments)
 
-    def freeze_attachments(
-        self, arguments: Mapping[str, Any]
-    ) -> tuple[AttachmentReference, ...]:
+    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
         canonical = self.canonicalize(arguments)
         if self.tool_name == "send_text":
             return ()
@@ -281,8 +280,7 @@ class WhatsAppAdapter:
                 *(
                     ("Declared and detected media MIME types differ.",)
                     if self.tool_name == "send_file"
-                    and canonical["media"]["mime_type"]
-                    != canonical["media"]["detected_mime"]
+                    and canonical["media"]["mime_type"] != canonical["media"]["detected_mime"]
                     else ()
                 ),
             ),
@@ -333,9 +331,7 @@ class WhatsAppAdapter:
             )
         return payload
 
-    async def execute(
-        self, downstream: MCPClient, payload: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    async def execute(self, downstream: MCPClient, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not self.reviewed_dispatch_enabled:
             raise WacliError("provider_contract_inactive", dispatch_may_have_occurred=False)
         detached = copy_json_object(payload)

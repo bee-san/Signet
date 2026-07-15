@@ -13,9 +13,7 @@ FAKE_ATTACHMENT_MASTER = "fake-attachment-master-key-material-32-bytes"
 FAKE_ATTACHMENT_KEY_REF = "keychain://Signet/fake-attachments"
 
 
-def attachment_cipher(
-    *, key_reference: str = FAKE_ATTACHMENT_KEY_REF
-) -> AttachmentCipher:
+def attachment_cipher(*, key_reference: str = FAKE_ATTACHMENT_KEY_REF) -> AttachmentCipher:
     return AttachmentCipher(
         Secret(FAKE_ATTACHMENT_MASTER),
         key_reference,

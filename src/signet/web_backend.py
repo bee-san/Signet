@@ -955,9 +955,7 @@ class WebBackend:
                 for row in visible
             ),
             has_more=has_more,
-            next_cursor=(
-                _encode_queue_cursor(visible[-1]) if has_more and visible else None
-            ),
+            next_cursor=(_encode_queue_cursor(visible[-1]) if has_more and visible else None),
         )
 
     def get_detail(self, principal: SessionPrincipal, request_id: str) -> RequestDetail:
@@ -1181,9 +1179,7 @@ class WebBackend:
         return DecisionPage(
             items=tuple(decisions),
             has_more=has_more,
-            next_event_id=(
-                int(visible[-1]["event_id"]) if has_more and visible else None
-            ),
+            next_event_id=(int(visible[-1]["event_id"]) if has_more and visible else None),
         )
 
     def begin_passkey_action(
@@ -1768,9 +1764,7 @@ def _unavailable_request_detail(
         review_available=False,
         content_purged=purged,
         content_purged_at=(
-            _optional_int(payload_metadata["purged_at"])
-            if payload_metadata is not None
-            else None
+            _optional_int(payload_metadata["purged_at"]) if payload_metadata is not None else None
         ),
         content_purge_reason=(
             str(payload_metadata["purge_reason"])
@@ -1837,10 +1831,15 @@ def _confirmation_provenance(
         action = str(row["action"])
         kind = str(row["kind"])
         path = str(row["path"])
-        if action not in {"approve", "deny"} or kind not in {"totp", "webauthn"} or path not in {
-            "web",
-            "mcp",
-        }:
+        if (
+            action not in {"approve", "deny"}
+            or kind not in {"totp", "webauthn"}
+            or path
+            not in {
+                "web",
+                "mcp",
+            }
+        ):
             raise WebConflict("request confirmation provenance is unavailable")
         key = (
             action,
@@ -1950,9 +1949,13 @@ def _encode_queue_cursor(row: Any) -> str:
 
 
 def _decode_queue_cursor(value: str) -> tuple[int, int, str]:
-    if not value or len(value) > 512 or any(
-        character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-        for character in value
+    if (
+        not value
+        or len(value) > 512
+        or any(
+            character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            for character in value
+        )
     ):
         raise WebConflict("queue page cursor is invalid")
     try:

@@ -30,9 +30,7 @@ class FakeFastmailClient:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.search_result = dict(search_result or {"messages": []})
 
-    async def call_tool(
-        self, tool_name: str, arguments: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
+    async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         self.calls.append((tool_name, dict(arguments)))
         if tool_name == "upload_attachment":
             return {"attachmentId": "blob-safe-id"}
@@ -126,8 +124,7 @@ def test_fastmail_agent_summary_is_deterministic_bounded_and_never_full() -> Non
 
     assert first == second
     assert first == (
-        "o*** at example.test, t*** at elsewhere.test, "
-        "t*** at example.test, (+1 more)"
+        "o*** at example.test, t*** at elsewhere.test, t*** at example.test, (+1 more)"
     )
     assert all(recipient not in first for recipient in raw_recipients)
 
@@ -150,7 +147,7 @@ def test_fastmail_rejects_ambiguous_or_injected_inputs(change: dict[str, Any]) -
 
 def test_fastmail_preserves_exact_executable_address_values() -> None:
     arguments = fixture_arguments()
-    arguments["to"] = ['Autumn Example <autumn@ex\u00e4mple.test>']
+    arguments["to"] = ["Autumn Example <autumn@ex\u00e4mple.test>"]
     arguments["body"] = "Cafe\u0301\r\nsecond line"
     arguments["subject"] = "  exact subject  "
     canonical = FastmailAdapter(account="primary").canonicalize(arguments)
@@ -303,9 +300,7 @@ async def test_fastmail_reconcile_confirms_only_a_captured_provider_identity() -
     adapter = FastmailAdapter(account="primary")
     arguments = fixture_arguments()
     request = adapter_request(arguments)
-    downstream = FakeFastmailClient(
-        search_result={"messages": [sent_search_candidate(arguments)]}
-    )
+    downstream = FakeFastmailClient(search_result={"messages": [sent_search_candidate(arguments)]})
     restricted = ReadOnlyMCPClient(downstream, adapter.reconciliation_tools)
     attempt = ExecutionAttempt(
         attempt_id="attempt_fastmail",
@@ -313,10 +308,7 @@ async def test_fastmail_reconcile_confirms_only_a_captured_provider_identity() -
         downstream_result={"messageId": "message-safe-id"},
     )
 
-    assert (
-        await adapter.reconcile(restricted, request, attempt)
-        is Reconciliation.CONFIRMED_EFFECT
-    )
+    assert await adapter.reconcile(restricted, request, attempt) is Reconciliation.CONFIRMED_EFFECT
     assert downstream.calls == [
         ("search_email", {"query": "message-safe-id", "folder": "Sent", "limit": 10})
     ]
@@ -345,8 +337,7 @@ async def test_fastmail_reconcile_never_claims_no_effect_from_missing_or_empty_s
         downstream_result={"messageId": "not-found"},
     )
     assert (
-        await adapter.reconcile(restricted, request, known_identity)
-        is Reconciliation.INCONCLUSIVE
+        await adapter.reconcile(restricted, request, known_identity) is Reconciliation.INCONCLUSIVE
     )
     assert adapter.supports_idempotency is False
 
@@ -376,10 +367,7 @@ async def test_fastmail_reconcile_rejects_unbound_malformed_and_error_hits() -> 
     for search_result in cases:
         downstream = FakeFastmailClient(search_result=search_result)
         restricted = ReadOnlyMCPClient(downstream, adapter.reconciliation_tools)
-        assert (
-            await adapter.reconcile(restricted, request, attempt)
-            is Reconciliation.INCONCLUSIVE
-        )
+        assert await adapter.reconcile(restricted, request, attempt) is Reconciliation.INCONCLUSIVE
         assert len(downstream.calls) == 1
 
 
@@ -398,9 +386,7 @@ async def test_fastmail_reconcile_with_attachments_requires_characterized_bindin
         }
     ]
     request = adapter_request(arguments)
-    downstream = FakeFastmailClient(
-        search_result={"messages": [sent_search_candidate(arguments)]}
-    )
+    downstream = FakeFastmailClient(search_result={"messages": [sent_search_candidate(arguments)]})
     restricted = ReadOnlyMCPClient(downstream, adapter.reconciliation_tools)
 
     assert (
@@ -422,9 +408,10 @@ def test_fastmail_ambiguous_tool_error_remains_unknown() -> None:
     assert adapter.classify_outcome({"isError": True, "message": "timeout"}) is (
         Outcome.OUTCOME_UNKNOWN
     )
-    assert adapter.classify_outcome(
-        {"isError": True, "status": "ok", "messageId": "not-proof"}
-    ) is Outcome.OUTCOME_UNKNOWN
+    assert (
+        adapter.classify_outcome({"isError": True, "status": "ok", "messageId": "not-proof"})
+        is Outcome.OUTCOME_UNKNOWN
+    )
     assert adapter.classify_outcome({"id": "attachment-like-id"}) is Outcome.OUTCOME_UNKNOWN
 
 

@@ -329,9 +329,7 @@ def _validate_schema_complexity(schema: Mapping[str, Any]) -> _SchemaValidationW
                         raise SchemaDriftError("the reviewed JSON schema is invalid")
                     patterns += 1
                     if patterns > _MAX_SCHEMA_PATTERNS:
-                        raise SchemaDriftError(
-                            "the reviewed JSON schema exceeds its pattern limit"
-                        )
+                        raise SchemaDriftError("the reviewed JSON schema exceeds its pattern limit")
                     child_bytes, child_atoms = _validate_linear_pattern(child)
                     pattern_bytes += child_bytes
                     pattern_expanded_atoms += child_atoms
@@ -340,9 +338,7 @@ def _validate_schema_complexity(schema: Mapping[str, Any]) -> _SchemaValidationW
                         raise SchemaDriftError("the reviewed JSON schema is invalid")
                     patterns += len(child)
                     if patterns > _MAX_SCHEMA_PATTERNS:
-                        raise SchemaDriftError(
-                            "the reviewed JSON schema exceeds its pattern limit"
-                        )
+                        raise SchemaDriftError("the reviewed JSON schema exceeds its pattern limit")
                     for pattern in child:
                         if not isinstance(pattern, str):
                             raise SchemaDriftError("the reviewed JSON schema is invalid")
@@ -371,9 +367,7 @@ def _validate_schema_complexity(schema: Mapping[str, Any]) -> _SchemaValidationW
             active_containers.add(container_id)
             stack.append((value, depth, True, position))
             child_position: _SchemaPosition = "schema" if position == "schema_list" else "data"
-            stack.extend(
-                (child, depth + 1, False, child_position) for child in reversed(value)
-            )
+            stack.extend((child, depth + 1, False, child_position) for child in reversed(value))
         elif isinstance(value, str):
             if position != "data":
                 raise SchemaDriftError("the reviewed JSON schema is invalid")
@@ -1078,11 +1072,7 @@ async def discover_all_tools(
                 if page_count >= max_pages:
                     raise MirrorError("downstream tools/list exceeded the page limit")
                 page_count += 1
-                params = (
-                    types.PaginatedRequestParams(cursor=cursor)
-                    if cursor is not None
-                    else None
-                )
+                params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
                 page = await session.list_tools(params=params)
                 if len(tools) + len(page.tools) > max_tools:
                     raise MirrorError("downstream tools/list exceeded the tool limit")
@@ -1101,14 +1091,10 @@ async def discover_all_tools(
                             ).encode("utf-8")
                         )
                     except (TypeError, ValueError):
-                        raise MirrorError(
-                            "downstream tools/list contained invalid JSON"
-                        ) from None
+                        raise MirrorError("downstream tools/list contained invalid JSON") from None
                     aggregate_bytes += encoded_size
                     if aggregate_bytes > max_aggregate_bytes:
-                        raise MirrorError(
-                            "downstream tools/list exceeded the aggregate byte limit"
-                        )
+                        raise MirrorError("downstream tools/list exceeded the aggregate byte limit")
                     names.add(name)
                     tools.append(raw)
                 next_cursor = page.nextCursor
@@ -1121,9 +1107,7 @@ async def discover_all_tools(
                     raise MirrorError("downstream tools/list cursor exceeded its limit")
                 aggregate_bytes += cursor_size
                 if aggregate_bytes > max_aggregate_bytes:
-                    raise MirrorError(
-                        "downstream tools/list exceeded the aggregate byte limit"
-                    )
+                    raise MirrorError("downstream tools/list exceeded the aggregate byte limit")
                 if next_cursor in cursors:
                     raise MirrorError("downstream tools/list pagination cursor repeated")
                 cursors.add(next_cursor)

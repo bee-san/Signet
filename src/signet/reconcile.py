@@ -280,8 +280,7 @@ def _safe_completion(value: object) -> Mapping[str, str | int | bool | None]:
     except (TypeError, ValueError):
         return MappingProxyType({})
     if not isinstance(parsed, dict) or any(
-        not isinstance(key, str)
-        or (item is not None and not isinstance(item, (str, int, bool)))
+        not isinstance(key, str) or (item is not None and not isinstance(item, (str, int, bool)))
         for key, item in parsed.items()
     ):
         return MappingProxyType({})

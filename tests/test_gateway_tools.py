@@ -458,17 +458,13 @@ async def test_list_pending_is_caller_scoped_masked_and_omits_expired(
     harness = make_harness(machine)
     machine.enqueue(enqueue_request("req_Own"))
     machine.enqueue(enqueue_request("req_Foreign", namespace="profile:two"))
-    machine.enqueue(
-        enqueue_request("req_Expired", created_at=NOW - 100, expires_at=NOW + 5)
-    )
+    machine.enqueue(enqueue_request("req_Expired", created_at=NOW - 100, expires_at=NOW + 5))
     harness.summaries.add("req_Own")
     harness.summaries.add("req_Foreign", destination="foreign@example.test")
     harness.summaries.add("req_Expired", destination="expired@example.test")
 
     result = structured(
-        await harness.tools.call_tool(
-            "list_pending_approvals", {}, principal=own_principal()
-        )
+        await harness.tools.call_tool("list_pending_approvals", {}, principal=own_principal())
     )
 
     assert result == {
@@ -507,9 +503,7 @@ async def test_list_pending_is_hard_bounded_and_keyset_paginated(
         harness.summaries.add(request_id)
 
     first = structured(
-        await harness.tools.call_tool(
-            "list_pending_approvals", {}, principal=own_principal()
-        )
+        await harness.tools.call_tool("list_pending_approvals", {}, principal=own_principal())
     )
 
     assert [item["request_id"] for item in first["requests"]] == request_ids[:10]
@@ -776,9 +770,7 @@ async def test_approve_binds_exact_revision_consumes_once_and_returns_safe_recei
             WHERE request_id = 'req_Approve' ORDER BY created_at, kind
             """
         ).fetchall()
-    assert [tuple(row) for row in consumed] == [
-        ("req_Approve", 1, digest("body-one"), "mcp")
-    ]
+    assert [tuple(row) for row in consumed] == [("req_Approve", 1, digest("body-one"), "mcp")]
     assert attempts == []
     assert [tuple(row) for row in notifications] == [
         ("new_pending", "fastmail", "send_email"),
@@ -1040,9 +1032,12 @@ async def test_totp_failures_are_stable_errors_with_no_transition(
     with machine.database.read() as connection:
         assert connection.execute("SELECT * FROM confirmation_consumptions").fetchall() == []
         assert connection.execute("SELECT * FROM execution_attempts").fetchall() == []
-        assert connection.execute(
-            "SELECT count(*) FROM notification_outbox WHERE kind = 'mcp_approved'"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM notification_outbox WHERE kind = 'mcp_approved'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.asyncio
@@ -1192,9 +1187,7 @@ async def test_gateway_surface_round_trips_exact_tools_and_error_channels(
         listed = await client.list_tools()
         assert [raw_model(tool) for tool in listed.tools] == GATEWAY_TOOL_DEFINITIONS
 
-        missing = await client.call_tool(
-            "check_approval_status", {"request_id": "req_Unknown"}
-        )
+        missing = await client.call_tool("check_approval_status", {"request_id": "req_Unknown"})
         assert missing.isError is True
         assert missing.structuredContent["error"]["code"] == "request_not_found"
 

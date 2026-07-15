@@ -312,13 +312,15 @@ class SQLitePushRepository:
 
     def unsubscribe(self, user_id: str, endpoint: str, *, now: int) -> bool:
         with self.database.transaction() as connection:
-            updated = int(connection.execute(
-                """
+            updated = int(
+                connection.execute(
+                    """
                 UPDATE push_subscriptions SET disabled_at = ?
                 WHERE user_id = ? AND endpoint = ? AND disabled_at IS NULL
                 """,
-                (now, user_id, endpoint),
-            ).rowcount)
+                    (now, user_id, endpoint),
+                ).rowcount
+            )
         return updated == 1
 
     @staticmethod
@@ -516,8 +518,7 @@ def _validate_subscription(subscription: PushSubscription) -> None:
         or not subscription.device_label
         or len(subscription.device_label.encode("utf-8")) > 80
         or any(
-            ord(character) < 32 or ord(character) == 127
-            for character in subscription.device_label
+            ord(character) < 32 or ord(character) == 127 for character in subscription.device_label
         )
         or subscription.failure_count < 0
         or any(

@@ -176,8 +176,7 @@ def test_totp_unenrolled_and_unavailable_are_distinct_from_invalid() -> None:
 def test_production_provider_rejects_non_authenticator_shaped_proof() -> None:
     provider = PyotpTotpProvider()
     assert (
-        provider.verify_step(Secret("not-authenticator-material"), "fake:proof", now=1_000)
-        is None
+        provider.verify_step(Secret("not-authenticator-material"), "fake:proof", now=1_000) is None
     )
 
 

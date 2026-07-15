@@ -201,9 +201,7 @@ class SQLiteActionDraftRepository:
             prepared_edit=prepared,
             created_at=int(row["created_at"]),
             expires_at=int(row["expires_at"]),
-            decision_note=(
-                str(row["decision_note"]) if row["decision_note"] is not None else None
-            ),
+            decision_note=(str(row["decision_note"]) if row["decision_note"] is not None else None),
         )
         _validate_draft(draft)
         return draft

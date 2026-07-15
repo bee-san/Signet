@@ -845,9 +845,7 @@ async def test_http_sse_stream_bounds_each_event_and_resets_on_delimiter() -> No
         limit_bytes=16,
         event_stream=True,
     )
-    assert b"".join([chunk async for chunk in valid]) == (
-        b"data: 1234\n\ndata: 5678\r\n\r\n"
-    )
+    assert b"".join([chunk async for chunk in valid]) == (b"data: 1234\n\ndata: 5678\r\n\r\n")
 
     oversized = _BoundedHTTPResponseStream(
         _ChunkStream((b"data: ", b"x" * 20)),

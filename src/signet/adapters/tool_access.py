@@ -78,9 +78,7 @@ class ToolAccessAdapter:
             "tool": arguments["tool"],
         }
 
-    def freeze_attachments(
-        self, arguments: Mapping[str, Any]
-    ) -> tuple[AttachmentReference, ...]:
+    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
         self.validate(arguments)
         return ()
 
@@ -111,9 +109,7 @@ class ToolAccessAdapter:
         del request
         raise AdapterValidationError("gateway policy proposals are never downstream requests")
 
-    async def execute(
-        self, downstream: MCPClient, payload: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    async def execute(self, downstream: MCPClient, payload: Mapping[str, Any]) -> dict[str, Any]:
         del downstream, payload
         raise DispatchError(
             "gateway policy proposals cannot be dispatched",

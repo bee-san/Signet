@@ -70,9 +70,10 @@ def test_envelope_uses_fresh_key_and_independent_aes_gcm_nonces() -> None:
     assert first != second
     assert PLAINTEXT not in first
     assert first[wrapping_start:payload_start] != first[payload_start:wrapped_start]
-    assert first[wrapped_start : wrapped_start + wrapped_size] != second[
-        wrapped_start : wrapped_start + wrapped_size
-    ]
+    assert (
+        first[wrapped_start : wrapped_start + wrapped_size]
+        != second[wrapped_start : wrapped_start + wrapped_size]
+    )
     assert decrypt(selected, first) == PLAINTEXT
     assert decrypt(selected, second) == PLAINTEXT
 
