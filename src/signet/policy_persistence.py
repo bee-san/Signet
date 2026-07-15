@@ -76,6 +76,30 @@ class SQLiteActionDraftRepository:
         edit = draft.prepared_edit
         try:
             with self.database.transaction() as connection:
+                cutoff = max(0, draft.created_at - 7 * 24 * 60 * 60)
+                connection.execute(
+                    """
+                    DELETE FROM web_action_drafts WHERE rowid IN (
+                        SELECT rowid FROM web_action_drafts
+                        WHERE expires_at <= ? ORDER BY expires_at LIMIT 500
+                    )
+                    """,
+                    (cutoff,),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM auth_challenges WHERE rowid IN (
+                        SELECT challenge.rowid FROM auth_challenges AS challenge
+                        WHERE challenge.action != 'login' AND challenge.expires_at <= ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM web_action_drafts AS draft
+                              WHERE draft.challenge_id = challenge.challenge_id
+                          )
+                        ORDER BY challenge.expires_at LIMIT 500
+                    )
+                    """,
+                    (cutoff,),
+                )
                 connection.execute(
                     """
                     INSERT INTO web_action_drafts(
@@ -674,11 +698,10 @@ class SQLitePolicyPromotionBoundary:
                 "SELECT 1 FROM durable_policy_file_state WHERE singleton = 1"
             ).fetchone() is not None:
                 raise PolicyUnavailable("durable policy was initialized concurrently")
-            existing = connection.execute(
-                "SELECT config_hash FROM policy_versions WHERE policy_version_id = ?",
-                (snapshot.version,),
-            ).fetchone()
-            if existing is None:
+            existing_versions = connection.execute(
+                "SELECT policy_version_id, config_hash FROM policy_versions"
+            ).fetchall()
+            if not existing_versions:
                 connection.execute(
                     """
                     INSERT INTO policy_versions(
@@ -688,8 +711,16 @@ class SQLitePolicyPromotionBoundary:
                     """,
                     (snapshot.version, now, config_hash),
                 )
-            elif not _same_text(str(existing["config_hash"]), config_hash):
-                raise PolicyDivergenceError("existing policy version conflicts with bootstrap")
+            elif (
+                len(existing_versions) != 1
+                or int(existing_versions[0]["policy_version_id"]) != snapshot.version
+                or not _same_text(
+                    str(existing_versions[0]["config_hash"]), config_hash
+                )
+            ):
+                raise PolicyDivergenceError(
+                    "existing policy history cannot be reconciled during bootstrap"
+                )
             connection.execute(
                 """
                 INSERT INTO durable_policy_snapshots(
@@ -917,7 +948,7 @@ class SQLitePolicyPromotionBoundary:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             descriptor = os.open(self.lock_path, flags, 0o600)
-            os.chmod(self.lock_path, 0o600)
+            os.fchmod(descriptor, 0o600)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
                 yield

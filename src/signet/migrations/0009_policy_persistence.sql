@@ -101,3 +101,21 @@ BEFORE UPDATE ON durable_policy_snapshots
 BEGIN
     SELECT RAISE(ABORT, 'durable policy snapshots are immutable');
 END;
+
+CREATE TRIGGER durable_policy_snapshots_no_delete
+BEFORE DELETE ON durable_policy_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'durable policy snapshots are append-only');
+END;
+
+CREATE TRIGGER policy_versions_no_update
+BEFORE UPDATE ON policy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'policy versions are immutable');
+END;
+
+CREATE TRIGGER policy_versions_no_delete
+BEFORE DELETE ON policy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'policy versions are append-only');
+END;

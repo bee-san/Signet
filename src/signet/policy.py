@@ -621,17 +621,16 @@ def policy_document(snapshot: PolicySnapshot) -> dict[str, Any]:
             }
         tools: dict[str, Any] = {}
         for name, tool in downstream.tools.items():
-            tool_data: dict[str, Any] = {"mode": tool.mode.value}
+            tool_data: dict[str, Any] = {
+                "mode": tool.mode.value,
+                "reviewed_read_only": tool.reviewed_read_only,
+                "communication_send": tool.communication_send,
+                "limits": dict(tool.limits),
+            }
             if tool.adapter is not None:
                 tool_data["adapter"] = tool.adapter
-            if tool.reviewed_read_only:
-                tool_data["reviewed_read_only"] = True
-            if tool.communication_send:
-                tool_data["communication_send"] = True
             if tool.schema_digest is not None:
                 tool_data["schema_digest"] = tool.schema_digest
-            if tool.limits:
-                tool_data["limits"] = dict(tool.limits)
             if tool.account_ref is not None:
                 tool_data["account_ref"] = tool.account_ref
             if tool.reviewed_classification is not None:

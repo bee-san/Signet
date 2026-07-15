@@ -324,6 +324,9 @@ def test_policy_migration_installs_restart_safe_tables_and_guards(tmp_path: Path
     assert {
         "web_action_drafts_no_update",
         "durable_policy_snapshots_no_update",
+        "durable_policy_snapshots_no_delete",
+        "policy_versions_no_update",
+        "policy_versions_no_delete",
     } <= triggers
 
 
@@ -708,7 +711,6 @@ def test_startup_refuses_policy_file_or_ledger_divergence(tmp_path: Path) -> Non
             policy_path,
             clock=lambda: NOW + 1,
         )
-
     policy_path.write_bytes(dump_policy(initial))
     with bundle.database.transaction() as connection:
         connection.execute(
@@ -725,6 +727,52 @@ def test_startup_refuses_policy_file_or_ledger_divergence(tmp_path: Path) -> Non
             clock=lambda: NOW + 2,
         )
 
+
+def test_bootstrap_refuses_unreconstructable_prior_policy_history(tmp_path: Path) -> None:
+    database = Database(tmp_path / "history.sqlite3")
+    database.initialize()
+    policy_path = tmp_path / "policy.yaml"
+    initial = _write_policy(policy_path)
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO policy_versions(
+                policy_version_id, actor, created_at, mode_diffs_json,
+                originating_event, config_hash, applied
+            ) VALUES (7, 'legacy:test', ?, '{}', 'file_change', ?, 1)
+            """,
+            (NOW - 1, "7" * 64),
+        )
+    bundle = assemble(database)
+    with pytest.raises(PolicyDivergenceError, match="cannot be reconciled"):
+        SQLitePolicyPromotionBoundary(
+            database,
+            bundle.state_machine,
+            _reviewer(bundle),
+            PolicyEngine(initial),
+            policy_path,
+            clock=lambda: NOW,
+        )
+
+
+def test_policy_ledger_rows_are_append_only(
+    durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
+) -> None:
+    bundle, _, _ = durable_bundle
+    with (
+        bundle.database.transaction() as connection,
+        pytest.raises(IntegrityError, match="immutable"),
+    ):
+        connection.execute(
+            "UPDATE policy_versions SET actor = 'tampered' WHERE policy_version_id = 1"
+        )
+    with (
+        bundle.database.transaction() as connection,
+        pytest.raises(IntegrityError, match="append-only"),
+    ):
+        connection.execute(
+            "DELETE FROM durable_policy_snapshots WHERE policy_version_id = 1"
+        )
 
 def test_writeback_preserves_every_strict_security_field(
     durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
