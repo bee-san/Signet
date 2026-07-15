@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -27,8 +28,10 @@ from typing import Any, cast
 from signet.adapters.base import DispatchError, copy_json_object
 from signet.staging import StagingError, StagingStore
 
-DEFAULT_WACLI_EXECUTABLE = Path("/opt/homebrew/bin/wacli")
 REVIEWED_WACLI_VERSION = "0.12.0"
+DEFAULT_WACLI_EXECUTABLE = Path(
+    f"/opt/homebrew/Cellar/wacli/{REVIEWED_WACLI_VERSION}/bin/wacli"
+)
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
@@ -107,6 +110,8 @@ class WacliConfig:
             object.__setattr__(self, "execution_snapshot_root", snapshot_root)
         if self.reviewed_dispatch_enabled and self.execution_snapshot_root is None:
             raise ValueError("active wacli dispatch requires a private execution snapshot root")
+        if self.reviewed_dispatch_enabled and self.expected_sha256 is None:
+            raise ValueError("active wacli dispatch requires a reviewed executable digest")
         if not isinstance(self.test_only_allow_script, bool):
             raise TypeError("wacli test script flag must be a boolean")
 
@@ -205,6 +210,14 @@ class WacliWrapper:
         try:
             if not stat.S_ISREG(source_before.st_mode) or source_before.st_mode & 0o111 == 0:
                 raise WacliError("executable_not_runnable", dispatch_may_have_occurred=False)
+            if (
+                source_before.st_uid not in {0, os.geteuid()}
+                or source_before.st_mode & 0o022
+            ):
+                raise WacliError(
+                    "executable_permissions_unsafe",
+                    dispatch_may_have_occurred=False,
+                )
             self._prepare_snapshot_root(snapshot_root)
             root_flags = os.O_RDONLY | os.O_CLOEXEC
             if hasattr(os, "O_DIRECTORY"):
@@ -256,9 +269,8 @@ class WacliWrapper:
             if not self._native_or_test_executable(leading):
                 raise WacliError("executable_format_unreviewed", dispatch_may_have_occurred=False)
             executable_digest = digest.hexdigest()
-            if (
-                self.config.expected_sha256 is not None
-                and executable_digest != self.config.expected_sha256
+            if self.config.expected_sha256 is not None and not hmac.compare_digest(
+                executable_digest, self.config.expected_sha256
             ):
                 raise WacliError("executable_digest_mismatch", dispatch_may_have_occurred=False)
 

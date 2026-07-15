@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -84,6 +85,7 @@ def wrapper_config(executable: Path, tmp_path: Path, **changes: Any) -> WacliCon
         "account": "personal",
         "executable": executable,
         "expected_version": "0.12.0",
+        "expected_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
         "staging_root": tmp_path / "staging",
         "home": tmp_path / "home",
         "timeout_seconds": 2,
@@ -247,7 +249,7 @@ async def test_wacli_wrapper_rejects_binary_change_after_version_preflight(tmp_p
     with pytest.raises(WacliError) as caught:
         await wrapper.send_text(text_arguments())
 
-    assert caught.value.code == "executable_changed"
+    assert caught.value.code == "executable_digest_mismatch"
     assert caught.value.dispatch_may_have_occurred is False
     assert "send\ntext" not in log.read_text(encoding="utf-8")
 
@@ -502,6 +504,31 @@ async def test_wacli_wrapper_rejects_symlinked_media_directory_before_process(
 def test_wacli_config_requires_absolute_pinned_executable() -> None:
     with pytest.raises(ValueError, match="absolute pinned path"):
         WacliConfig(account="personal", executable=Path("wacli"))
+
+    with pytest.raises(ValueError, match="reviewed executable digest"):
+        WacliConfig(
+            account="personal",
+            executable=Path("/opt/reviewed/wacli"),
+            reviewed_dispatch_enabled=True,
+            execution_snapshot_root=Path("/private/snapshots"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_wacli_wrapper_rejects_group_writable_reviewed_executable(
+    tmp_path: Path,
+) -> None:
+    executable, log = make_fake_wacli(tmp_path)
+    config = wrapper_config(executable, tmp_path)
+    executable.chmod(0o720)
+    wrapper = WacliWrapper(config)
+
+    with pytest.raises(WacliError) as caught:
+        await wrapper.send_text(text_arguments())
+
+    assert caught.value.code == "executable_permissions_unsafe"
+    assert caught.value.dispatch_may_have_occurred is False
+    assert not log.exists()
 
 
 @pytest.mark.asyncio

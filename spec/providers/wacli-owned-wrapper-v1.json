@@ -6,9 +6,12 @@
   "runtime_activation_default": "disabled",
   "contract": "signet.wacli.v1",
   "executable": {
-    "path": "/opt/homebrew/bin/wacli",
+    "path": "/opt/homebrew/Cellar/wacli/0.12.0/bin/wacli",
     "version": "0.12.0",
     "version_preflight_required": true,
+    "sha256_preflight_required": true,
+    "resolved_non_symlink_path_required": true,
+    "safe_owner_and_mode_required": true,
     "shell": false,
     "stdin": "closed",
     "environment": "minimal_allowlist",

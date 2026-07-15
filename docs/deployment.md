@@ -123,6 +123,12 @@ launchd `EnvironmentVariables`, or pass them in process arguments. Ordinary
 settings reject literal secret fields. Downstream HTTP configuration accepts HTTPS
 or loopback HTTP only; stdio uses an allowlisted argument vector without a shell.
 
+The owned `wacli` launcher must pin the resolved, non-symlink Cellar executable,
+its reviewed SHA-256 digest, and an owner/mode that is not group- or world-writable.
+Do not configure `/opt/homebrew/bin/wacli`: Homebrew normally exposes that path as
+a mutable symlink, and Signet intentionally rejects it. Re-review the resolved path,
+version, and digest together after every upgrade.
+
 `TokenRegistry.issue()` is an API, not a shipped enrollment CLI. During the later
 human-authorized installation, issue one caller token per Hermes profile with the
 exact allowed alias set (for example `fastmail`, `whatsapp`, and `approvals`). Store

@@ -82,7 +82,7 @@ downstreams:
     wrapper_contract:
       id: signet.wacli.send-text.v1
       ownership: gateway
-      executable: /opt/homebrew/bin/wacli
+      executable: /opt/homebrew/Cellar/wacli/0.12.0/bin/wacli
       executable_version: preflight_required
       output: json_only
       shell_interpolation: forbidden
