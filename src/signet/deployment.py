@@ -374,7 +374,7 @@ def add_deployment_parser(subcommands: Any) -> None:
     for name in ("revoke", "rotate"):
         command = token_commands.add_parser(name, help=f"{name} a caller token")
         command.add_argument("--config", type=Path, required=True)
-        command.add_argument("token_id")
+        command.add_argument("--token-id", required=True)
 
 
 def run_deployment_command(args: argparse.Namespace, *, runner: Runner) -> None:

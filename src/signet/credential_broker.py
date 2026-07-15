@@ -147,9 +147,9 @@ class TokenRegistry:
         aliases = frozenset(allowed_aliases)
         if not namespace or not aliases or any(not alias for alias in aliases):
             raise CredentialError("namespace and at least one alias are required")
-        token_id = secrets.token_urlsafe(12)
+        token_id = _new_token_id()
         while token_id in self._records:
-            token_id = secrets.token_urlsafe(12)
+            token_id = _new_token_id()
         raw_secret = secrets.token_urlsafe(32)
         raw_token = f"sgt_{token_id}.{raw_secret}"
         self._records[token_id] = TokenRecord(
@@ -415,9 +415,15 @@ def _decode_machine_token_verifier(verifier: str) -> bytes:
 
 
 def _new_machine_token() -> IssuedToken:
-    token_id = secrets.token_urlsafe(12)
+    token_id = _new_token_id()
     raw_secret = secrets.token_urlsafe(32)
     return IssuedToken(token_id=token_id, token=f"sgt_{token_id}.{raw_secret}")
+
+
+def _new_token_id() -> str:
+    # A leading '-' is ambiguous to command-line parsers when operators rotate it.
+    first = secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+    return first + secrets.token_urlsafe(12)[1:]
 
 
 def _parse_machine_authorization(

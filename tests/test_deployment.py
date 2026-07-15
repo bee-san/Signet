@@ -118,6 +118,7 @@ def test_init_creates_only_private_disabled_state_and_cli_never_reprints_token(
     assert metadata[0]["allowed_aliases"] == ["approvals"]
 
     token_id = metadata[0]["token_id"]
+    assert token_id[0].isalnum()
     main(
         [
             "deployment",
@@ -125,6 +126,7 @@ def test_init_creates_only_private_disabled_state_and_cli_never_reprints_token(
             "rotate",
             "--config",
             str(config_path),
+            "--token-id",
             token_id,
         ]
     )
@@ -145,6 +147,7 @@ def test_init_creates_only_private_disabled_state_and_cli_never_reprints_token(
             "revoke",
             "--config",
             str(config_path),
+            "--token-id",
             token_id,
         ]
     )
@@ -235,6 +238,7 @@ def test_rotation_stdout_failure_preserves_old_token_and_recoverable_metadata(
                     "rotate",
                     "--config",
                     str(config_path),
+                    "--token-id",
                     issued.token_id,
                 ]
             )
