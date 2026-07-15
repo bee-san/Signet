@@ -78,3 +78,57 @@ jobs:
         run: >-
           uv run --with pip-audit==2.10.1 pip-audit
           -r /tmp/signet-requirements.txt --strict
+
+  macos-boundaries:
+    name: macOS process and inert launchd boundaries
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+          version: "0.11.28"
+      - name: Install locked environment
+        run: uv sync --frozen
+      - name: Check process boundaries with fake executables
+        run: >-
+          uv run pytest -q
+          tests/test_reviewed_process.py
+          tests/test_downstream.py
+          tests/test_adapters_whatsapp.py
+          tests/test_adapters_provider_fixtures.py
+          tests/test_config_credentials.py
+          tests/test_launchd_render.py
+          -k 'not whatsapp_media_is_decrypted and
+          not wacli_wrapper_rehashes_open_descriptor and
+          not wacli_wrapper_rejects_media_outside and
+          not wacli_wrapper_rejects_symlinked_media'
+      - name: Render and lint inactive launchd plists without installing them
+        shell: bash
+        run: |
+          root="$(mktemp -d)"
+          trap 'chmod -R u+rwX "$root"; rm -rf "$root"' EXIT
+          chmod 700 "$root"
+          install -d -m 0700 "$root/logs" "$root/output"
+          printf '{}\n' > "$root/disabled-placeholder.json"
+          chmod 600 "$root/disabled-placeholder.json"
+          repo="$(pwd -P)"
+          uv run python deploy/launchd/render-disabled-plists.py \
+            --signet-executable "$repo/.venv/bin/signet" \
+            --config "$root/disabled-placeholder.json" \
+            --working-directory "$repo" \
+            --logs-directory "$root/logs" \
+            --output-directory "$root/output"
+          plutil -lint "$root/output/ai.hermes.signet.mcp.plist"
+          plutil -lint "$root/output/ai.hermes.signet.web.plist"
+          plutil -p "$root/output/ai.hermes.signet.mcp.plist" >/dev/null
+          plutil -p "$root/output/ai.hermes.signet.web.plist" >/dev/null
+          if grep -R -E '/ABSOLUTE/PATH/|sgt_[A-Za-z0-9_-]+' "$root/output"; then
+            echo "rendered inactive plist contains a placeholder or token-like value" >&2
+            exit 1
+          fi

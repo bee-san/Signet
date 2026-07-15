@@ -57,6 +57,20 @@ _DESTINATION_RE = re.compile(
 )
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    try:
+        first.relative_to(second)
+    except ValueError:
+        pass
+    else:
+        return True
+    try:
+        second.relative_to(first)
+    except ValueError:
+        return False
+    return True
+
+
 class WacliError(DispatchError):
     """A redacted ``wacli`` boundary failure."""
 
@@ -141,6 +155,14 @@ class WacliConfig:
                 raise ValueError(
                     "active wacli home and store must be distinct children of one "
                     "private runtime root"
+                )
+            active_staging_root = self.staging_root
+            if active_staging_root is not None and _paths_overlap(
+                active_staging_root,
+                active_home.parent,
+            ):
+                raise ValueError(
+                    "wacli staging root and child-visible runtime root must be disjoint"
                 )
 
 
@@ -229,6 +251,21 @@ class WacliWrapper:
             self._staging_root_identity = self._verify_runtime_directory(
                 config.staging_root,
                 "staging_root",
+            )
+        directory_identities = [
+            identity
+            for identity in (
+                self._home_identity,
+                self._store_identity,
+                self._runtime_root_identity,
+                self._staging_root_identity,
+            )
+            if identity is not None
+        ]
+        if len(directory_identities) != len(set(directory_identities)):
+            raise WacliError(
+                "runtime_directories_overlap",
+                dispatch_may_have_occurred=False,
             )
         if staging_store is not None and not isinstance(staging_store, StagingStore):
             raise TypeError("wacli staging store is invalid")

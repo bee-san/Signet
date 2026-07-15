@@ -1,6 +1,7 @@
 {
   "fixture_kind": "owned_provider_wrapper_contract",
-  "source": "https://github.com/openclaw/wacli/blob/main/docs/send.md",
+  "source": "https://github.com/openclaw/wacli/blob/v0.12.0/docs/send.md",
+  "store_source": "https://github.com/openclaw/wacli/blob/v0.12.0/docs/accounts.md",
   "reviewed_on": "2026-07-15",
   "must_not_dispatch": true,
   "runtime_activation_default": "disabled",
@@ -20,12 +21,31 @@
     "output_bounded": true
   },
   "global_argv": [
-    "--account",
-    "ACCOUNT",
+    "--store",
+    "INHERITED_REVIEWED_STORE_DIRECTORY_DESCRIPTOR",
     "--json",
     "--timeout",
     "15s"
   ],
+  "process_boundary": {
+    "working_directory": "INHERITED_REVIEWED_HOME_DIRECTORY_DESCRIPTOR",
+    "home_environment": "INHERITED_REVIEWED_HOME_DIRECTORY_DESCRIPTOR",
+    "runtime_root": "canonical_existing_euid_owned_mode_0700",
+    "home_and_store": "distinct_direct_children_of_runtime_root",
+    "store": "canonical_existing_euid_owned_mode_0700",
+    "staging_root": "canonical_disjoint_from_child_visible_runtime_root",
+    "directory_identity_aliases_rejected": true,
+    "inherited_directory_descriptors": [
+      "home",
+      "store"
+    ],
+    "never_inherited": [
+      "encrypted_staging_root",
+      "runtime_root"
+    ],
+    "test_script_capability": "in_memory_test_injection_only_not_serializable",
+    "macos_pinned_binary_characterization_required_before_activation": true
+  },
   "tools": {
     "send_text": {
       "argv": [
@@ -112,7 +132,9 @@
     "open_flags": ["O_RDONLY", "O_NOFOLLOW"],
     "regular_single_link_required": true,
     "size_and_sha256_reverified_after_open": true,
-    "child_receives": "/dev/fd/<inherited-fd>"
+    "parent_reverifies_staging_root_before_spawn": true,
+    "staging_root_descriptor_inherited": false,
+    "child_receives": "/dev/fd/<selected-decrypted-anonymous-fd>"
   },
   "reconciliation": {
     "read_only_tools": [],

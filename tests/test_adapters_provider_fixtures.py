@@ -54,9 +54,26 @@ def test_owned_wacli_contract_matches_pinned_wrapper_and_adapter_schemas() -> No
     assert executable["version"] == REVIEWED_WACLI_VERSION
     assert executable["shell"] is False
     assert executable["output"] == "single_json_object"
+    assert fixture["source"].endswith("/blob/v0.12.0/docs/send.md")
+    assert fixture["store_source"].endswith("/blob/v0.12.0/docs/accounts.md")
+    assert fixture["global_argv"] == [
+        "--store",
+        "INHERITED_REVIEWED_STORE_DIRECTORY_DESCRIPTOR",
+        "--json",
+        "--timeout",
+        "15s",
+    ]
+    boundary = fixture["process_boundary"]
+    assert boundary["home_and_store"] == "distinct_direct_children_of_runtime_root"
+    assert boundary["staging_root"] == "canonical_disjoint_from_child_visible_runtime_root"
+    assert boundary["directory_identity_aliases_rejected"] is True
+    assert boundary["inherited_directory_descriptors"] == ["home", "store"]
+    assert boundary["never_inherited"] == ["encrypted_staging_root", "runtime_root"]
+    assert boundary["macos_pinned_binary_characterization_required_before_activation"] is True
     assert tools["send_text"]["input_schema"] == dict(WHATSAPP_TEXT_SCHEMA)
     assert tools["send_file"]["input_schema"] == dict(WHATSAPP_FILE_SCHEMA)
     assert fixture["media_boundary"]["size_and_sha256_reverified_after_open"] is True
+    assert fixture["media_boundary"]["staging_root_descriptor_inherited"] is False
     assert fixture["reconciliation"]["read_only_tools"] == []
     assert fixture["reconciliation"]["provider_idempotency_key"] is None
     assert fixture["reconciliation"]["decision"] == "inconclusive"

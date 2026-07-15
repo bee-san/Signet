@@ -296,6 +296,18 @@ Do not configure `/opt/homebrew/bin/wacli`: Homebrew normally exposes that path 
 a mutable symlink, and Signet intentionally rejects it. Re-review the resolved path,
 version, and digest together after every upgrade.
 
+The wrapper selects one exact descriptor-bound store with `--store`; it does not
+resolve a named `--account` from the operator's normal HOME. Active configuration
+requires a dedicated private runtime root with distinct HOME and store children.
+The encrypted staging tree must be canonically disjoint from that child-visible
+runtime tree in both directions. Existing linked-device state therefore needs an
+explicit stopped-store migration or a human-authorized re-pair, never an implicit
+HOME change. The full layout, migration decision, inherited-descriptor boundary,
+and target-macOS characterization blocker are in
+[`wacli-process-boundary.md`](wacli-process-boundary.md). The repository and CI do
+not perform pairing, migration, provider contact, or sends, and the live assembly
+remains disabled.
+
 The shipped persistent token CLI provisions only the `approvals` route in disabled
 mode. A later live assembly must explicitly migrate the same namespace to the exact
 reviewed downstream aliases (for example `fastmail` and `whatsapp`) and rotate the

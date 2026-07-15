@@ -150,6 +150,31 @@ def test_launchd_guide_renders_then_lints_exact_private_outputs() -> None:
     assert (ROOT / "deploy" / "launchd" / "render-disabled-plists.py").is_file()
 
 
+def test_wacli_boundary_documents_descriptor_store_and_disabled_migration_gate() -> None:
+    deployment = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
+    deploy_readme = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+    boundary_path = ROOT / "docs" / "wacli-process-boundary.md"
+    boundary = boundary_path.read_text(encoding="utf-8")
+    normalized = " ".join(boundary.split())
+
+    assert "wacli-process-boundary.md" in deployment
+    assert "wacli-process-boundary.md" in deploy_readme
+    for expected in (
+        "--store /dev/fd/STORE_FD",
+        "distinct direct children",
+        "must be disjoint",
+        "never inherited",
+        "Re-pair",
+        "no generic copy command",
+        "macOS characterization gate",
+        "must_not_dispatch",
+        "live activation is blocked",
+    ):
+        assert expected in normalized
+    assert "cp -R" not in boundary
+    assert "--account ACCOUNT" not in boundary
+
+
 def test_operator_docs_do_not_claim_demo_or_live_readiness() -> None:
     paths = (
         ROOT / "README.md",

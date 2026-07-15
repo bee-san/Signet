@@ -95,8 +95,11 @@ esac
 
 
 def wrapper_config(executable: Path, tmp_path: Path, **changes: Any) -> WacliConfig:
-    home = tmp_path / "home"
-    store = tmp_path / "wacli-store"
+    runtime_root = tmp_path / "wacli-runtime"
+    runtime_root.mkdir(mode=0o700, exist_ok=True)
+    runtime_root.chmod(0o700)
+    home = runtime_root / "home"
+    store = runtime_root / "store"
     staging_root = tmp_path / "staging"
     for directory in (home, store, staging_root):
         directory.mkdir(mode=0o700, exist_ok=True)
@@ -453,8 +456,8 @@ async def test_whatsapp_media_is_decrypted_only_to_an_inherited_anonymous_descri
         target.startswith(f"{store.root}/") and target.endswith(" (deleted)")
         for target in inherited_targets
     )
-    assert str(tmp_path / "home") in inherited_targets
-    assert str(tmp_path / "wacli-store") in inherited_targets
+    assert str(tmp_path / "wacli-runtime" / "home") in inherited_targets
+    assert str(tmp_path / "wacli-runtime" / "store") in inherited_targets
 
 
 @pytest.mark.asyncio
@@ -600,6 +603,32 @@ def test_wacli_config_requires_absolute_pinned_executable() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "staging_root",
+    [
+        Path("/private/wacli-runtime"),
+        Path("/private/wacli-runtime/home"),
+        Path("/private/wacli-runtime/store"),
+        Path("/private/wacli-runtime/nested-staging"),
+        Path("/private"),
+    ],
+)
+def test_wacli_config_requires_staging_and_child_runtime_trees_to_be_disjoint(
+    staging_root: Path,
+) -> None:
+    with pytest.raises(ValueError, match="must be disjoint"):
+        WacliConfig(
+            account="personal",
+            executable=Path("/opt/reviewed/wacli"),
+            expected_sha256="a" * 64,
+            home=Path("/private/wacli-runtime/home"),
+            store=Path("/private/wacli-runtime/store"),
+            staging_root=staging_root,
+            reviewed_dispatch_enabled=True,
+            execution_snapshot_root=Path("/private/snapshots"),
+        )
+
+
 @pytest.mark.parametrize("directory_name", ["home", "store", "staging_root"])
 @pytest.mark.parametrize("kind", ["symlink", "group_writable"])
 def test_wacli_wrapper_rejects_unsafe_runtime_directories(
@@ -637,12 +666,29 @@ def test_wacli_wrapper_rejects_foreign_owned_home(
 def test_wacli_wrapper_rejects_unsafe_shared_runtime_root(tmp_path: Path) -> None:
     executable, _ = make_fake_wacli(tmp_path)
     config = wrapper_config(executable, tmp_path)
-    tmp_path.chmod(0o750)
+    runtime_root = cast(Path, config.home).parent
+    runtime_root.chmod(0o750)
     try:
         with pytest.raises(WacliError, match="runtime_root_unsafe"):
             _make_test_wrapper(config)
     finally:
-        tmp_path.chmod(0o700)
+        runtime_root.chmod(0o700)
+
+
+def test_wacli_wrapper_rejects_distinct_paths_aliasing_one_directory_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, _ = make_fake_wacli(tmp_path)
+    config = wrapper_config(executable, tmp_path)
+    monkeypatch.setattr(
+        WacliWrapper,
+        "_verify_runtime_directory",
+        staticmethod(lambda _path, _code: (1, 1)),
+    )
+
+    with pytest.raises(WacliError, match="runtime_directories_overlap"):
+        _make_test_wrapper(config)
 
 
 @pytest.mark.asyncio

@@ -19,5 +19,7 @@ They cannot create a provider client or dispatch an action.
 Start with `docs/operator-runbook.md` for fake-only local verification, then use
 `docs/deployment.md` for the deferred deployment review. Do not apply a template
 merely because it parses.
+The deferred owned-provider filesystem and migration contract is documented in
+`docs/wacli-process-boundary.md`; it is not an activation procedure.
 Credential enrollment, proxy changes, service startup, live discovery, route
 replacement, and provider calls require a separate human-authorized cutover.
