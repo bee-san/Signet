@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27,<2"]
+requires = ["hatchling>=1.31.0,<2"]
 build-backend = "hatchling.build"
 
 [project]
@@ -19,7 +19,7 @@ classifiers = [
 dependencies = [
   "aiosqlite>=0.20,<1",
   "argon2-cffi>=23.1,<26",
-  "cryptography>=48.0.1,<49",
+  "cryptography>=49.0.0,<50",
   "fastapi>=0.115,<1",
   "jinja2>=3.1,<4",
   "jsonschema>=4.23,<5",
@@ -33,8 +33,8 @@ dependencies = [
   "pywebpush>=2.0,<3",
   "pyyaml>=6.0,<7",
   "requests>=2.34,<3",
-  "uvicorn[standard]>=0.34,<1",
-  "webauthn>=2.2,<3",
+  "uvicorn[standard]>=0.51.0,<1",
+  "webauthn>=3.0.0,<4",
 ]
 
 [project.urls]
@@ -48,7 +48,7 @@ signet = "signet.app:main"
 [dependency-groups]
 dev = [
   "httpx>=0.28,<1",
-  "mypy>=1.14,<2",
+  "mypy>=2.2.0,<3",
   "playwright==1.61.0",
   "pytest>=8.3,<10",
   "pytest-asyncio>=0.25,<2",
