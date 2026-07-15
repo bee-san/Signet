@@ -688,6 +688,13 @@ class PolicyEngine:
     def snapshot(self) -> PolicySnapshot:
         return self._snapshot
 
+    def restore_durable_snapshot(self, snapshot: PolicySnapshot) -> None:
+        """Replace runtime state with an already verified durable snapshot."""
+
+        if not isinstance(snapshot, PolicySnapshot):
+            raise TypeError("durable policy snapshot is invalid")
+        self._snapshot = snapshot
+
     def promote(
         self,
         alias: str,

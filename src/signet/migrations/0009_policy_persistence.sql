@@ -89,6 +89,7 @@ CREATE TABLE durable_policy_file_state (
     config_hash TEXT NOT NULL CHECK (length(config_hash) = 64),
     file_sha256 TEXT NOT NULL CHECK (length(file_sha256) = 64),
     sync_state TEXT NOT NULL CHECK (sync_state IN ('pending', 'synced')),
+    publication_pending INTEGER NOT NULL CHECK (publication_pending IN (0, 1)),
     updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
     FOREIGN KEY (policy_version_id) REFERENCES durable_policy_snapshots(policy_version_id)
         ON DELETE RESTRICT,

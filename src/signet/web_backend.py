@@ -33,6 +33,7 @@ from signet.canonical import CanonicalizationError, canonical_json
 from signet.db import Database
 from signet.models import (
     ApprovalConfirmation,
+    AttachmentReference,
     ConfirmationKind,
     ConfirmationReplay,
     InvalidConfirmation,
@@ -81,7 +82,14 @@ from signet.webauthn import (
     WebAuthnRepository,
 )
 
-type ConfirmationAction = Literal["approve", "deny", "human_cancel", "edit"]
+type ConfirmationAction = Literal[
+    "approve",
+    "deny",
+    "human_cancel",
+    "edit",
+    "promote_approval",
+    "promote_passthrough",
+]
 type PolicyPromotion = Literal["promote_approval", "promote_passthrough"]
 
 _ENVELOPE_FIELDS = frozenset(
@@ -100,6 +108,10 @@ _SHA256 = frozenset("0123456789abcdef")
 
 class WebPayloadError(RuntimeError):
     """A private payload could not be authenticated or reviewed."""
+
+
+class PolicyPromotionError(RuntimeError):
+    """A policy change failed closed at its durable boundary."""
 
 
 class PayloadCodec(Protocol):
@@ -137,6 +149,7 @@ class ReviewedPayload:
     adapter_version: str
     schema_version: str
     staged_file_hashes: tuple[str, ...]
+    attachments: tuple[AttachmentReference, ...]
 
     def __repr__(self) -> str:
         return "ReviewedPayload(payload=<redacted>)"
@@ -194,10 +207,7 @@ class EncryptedPayloadReviewer:
         if max_payload_bytes <= 0 or max_payload_bytes > 64 * 1024 * 1024:
             raise ValueError("private payload size limit is invalid")
         if not adapters or any(
-            not alias
-            or not tool
-            or adapter.downstream_alias != alias
-            or adapter.tool_name != tool
+            not alias or not tool or adapter.downstream_alias != alias or adapter.tool_name != tool
             for (alias, tool), adapter in adapters.items()
         ):
             raise ValueError("adapter registry keys must match reviewed adapters")
@@ -216,9 +226,8 @@ class EncryptedPayloadReviewer:
         payload_hash: str,
     ) -> ReviewedPayload:
         request = self._state_machine.get_request(request_id)
-        if (
-            request["current_version"] != version
-            or not _same_hash(request["current_payload_hash"], payload_hash)
+        if request["current_version"] != version or not _same_hash(
+            request["current_payload_hash"], payload_hash
         ):
             raise WebPayloadError("request revision is no longer current")
         payload = self._state_machine.get_payload_version(request_id, version)
@@ -299,8 +308,23 @@ class EncryptedPayloadReviewer:
             if canonical_json(canonical_arguments) != canonical_json(arguments):
                 raise ValueError
             summary = adapter.summarize_for_web(canonical_arguments)
+            frozen_attachments = adapter.freeze_attachments(canonical_arguments)
         except Exception:
             raise WebPayloadError("private payload failed reviewed adapter validation") from None
+        try:
+            stored_attachments = self._state_machine.get_attachment_references(
+                request_id,
+                version=version,
+                payload_hash=payload_hash,
+            )
+        except (RequestNotFound, InvalidTransition):
+            raise WebPayloadError("private payload attachment snapshot is unavailable") from None
+        if tuple(attachment.sha256 for attachment in frozen_attachments) != tuple(
+            cast(list[str], staged_hashes)
+        ) or _sorted_attachment_identities(frozen_attachments) != _sorted_attachment_identities(
+            stored_attachments
+        ):
+            raise WebPayloadError("private payload attachment snapshot does not match")
         schema_version = payload["schema_version"]
         if not isinstance(schema_version, str) or not schema_version:
             raise WebPayloadError("private payload schema metadata is invalid")
@@ -312,6 +336,7 @@ class EncryptedPayloadReviewer:
             adapter_version=adapter_version,
             schema_version=schema_version,
             staged_file_hashes=tuple(cast(list[str], staged_hashes)),
+            attachments=frozen_attachments,
         )
 
     def prepare_edit(
@@ -330,12 +355,17 @@ class EncryptedPayloadReviewer:
         prospective = _strict_json_object(prospective_arguments_json)
         try:
             arguments = reviewed.adapter.canonicalize(prospective)
+            edited_attachments = reviewed.adapter.freeze_attachments(arguments)
+            if tuple(
+                _attachment_identity(attachment) for attachment in edited_attachments
+            ) != tuple(_attachment_identity(attachment) for attachment in reviewed.attachments):
+                raise ValueError("attachment references cannot be changed by an edit")
             envelope = {
                 "adapter_version": reviewed.adapter_version,
                 "alias": reviewed.adapter.downstream_alias,
                 "arguments": arguments,
                 "policy_version": reviewed.policy_version,
-                "staged_file_hashes": list(reviewed.staged_file_hashes),
+                "staged_file_hashes": [attachment.sha256 for attachment in edited_attachments],
                 "tool": reviewed.adapter.tool_name,
             }
             plaintext = canonical_json(envelope)
@@ -409,9 +439,29 @@ class PolicyPromotionBoundary(Protocol):
     transaction.  No in-memory implementation is supplied here.
     """
 
+    def binding_action(
+        self,
+        request_id: str,
+        action: HumanAction,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        now: int,
+    ) -> ConfirmationAction: ...
+
     def promote(
         self,
         draft: WebActionDraft,
+        confirmation: ApprovalConfirmation,
+        *,
+        actor: str,
+        now: int,
+    ) -> str: ...
+
+    def promote_totp(
+        self,
+        action: HumanAction,
+        binding: ActionBinding,
         confirmation: ApprovalConfirmation,
         *,
         actor: str,
@@ -610,16 +660,14 @@ class WebBackend:
         scopes = [
             ("passkey-login:global", self._passkey_login_global_limit),
             (
-                "passkey-login:source:"
-                + hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                "passkey-login:source:" + hashlib.sha256(source.encode("utf-8")).hexdigest(),
                 self._passkey_login_source_limit,
             ),
         ]
         if account is not None:
             scopes.append(
                 (
-                    "passkey-login:account:"
-                    + hashlib.sha256(account.encode("utf-8")).hexdigest(),
+                    "passkey-login:account:" + hashlib.sha256(account.encode("utf-8")).hexdigest(),
                     self._passkey_login_account_limit,
                 )
             )
@@ -952,9 +1000,7 @@ class WebBackend:
             completed_at=_optional_int(request["completed_at"]),
             safe_outcome_json=_stored_json_for_display(request["safe_outcome_json"]),
             failure_reason=(
-                str(request["failure_reason"])
-                if request["failure_reason"] is not None
-                else None
+                str(request["failure_reason"]) if request["failure_reason"] is not None else None
             ),
             manual_retry_allowed=bool(request["manual_retry_allowed"]),
             duplicate_warning_required=bool(request["duplicate_warning_required"]),
@@ -994,7 +1040,6 @@ class WebBackend:
         now: int,
     ) -> ActionOptions:
         _require_ui_principal(principal)
-        binding_action = _confirmation_action(action)
         request = self._require_pending_revision(
             request_id,
             expected_version=expected_version,
@@ -1008,6 +1053,21 @@ class WebBackend:
             "promote_passthrough",
         }:
             raise WebForbidden("gateway-internal policy proposals cannot be retargeted")
+        policy_change = action in {
+            "promote_approval",
+            "promote_passthrough",
+        } or (gateway_internal and action == "approve")
+        binding_action = (
+            self._policy_binding_action(
+                request_id,
+                action,
+                expected_version=expected_version,
+                expected_payload_hash=expected_payload_hash,
+                now=now,
+            )
+            if policy_change
+            else _confirmation_action(action)
+        )
         prepared = self._prepare_action_edit(
             action,
             request_id=request_id,
@@ -1040,10 +1100,7 @@ class WebBackend:
             binding=binding,
             user_id=principal.user_id,
             session_id=principal.session_id,
-            policy_change=(
-                action in {"promote_approval", "promote_passthrough"}
-                or (gateway_internal and action == "approve")
-            ),
+            policy_change=policy_change,
             prepared_edit=prepared,
             created_at=now,
             expires_at=issued.expires_at,
@@ -1051,6 +1108,10 @@ class WebBackend:
         try:
             self._action_drafts.save(draft)
         except Exception:
+            self._webauthn_repository.invalidate_challenge(
+                issued.challenge_id,
+                now=now,
+            )
             raise WebConflict("passkey action could not be durably staged") from None
         return ActionOptions(
             challenge_id=issued.challenge_id,
@@ -1124,6 +1185,8 @@ class WebBackend:
             raise WebForbidden("passkey confirmation is invalid") from exc
         except (RequestNotFound, StaleVersion, InvalidTransition, RequestExpired) as exc:
             raise WebConflict("request changed after review") from exc
+        except PolicyPromotionError as exc:
+            raise WebConflict("policy change could not be applied safely") from exc
 
     def complete_totp_action(
         self,
@@ -1138,19 +1201,34 @@ class WebBackend:
         now: int,
     ) -> str:
         _require_ui_principal(principal)
-        if action in {"promote_approval", "promote_passthrough"}:
-            raise WebForbidden("policy promotion requires a passkey")
-        binding_action = _confirmation_action(action)
         request = self._require_pending_revision(
             request_id,
             expected_version=expected_version,
             expected_payload_hash=expected_payload_hash,
             now=now,
         )
-        if bool(request["gateway_internal"]) and action == "approve":
-            raise WebForbidden(
-                "policy approval requires the atomic web policy boundary"
+        gateway_internal = bool(request["gateway_internal"])
+        if gateway_internal and action in {
+            "edit",
+            "promote_approval",
+            "promote_passthrough",
+        }:
+            raise WebForbidden("gateway-internal policy proposals cannot be retargeted")
+        policy_change = action in {
+            "promote_approval",
+            "promote_passthrough",
+        } or (gateway_internal and action == "approve")
+        binding_action = (
+            self._policy_binding_action(
+                request_id,
+                action,
+                expected_version=expected_version,
+                expected_payload_hash=expected_payload_hash,
+                now=now,
             )
+            if policy_change
+            else _confirmation_action(action)
+        )
         prepared = self._prepare_action_edit(
             action,
             request_id=request_id,
@@ -1175,10 +1253,19 @@ class WebBackend:
                 http_method="POST",
                 now=now,
             )
+            confirmation = _totp_confirmation(proof)
+            if policy_change:
+                return self._policy_promotions.promote_totp(
+                    action,
+                    binding,
+                    confirmation,
+                    actor=_actor(principal),
+                    now=now,
+                )
             return self._apply_request_action(
                 action,
                 binding,
-                _totp_confirmation(proof),
+                confirmation,
                 prepared_edit=prepared,
                 actor=_actor(principal),
                 now=now,
@@ -1193,6 +1280,8 @@ class WebBackend:
             raise WebForbidden("TOTP confirmation is invalid") from exc
         except (RequestNotFound, StaleVersion, InvalidTransition, RequestExpired) as exc:
             raise WebConflict("request changed after review") from exc
+        except PolicyPromotionError as exc:
+            raise WebConflict("policy change could not be applied safely") from exc
 
     def subscribe_push(
         self,
@@ -1217,9 +1306,7 @@ class WebBackend:
                 )
             )
         except ValueError:
-            raise WebForbidden(
-                "push subscription is invalid or belongs to another user"
-            ) from None
+            raise WebForbidden("push subscription is invalid or belongs to another user") from None
 
     def unsubscribe_push(
         self,
@@ -1300,6 +1387,28 @@ class WebBackend:
         if prospective_arguments_json is not None:
             raise WebConflict("only edits may carry prospective arguments")
         return None
+
+    def _policy_binding_action(
+        self,
+        request_id: str,
+        action: HumanAction,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        now: int,
+    ) -> ConfirmationAction:
+        try:
+            return self._policy_promotions.binding_action(
+                request_id,
+                action,
+                expected_version=expected_version,
+                expected_payload_hash=expected_payload_hash,
+                now=now,
+            )
+        except PolicyPromotionError as exc:
+            raise WebConflict("policy change could not be staged safely") from exc
+        except (RequestNotFound, StaleVersion, InvalidTransition, RequestExpired) as exc:
+            raise WebConflict("request changed after review") from exc
 
     def _apply_request_action(
         self,
@@ -1419,8 +1528,8 @@ def _confirmation_action(action: HumanAction) -> ConfirmationAction:
         "deny": "deny",
         "cancel": "human_cancel",
         "edit": "edit",
-        "promote_approval": "approve",
-        "promote_passthrough": "approve",
+        "promote_approval": "promote_approval",
+        "promote_passthrough": "promote_passthrough",
     }
     try:
         return values[action]
@@ -1519,14 +1628,33 @@ def _same_hash(value: object, expected: str) -> bool:
     )
 
 
+def _attachment_identity(
+    attachment: AttachmentReference,
+) -> tuple[str, str, str, int, str, str]:
+    if not isinstance(attachment, AttachmentReference):
+        raise WebPayloadError("private payload attachment snapshot is invalid")
+    return (
+        attachment.attachment_id,
+        attachment.filename,
+        attachment.mime_type,
+        attachment.size_bytes,
+        attachment.sha256,
+        attachment.storage_path,
+    )
+
+
+def _sorted_attachment_identities(
+    attachments: tuple[AttachmentReference, ...],
+) -> tuple[tuple[str, str, str, int, str, str], ...]:
+    return tuple(sorted(_attachment_identity(attachment) for attachment in attachments))
+
+
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and set(value) <= _SHA256
 
 
 def _require_ui_principal(principal: SessionPrincipal) -> None:
-    if not isinstance(principal, SessionPrincipal) or _is_preauth_method(
-        principal.auth_method
-    ):
+    if not isinstance(principal, SessionPrincipal) or _is_preauth_method(principal.auth_method):
         raise WebUnauthorized("a completed human session is required")
 
 

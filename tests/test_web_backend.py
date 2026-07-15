@@ -18,8 +18,10 @@ from signet.adapters.base import (
 from signet.adapters.base import (
     DetailBlock as AdapterDetailBlock,
 )
+from signet.adapters.fastmail import FastmailAdapter
 from signet.auth import (
     WEBAUTHN_PROOF_DOMAIN,
+    ActionBinding,
     Argon2PasswordVerifier,
     InvalidSession,
     PasswordAuthenticator,
@@ -37,8 +39,9 @@ from signet.credential_broker import MemorySecretStore, Secret
 from signet.crypto import PayloadCipher
 from signet.db import Database
 from signet.freezer import RequestFreezer
-from signet.models import ApprovalConfirmation
+from signet.models import ApprovalConfirmation, AttachmentReference
 from signet.notifications import NotificationKind, SQLitePushRepository
+from signet.staging import StagingStore
 from signet.state_machine import ApprovalStateMachine
 from signet.totp import (
     SQLiteTotpCredentialRepository,
@@ -58,6 +61,7 @@ from signet.web_backend import (
     PolicyPromotionBoundary,
     WebActionDraft,
     WebBackend,
+    WebPayloadError,
 )
 from signet.webauthn import (
     FakeAssertion,
@@ -67,6 +71,7 @@ from signet.webauthn import (
     WebAuthnChallengeIssuer,
     WebAuthnCredential,
 )
+from tests.attachment_fixtures import attachment_cipher
 
 NOW = 1_800_000_000
 USER_ID = "autumn"
@@ -80,9 +85,7 @@ CAPABILITIES = ProofCapability(CAPABILITY_KEY)
 MASTER_SECRET = "fake-web-backend-payload-master-key-0001"
 KEY_REFERENCE = "keychain://Signet/fake-web-backend-payload-key"
 TOTP_REFERENCE = "keychain://Signet/web-backend-totp"
-WEB_CREDENTIAL_ID = base64.urlsafe_b64encode(b"fake-web-backend-credential").rstrip(
-    b"="
-).decode()
+WEB_CREDENTIAL_ID = base64.urlsafe_b64encode(b"fake-web-backend-credential").rstrip(b"=").decode()
 P256DH = base64.urlsafe_b64encode(b"\x04" + b"p" * 64).rstrip(b"=").decode()
 PUSH_AUTH = base64.urlsafe_b64encode(b"a" * 16).rstrip(b"=").decode()
 
@@ -123,6 +126,10 @@ class ReviewOnlyAdapter:
             raise ValueError("fake arguments are invalid")
         return {"body": body, "recipient": recipient}
 
+    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
+        self.canonicalize(arguments)
+        return ()
+
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> ApprovalSummary:
         canonical = self.canonicalize(arguments)
         return ApprovalSummary(
@@ -130,9 +137,7 @@ class ReviewOnlyAdapter:
             action="Create item",
             title="Review private item",
             destination_summary=cast(str, canonical["recipient"]),
-            detail_blocks=(
-                AdapterDetailBlock("Body", "plain_text", canonical["body"]),
-            ),
+            detail_blocks=(AdapterDetailBlock("Body", "plain_text", canonical["body"]),),
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -168,9 +173,22 @@ class DurableFakeDraftRepository:
 
 @dataclass
 class FakePolicyPromotionBoundary:
-    calls: list[tuple[WebActionDraft, ApprovalConfirmation, str, int]] = field(
+    calls: list[tuple[WebActionDraft, ApprovalConfirmation, str, int]] = field(default_factory=list)
+    totp_calls: list[tuple[str, ActionBinding, ApprovalConfirmation, str, int]] = field(
         default_factory=list
     )
+
+    def binding_action(
+        self,
+        request_id: str,
+        action: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        now: int,
+    ) -> str:
+        del request_id, expected_version, expected_payload_hash, now
+        return action if action.startswith("promote_") else "promote_approval"
 
     def promote(
         self,
@@ -181,6 +199,18 @@ class FakePolicyPromotionBoundary:
         now: int,
     ) -> str:
         self.calls.append((draft, confirmation, actor, now))
+        return "policy_updated"
+
+    def promote_totp(
+        self,
+        action: str,
+        binding: ActionBinding,
+        confirmation: ApprovalConfirmation,
+        *,
+        actor: str,
+        now: int,
+    ) -> str:
+        self.totp_calls.append((action, binding, confirmation, actor, now))
         return "policy_updated"
 
 
@@ -667,6 +697,100 @@ def test_wrong_payload_key_fails_closed_without_private_data(
     assert bundle.adapter.downstream_calls == []
 
 
+def test_attachment_edit_and_review_are_bound_to_exact_catalog_snapshot(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "attachment-edit.sqlite3")
+    database.initialize()
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "review.txt"
+    source.write_bytes(b"same bytes under two opaque identifiers")
+    staging = StagingStore(
+        tmp_path / "staging",
+        database=database,
+        cipher=attachment_cipher(),
+        allowed_source_roots=(source_root,),
+        minimum_free_bytes=0,
+    )
+    adapter = FastmailAdapter(staging_store=staging, account="primary")
+    original = adapter.stage_attachment(
+        source,
+        filename="review.txt",
+        mime_type="text/plain",
+    )
+    replacement = adapter.stage_attachment(
+        source,
+        filename="review.txt",
+        mime_type="text/plain",
+    )
+    assert original["sha256"] == replacement["sha256"]
+    arguments = {
+        "from": "sender@example.test",
+        "to": ["recipient@example.test"],
+        "cc": [],
+        "bcc": [],
+        "subject": "Review",
+        "body": "original body",
+        "attachments": [original],
+    }
+    payload_cipher = PayloadCipher(Secret(MASTER_SECRET), KEY_REFERENCE)
+    freezer = RequestFreezer(
+        payload_cipher,
+        clock=lambda: datetime.fromtimestamp(NOW, tz=UTC),
+    )
+    frozen = freezer.freeze(
+        adapter,
+        arguments,
+        origin_namespace="profile:web-attachment-test",
+        policy_version=3,
+        schema_version="schema-1",
+        editor_actor="caller:web-attachment-test",
+        attachments=adapter.freeze_attachments(arguments),
+    )
+    machine = ApprovalStateMachine(database)
+    machine.enqueue(frozen.enqueue_request)
+    request_id = frozen.enqueue_request.request_id
+    payload_hash = frozen.enqueue_request.payload_hash
+    reviewer = EncryptedPayloadReviewer(
+        machine,
+        payload_cipher,
+        {(adapter.downstream_alias, adapter.tool_name): adapter},
+    )
+
+    retargeted = {**arguments, "body": "edited body", "attachments": [replacement]}
+    with pytest.raises(WebPayloadError, match="adapter validation"):
+        reviewer.prepare_edit(
+            request_id,
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=json.dumps(retargeted),
+        )
+
+    unchanged = {**arguments, "body": "edited body"}
+    prepared = reviewer.prepare_edit(
+        request_id,
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+        prospective_arguments_json=json.dumps(unchanged),
+    )
+    plaintext = payload_cipher.decrypt(
+        prepared.encrypted_payload,
+        key_reference=prepared.encryption_key_ref,
+        request_id=request_id,
+        version=2,
+        payload_hash=prepared.payload_hash,
+    )
+    edited_envelope = json.loads(plaintext)
+    assert edited_envelope["arguments"]["attachments"] == [original]
+    assert edited_envelope["staged_file_hashes"] == [original["sha256"]]
+
+    with database.transaction() as connection:
+        connection.execute("DELETE FROM attachments WHERE request_id = ?", (request_id,))
+    with pytest.raises(WebPayloadError, match="does not match"):
+        reviewer.review(request_id, version=1, payload_hash=payload_hash)
+
+
 @pytest.mark.parametrize(
     ("action", "expected_state"),
     [
@@ -689,9 +813,7 @@ def test_totp_request_actions_are_exact_and_make_no_downstream_call(
         cast(Any, action),
         f"fake:{200 + len(action)}",
         expected_version=1,
-        expected_payload_hash=bundle.state_machine.get_request(request_id)[
-            "current_payload_hash"
-        ],
+        expected_payload_hash=bundle.state_machine.get_request(request_id)["current_payload_hash"],
         prospective_arguments_json=(
             '{"recipient":"edited@example.test","body":"edited private body"}'
             if action == "edit"
@@ -785,9 +907,7 @@ def test_passkey_actions_use_durable_drafts_and_exact_options(
                 expected_counter=cast(int, confirmation.expected_counter),
                 new_counter=cast(int, confirmation.new_counter),
                 device_type=cast(str, confirmation.device_type),
-                expected_backup_eligible=cast(
-                    bool, confirmation.expected_backup_eligible
-                ),
+                expected_backup_eligible=cast(bool, confirmation.expected_backup_eligible),
                 new_backup_eligible=cast(bool, confirmation.new_backup_eligible),
                 previous_backed_up=cast(bool, confirmation.previous_backed_up),
                 new_backed_up=cast(bool, confirmation.new_backed_up),
@@ -828,14 +948,17 @@ def test_gateway_internal_approval_uses_policy_boundary_and_cannot_be_retargeted
         http_method="POST",
         now=NOW + 2,
     )
-    assert bundle.backend.complete_passkey_action(
-        principal,
-        request_id,
-        options.challenge_id,
-        cast(Mapping[str, Any], bundle.assertion(options.challenge_id)),
-        http_method="POST",
-        now=NOW + 3,
-    ) == "policy_updated"
+    assert (
+        bundle.backend.complete_passkey_action(
+            principal,
+            request_id,
+            options.challenge_id,
+            cast(Mapping[str, Any], bundle.assertion(options.challenge_id)),
+            http_method="POST",
+            now=NOW + 3,
+        )
+        == "policy_updated"
+    )
     assert bundle.promotions.calls[-1][0].policy_change is True
     assert bundle.state_machine.get_request(request_id)["state"] == "pending_approval"
 
@@ -872,30 +995,28 @@ def test_passkey_completion_rejects_a_different_route_request_id(
     assert bundle.state_machine.get_request(other_id)["state"] == "pending_approval"
 
 
-def test_totp_gateway_internal_approval_fails_before_code_verification(
+def test_totp_gateway_internal_approval_uses_atomic_policy_boundary(
     bundle: BackendBundle,
 ) -> None:
     request_id = bundle.enqueue(gateway_internal=True)
     _, principal = bundle.session()
     row = bundle.state_machine.get_request(request_id)
 
-    with pytest.raises(WebForbidden, match="atomic web policy boundary"):
-        bundle.backend.complete_totp_action(
-            principal,
-            request_id,
-            "approve",
-            "fake:777",
-            expected_version=1,
-            expected_payload_hash=row["current_payload_hash"],
-            prospective_arguments_json=None,
-            now=NOW + 1,
-        )
+    result = bundle.backend.complete_totp_action(
+        principal,
+        request_id,
+        "approve",
+        "fake:777",
+        expected_version=1,
+        expected_payload_hash=row["current_payload_hash"],
+        prospective_arguments_json=None,
+        now=NOW + 1,
+    )
 
+    assert result == "policy_updated"
     assert bundle.state_machine.get_request(request_id)["state"] == "pending_approval"
-    with bundle.database.read() as connection:
-        assert connection.execute(
-            "SELECT 1 FROM auth_proof_consumptions WHERE use_id = 'totp:777'"
-        ).fetchone() is None
+    assert bundle.promotions.totp_calls[-1][0] == "approve"
+    assert bundle.promotions.totp_calls[-1][1].action == "promote_approval"
 
 
 def test_stale_and_tampered_passkey_proofs_do_not_mutate_request(
@@ -962,9 +1083,7 @@ def test_tampered_durable_edit_draft_cannot_retarget_verified_capability(
         "edit",
         expected_version=1,
         expected_payload_hash=payload_hash,
-        prospective_arguments_json=(
-            '{"recipient":"edited@example.test","body":"intended edit"}'
-        ),
+        prospective_arguments_json=('{"recipient":"edited@example.test","body":"intended edit"}'),
         http_method="POST",
         now=NOW + 1,
     )
@@ -985,9 +1104,12 @@ def test_tampered_durable_edit_draft_cannot_retarget_verified_capability(
         )
     assert bundle.state_machine.get_request(request_id)["current_version"] == 1
     with bundle.database.read() as connection:
-        assert connection.execute(
-            "SELECT 1 FROM auth_proof_consumptions WHERE purpose = 'mutation'"
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT 1 FROM auth_proof_consumptions WHERE purpose = 'mutation'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_passkey_edit_completes_after_backend_restart_through_injected_draft_store(
@@ -1002,9 +1124,7 @@ def test_passkey_edit_completes_after_backend_restart_through_injected_draft_sto
         "edit",
         expected_version=1,
         expected_payload_hash=payload_hash,
-        prospective_arguments_json=(
-            '{"recipient":"restart@example.test","body":"durable draft"}'
-        ),
+        prospective_arguments_json=('{"recipient":"restart@example.test","body":"durable draft"}'),
         http_method="POST",
         now=NOW + 1,
     )
@@ -1017,14 +1137,17 @@ def test_passkey_edit_completes_after_backend_restart_through_injected_draft_sto
         adapter=bundle.adapter,
     )
     restarted_principal = restarted.backend.authenticate(token, now=NOW + 2)
-    assert restarted.backend.complete_passkey_action(
-        restarted_principal,
-        request_id,
-        options.challenge_id,
-        cast(Mapping[str, Any], assertion),
-        http_method="POST",
-        now=NOW + 3,
-    ) == "pending_approval"
+    assert (
+        restarted.backend.complete_passkey_action(
+            restarted_principal,
+            request_id,
+            options.challenge_id,
+            cast(Mapping[str, Any], assertion),
+            http_method="POST",
+            now=NOW + 3,
+        )
+        == "pending_approval"
+    )
     detail = restarted.backend.get_detail(restarted_principal, request_id)
     assert detail.destination_summary == "restart@example.test"
     assert detail.detail_blocks[0].value == "durable draft"
@@ -1053,11 +1176,13 @@ def test_push_subscription_ownership_survives_restart(bundle: BackendBundle) -> 
     assert repository.active_for(USER_ID, NotificationKind.NEW_PENDING) == ()
 
 
-def test_policy_promotion_requires_passkey(bundle: BackendBundle) -> None:
+def test_policy_promotion_accepts_web_totp_with_distinct_binding(
+    bundle: BackendBundle,
+) -> None:
     request_id = bundle.enqueue()
     _, principal = bundle.session()
     row = bundle.state_machine.get_request(request_id)
-    with pytest.raises(WebForbidden):
+    assert (
         bundle.backend.complete_totp_action(
             principal,
             request_id,
@@ -1068,3 +1193,6 @@ def test_policy_promotion_requires_passkey(bundle: BackendBundle) -> None:
             prospective_arguments_json=None,
             now=NOW + 1,
         )
+        == "policy_updated"
+    )
+    assert bundle.promotions.totp_calls[-1][1].action == "promote_approval"
