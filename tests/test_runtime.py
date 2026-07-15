@@ -78,6 +78,7 @@ class RuntimeHarness:
     runtime: MCPRuntime
     alias_calls: list[tuple[str, str, dict[str, Any], str]]
     gateway_tools: FakeGatewayTools
+    alias_surface: AliasToolSurface
 
 
 @pytest.fixture(scope="module")
@@ -188,13 +189,14 @@ def make_runtime(
         tools=cast(Any, gateway_tools),
         principal_provider=gateway_principal_provider("human:one"),
     )
+    surface = alias_surface(selected_handler)
     runtime = assemble_mcp_runtime(
-        aliases={"fastmail": alias_surface(selected_handler)},
+        aliases={"fastmail": surface},
         approvals=approvals,
         tokens=auth.registry,
         json_response=json_response,
     )
-    return RuntimeHarness(runtime, calls, gateway_tools)
+    return RuntimeHarness(runtime, calls, gateway_tools, surface)
 
 
 @asynccontextmanager
@@ -391,6 +393,7 @@ async def test_stateful_session_is_bound_to_token_and_delete_cancels_it(
         )
         assert cancelled.status_code == 200
         assert session_id not in harness.runtime.managers["fastmail"]._server_instances
+        assert harness.alias_surface.tracked_session_count == 0
 
 
 @pytest.mark.asyncio

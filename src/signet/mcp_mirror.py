@@ -7,6 +7,7 @@ import inspect
 import json
 import re
 import secrets
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -466,7 +467,14 @@ class AliasToolSurface:
         call_handler: ToolCallHandler,
         denied_event_handler: DeniedEventHandler | None = None,
         namespace_provider: NamespaceProvider | None = None,
+        tracked_session_limit: int = 1_024,
+        tracked_session_ttl_seconds: float = 35 * 60,
+        session_clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if tracked_session_limit < 1 or tracked_session_limit > 10_000:
+            raise ValueError("tracked MCP session limit is invalid")
+        if tracked_session_ttl_seconds < 60 or tracked_session_ttl_seconds > 24 * 60 * 60:
+            raise ValueError("tracked MCP session TTL is invalid")
         self.alias = alias
         self.mirror = mirror
         self.call_handler = call_handler
@@ -475,6 +483,11 @@ class AliasToolSurface:
         self.server: LosslessToolServer = LosslessToolServer("Signet", version="0.1.0")
         self._sessions: set[Any] = set()
         self._session_invocation_scopes: dict[Any, str] = {}
+        self._session_ids: dict[str, Any] = {}
+        self._session_last_seen: dict[Any, float] = {}
+        self._tracked_session_limit = tracked_session_limit
+        self._tracked_session_ttl_seconds = tracked_session_ttl_seconds
+        self._session_clock = session_clock
         self.server.request_handlers[types.ListToolsRequest] = self._list_tools
         self.server.request_handlers[types.CallToolRequest] = self._call_tool
 
@@ -496,8 +509,58 @@ class AliasToolSurface:
 
     def _remember_session(self) -> None:
         session = self.server.request_context.session
+        now = self._session_clock()
+        self._prune_sessions(now, reserve_new=session not in self._sessions)
         self._sessions.add(session)
         self._session_invocation_scopes.setdefault(session, secrets.token_urlsafe(24))
+        self._session_last_seen[session] = now
+        request = self.server.request_context.request
+        if request is not None:
+            session_id = _scope_header(request.scope, b"mcp-session-id")
+            if session_id is not None and 1 <= len(session_id) <= 128:
+                previous = self._session_ids.get(session_id)
+                if previous is not None and previous is not session:
+                    self._forget_session(previous)
+                self._session_ids[session_id] = session
+
+    @property
+    def tracked_session_count(self) -> int:
+        return len(self._sessions)
+
+    def retire_session(self, session_id: str) -> bool:
+        """Forget a transport session after an authenticated SDK termination."""
+
+        session = self._session_ids.pop(session_id, None)
+        if session is None:
+            return False
+        self._forget_session(session)
+        return True
+
+    def _prune_sessions(self, now: float, *, reserve_new: bool = False) -> None:
+        stale = [
+            session
+            for session, last_seen in self._session_last_seen.items()
+            if now - last_seen >= self._tracked_session_ttl_seconds
+        ]
+        for session in stale:
+            self._forget_session(session)
+        capacity = self._tracked_session_limit - int(reserve_new)
+        overflow = len(self._sessions) - capacity
+        if overflow > 0:
+            oldest = sorted(
+                self._sessions,
+                key=lambda session: self._session_last_seen.get(session, 0.0),
+            )[:overflow]
+            for session in oldest:
+                self._forget_session(session)
+
+    def _forget_session(self, session: Any) -> None:
+        self._sessions.discard(session)
+        self._session_invocation_scopes.pop(session, None)
+        self._session_last_seen.pop(session, None)
+        for session_id, candidate in tuple(self._session_ids.items()):
+            if candidate is session:
+                del self._session_ids[session_id]
 
     def _invocation_identity(self, namespace: str, tool: str) -> InvocationIdentity:
         context = self.server.request_context
@@ -570,6 +633,7 @@ class AliasToolSurface:
             return RawServerResult(domain_error_result(exc.code, exc.message, details=exc.details))
 
     async def notify_list_changed(self) -> int:
+        self._prune_sessions(self._session_clock())
         sent = 0
         stale: list[Any] = []
         for session in tuple(self._sessions):
@@ -579,6 +643,15 @@ class AliasToolSurface:
             except Exception:
                 stale.append(session)
         for session in stale:
-            self._sessions.discard(session)
-            self._session_invocation_scopes.pop(session, None)
+            self._forget_session(session)
         return sent
+
+
+def _scope_header(scope: Mapping[str, Any], name: bytes) -> str | None:
+    for key, value in scope.get("headers", []):
+        if bytes(key).lower() == name:
+            try:
+                return bytes(value).decode("ascii")
+            except UnicodeDecodeError:
+                return None
+    return None

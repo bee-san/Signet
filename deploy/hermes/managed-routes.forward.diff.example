@@ -1,0 +1,31 @@
+--- hermes-managed-mcp.before.yaml
++++ hermes-managed-mcp.after.yaml
+@@
+ mcp_servers:
+   fastmail:
+-    url: https://REDACTED_PROVIDER_HOST/mcp
+-    credential_ref: REDACTED_DIRECT_REFERENCE
++    url: http://127.0.0.1:8789/mcp/fastmail
++    headers:
++      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
++    sampling:
++      enabled: false
+   whatsapp:
+-    command_ref: REDACTED_DIRECT_WHATSAPP_LAUNCHER
++    url: http://127.0.0.1:8789/mcp/whatsapp
++    headers:
++      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
++    sampling:
++      enabled: false
++  signet_approvals:
++    url: http://127.0.0.1:8789/mcp/approvals
++    headers:
++      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
++    sampling:
++      enabled: false
+
+# Keep the original aliases (fastmail and whatsapp). This is illustrative syntax,
+# not a patch for any live profile. Direct credentials are removed only after the
+# human ceremony, fake-provider acceptance, bypass audit, and authorized cutover.
+# SIGNET_MCP_CALLER_TOKEN is a profile-scoped Signet caller token resolved by the
+# deployment's reviewed Hermes secret mechanism. It is never committed here.

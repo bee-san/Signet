@@ -158,8 +158,14 @@ class CallerContextMiddleware:
 class _ManagerEndpoint:
     """Call the SDK manager and retire explicitly terminated stateful sessions."""
 
-    def __init__(self, manager: StreamableHTTPSessionManager) -> None:
+    def __init__(
+        self,
+        manager: StreamableHTTPSessionManager,
+        *,
+        on_session_closed: Callable[[str], object] | None = None,
+    ) -> None:
         self._manager = manager
+        self._on_session_closed = on_session_closed
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         session_id = _header(scope, b"mcp-session-id")
@@ -169,6 +175,8 @@ class _ManagerEndpoint:
             if transport is not None and transport.is_terminated:
                 self._manager._server_instances.pop(session_id, None)
                 self._manager._session_owners.pop(session_id, None)
+                if self._on_session_closed is not None:
+                    self._on_session_closed(session_id)
 
 
 def current_caller() -> CallerPrincipal:
@@ -245,7 +253,13 @@ def assemble_mcp_runtime(
 
     routes: list[Route] = []
     for alias, manager in managers.items():
-        endpoint: ASGIApp = _ManagerEndpoint(manager)
+        bound_surface = aliases.get(alias)
+        endpoint: ASGIApp = _ManagerEndpoint(
+            manager,
+            on_session_closed=(
+                bound_surface.retire_session if bound_surface is not None else None
+            ),
+        )
         endpoint = RequireAuthMiddleware(endpoint, required_scopes=[_alias_scope(alias)])
         endpoint = CallerContextMiddleware(endpoint, alias=alias)
         endpoint = AuthenticationMiddleware(

@@ -1,0 +1,10 @@
+{
+  "human_cutover_authorization": {"present": false, "reference": "not-completed"},
+  "web_authenticator_enrolled": {"present": false, "reference": "not-completed"},
+  "downstream_credentials_enrolled": {"present": false, "reference": "not-completed"},
+  "live_schema_digests_reviewed": {"present": false, "reference": "not-completed"},
+  "bypass_inventory_reviewed": {"present": false, "reference": "not-completed"},
+  "backup_restore_drill_verified": {"present": false, "reference": "not-completed"},
+  "route_diffs_approved": {"present": false, "reference": "not-completed"},
+  "funnel_disabled": {"present": false, "reference": "not-completed"}
+}

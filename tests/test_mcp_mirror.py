@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import mcp.types as types
 import pytest
@@ -326,6 +327,37 @@ async def test_surface_passes_hashed_explicit_and_session_request_invocation_ide
     assert "invocation-001" not in repr(identities[0])
     assert identities[2].source == identities[3].source == "session_request"
     assert identities[2].invocation_key != identities[3].invocation_key
+
+
+@pytest.mark.asyncio
+async def test_surface_bounds_and_expires_tracked_sessions() -> None:
+    now = 1_000.0
+    surface = AliasToolSurface(
+        alias="mail",
+        mirror=SchemaMirror(_policy()),
+        call_handler=AsyncMock(),
+        tracked_session_limit=2,
+        tracked_session_ttl_seconds=60,
+        session_clock=lambda: now,
+    )
+    oldest = AsyncMock()
+    current = AsyncMock()
+    surface._sessions.update((oldest, current))
+    surface._session_last_seen[oldest] = now - 10
+    surface._session_last_seen[current] = now
+    surface._session_invocation_scopes[oldest] = "old"
+    surface._session_invocation_scopes[current] = "current"
+
+    surface._prune_sessions(now)
+    assert surface.tracked_session_count == 2
+
+    surface._prune_sessions(now, reserve_new=True)
+    assert oldest not in surface._sessions
+    assert current in surface._sessions
+
+    now += 61
+    assert await surface.notify_list_changed() == 0
+    assert surface.tracked_session_count == 0
 
 
 @pytest.mark.asyncio

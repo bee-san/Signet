@@ -1,0 +1,24 @@
+{
+  "fixture_version": 1,
+  "source": "provided_metadata_only",
+  "coverage": {
+    "hermes_profile": "unknown",
+    "config": "unknown",
+    "environment_file": "unknown",
+    "launchd_plist": "unknown",
+    "cron": "unknown",
+    "script": "unknown",
+    "skill": "unknown",
+    "backup": "unknown",
+    "browser_session": "unknown",
+    "native_adapter": "unknown",
+    "terminal_path": "unknown",
+    "sdk_path": "unknown",
+    "jmap_path": "unknown",
+    "webhook": "unknown",
+    "shell_environment": "unknown",
+    "direct_mcp_url": "unknown",
+    "credential_reference": "unknown"
+  },
+  "records": []
+}

@@ -1,0 +1,9 @@
+# Merge this one service into an existing Homepage group. Do not replace the
+# group or services.yaml. Copy src/signet/static/icons/signet-1254.png into the
+# Homepage /app/public/icons mount as signet.png first.
+- Applications:
+    - Signet:
+        icon: /icons/signet.png
+        href: https://REVIEWED_TAILNET_HOSTNAME:8443/
+        description: Approval queue
+        target: _self

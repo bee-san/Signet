@@ -1,0 +1,30 @@
+--- hermes-managed-mcp.signet.yaml
++++ hermes-managed-mcp.direct-rollback.yaml
+@@
+ mcp_servers:
+   fastmail:
+-    url: http://127.0.0.1:8789/mcp/fastmail
+-    headers:
+-      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
+-    sampling:
+-      enabled: false
++    url: https://REDACTED_PROVIDER_HOST/mcp
++    credential_ref: REDACTED_DIRECT_REFERENCE
+   whatsapp:
+-    url: http://127.0.0.1:8789/mcp/whatsapp
+-    headers:
+-      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
+-    sampling:
+-      enabled: false
+-  signet_approvals:
+-    url: http://127.0.0.1:8789/mcp/approvals
+-    headers:
+-      Authorization: Bearer ${SIGNET_MCP_CALLER_TOKEN}
+-    sampling:
+-      enabled: false
++    command_ref: REDACTED_DIRECT_WHATSAPP_LAUNCHER
+
+# Never apply this reverse route while pending, executing, or outcome_unknown work
+# exists, after a direct credential has been revoked, or without explicit human
+# authorization. A safer service rollback leaves direct writes disabled and keeps
+# the Signet database/idempotency ledger intact while the binary is repaired.
