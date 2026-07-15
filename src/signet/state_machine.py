@@ -1,0 +1,1741 @@
+"""Transactional approval lifecycle and fenced execution state machine."""
+
+from __future__ import annotations
+
+import hmac
+import inspect
+import json
+import secrets
+import uuid
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any
+
+from .db import Database, IntegrityError
+from .models import (
+    ApprovalConfirmation,
+    AttachmentReference,
+    ConfirmationKind,
+    ConfirmationReplay,
+    EnqueueRequest,
+    EnqueueResult,
+    ExecutionLease,
+    ExecutionPhase,
+    FenceRejected,
+    IdempotencyConflict,
+    InvalidConfirmation,
+    InvalidTransition,
+    OutcomeClassification,
+    ReadOnlyToolViolation,
+    ReconciliationAction,
+    ReconciliationDecision,
+    ReconciliationRejected,
+    ReconciliationResult,
+    RecoverySummary,
+    RequestExpired,
+    RequestNotFound,
+    RequestState,
+    ResultAlias,
+    StaleVersion,
+)
+
+FaultInjector = Callable[[str], None]
+TokenFactory = Callable[[], str]
+
+_TERMINAL_STATES = {
+    RequestState.SUCCEEDED,
+    RequestState.FAILED,
+    RequestState.DENIED,
+    RequestState.EXPIRED,
+    RequestState.CANCELLED,
+}
+
+
+class ApprovalStateMachine:
+    """Own all durable lifecycle mutations.
+
+    The public methods deliberately accept explicit versions, hashes, fencing
+    tokens, and reconciliation counters.  Those values are the CAS inputs that
+    make stale browser tabs, duplicate approvals, and old workers lose without
+    changing persistent state.
+    """
+
+    def __init__(
+        self,
+        database: Database,
+        *,
+        fault_injector: FaultInjector | None = None,
+        token_factory: TokenFactory | None = None,
+    ) -> None:
+        self.database = database
+        self._fault_injector = fault_injector
+        self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
+
+    def enqueue(self, request: EnqueueRequest) -> EnqueueResult:
+        """Durably enqueue or replay a caller-scoped invocation.
+
+        The return happens only after the FULL-synchronous transaction context
+        has committed.  A fault at ``enqueue:before_commit`` therefore produces
+        neither a stored request nor an acknowledgement.
+        """
+
+        self._validate_enqueue(request)
+        replay: EnqueueResult | None = None
+        with self.database.transaction() as connection:
+            if request.idempotency_key is not None:
+                existing = connection.execute(
+                    """
+                    SELECT request_id, payload_fingerprint, pending_result
+                    FROM idempotency_records
+                    WHERE origin_namespace = ? AND downstream_alias = ?
+                      AND tool_name = ? AND invocation_key = ?
+                    """,
+                    (
+                        request.origin_namespace,
+                        request.downstream_alias,
+                        request.tool_name,
+                        request.idempotency_key,
+                    ),
+                ).fetchone()
+                if existing is not None:
+                    if not hmac.compare_digest(
+                        existing["payload_fingerprint"],
+                        request.payload_fingerprint,
+                    ):
+                        raise IdempotencyConflict(
+                            "the invocation key is already bound to a different payload"
+                        )
+                    replay = EnqueueResult(
+                        request_id=existing["request_id"],
+                        pending_result=bytes(existing["pending_result"]),
+                        created=False,
+                    )
+
+            if replay is None:
+                duplicate_warning = 0
+                if request.retry_of_request_id is not None:
+                    prior = connection.execute(
+                        """
+                        SELECT state FROM approval_requests WHERE request_id = ?
+                        """,
+                        (request.retry_of_request_id,),
+                    ).fetchone()
+                    if prior is None:
+                        raise RequestNotFound(request.retry_of_request_id)
+                    if prior["state"] not in {
+                        RequestState.FAILED.value,
+                        RequestState.OUTCOME_UNKNOWN.value,
+                    }:
+                        raise InvalidTransition(
+                            "manual send-again requires a failed or unknown prior request"
+                        )
+                    duplicate_warning = int(prior["state"] == RequestState.OUTCOME_UNKNOWN.value)
+
+                connection.execute(
+                    """
+                    INSERT INTO approval_requests(
+                        request_id, downstream_alias, tool_name, policy_mode,
+                        state, current_version, current_payload_hash,
+                        origin_namespace, pending_result, retry_of_request_id,
+                        gateway_internal, created_at, expires_at,
+                        duplicate_warning_required
+                    ) VALUES (?, ?, ?, ?, 'pending_approval', 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request.request_id,
+                        request.downstream_alias,
+                        request.tool_name,
+                        request.policy_mode,
+                        request.payload_hash,
+                        request.origin_namespace,
+                        request.pending_result,
+                        request.retry_of_request_id,
+                        int(request.gateway_internal),
+                        request.created_at,
+                        request.expires_at,
+                        duplicate_warning,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO payload_versions(
+                        request_id, version, encrypted_payload, payload_hash,
+                        canonical_size, policy_version, adapter_version,
+                        schema_version, editor_actor, created_at,
+                        encryption_key_ref
+                    ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request.request_id,
+                        request.encrypted_payload,
+                        request.payload_hash,
+                        request.canonical_size
+                        if request.canonical_size is not None
+                        else len(request.encrypted_payload),
+                        request.policy_version,
+                        request.adapter_version,
+                        request.schema_version,
+                        request.editor_actor,
+                        request.created_at,
+                        request.encryption_key_ref,
+                    ),
+                )
+                for attachment in request.attachments:
+                    connection.execute(
+                        """
+                        INSERT INTO attachments(
+                            attachment_id, request_id, version, payload_hash, filename,
+                            mime_type, size_bytes, sha256, storage_path,
+                            created_at, purge_after
+                        ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            attachment.attachment_id,
+                            request.request_id,
+                            request.payload_hash,
+                            attachment.filename,
+                            attachment.mime_type,
+                            attachment.size_bytes,
+                            attachment.sha256,
+                            attachment.storage_path,
+                            request.created_at,
+                            attachment.purge_after,
+                        ),
+                    )
+                if request.idempotency_key is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO idempotency_records(
+                            origin_namespace, downstream_alias, tool_name,
+                            invocation_key, payload_fingerprint, request_id,
+                            pending_result, created_at, expires_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            request.origin_namespace,
+                            request.downstream_alias,
+                            request.tool_name,
+                            request.idempotency_key,
+                            request.payload_fingerprint,
+                            request.request_id,
+                            request.pending_result,
+                            request.created_at,
+                            request.expires_at,
+                        ),
+                    )
+                self._event(
+                    connection,
+                    request.request_id,
+                    request.editor_actor,
+                    "pending_enqueued",
+                    request.created_at,
+                    1,
+                    request.payload_hash,
+                )
+                self._fault("enqueue:before_commit")
+
+        if replay is not None:
+            return replay
+        return EnqueueResult(
+            request_id=request.request_id,
+            pending_result=request.pending_result,
+            created=True,
+        )
+
+    def get_request(self, request_id: str) -> dict[str, Any]:
+        with self.database.read() as connection:
+            row = connection.execute(
+                "SELECT * FROM approval_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            raise RequestNotFound(request_id)
+        return dict(row)
+
+    def get_payload_version(self, request_id: str, version: int) -> dict[str, Any]:
+        with self.database.read() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM payload_versions
+                WHERE request_id = ? AND version = ?
+                """,
+                (request_id, version),
+            ).fetchone()
+        if row is None:
+            raise RequestNotFound(f"{request_id}@{version}")
+        return dict(row)
+
+    def list_events(self, request_id: str) -> list[dict[str, Any]]:
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM request_events
+                WHERE request_id = ? ORDER BY event_id
+                """,
+                (request_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def edit(
+        self,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        encrypted_payload: bytes,
+        payload_hash: str,
+        canonical_size: int,
+        policy_version: str,
+        adapter_version: str,
+        schema_version: str,
+        editor_actor: str,
+        now: int,
+        encryption_key_ref: str | None = None,
+        attachments: tuple[AttachmentReference, ...] | None = None,
+    ) -> int:
+        self._validate_hash(payload_hash)
+        if not encrypted_payload or canonical_size < 0:
+            raise ValueError("an edited payload and non-negative canonical size are required")
+
+        with self.database.transaction() as connection:
+            request = self._request_for_update(connection, request_id)
+            self._require_current(request, expected_version, expected_payload_hash)
+            if request["state"] != RequestState.PENDING_APPROVAL.value:
+                raise InvalidTransition(f"cannot edit a request in state {request['state']}")
+            if hmac.compare_digest(request["current_payload_hash"], payload_hash):
+                raise InvalidTransition("an edit must create a different payload hash")
+
+            new_version = expected_version + 1
+            connection.execute(
+                """
+                INSERT INTO payload_versions(
+                    request_id, version, encrypted_payload, payload_hash,
+                    canonical_size, policy_version, adapter_version,
+                    schema_version, editor_actor, created_at,
+                    encryption_key_ref
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    new_version,
+                    encrypted_payload,
+                    payload_hash,
+                    canonical_size,
+                    policy_version,
+                    adapter_version,
+                    schema_version,
+                    editor_actor,
+                    now,
+                    encryption_key_ref,
+                ),
+            )
+            if attachments is None:
+                connection.execute(
+                    """
+                    INSERT INTO attachments(
+                        attachment_id, request_id, version, payload_hash,
+                        filename, mime_type, size_bytes, sha256, storage_path,
+                        created_at, purge_after, purged_at
+                    )
+                    SELECT attachment_id, request_id, ?, ?, filename, mime_type,
+                           size_bytes, sha256, storage_path, ?, purge_after, purged_at
+                    FROM attachments
+                    WHERE request_id = ? AND version = ?
+                    """,
+                    (new_version, payload_hash, now, request_id, expected_version),
+                )
+            else:
+                self._validate_attachments(attachments)
+                self._insert_attachments(
+                    connection,
+                    request_id=request_id,
+                    version=new_version,
+                    payload_hash=payload_hash,
+                    attachments=attachments,
+                    created_at=now,
+                )
+            updated = connection.execute(
+                """
+                UPDATE approval_requests
+                SET current_version = ?, current_payload_hash = ?,
+                    state = 'pending_approval', approved_at = NULL,
+                    execution_started_at = NULL, completed_at = NULL,
+                    safe_outcome_json = NULL, failure_reason = NULL,
+                    manual_retry_allowed = 0,
+                    duplicate_warning_required = 0, revision = revision + 1
+                WHERE request_id = ? AND state = 'pending_approval'
+                  AND current_version = ? AND current_payload_hash = ?
+                """,
+                (
+                    new_version,
+                    payload_hash,
+                    request_id,
+                    expected_version,
+                    expected_payload_hash,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise StaleVersion(request_id)
+            connection.execute(
+                """
+                UPDATE approval_challenges
+                SET invalidated_at = ?
+                WHERE request_id = ? AND invalidated_at IS NULL
+                  AND consumed_at IS NULL
+                """,
+                (now, request_id),
+            )
+            connection.execute(
+                """
+                UPDATE browser_views SET invalidated_at = ?
+                WHERE request_id = ? AND invalidated_at IS NULL
+                """,
+                (now, request_id),
+            )
+            self._event(
+                connection,
+                request_id,
+                editor_actor,
+                "payload_edited",
+                now,
+                new_version,
+                payload_hash,
+            )
+            self._fault("edit:before_commit")
+        return new_version
+
+    def create_challenge(
+        self,
+        challenge_id: str,
+        request_id: str,
+        *,
+        kind: ConfirmationKind,
+        expected_version: int,
+        expected_payload_hash: str,
+        created_at: int,
+        expires_at: int,
+    ) -> None:
+        if expires_at <= created_at:
+            raise ValueError("challenge expiry must be after creation")
+        with self.database.transaction() as connection:
+            request = self._request_for_update(connection, request_id)
+            self._require_current(request, expected_version, expected_payload_hash)
+            if request["state"] != RequestState.PENDING_APPROVAL.value:
+                raise InvalidTransition("challenges require a pending request")
+            connection.execute(
+                """
+                INSERT INTO approval_challenges(
+                    challenge_id, kind, request_id, version, payload_hash,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    challenge_id,
+                    kind.value,
+                    request_id,
+                    expected_version,
+                    expected_payload_hash,
+                    created_at,
+                    expires_at,
+                ),
+            )
+
+    def create_browser_view(
+        self,
+        view_id: str,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        created_at: int,
+    ) -> None:
+        with self.database.transaction() as connection:
+            request = self._request_for_update(connection, request_id)
+            self._require_current(request, expected_version, expected_payload_hash)
+            connection.execute(
+                """
+                INSERT INTO browser_views(
+                    view_id, request_id, version, payload_hash,
+                    request_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    view_id,
+                    request_id,
+                    expected_version,
+                    expected_payload_hash,
+                    request["revision"],
+                    created_at,
+                ),
+            )
+
+    def browser_view_is_current(self, view_id: str) -> bool:
+        with self.database.read() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM browser_views AS view
+                JOIN approval_requests AS request
+                  ON request.request_id = view.request_id
+                WHERE view.view_id = ? AND view.invalidated_at IS NULL
+                  AND view.version = request.current_version
+                  AND view.payload_hash = request.current_payload_hash
+                  AND view.request_revision = request.revision
+                  AND request.state = 'pending_approval'
+                """,
+                (view_id,),
+            ).fetchone()
+        return row is not None
+
+    def approve(
+        self,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        confirmation: ApprovalConfirmation,
+        actor: str,
+        now: int,
+    ) -> None:
+        with self.database.transaction() as connection:
+            request = self._request_for_update(connection, request_id)
+            self._require_current(request, expected_version, expected_payload_hash)
+            if request["state"] != RequestState.PENDING_APPROVAL.value:
+                raise InvalidTransition(f"cannot approve a request in state {request['state']}")
+            if now >= request["expires_at"]:
+                raise RequestExpired(request_id)
+            if request["gateway_internal"] and confirmation.path == "mcp":
+                raise InvalidConfirmation("gateway-internal policy changes are web-approval-only")
+
+            if confirmation.kind == ConfirmationKind.WEBAUTHN:
+                if confirmation.challenge_id is None:
+                    raise InvalidConfirmation("WebAuthn approval requires a challenge")
+                self._consume_webauthn_credential(connection, confirmation, now=now)
+                consumed = connection.execute(
+                    """
+                    UPDATE approval_challenges
+                    SET consumed_at = ?
+                    WHERE challenge_id = ? AND kind = 'webauthn'
+                      AND request_id = ? AND version = ? AND payload_hash = ?
+                      AND consumed_at IS NULL AND invalidated_at IS NULL
+                      AND expires_at > ?
+                    """,
+                    (
+                        now,
+                        confirmation.challenge_id,
+                        request_id,
+                        expected_version,
+                        expected_payload_hash,
+                        now,
+                    ),
+                ).rowcount
+                if consumed != 1:
+                    raise InvalidConfirmation("challenge is stale, expired, or consumed")
+            elif any(
+                value is not None
+                for value in (
+                    confirmation.challenge_id,
+                    confirmation.credential_id,
+                    confirmation.credential_user_id,
+                    confirmation.expected_counter,
+                    confirmation.new_counter,
+                    confirmation.expected_backup_eligible,
+                    confirmation.new_backup_eligible,
+                    confirmation.previous_backed_up,
+                    confirmation.new_backed_up,
+                )
+            ):
+                raise InvalidConfirmation("TOTP confirmation contains WebAuthn state")
+
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO confirmation_consumptions(
+                        kind, use_id, request_id, version, payload_hash,
+                        path, consumed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        confirmation.kind.value,
+                        confirmation.use_id,
+                        request_id,
+                        expected_version,
+                        expected_payload_hash,
+                        confirmation.path,
+                        now,
+                    ),
+                )
+            except IntegrityError as exc:
+                raise ConfirmationReplay("confirmation was already consumed") from exc
+
+            updated = connection.execute(
+                """
+                UPDATE approval_requests
+                SET state = 'approved', approved_at = ?, revision = revision + 1
+                WHERE request_id = ? AND state = 'pending_approval'
+                  AND current_version = ? AND current_payload_hash = ?
+                """,
+                (now, request_id, expected_version, expected_payload_hash),
+            ).rowcount
+            if updated != 1:
+                raise StaleVersion(request_id)
+            connection.execute(
+                """
+                UPDATE approval_challenges SET invalidated_at = ?
+                WHERE request_id = ? AND consumed_at IS NULL
+                  AND invalidated_at IS NULL
+                """,
+                (now, request_id),
+            )
+            connection.execute(
+                """
+                UPDATE browser_views SET invalidated_at = ?
+                WHERE request_id = ? AND invalidated_at IS NULL
+                """,
+                (now, request_id),
+            )
+            self._event(
+                connection,
+                request_id,
+                actor,
+                f"approved_via_{confirmation.path}",
+                now,
+                expected_version,
+                expected_payload_hash,
+            )
+            self._fault("approve:before_commit")
+
+    @staticmethod
+    def _consume_webauthn_credential(
+        connection: Any,
+        confirmation: ApprovalConfirmation,
+        *,
+        now: int,
+    ) -> None:
+        required = (
+            confirmation.credential_id,
+            confirmation.credential_user_id,
+            confirmation.expected_counter,
+            confirmation.new_counter,
+            confirmation.expected_backup_eligible,
+            confirmation.new_backup_eligible,
+            confirmation.previous_backed_up,
+            confirmation.new_backed_up,
+        )
+        if any(value is None for value in required):
+            raise InvalidConfirmation("WebAuthn confirmation is missing credential state")
+
+        expected_counter = confirmation.expected_counter
+        new_counter = confirmation.new_counter
+        expected_eligible = confirmation.expected_backup_eligible
+        new_eligible = confirmation.new_backup_eligible
+        previous_backed_up = confirmation.previous_backed_up
+        new_backed_up = confirmation.new_backed_up
+        assert expected_counter is not None
+        assert new_counter is not None
+        assert expected_eligible is not None
+        assert new_eligible is not None
+        assert previous_backed_up is not None
+        assert new_backed_up is not None
+        if expected_counter < 0 or not (
+            expected_counter == new_counter == 0 or new_counter > expected_counter
+        ):
+            raise InvalidConfirmation("WebAuthn signature counter transition is invalid")
+        if (
+            expected_eligible != new_eligible
+            or (not new_eligible and new_backed_up)
+            or (previous_backed_up and not new_backed_up)
+        ):
+            raise InvalidConfirmation("WebAuthn backup state transition is invalid")
+
+        updated = connection.execute(
+            """
+            UPDATE auth_credentials
+            SET sign_count = ?, backup_eligible = ?, backup_state = ?,
+                last_used_at = ?
+            WHERE credential_id = ? AND user_id = ? AND kind = 'webauthn'
+              AND disabled_at IS NULL AND sign_count = ?
+              AND backup_eligible = ? AND backup_state = ?
+            """,
+            (
+                new_counter,
+                int(new_eligible),
+                int(new_backed_up),
+                now,
+                confirmation.credential_id,
+                confirmation.credential_user_id,
+                expected_counter,
+                int(expected_eligible),
+                int(previous_backed_up),
+            ),
+        ).rowcount
+        if updated != 1:
+            raise InvalidConfirmation("WebAuthn credential state is stale or unavailable")
+
+    def deny(
+        self,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        actor: str,
+        now: int,
+    ) -> None:
+        self._finish_pending(
+            request_id,
+            expected_version=expected_version,
+            expected_payload_hash=expected_payload_hash,
+            state=RequestState.DENIED,
+            actor=actor,
+            now=now,
+        )
+
+    def cancel(
+        self,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        actor: str,
+        now: int,
+        origin_namespace: str | None = None,
+    ) -> None:
+        self._finish_pending(
+            request_id,
+            expected_version=expected_version,
+            expected_payload_hash=expected_payload_hash,
+            state=RequestState.CANCELLED,
+            actor=actor,
+            now=now,
+            origin_namespace=origin_namespace,
+        )
+
+    def expire(
+        self,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        actor: str,
+        now: int,
+    ) -> None:
+        self._finish_pending(
+            request_id,
+            expected_version=expected_version,
+            expected_payload_hash=expected_payload_hash,
+            state=RequestState.EXPIRED,
+            actor=actor,
+            now=now,
+            require_expired=True,
+        )
+
+    def claim_execution(
+        self,
+        request_id: str,
+        *,
+        worker_id: str,
+        now: int,
+        lease_seconds: int,
+        downstream_idempotency_key: str | None = None,
+    ) -> ExecutionLease:
+        if not worker_id or lease_seconds <= 0:
+            raise ValueError("worker ID and a positive lease are required")
+        lease_expires_at = now + lease_seconds
+        token = self._token_factory()
+
+        with self.database.transaction() as connection:
+            request = self._request_for_update(connection, request_id)
+            if request["state"] == RequestState.APPROVED.value:
+                attempt_id = str(uuid.uuid4())
+                updated = connection.execute(
+                    """
+                    UPDATE approval_requests
+                    SET state = 'executing', execution_started_at = ?,
+                        revision = revision + 1
+                    WHERE request_id = ? AND state = 'approved'
+                    """,
+                    (now, request_id),
+                ).rowcount
+                if updated != 1:
+                    raise InvalidTransition("approval was already claimed")
+                connection.execute(
+                    """
+                    INSERT INTO execution_attempts(
+                        attempt_id, request_id, version, payload_hash,
+                        fencing_token, worker_id, worker_generation, phase,
+                        claimed_at, lease_expires_at,
+                        downstream_idempotency_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, 'preparing', ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        request_id,
+                        request["current_version"],
+                        request["current_payload_hash"],
+                        token,
+                        worker_id,
+                        now,
+                        lease_expires_at,
+                        downstream_idempotency_key,
+                    ),
+                )
+                generation = 1
+                phase = ExecutionPhase.PREPARING
+                action = "execution_claimed"
+            elif request["state"] == RequestState.EXECUTING.value:
+                attempt = connection.execute(
+                    """
+                    SELECT * FROM execution_attempts
+                    WHERE request_id = ? AND version = ?
+                    """,
+                    (request_id, request["current_version"]),
+                ).fetchone()
+                if attempt is None:
+                    raise InvalidTransition("executing request has no durable attempt")
+                if attempt["phase"] not in {
+                    ExecutionPhase.PREPARING.value,
+                    ExecutionPhase.REDISPATCH_PREPARING.value,
+                }:
+                    raise InvalidTransition(
+                        "dispatch has started and cannot be reclaimed for blind retry"
+                    )
+                if attempt["lease_expires_at"] is None or attempt["lease_expires_at"] > now:
+                    raise InvalidTransition("the current execution lease is still active")
+                generation = int(attempt["worker_generation"]) + 1
+                phase = ExecutionPhase(attempt["phase"])
+                updated = connection.execute(
+                    """
+                    UPDATE execution_attempts
+                    SET fencing_token = ?, worker_id = ?, worker_generation = ?,
+                        claimed_at = ?, lease_expires_at = ?
+                    WHERE attempt_id = ? AND fencing_token = ?
+                      AND worker_generation = ? AND lease_expires_at <= ?
+                      AND phase = ?
+                    """,
+                    (
+                        token,
+                        worker_id,
+                        generation,
+                        now,
+                        lease_expires_at,
+                        attempt["attempt_id"],
+                        attempt["fencing_token"],
+                        attempt["worker_generation"],
+                        now,
+                        attempt["phase"],
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise FenceRejected("the expired lease was reclaimed concurrently")
+                attempt_id = attempt["attempt_id"]
+                downstream_idempotency_key = attempt["downstream_idempotency_key"]
+                action = "execution_reclaimed"
+            else:
+                raise InvalidTransition(f"request in state {request['state']} cannot execute")
+
+            self._event(
+                connection,
+                request_id,
+                f"gateway:{worker_id}",
+                action,
+                now,
+                request["current_version"],
+                request["current_payload_hash"],
+                {"worker_generation": generation, "phase": phase.value},
+            )
+            self._fault("execution_claim:before_commit")
+
+        return ExecutionLease(
+            request_id=request_id,
+            version=request["current_version"],
+            payload_hash=request["current_payload_hash"],
+            attempt_id=attempt_id,
+            fencing_token=token,
+            worker_generation=generation,
+            lease_expires_at=lease_expires_at,
+            phase=phase,
+            downstream_idempotency_key=downstream_idempotency_key,
+        )
+
+    def heartbeat(
+        self,
+        lease: ExecutionLease,
+        *,
+        now: int,
+        lease_seconds: int,
+    ) -> ExecutionLease:
+        if lease_seconds <= 0:
+            raise ValueError("lease duration must be positive")
+        new_expiry = now + lease_seconds
+        with self.database.transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE execution_attempts
+                SET lease_expires_at = ?
+                WHERE attempt_id = ? AND request_id = ? AND version = ?
+                  AND fencing_token = ? AND worker_generation = ?
+                  AND phase IN ('preparing', 'redispatch_preparing')
+                  AND lease_expires_at > ?
+                """,
+                (
+                    new_expiry,
+                    lease.attempt_id,
+                    lease.request_id,
+                    lease.version,
+                    lease.fencing_token,
+                    lease.worker_generation,
+                    now,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise FenceRejected("heartbeat lost its execution fence or lease")
+        return ExecutionLease(
+            request_id=lease.request_id,
+            version=lease.version,
+            payload_hash=lease.payload_hash,
+            attempt_id=lease.attempt_id,
+            fencing_token=lease.fencing_token,
+            worker_generation=lease.worker_generation,
+            lease_expires_at=new_expiry,
+            phase=lease.phase,
+            downstream_idempotency_key=lease.downstream_idempotency_key,
+        )
+
+    def mark_dispatch_started(self, lease: ExecutionLease, *, now: int) -> None:
+        with self.database.transaction() as connection:
+            attempt = self._attempt_for_fence(connection, lease, now=now)
+            if attempt["phase"] == ExecutionPhase.PREPARING.value:
+                next_phase = ExecutionPhase.DISPATCH_STARTED
+                timestamp_column = "dispatch_started_at"
+            elif attempt["phase"] == ExecutionPhase.REDISPATCH_PREPARING.value:
+                next_phase = ExecutionPhase.REDISPATCH_STARTED
+                timestamp_column = "redispatch_started_at"
+            else:
+                raise FenceRejected("attempt is not at a dispatch boundary")
+
+            updated = connection.execute(
+                f"""
+                UPDATE execution_attempts
+                SET phase = ?, {timestamp_column} = ?
+                WHERE attempt_id = ? AND fencing_token = ?
+                  AND worker_generation = ? AND phase = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    next_phase.value,
+                    now,
+                    lease.attempt_id,
+                    lease.fencing_token,
+                    lease.worker_generation,
+                    attempt["phase"],
+                    now,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise FenceRejected("dispatch boundary lost its fence")
+            self._event(
+                connection,
+                lease.request_id,
+                f"gateway:{attempt['worker_id']}",
+                next_phase.value,
+                now,
+                lease.version,
+                lease.payload_hash,
+                {"worker_generation": lease.worker_generation},
+            )
+            self._fault("dispatch_started:before_commit")
+
+    def record_outcome(
+        self,
+        lease: ExecutionLease,
+        *,
+        classification: OutcomeClassification,
+        now: int,
+        safe_outcome: Mapping[str, Any] | None = None,
+        failure_reason: str | None = None,
+        reconciliation_next_at: int | None = None,
+        result_aliases: tuple[ResultAlias, ...] = (),
+    ) -> None:
+        safe_json = self._safe_outcome_json(safe_outcome)
+        with self.database.transaction() as connection:
+            attempt = self._attempt_for_fence(connection, lease)
+            if attempt["phase"] not in {
+                ExecutionPhase.DISPATCH_STARTED.value,
+                ExecutionPhase.REDISPATCH_STARTED.value,
+            }:
+                raise FenceRejected("outcome requires a committed dispatch boundary")
+
+            if classification == OutcomeClassification.SUCCEEDED:
+                request_state = RequestState.SUCCEEDED
+                attempt_phase = ExecutionPhase.SUCCEEDED
+                manual_retry = 0
+                duplicate_warning = 0
+                notify = 0
+            elif classification == OutcomeClassification.DEFINITE_FAILURE:
+                if not failure_reason:
+                    raise ValueError("definite failures require a safe reason code")
+                request_state = RequestState.FAILED
+                attempt_phase = ExecutionPhase.FAILED
+                manual_retry = 1
+                duplicate_warning = 0
+                notify = 0
+            else:
+                if reconciliation_next_at is None or reconciliation_next_at < now:
+                    raise ValueError("unknown outcomes require a reconciliation time")
+                request_state = RequestState.OUTCOME_UNKNOWN
+                attempt_phase = ExecutionPhase.OUTCOME_UNKNOWN
+                manual_retry = 1
+                duplicate_warning = 1
+                notify = 1
+
+            connection.execute(
+                """
+                UPDATE approval_requests
+                SET state = ?, completed_at = ?, safe_outcome_json = ?,
+                    failure_reason = ?, manual_retry_allowed = ?,
+                    duplicate_warning_required = ?, revision = revision + 1
+                WHERE request_id = ? AND state = 'executing'
+                  AND current_version = ? AND current_payload_hash = ?
+                """,
+                (
+                    request_state.value,
+                    now if request_state != RequestState.OUTCOME_UNKNOWN else None,
+                    safe_json,
+                    failure_reason,
+                    manual_retry,
+                    duplicate_warning,
+                    lease.request_id,
+                    lease.version,
+                    lease.payload_hash,
+                ),
+            )
+            if request_state == RequestState.SUCCEEDED:
+                request = self._request_for_update(connection, lease.request_id)
+                self._insert_result_aliases(
+                    connection,
+                    request=request,
+                    aliases=result_aliases,
+                    created_at=now,
+                )
+            elif result_aliases:
+                raise ValueError("result aliases require a confirmed successful outcome")
+            connection.execute(
+                """
+                UPDATE execution_attempts
+                SET phase = ?, lease_expires_at = NULL,
+                    reconciliation_next_at = ?,
+                    reconciliation_notification_required = ?,
+                    completed_at = ?, safe_completion_json = ?,
+                    outcome_classification = ?, failure_reason = ?
+                WHERE attempt_id = ? AND fencing_token = ?
+                  AND worker_generation = ?
+                """,
+                (
+                    attempt_phase.value,
+                    reconciliation_next_at,
+                    notify,
+                    now if request_state != RequestState.OUTCOME_UNKNOWN else None,
+                    safe_json,
+                    classification.value,
+                    failure_reason,
+                    lease.attempt_id,
+                    lease.fencing_token,
+                    lease.worker_generation,
+                ),
+            )
+            self._event(
+                connection,
+                lease.request_id,
+                f"gateway:{attempt['worker_id']}",
+                f"execution_{request_state.value}",
+                now,
+                lease.version,
+                lease.payload_hash,
+                {"classification": classification.value},
+            )
+            self._fault("outcome:before_commit")
+
+    def reconcile(
+        self,
+        request_id: str,
+        *,
+        expected_reconciliation_count: int,
+        decision: ReconciliationDecision,
+        worker_id: str,
+        now: int,
+        next_check_at: int | None = None,
+        exhausted: bool = False,
+        lease_seconds: int = 30,
+        safe_outcome: Mapping[str, Any] | None = None,
+        result_aliases: tuple[ResultAlias, ...] = (),
+    ) -> ReconciliationResult:
+        safe_json = self._safe_outcome_json(safe_outcome)
+        with self.database.transaction() as connection:
+            request = self._request_for_update(connection, request_id)
+            if request["state"] != RequestState.OUTCOME_UNKNOWN.value:
+                raise ReconciliationRejected(f"request is not outcome_unknown: {request['state']}")
+            attempt = connection.execute(
+                """
+                SELECT * FROM execution_attempts
+                WHERE request_id = ? AND version = ? AND phase = 'outcome_unknown'
+                """,
+                (request_id, request["current_version"]),
+            ).fetchone()
+            if attempt is None:
+                raise ReconciliationRejected("unknown request has no reconcilable attempt")
+            if attempt["reconciliation_attempt_count"] != expected_reconciliation_count:
+                raise ReconciliationRejected("stale reconciliation decision")
+            if (
+                attempt["reconciliation_next_at"] is not None
+                and attempt["reconciliation_next_at"] > now
+            ):
+                raise ReconciliationRejected("reconciliation is not due")
+
+            count = expected_reconciliation_count + 1
+            lease: ExecutionLease | None = None
+            if decision == ReconciliationDecision.CONFIRMED_EFFECT:
+                connection.execute(
+                    """
+                    UPDATE approval_requests
+                    SET state = 'succeeded', completed_at = ?,
+                        safe_outcome_json = COALESCE(?, safe_outcome_json),
+                        failure_reason = NULL, manual_retry_allowed = 0,
+                        duplicate_warning_required = 0, revision = revision + 1
+                    WHERE request_id = ? AND state = 'outcome_unknown'
+                    """,
+                    (now, safe_json, request_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE execution_attempts
+                    SET phase = 'succeeded', reconciliation_attempt_count = ?,
+                        reconciliation_next_at = NULL,
+                        reconciliation_resolution = 'confirmed_effect',
+                        reconciliation_notification_required = 1,
+                        completed_at = ?, safe_completion_json = COALESCE(?, safe_completion_json),
+                        outcome_classification = 'succeeded'
+                    WHERE attempt_id = ?
+                    """,
+                    (count, now, safe_json, attempt["attempt_id"]),
+                )
+                self._insert_result_aliases(
+                    connection,
+                    request=request,
+                    aliases=result_aliases,
+                    created_at=now,
+                )
+                action = ReconciliationAction.SUCCEEDED
+            elif decision == ReconciliationDecision.CONFIRMED_NO_EFFECT:
+                if attempt["downstream_idempotency_key"] and not attempt["redispatch_used"]:
+                    if lease_seconds <= 0:
+                        raise ValueError("redispatch lease must be positive")
+                    token = self._token_factory()
+                    generation = int(attempt["worker_generation"]) + 1
+                    lease_expiry = now + lease_seconds
+                    connection.execute(
+                        """
+                        UPDATE approval_requests
+                        SET state = 'executing', completed_at = NULL,
+                            failure_reason = NULL, manual_retry_allowed = 0,
+                            duplicate_warning_required = 0, revision = revision + 1
+                        WHERE request_id = ? AND state = 'outcome_unknown'
+                        """,
+                        (request_id,),
+                    )
+                    updated = connection.execute(
+                        """
+                        UPDATE execution_attempts
+                        SET phase = 'redispatch_preparing', fencing_token = ?,
+                            worker_id = ?, worker_generation = ?, claimed_at = ?,
+                            lease_expires_at = ?, reconciliation_attempt_count = ?,
+                            reconciliation_next_at = NULL,
+                            reconciliation_resolution = 'confirmed_no_effect',
+                            reconciliation_notification_required = 0,
+                            redispatch_used = 1
+                        WHERE attempt_id = ? AND phase = 'outcome_unknown'
+                          AND redispatch_used = 0
+                        """,
+                        (
+                            token,
+                            worker_id,
+                            generation,
+                            now,
+                            lease_expiry,
+                            count,
+                            attempt["attempt_id"],
+                        ),
+                    ).rowcount
+                    if updated != 1:
+                        raise ReconciliationRejected("redispatch was already consumed")
+                    lease = ExecutionLease(
+                        request_id=request_id,
+                        version=request["current_version"],
+                        payload_hash=request["current_payload_hash"],
+                        attempt_id=attempt["attempt_id"],
+                        fencing_token=token,
+                        worker_generation=generation,
+                        lease_expires_at=lease_expiry,
+                        phase=ExecutionPhase.REDISPATCH_PREPARING,
+                        downstream_idempotency_key=attempt["downstream_idempotency_key"],
+                    )
+                    action = ReconciliationAction.REDISPATCH
+                else:
+                    reason = (
+                        "reconciled_no_effect_after_redispatch"
+                        if attempt["redispatch_used"]
+                        else "reconciled_no_effect"
+                    )
+                    connection.execute(
+                        """
+                        UPDATE approval_requests
+                        SET state = 'failed', completed_at = ?, failure_reason = ?,
+                            manual_retry_allowed = 1,
+                            duplicate_warning_required = 0,
+                            revision = revision + 1
+                        WHERE request_id = ? AND state = 'outcome_unknown'
+                        """,
+                        (now, reason, request_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE execution_attempts
+                        SET phase = 'failed', reconciliation_attempt_count = ?,
+                            reconciliation_next_at = NULL,
+                            reconciliation_resolution = 'confirmed_no_effect',
+                            reconciliation_notification_required = 1,
+                            completed_at = ?, outcome_classification = 'definite_failure',
+                            failure_reason = ?
+                        WHERE attempt_id = ?
+                        """,
+                        (count, now, reason, attempt["attempt_id"]),
+                    )
+                    action = ReconciliationAction.FAILED_NO_EFFECT
+            else:
+                if result_aliases:
+                    raise ValueError("result aliases require a confirmed external effect")
+                if exhausted:
+                    connection.execute(
+                        """
+                        UPDATE execution_attempts
+                        SET reconciliation_attempt_count = ?,
+                            reconciliation_next_at = NULL,
+                            reconciliation_resolution = 'exhausted',
+                            reconciliation_exhausted_at = ?,
+                            reconciliation_notification_required = 1
+                        WHERE attempt_id = ?
+                        """,
+                        (count, now, attempt["attempt_id"]),
+                    )
+                    action = ReconciliationAction.EXHAUSTED
+                else:
+                    if next_check_at is None or next_check_at <= now:
+                        raise ValueError("inconclusive reconciliation requires a future check")
+                    connection.execute(
+                        """
+                        UPDATE execution_attempts
+                        SET reconciliation_attempt_count = ?,
+                            reconciliation_next_at = ?,
+                            reconciliation_resolution = 'inconclusive',
+                            reconciliation_notification_required = 0
+                        WHERE attempt_id = ?
+                        """,
+                        (count, next_check_at, attempt["attempt_id"]),
+                    )
+                    action = ReconciliationAction.RESCHEDULED
+
+            self._event(
+                connection,
+                request_id,
+                f"gateway:{worker_id}",
+                f"reconciliation_{action.value}",
+                now,
+                request["current_version"],
+                request["current_payload_hash"],
+                {"decision": decision.value, "attempt": count},
+            )
+            self._fault("reconciliation:before_commit")
+
+        return ReconciliationResult(action=action, reconciliation_count=count, lease=lease)
+
+    def recover_startup(self, *, now: int) -> RecoverySummary:
+        active: list[str] = []
+        reclaimable: list[str] = []
+        routed: list[str] = []
+        with self.database.transaction() as connection:
+            attempts = connection.execute(
+                """
+                SELECT attempt.*, request.current_version,
+                       request.current_payload_hash, request.state
+                FROM execution_attempts AS attempt
+                JOIN approval_requests AS request
+                  ON request.request_id = attempt.request_id
+                WHERE request.state = 'executing'
+                  AND attempt.phase IN (
+                      'preparing', 'redispatch_preparing',
+                      'dispatch_started', 'redispatch_started'
+                  )
+                ORDER BY attempt.request_id
+                """
+            ).fetchall()
+            for attempt in attempts:
+                if attempt["lease_expires_at"] is not None and attempt["lease_expires_at"] > now:
+                    active.append(attempt["request_id"])
+                    continue
+                if attempt["phase"] in {
+                    ExecutionPhase.PREPARING.value,
+                    ExecutionPhase.REDISPATCH_PREPARING.value,
+                }:
+                    reclaimable.append(attempt["request_id"])
+                    continue
+
+                connection.execute(
+                    """
+                    UPDATE approval_requests
+                    SET state = 'outcome_unknown', completed_at = NULL,
+                        manual_retry_allowed = 1,
+                        duplicate_warning_required = 1,
+                        revision = revision + 1
+                    WHERE request_id = ? AND state = 'executing'
+                    """,
+                    (attempt["request_id"],),
+                )
+                connection.execute(
+                    """
+                    UPDATE execution_attempts
+                    SET phase = 'outcome_unknown', lease_expires_at = NULL,
+                        reconciliation_next_at = ?,
+                        reconciliation_resolution = 'startup_abandoned_after_dispatch',
+                        reconciliation_notification_required = 1,
+                        outcome_classification = 'outcome_unknown'
+                    WHERE attempt_id = ? AND phase = ?
+                    """,
+                    (now, attempt["attempt_id"], attempt["phase"]),
+                )
+                self._event(
+                    connection,
+                    attempt["request_id"],
+                    "gateway:startup_recovery",
+                    "abandoned_dispatch_outcome_unknown",
+                    now,
+                    attempt["current_version"],
+                    attempt["current_payload_hash"],
+                )
+                routed.append(attempt["request_id"])
+            self._fault("startup_recovery:before_commit")
+        return RecoverySummary(
+            active=tuple(active),
+            reclaimable=tuple(reclaimable),
+            routed_to_reconciliation=tuple(routed),
+        )
+
+    def add_attachment(
+        self,
+        request_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+        attachment_id: str,
+        filename: str,
+        mime_type: str,
+        size_bytes: int,
+        sha256: str,
+        storage_path: str,
+        created_at: int,
+    ) -> None:
+        self._validate_hash(sha256)
+        with self.database.transaction() as connection:
+            request = self._request_for_update(connection, request_id)
+            self._require_current(request, version, payload_hash)
+            if request["state"] != RequestState.PENDING_APPROVAL.value:
+                raise InvalidTransition("attachments can only be staged while pending")
+            connection.execute(
+                """
+                INSERT INTO attachments(
+                    attachment_id, request_id, version, payload_hash, filename, mime_type,
+                    size_bytes, sha256, storage_path, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attachment_id,
+                    request_id,
+                    version,
+                    payload_hash,
+                    filename,
+                    mime_type,
+                    size_bytes,
+                    sha256,
+                    storage_path,
+                    created_at,
+                ),
+            )
+
+    def add_result_alias(
+        self,
+        request_id: str,
+        *,
+        downstream_alias: str,
+        tool_name: str,
+        account_namespace: str,
+        identifier_kind: str,
+        downstream_identifier: str,
+        created_at: int,
+    ) -> None:
+        with self.database.transaction() as connection:
+            request = self._request_for_update(connection, request_id)
+            if request["state"] != RequestState.SUCCEEDED.value:
+                raise InvalidTransition("result aliases require confirmed success")
+            if request["downstream_alias"] != downstream_alias or request["tool_name"] != tool_name:
+                raise InvalidTransition("result alias scope does not match the request")
+            connection.execute(
+                """
+                INSERT INTO result_aliases(
+                    request_id, downstream_alias, tool_name, account_namespace,
+                    identifier_kind, downstream_identifier, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    downstream_alias,
+                    tool_name,
+                    account_namespace,
+                    identifier_kind,
+                    downstream_identifier,
+                    created_at,
+                ),
+            )
+
+    def _finish_pending(
+        self,
+        request_id: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        state: RequestState,
+        actor: str,
+        now: int,
+        origin_namespace: str | None = None,
+        require_expired: bool = False,
+    ) -> None:
+        if state not in {
+            RequestState.DENIED,
+            RequestState.EXPIRED,
+            RequestState.CANCELLED,
+        }:
+            raise ValueError("pending requests may only be denied, expired, or cancelled")
+        with self.database.transaction() as connection:
+            request = self._request_for_update(connection, request_id)
+            self._require_current(request, expected_version, expected_payload_hash)
+            if request["state"] != RequestState.PENDING_APPROVAL.value:
+                raise InvalidTransition(
+                    f"cannot {state.value} a request in state {request['state']}"
+                )
+            if origin_namespace is not None and not hmac.compare_digest(
+                request["origin_namespace"], origin_namespace
+            ):
+                raise RequestNotFound(request_id)
+            if require_expired and now < request["expires_at"]:
+                raise InvalidTransition("request has not reached its expiry")
+            connection.execute(
+                """
+                UPDATE approval_requests
+                SET state = ?, completed_at = ?, revision = revision + 1
+                WHERE request_id = ? AND state = 'pending_approval'
+                  AND current_version = ? AND current_payload_hash = ?
+                """,
+                (
+                    state.value,
+                    now,
+                    request_id,
+                    expected_version,
+                    expected_payload_hash,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE approval_challenges SET invalidated_at = ?
+                WHERE request_id = ? AND consumed_at IS NULL
+                  AND invalidated_at IS NULL
+                """,
+                (now, request_id),
+            )
+            connection.execute(
+                """
+                UPDATE browser_views SET invalidated_at = ?
+                WHERE request_id = ? AND invalidated_at IS NULL
+                """,
+                (now, request_id),
+            )
+            self._event(
+                connection,
+                request_id,
+                actor,
+                state.value,
+                now,
+                expected_version,
+                expected_payload_hash,
+            )
+
+    def _attempt_for_fence(
+        self,
+        connection: Any,
+        lease: ExecutionLease,
+        *,
+        now: int | None = None,
+    ) -> Any:
+        attempt = connection.execute(
+            """
+            SELECT * FROM execution_attempts
+            WHERE attempt_id = ? AND request_id = ? AND version = ?
+            """,
+            (lease.attempt_id, lease.request_id, lease.version),
+        ).fetchone()
+        if attempt is None:
+            raise FenceRejected("execution attempt no longer exists")
+        if not hmac.compare_digest(attempt["fencing_token"], lease.fencing_token):
+            raise FenceRejected("fencing token is stale")
+        if attempt["worker_generation"] != lease.worker_generation:
+            raise FenceRejected("worker generation is stale")
+        if not hmac.compare_digest(attempt["payload_hash"], lease.payload_hash):
+            raise FenceRejected("execution payload changed")
+        if now is not None and (
+            attempt["lease_expires_at"] is None or attempt["lease_expires_at"] <= now
+        ):
+            raise FenceRejected("execution lease expired")
+        return attempt
+
+    @staticmethod
+    def _request_for_update(connection: Any, request_id: str) -> Any:
+        row = connection.execute(
+            "SELECT * FROM approval_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            raise RequestNotFound(request_id)
+        return row
+
+    @staticmethod
+    def _require_current(
+        request: Any,
+        expected_version: int,
+        expected_payload_hash: str,
+    ) -> None:
+        if request["current_version"] != expected_version or not hmac.compare_digest(
+            request["current_payload_hash"], expected_payload_hash
+        ):
+            raise StaleVersion(request["request_id"])
+
+    @staticmethod
+    def _event(
+        connection: Any,
+        request_id: str,
+        actor: str,
+        action: str,
+        occurred_at: int,
+        version: int,
+        payload_hash: str,
+        safe_details: Mapping[str, Any] | None = None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO request_events(
+                request_id, actor, action, occurred_at,
+                version, payload_hash, safe_details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                actor,
+                action,
+                occurred_at,
+                version,
+                payload_hash,
+                ApprovalStateMachine._safe_json(safe_details),
+            ),
+        )
+
+    @staticmethod
+    def _safe_json(value: Mapping[str, Any] | None) -> str | None:
+        if value is None:
+            return None
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _validate_hash(value: str) -> None:
+        if len(value) != 64:
+            raise ValueError("hashes must be 64-character SHA-256 hex digests")
+        try:
+            bytes.fromhex(value)
+        except ValueError as exc:
+            raise ValueError("hashes must be SHA-256 hex digests") from exc
+
+    def _validate_enqueue(self, request: EnqueueRequest) -> None:
+        if not all(
+            (
+                request.request_id,
+                request.downstream_alias,
+                request.tool_name,
+                request.origin_namespace,
+                request.encrypted_payload,
+                request.pending_result,
+                request.payload_fingerprint,
+            )
+        ):
+            raise ValueError("enqueue fields must not be empty")
+        if request.policy_mode not in {
+            "deny",
+            "approval",
+            "passthrough",
+            "virtualize_local",
+        }:
+            raise ValueError(f"invalid policy mode: {request.policy_mode}")
+        if request.expires_at <= request.created_at:
+            raise ValueError("request expiry must be after creation")
+        self._validate_hash(request.payload_hash)
+        self._validate_attachments(request.attachments)
+
+    @staticmethod
+    def _validate_attachments(attachments: tuple[AttachmentReference, ...]) -> None:
+        attachment_ids: set[str] = set()
+        for attachment in attachments:
+            if not isinstance(attachment, AttachmentReference):
+                raise ValueError("attachments must be immutable attachment references")
+            if (
+                not attachment.attachment_id
+                or attachment.attachment_id in attachment_ids
+                or not attachment.filename
+                or not attachment.mime_type
+                or attachment.size_bytes < 0
+                or len(attachment.sha256) != 64
+                or not attachment.storage_path
+            ):
+                raise ValueError("invalid attachment reference")
+            attachment_ids.add(attachment.attachment_id)
+
+    @staticmethod
+    def _insert_attachments(
+        connection: Any,
+        *,
+        request_id: str,
+        version: int,
+        payload_hash: str,
+        attachments: tuple[AttachmentReference, ...],
+        created_at: int,
+    ) -> None:
+        for attachment in attachments:
+            connection.execute(
+                """
+                INSERT INTO attachments(
+                    attachment_id, request_id, version, payload_hash,
+                    filename, mime_type, size_bytes, sha256, storage_path,
+                    created_at, purge_after
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attachment.attachment_id,
+                    request_id,
+                    version,
+                    payload_hash,
+                    attachment.filename,
+                    attachment.mime_type,
+                    attachment.size_bytes,
+                    attachment.sha256,
+                    attachment.storage_path,
+                    created_at,
+                    attachment.purge_after,
+                ),
+            )
+
+    @staticmethod
+    def _safe_outcome_json(value: Mapping[str, Any] | None) -> str | None:
+        if value is None:
+            return None
+        allowed = {
+            "provider_id",
+            "message_id",
+            "submission_id",
+            "thread_id",
+            "chat_message_id",
+            "status",
+            "state",
+            "provider_status",
+            "reconciled_at",
+            "delivered_at",
+            "idempotency_key_applied",
+        }
+        if set(value) - allowed:
+            raise ValueError("safe outcome metadata contains an unreviewed field")
+        for item in value.values():
+            if item is not None and not isinstance(item, (str, int, bool)):
+                raise ValueError("safe outcome metadata values must be scalar")
+            if isinstance(item, str) and len(item) > 512:
+                raise ValueError("safe outcome metadata value is too long")
+        encoded = json.dumps(dict(value), ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 4096:
+            raise ValueError("safe outcome metadata exceeds the storage limit")
+        return encoded
+
+    @staticmethod
+    def _insert_result_aliases(
+        connection: Any,
+        *,
+        request: Any,
+        aliases: tuple[ResultAlias, ...],
+        created_at: int,
+    ) -> None:
+        for alias in aliases:
+            if (
+                not alias.account_namespace
+                or not alias.identifier_kind
+                or not alias.downstream_identifier
+                or len(alias.downstream_identifier) > 512
+            ):
+                raise ValueError("invalid safe downstream result alias")
+            connection.execute(
+                """
+                INSERT INTO result_aliases(
+                    request_id, downstream_alias, tool_name, account_namespace,
+                    identifier_kind, downstream_identifier, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request["request_id"],
+                    request["downstream_alias"],
+                    request["tool_name"],
+                    alias.account_namespace,
+                    alias.identifier_kind,
+                    alias.downstream_identifier,
+                    created_at,
+                ),
+            )
+
+    def _fault(self, stage: str) -> None:
+        if self._fault_injector is not None:
+            self._fault_injector(stage)
+
+
+class ReadOnlyMCPClient:
+    """Structurally restrict adapter reconciliation to reviewed read tools."""
+
+    def __init__(
+        self,
+        allowed_tools: set[str] | frozenset[str],
+        call_tool: Callable[[str, Mapping[str, Any]], Any | Awaitable[Any]],
+    ) -> None:
+        self._allowed_tools = frozenset(allowed_tools)
+        self._call_tool = call_tool
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> Any:
+        if tool_name not in self._allowed_tools:
+            raise ReadOnlyToolViolation(
+                f"reconciliation tool is not on the reviewed read-only allowlist: {tool_name}"
+            )
+        result = self._call_tool(tool_name, arguments)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+
+StateMachine = ApprovalStateMachine
