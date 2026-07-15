@@ -84,6 +84,17 @@ def test_daily_digest_contains_only_count() -> None:
         PushMessage(NotificationKind.DAILY_DIGEST, service="Fastmail", count=1)
 
 
+def test_mcp_approval_copy_does_not_claim_delivery_before_dispatch() -> None:
+    payload = PushMessage(
+        NotificationKind.MCP_APPROVED,
+        service="Fastmail",
+        action="send_email",
+    ).payload()
+
+    assert payload["body"] == "Request approved via chat"
+    assert "dispatch" not in str(payload["body"]).lower()
+
+
 @pytest.mark.asyncio
 async def test_push_failure_never_escapes_and_disables_only_failing_device() -> None:
     repository = InMemoryPushRepository()

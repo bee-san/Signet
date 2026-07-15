@@ -73,7 +73,7 @@ class PushMessage:
         body_by_kind = {
             NotificationKind.NEW_PENDING: "New request waiting for approval",
             NotificationKind.APPROACHING_EXPIRY: "Request approaching expiry",
-            NotificationKind.MCP_APPROVED: "Request approved via chat and dispatched",
+            NotificationKind.MCP_APPROVED: "Request approved via chat",
             NotificationKind.OUTCOME_UNKNOWN_ENTERED: "Delivery outcome needs attention",
             NotificationKind.OUTCOME_UNKNOWN_RESOLVED: "Unknown delivery outcome resolved",
             NotificationKind.OUTCOME_UNKNOWN_EXHAUSTED: "Delivery reconciliation exhausted",
