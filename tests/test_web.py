@@ -258,6 +258,29 @@ def test_agent_listener_has_only_privacy_safe_health() -> None:
     assert "request" not in health.text and "target" not in health.text
 
 
+def test_oversized_passkey_login_is_rejected_before_backend(
+    client: TestClient,
+    backend: FakeBackend,
+) -> None:
+    page = client.get("/login")
+    token = client.cookies.get("__Host-signet_login_csrf")
+    assert page.status_code == 200 and token
+
+    response = client.post(
+        "/login/passkey/options",
+        content=b"{" + b'"padding":"' + b"x" * 9000 + b'"}',
+        headers={
+            "Content-Type": "application/json",
+            "Origin": ORIGIN,
+            "X-CSRF-Token": token,
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.headers["cache-control"] == "no-store"
+    assert backend.actions == []
+
+
 def test_queue_and_detail_require_session_and_ignore_mcp_bearer(client: TestClient) -> None:
     assert client.get("/").status_code == 401
     response = client.get(

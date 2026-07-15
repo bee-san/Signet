@@ -267,6 +267,22 @@ def test_health_is_privacy_safe_host_guarded_and_has_no_ui_routes(auth: AuthFixt
         assert "fastmail" not in rejected.text
 
 
+def test_mcp_listener_rejects_declared_oversized_body_before_auth(auth: AuthFixture) -> None:
+    harness = make_runtime(auth)
+    with TestClient(harness.runtime.app, base_url="http://localhost:8789") as client:
+        response = client.post(
+            "/mcp/fastmail",
+            content=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(16 * 1024 * 1024 + 1),
+            },
+        )
+    assert response.status_code == 413
+    assert response.headers["cache-control"] == "no-store"
+    assert harness.alias_calls == []
+
+
 @pytest.mark.asyncio
 async def test_bearer_auth_alias_scope_and_transport_security(auth: AuthFixture) -> None:
     harness = make_runtime(auth)

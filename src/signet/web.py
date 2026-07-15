@@ -21,6 +21,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from signet.auth import InvalidSession, SessionPrincipal
+from signet.http_security import RequestBodyLimitMiddleware
 
 type HumanAction = Literal[
     "approve",
@@ -356,6 +357,17 @@ def create_web_app(
     app = FastAPI(title="Signet", docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(SecurityHeadersMiddleware, public_origin=settings.public_origin)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts))
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        default_limit=4_100_000,
+        route_limits={
+            ("POST", "/login/password"): 16 * 1024,
+            ("POST", "/login/passkey/options"): 8 * 1024,
+            ("POST", "/login/passkey/complete"): 128 * 1024,
+            ("POST", "/push/subscriptions"): 16 * 1024,
+            ("DELETE", "/push/subscriptions"): 8 * 1024,
+        },
+    )
     app.mount("/static", StaticFiles(directory=package_root / "static"), name="static")
 
     def source(request: Request) -> str:
@@ -470,12 +482,12 @@ def create_web_app(
 
     @app.post("/login/passkey/options")
     async def passkey_login_options(request: Request) -> LoginOptions:
-        body = await _json_object(request)
         if not csrf.verify_login(
             request.cookies.get(_LOGIN_CSRF_COOKIE),
             request.headers.get("x-csrf-token"),
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+        body = await _json_object(request)
         user_id = body.get("user_id")
         if not isinstance(user_id, str) or not user_id or len(user_id) > 256:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
@@ -488,12 +500,12 @@ def create_web_app(
 
     @app.post("/login/passkey/complete")
     async def passkey_login_complete(request: Request) -> Response:
-        body = await _json_object(request)
         if not csrf.verify_login(
             request.cookies.get(_LOGIN_CSRF_COOKIE),
             request.headers.get("x-csrf-token"),
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+        body = await _json_object(request)
         challenge_id = body.get("challenge_id")
         assertion = body.get("assertion")
         if not isinstance(challenge_id, str) or not isinstance(assertion, dict):

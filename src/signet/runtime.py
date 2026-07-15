@@ -38,6 +38,7 @@ from signet.credential_broker import (
     TokenRegistry,
 )
 from signet.gateway_tools import GatewayPrincipal, GatewayToolSurface
+from signet.http_security import RequestBodyLimitMiddleware
 from signet.mcp_mirror import AliasToolSurface
 
 APPROVALS_ALIAS = "approvals"
@@ -281,7 +282,10 @@ def assemble_mcp_runtime(
     app = Starlette(
         debug=False,
         routes=routes,
-        middleware=[Middleware(LoopbackHostMiddleware, allowed_hosts=allowed_hosts)],
+        middleware=[
+            Middleware(RequestBodyLimitMiddleware, default_limit=16 * 1024 * 1024),
+            Middleware(LoopbackHostMiddleware, allowed_hosts=allowed_hosts),
+        ],
         lifespan=lifespan,
     )
     app.router.redirect_slashes = False
