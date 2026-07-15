@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import stat
 from collections.abc import Mapping
@@ -30,6 +31,20 @@ DEFAULT_WACLI_EXECUTABLE = Path("/opt/homebrew/bin/wacli")
 REVIEWED_WACLI_VERSION = "0.12.0"
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _HASH_RE = re.compile(r"^[a-f0-9]{64}$")
+_MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
+_NATIVE_EXECUTABLE_MAGICS = frozenset(
+    {
+        b"\x7fELF",
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+        b"\xfe\xed\xfa\xce",
+        b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",
+        b"\xcf\xfa\xed\xfe",
+    }
+)
 _DESTINATION_RE = re.compile(
     r"(?:\+[1-9][0-9]{7,14}|[1-9][0-9]{6,31}@(s\.whatsapp\.net|g\.us|newsletter))"
 )
@@ -62,6 +77,8 @@ class WacliConfig:
     cli_timeout: str = "15s"
     max_output_bytes: int = 256 * 1024
     reviewed_dispatch_enabled: bool = False
+    execution_snapshot_root: Path | None = None
+    test_only_allow_script: bool = False
 
     def __post_init__(self) -> None:
         executable = Path(self.executable)
@@ -83,6 +100,15 @@ class WacliConfig:
         object.__setattr__(self, "home", Path(self.home))
         if self.staging_root is not None:
             object.__setattr__(self, "staging_root", Path(self.staging_root).resolve())
+        if self.execution_snapshot_root is not None:
+            snapshot_root = Path(self.execution_snapshot_root)
+            if not snapshot_root.is_absolute():
+                raise ValueError("wacli execution snapshot root must be absolute")
+            object.__setattr__(self, "execution_snapshot_root", snapshot_root)
+        if self.reviewed_dispatch_enabled and self.execution_snapshot_root is None:
+            raise ValueError("active wacli dispatch requires a private execution snapshot root")
+        if not isinstance(self.test_only_allow_script, bool):
+            raise TypeError("wacli test script flag must be a boolean")
 
 
 def normalize_destination(value: str) -> str:
@@ -96,6 +122,34 @@ def validate_message(value: str) -> str:
     if not value or len(value) > 65_536 or "\x00" in value:
         raise WacliError("invalid_message", dispatch_may_have_occurred=False)
     return value
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _write_all(descriptor: int, value: bytes) -> None:
+    view = memoryview(value)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("executable snapshot write made no progress")
+        view = view[written:]
+
+
+def _hash_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest()
 
 
 async def _read_bounded(stream: asyncio.StreamReader, limit: int) -> bytes:
@@ -117,28 +171,157 @@ class WacliWrapper:
     def __init__(self, config: WacliConfig) -> None:
         self.config = config
         self._version_lock = asyncio.Lock()
-        self._verified_signature: tuple[int, int, int, int] | None = None
+        self._verified_signature: tuple[int, int, int, int, str] | None = None
 
-    def _binary_signature(self) -> tuple[int, int, int, int]:
+    def _open_verified_executable(self) -> tuple[int, tuple[int, int, int, int, str]]:
+        snapshot_root = self.config.execution_snapshot_root
+        if snapshot_root is None:
+            raise WacliError("snapshot_root_unavailable", dispatch_may_have_occurred=False)
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         try:
-            metadata = self.config.executable.stat()
+            source_descriptor = os.open(self.config.executable, flags)
+            source_before = os.fstat(source_descriptor)
         except OSError as exc:
             raise WacliError("executable_unavailable", dispatch_may_have_occurred=False) from exc
-        if not stat.S_ISREG(metadata.st_mode) or not os.access(self.config.executable, os.X_OK):
-            raise WacliError("executable_not_runnable", dispatch_may_have_occurred=False)
-        if self.config.expected_sha256 is not None:
+
+        root_descriptor = -1
+        writer = -1
+        snapshot_descriptor = -1
+        snapshot_name: str | None = None
+        try:
+            if not stat.S_ISREG(source_before.st_mode) or source_before.st_mode & 0o111 == 0:
+                raise WacliError("executable_not_runnable", dispatch_may_have_occurred=False)
+            self._prepare_snapshot_root(snapshot_root)
+            root_flags = os.O_RDONLY | os.O_CLOEXEC
+            if hasattr(os, "O_DIRECTORY"):
+                root_flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                root_flags |= os.O_NOFOLLOW
+            root_descriptor = os.open(snapshot_root, root_flags)
+
+            for _ in range(4):
+                candidate = f".wacli-exec-{secrets.token_hex(18)}"
+                try:
+                    writer = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=root_descriptor,
+                    )
+                except FileExistsError:
+                    continue
+                snapshot_name = candidate
+                break
+            if writer < 0 or snapshot_name is None:
+                raise WacliError("snapshot_create_failed", dispatch_may_have_occurred=False)
+
             digest = hashlib.sha256()
+            copied = 0
+            leading = b""
             try:
-                with self.config.executable.open("rb") as executable_file:
-                    while chunk := executable_file.read(1024 * 1024):
-                        digest.update(chunk)
+                while chunk := os.read(source_descriptor, 1024 * 1024):
+                    copied += len(chunk)
+                    if copied > _MAX_EXECUTABLE_BYTES:
+                        raise WacliError(
+                            "executable_too_large", dispatch_may_have_occurred=False
+                        )
+                    if len(leading) < 4:
+                        leading = (leading + chunk)[:4]
+                    digest.update(chunk)
+                    _write_all(writer, chunk)
             except OSError as exc:
                 raise WacliError(
                     "executable_digest_unavailable", dispatch_may_have_occurred=False
                 ) from exc
-            if digest.hexdigest() != self.config.expected_sha256:
+            source_after = os.fstat(source_descriptor)
+            if (
+                _file_identity(source_before) != _file_identity(source_after)
+                or copied != source_before.st_size
+            ):
+                raise WacliError("executable_changed", dispatch_may_have_occurred=False)
+            if not self._native_or_test_executable(leading):
+                raise WacliError("executable_format_unreviewed", dispatch_may_have_occurred=False)
+            executable_digest = digest.hexdigest()
+            if (
+                self.config.expected_sha256 is not None
+                and executable_digest != self.config.expected_sha256
+            ):
                 raise WacliError("executable_digest_mismatch", dispatch_may_have_occurred=False)
-        return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+
+            os.fsync(writer)
+            os.fchmod(writer, 0o500)
+            os.close(writer)
+            writer = -1
+            snapshot_descriptor = os.open(
+                snapshot_name,
+                flags,
+                dir_fd=root_descriptor,
+            )
+            snapshot_metadata = os.fstat(snapshot_descriptor)
+            if (
+                not stat.S_ISREG(snapshot_metadata.st_mode)
+                or snapshot_metadata.st_size != copied
+                or snapshot_metadata.st_nlink != 1
+                or _hash_descriptor(snapshot_descriptor) != executable_digest
+            ):
+                raise WacliError("snapshot_integrity_failed", dispatch_may_have_occurred=False)
+            os.unlink(snapshot_name, dir_fd=root_descriptor)
+            snapshot_name = None
+            os.fsync(root_descriptor)
+            if os.fstat(snapshot_descriptor).st_nlink != 0:
+                raise WacliError("snapshot_unlink_failed", dispatch_may_have_occurred=False)
+            os.lseek(snapshot_descriptor, 0, os.SEEK_SET)
+            signature = (
+                source_before.st_dev,
+                source_before.st_ino,
+                source_before.st_size,
+                source_before.st_mtime_ns,
+                executable_digest,
+            )
+            result = snapshot_descriptor
+            snapshot_descriptor = -1
+            return result, signature
+        except BaseException:
+            raise
+        finally:
+            if writer >= 0:
+                os.close(writer)
+            if snapshot_descriptor >= 0:
+                os.close(snapshot_descriptor)
+            if snapshot_name is not None and root_descriptor >= 0:
+                with suppress(OSError):
+                    os.unlink(snapshot_name, dir_fd=root_descriptor)
+            if root_descriptor >= 0:
+                os.close(root_descriptor)
+            os.close(source_descriptor)
+
+    @staticmethod
+    def _prepare_snapshot_root(root: Path) -> None:
+        try:
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            metadata = root.lstat()
+            resolved = root.resolve(strict=True)
+        except OSError as exc:
+            raise WacliError("snapshot_root_unavailable", dispatch_may_have_occurred=False) from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or resolved != root
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise WacliError("snapshot_root_unsafe", dispatch_may_have_occurred=False)
+
+    def _native_or_test_executable(self, leading: bytes) -> bool:
+        if leading in _NATIVE_EXECUTABLE_MAGICS:
+            return True
+        return self.config.test_only_allow_script and leading.startswith(b"#!")
+
+    @staticmethod
+    def _descriptor_path(descriptor: int) -> str:
+        proc_path = f"/proc/self/fd/{descriptor}"
+        return proc_path if Path("/proc/self/fd").is_dir() else f"/dev/fd/{descriptor}"
 
     def _environment(self) -> dict[str, str]:
         return {
@@ -163,16 +346,17 @@ class WacliWrapper:
         command_arguments: tuple[str, ...],
         *,
         dispatch_may_have_occurred: bool,
-        required_signature: tuple[int, int, int, int] | None = None,
+        required_signature: tuple[int, int, int, int, str] | None = None,
         pass_fds: tuple[int, ...] = (),
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], tuple[int, int, int, int, str]]:
         if any("\x00" in argument for argument in command_arguments):
             raise WacliError("invalid_argument", dispatch_may_have_occurred=False)
-        signature = self._binary_signature()
+        executable_fd, signature = self._open_verified_executable()
         if required_signature is not None and signature != required_signature:
+            os.close(executable_fd)
             raise WacliError("executable_changed", dispatch_may_have_occurred=False)
         argv = (
-            str(self.config.executable),
+            self._descriptor_path(executable_fd),
             "--account",
             self.config.account,
             "--json",
@@ -188,10 +372,12 @@ class WacliWrapper:
                 stderr=asyncio.subprocess.PIPE,
                 env=self._environment(),
                 start_new_session=True,
-                pass_fds=pass_fds,
+                pass_fds=tuple(dict.fromkeys((*pass_fds, executable_fd))),
             )
         except OSError as exc:
             raise WacliError("process_start_failed", dispatch_may_have_occurred=False) from exc
+        finally:
+            os.close(executable_fd)
         assert process.stdout is not None
         assert process.stderr is not None
         try:
@@ -239,7 +425,7 @@ class WacliWrapper:
                 "command_failed",
                 dispatch_may_have_occurred=dispatch_may_have_occurred,
             )
-        return cast(dict[str, Any], value)
+        return cast(dict[str, Any], value), signature
 
     @staticmethod
     def _reported_version(result: Mapping[str, Any]) -> str | None:
@@ -255,10 +441,9 @@ class WacliWrapper:
     async def verify_version(self) -> None:
         """Preflight the exact binary version, caching only an unchanged inode."""
         async with self._version_lock:
-            signature = self._binary_signature()
-            if signature == self._verified_signature:
-                return
-            result = await self._run_json(("version",), dispatch_may_have_occurred=False)
+            result, signature = await self._run_json(
+                ("version",), dispatch_may_have_occurred=False
+            )
             if self._reported_version(result) != self.config.expected_version:
                 raise WacliError("version_mismatch", dispatch_may_have_occurred=False)
             self._verified_signature = signature
@@ -341,11 +526,12 @@ class WacliWrapper:
             command.extend(("--reply-to-sender", normalize_destination(reply_sender)))
         await self.verify_version()
         assert self._verified_signature is not None
-        return await self._run_json(
+        result, _ = await self._run_json(
             tuple(command),
             dispatch_may_have_occurred=True,
             required_signature=self._verified_signature,
         )
+        return result
 
     async def send_file(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {
@@ -424,11 +610,12 @@ class WacliWrapper:
                 command.extend(
                     ("--reply-to-sender", normalize_destination(reply_sender))
                 )
-            return await self._run_json(
+            result, _ = await self._run_json(
                 tuple(command),
                 dispatch_may_have_occurred=True,
                 required_signature=self._verified_signature,
                 pass_fds=(descriptor,),
             )
+            return result
         finally:
             os.close(descriptor)

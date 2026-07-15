@@ -89,6 +89,8 @@ def wrapper_config(executable: Path, tmp_path: Path, **changes: Any) -> WacliCon
         "timeout_seconds": 2,
         "max_output_bytes": 16 * 1024,
         "reviewed_dispatch_enabled": True,
+        "execution_snapshot_root": tmp_path / "exec-snapshots",
+        "test_only_allow_script": True,
     }
     values.update(changes)
     return WacliConfig(**values)
@@ -203,6 +205,41 @@ async def test_wacli_wrapper_rejects_binary_change_after_version_preflight(tmp_p
     assert caught.value.code == "executable_changed"
     assert caught.value.dispatch_may_have_occurred is False
     assert "send\ntext" not in log.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_wacli_wrapper_executes_verified_descriptor_not_swapped_path(
+    tmp_path: Path,
+) -> None:
+    executable, log = make_fake_wacli(tmp_path)
+    malicious_marker = tmp_path / "replacement-executed"
+
+    class SwapAfterOpenWrapper(WacliWrapper):
+        opens = 0
+
+        def _open_verified_executable(
+            self,
+        ) -> tuple[int, tuple[int, int, int, int, str]]:
+            descriptor, signature = super()._open_verified_executable()
+            self.opens += 1
+            if self.opens == 2:
+                replacement = tmp_path / "replacement-wacli"
+                replacement.write_text(
+                    "#!/bin/sh\n"
+                    f"touch {str(malicious_marker)!r}\n"
+                    "printf '%s' '{\"sent\":true}'\n",
+                    encoding="utf-8",
+                )
+                replacement.chmod(0o700)
+                os.replace(replacement, executable)
+            return descriptor, signature
+
+    wrapper = SwapAfterOpenWrapper(wrapper_config(executable, tmp_path))
+    result = await wrapper.send_text(text_arguments())
+
+    assert result == {"sent": True, "message_id": "wa-safe-id"}
+    assert not malicious_marker.exists()
+    assert log.read_text(encoding="utf-8").count("CALL") == 2
 
 
 @pytest.mark.asyncio
