@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -37,6 +37,7 @@ from signet.policy import (
     dump_policy,
     parse_policy_yaml,
     policy_config_hash,
+    policy_document,
 )
 from signet.state_machine import ApprovalStateMachine
 from signet.web_backend import (
@@ -51,6 +52,27 @@ PolicyApplyCallback = Callable[[PolicySnapshot], None]
 ListChangedCallback = Callable[[frozenset[str]], None]
 _POLICY_ACTIONS = frozenset({"promote_approval", "promote_passthrough"})
 _MAX_POLICY_BYTES = 4 * 1024 * 1024
+_DEFAULT_MAX_POLICY_VERSIONS = 10_000
+_DEFAULT_MAX_POLICY_HISTORY_BYTES = 256 * 1024 * 1024
+_SQLITE_MAX_INTEGER = (2**63) - 1
+
+_INVALIDATE_APPROVAL_CHALLENGES = """
+    UPDATE approval_challenges SET invalidated_at = ?
+    WHERE request_id = ? AND invalidated_at IS NULL AND consumed_at IS NULL
+"""
+_INVALIDATE_AUTH_CHALLENGES = """
+    UPDATE auth_challenges SET invalidated_at = ?
+    WHERE request_id = ? AND invalidated_at IS NULL AND consumed_at IS NULL
+"""
+_INVALIDATE_BROWSER_VIEWS = """
+    UPDATE browser_views SET invalidated_at = ?
+    WHERE request_id = ? AND invalidated_at IS NULL
+"""
+_INVALIDATION_QUERIES = (
+    _INVALIDATE_APPROVAL_CHALLENGES,
+    _INVALIDATE_AUTH_CHALLENGES,
+    _INVALIDATE_BROWSER_VIEWS,
+)
 
 
 class PolicyPersistenceError(PolicyPromotionError):
@@ -235,11 +257,39 @@ class SQLitePolicyPromotionBoundary:
         notify_list_changed: ListChangedCallback | None = None,
         fault_injector: PolicyFaultInjector | None = None,
         clock: Callable[[], int] | None = None,
+        max_policy_versions: int = _DEFAULT_MAX_POLICY_VERSIONS,
+        max_policy_history_bytes: int = _DEFAULT_MAX_POLICY_HISTORY_BYTES,
     ) -> None:
-        resolved = policy_path.expanduser().resolve(strict=True)
-        if not resolved.is_file() or policy_path.is_symlink():
+        if (
+            not isinstance(max_policy_versions, int)
+            or isinstance(max_policy_versions, bool)
+            or not 1 <= max_policy_versions <= 1_000_000
+            or not isinstance(max_policy_history_bytes, int)
+            or isinstance(max_policy_history_bytes, bool)
+            or not 1 <= max_policy_history_bytes <= 8 * 1024 * 1024 * 1024
+        ):
+            raise ValueError("durable policy history limits are invalid")
+        expanded = policy_path.expanduser()
+        resolved_parent = expanded.parent.resolve(strict=True)
+        _require_secure_directory(resolved_parent)
+        if expanded.is_symlink():
             raise PolicyPersistenceError("policy path must be an existing regular file")
-        if database.path.parent.resolve() == resolved:
+        resolved = resolved_parent / expanded.name
+        try:
+            _read_regular(resolved)
+        except FileNotFoundError:
+            with database.read() as connection:
+                recoverable = connection.execute(
+                    """
+                    SELECT 1 FROM durable_policy_file_state
+                    WHERE singleton = 1 AND sync_state = 'pending'
+                    """
+                ).fetchone()
+            if recoverable is None:
+                raise PolicyPersistenceError(
+                    "missing policy file has no committed pending recovery"
+                ) from None
+        if database.path.expanduser().resolve() == resolved:
             raise PolicyPersistenceError("policy path cannot be the approval database")
         self.database = database
         self.state_machine = state_machine
@@ -252,6 +302,8 @@ class SQLitePolicyPromotionBoundary:
         self._notify_list_changed = notify_list_changed
         self._fault_injector = fault_injector
         self._clock = clock or (lambda: int(time.time()))
+        self._max_policy_versions = max_policy_versions
+        self._max_policy_history_bytes = max_policy_history_bytes
         self._thread_lock = threading.RLock()
         self._ready = False
         self.recover(now=self._clock())
@@ -316,9 +368,10 @@ class SQLitePolicyPromotionBoundary:
 
         self._ready = False
         with self._locked():
-            stored = self._stored_policy()
+            stored = self._stored_policy(verify_history=True)
             if stored is None:
                 self._bootstrap(now=now)
+                self._remove_untracked_pending()
                 if self._apply_policy is not None:
                     self._apply_policy(self.engine.snapshot)
                 self._ready = True
@@ -334,7 +387,7 @@ class SQLitePolicyPromotionBoundary:
                     raise PolicyDivergenceError(
                         "policy file differs from the synced durable policy snapshot"
                     )
-                if self.pending_path.exists():
+                if self.pending_path.exists() or self.pending_path.is_symlink():
                     self._remove_untracked_pending()
             self.engine.restore_durable_snapshot(snapshot)
             if self._apply_policy is not None:
@@ -377,6 +430,10 @@ class SQLitePolicyPromotionBoundary:
                 self._fault("policy:pending_fsynced")
                 with self.database.transaction() as connection:
                     self._require_current_policy(connection, plan)
+                    self._require_history_capacity(
+                        connection,
+                        additional_bytes=len(plan.snapshot_yaml),
+                    )
                     request = connection.execute(
                         "SELECT * FROM approval_requests WHERE request_id = ?",
                         (request_id,),
@@ -473,7 +530,8 @@ class SQLitePolicyPromotionBoundary:
                 self._fault("policy:db_committed")
                 self._fault("policy:before_rename")
                 self._replace_pending(
-                    expected_current_hash=plan.previous_file_sha256
+                    expected_current_hash=plan.previous_file_sha256,
+                    expected_pending_hash=plan.file_sha256,
                 )
                 self._fault("policy:renamed")
                 self._fault("policy:before_sync_mark")
@@ -568,11 +626,7 @@ class SQLitePolicyPromotionBoundary:
                 raise InvalidTransition("request action is not a policy promotion")
             alias = str(request["downstream_alias"])
             tool = str(request["tool_name"])
-            mode = (
-                PolicyMode.APPROVAL
-                if action == "promote_approval"
-                else PolicyMode.PASSTHROUGH
-            )
+            mode = PolicyMode.APPROVAL if action == "promote_approval" else PolicyMode.PASSTHROUGH
             origin = "one_click_promotion"
         binding_action = f"promote_{mode.value}"
         stored = self._stored_policy()
@@ -584,11 +638,18 @@ class SQLitePolicyPromotionBoundary:
             or not _same_text(stored.config_hash, policy_config_hash(self.engine.snapshot))
         ):
             raise PolicyUnavailable("durable policy is not ready for promotion")
+        if self.engine.snapshot.version >= _SQLITE_MAX_INTEGER:
+            raise PolicyUnavailable("durable policy version space is exhausted")
         try:
             snapshot, previous, updated = self.engine.preview_promotion(alias, tool, mode)
         except PolicyError as exc:
             raise PolicyPersistenceError("reviewed policy promotion was refused") from exc
         serialized = dump_policy(snapshot)
+        with self.database.read() as connection:
+            self._require_history_capacity(
+                connection,
+                additional_bytes=len(serialized),
+            )
         return _PromotionPlan(
             request_id=request_id,
             version=expected_version,
@@ -644,15 +705,8 @@ class SQLitePolicyPromotionBoundary:
             ).rowcount
         if updated != 1:
             raise StaleVersion(plan.request_id)
-        for table in ("approval_challenges", "auth_challenges", "browser_views"):
-            connection.execute(
-                f"""
-                UPDATE {table} SET invalidated_at = ?
-                WHERE request_id = ? AND invalidated_at IS NULL
-                  {"AND consumed_at IS NULL" if table != "browser_views" else ""}
-                """,
-                (now, plan.request_id),
-            )
+        for query in _INVALIDATION_QUERIES:
+            connection.execute(query, (now, plan.request_id))
         connection.execute(
             """
             INSERT INTO request_events(
@@ -684,22 +738,28 @@ class SQLitePolicyPromotionBoundary:
     def _bootstrap(self, *, now: int) -> None:
         raw = _read_regular(self.policy_path)
         snapshot = _parse_snapshot(raw)
-        if (
-            snapshot.version != self.engine.snapshot.version
-            or policy_config_hash(snapshot) != policy_config_hash(self.engine.snapshot)
-        ):
+        if len(raw) > self._max_policy_history_bytes:
+            raise PolicyUnavailable("initial policy exceeds the durable history limit")
+        if snapshot.version > _SQLITE_MAX_INTEGER:
+            raise PolicyDivergenceError("policy version exceeds SQLite's integer range")
+        if snapshot.version != self.engine.snapshot.version or policy_config_hash(
+            snapshot
+        ) != policy_config_hash(self.engine.snapshot):
             raise PolicyDivergenceError(
                 "runtime policy does not match the policy file during bootstrap"
             )
         config_hash = policy_config_hash(snapshot)
         file_hash = hashlib.sha256(raw).hexdigest()
         with self.database.transaction() as connection:
-            if connection.execute(
-                "SELECT 1 FROM durable_policy_file_state WHERE singleton = 1"
-            ).fetchone() is not None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM durable_policy_file_state WHERE singleton = 1"
+                ).fetchone()
+                is not None
+            ):
                 raise PolicyUnavailable("durable policy was initialized concurrently")
             existing_versions = connection.execute(
-                "SELECT policy_version_id, config_hash FROM policy_versions"
+                "SELECT policy_version_id, config_hash, applied FROM policy_versions"
             ).fetchall()
             if not existing_versions:
                 connection.execute(
@@ -714,9 +774,8 @@ class SQLitePolicyPromotionBoundary:
             elif (
                 len(existing_versions) != 1
                 or int(existing_versions[0]["policy_version_id"]) != snapshot.version
-                or not _same_text(
-                    str(existing_versions[0]["config_hash"]), config_hash
-                )
+                or not bool(existing_versions[0]["applied"])
+                or not _same_text(str(existing_versions[0]["config_hash"]), config_hash)
             ):
                 raise PolicyDivergenceError(
                     "existing policy history cannot be reconciled during bootstrap"
@@ -739,8 +798,13 @@ class SQLitePolicyPromotionBoundary:
                 """,
                 (snapshot.version, config_hash, file_hash, now),
             )
+        current = _read_regular(self.policy_path)
+        if not _same_digest(current, file_hash):
+            raise PolicyDivergenceError(
+                "policy file changed while its durable ledger was initialized"
+            )
 
-    def _stored_policy(self) -> _StoredPolicy | None:
+    def _stored_policy(self, *, verify_history: bool = False) -> _StoredPolicy | None:
         with self.database.read() as connection:
             row = connection.execute(
                 """
@@ -762,6 +826,10 @@ class SQLitePolicyPromotionBoundary:
                 WHERE state.singleton = 1
                 """
             ).fetchone()
+            if row is not None:
+                self._validate_history_bounds(connection, latest_version=int(row[0]))
+                if verify_history:
+                    self._validate_policy_history(connection)
         if row is None:
             return None
         hashes = {
@@ -787,6 +855,107 @@ class SQLitePolicyPromotionBoundary:
             ),
         )
 
+    def _validate_history_bounds(self, connection: Any, *, latest_version: int) -> None:
+        statistics = connection.execute(
+            """
+            SELECT count(*) AS snapshot_count,
+                   coalesce(sum(length(snapshot_yaml)), 0) AS aggregate_bytes,
+                   min(policy_version_id) AS first_version,
+                   max(policy_version_id) AS last_version
+            FROM durable_policy_snapshots
+            """
+        ).fetchone()
+        version_statistics = connection.execute(
+            """
+            SELECT count(*) AS version_count,
+                   min(policy_version_id) AS first_version,
+                   max(policy_version_id) AS last_version
+            FROM policy_versions
+            """
+        ).fetchone()
+        snapshot_count = int(statistics["snapshot_count"])
+        version_count = int(version_statistics["version_count"])
+        aggregate_bytes = int(statistics["aggregate_bytes"])
+        first_version = statistics["first_version"]
+        last_version = statistics["last_version"]
+        if (
+            snapshot_count < 1
+            or snapshot_count != version_count
+            or snapshot_count > self._max_policy_versions
+            or aggregate_bytes > self._max_policy_history_bytes
+            or first_version is None
+            or last_version is None
+            or int(last_version) != latest_version
+            or int(version_statistics["last_version"]) != latest_version
+            or int(first_version) != int(version_statistics["first_version"])
+            or int(last_version) - int(first_version) + 1 != snapshot_count
+        ):
+            raise PolicyDivergenceError("durable policy history is incomplete or exceeds limits")
+
+    def _validate_policy_history(self, connection: Any) -> None:
+        rows = connection.execute(
+            """
+            SELECT snapshot.policy_version_id, snapshot.config_hash,
+                   snapshot.prior_config_hash, snapshot.snapshot_yaml,
+                   snapshot.file_sha256, version.config_hash AS version_config_hash,
+                   version.applied, version.mode_diffs_json,
+                   version.originating_event
+            FROM durable_policy_snapshots AS snapshot
+            JOIN policy_versions AS version
+              ON version.policy_version_id = snapshot.policy_version_id
+            ORDER BY snapshot.policy_version_id
+            """
+        )
+        previous_version: int | None = None
+        previous_hash: str | None = None
+        previous_snapshot: PolicySnapshot | None = None
+        for row in rows:
+            version = int(row["policy_version_id"])
+            config_hash = str(row["config_hash"])
+            snapshot_yaml = bytes(row["snapshot_yaml"])
+            snapshot = _parse_snapshot(snapshot_yaml)
+            if (
+                not bool(row["applied"])
+                or not _same_text(config_hash, str(row["version_config_hash"]))
+                or not _same_digest(snapshot_yaml, str(row["file_sha256"]))
+                or snapshot.version != version
+                or not _same_text(policy_config_hash(snapshot), config_hash)
+                or (previous_version is None and row["prior_config_hash"] is not None)
+                or (
+                    previous_version is not None
+                    and (
+                        version != previous_version + 1
+                        or row["prior_config_hash"] is None
+                        or not _same_text(str(row["prior_config_hash"]), previous_hash or "")
+                    )
+                )
+            ):
+                raise PolicyDivergenceError("durable policy history failed integrity review")
+            if previous_snapshot is not None:
+                _validate_policy_transition(previous_snapshot, snapshot, row)
+            previous_version = version
+            previous_hash = config_hash
+            previous_snapshot = snapshot
+
+    def _require_history_capacity(
+        self,
+        connection: Any,
+        *,
+        additional_bytes: int,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT count(*) AS snapshot_count,
+                   coalesce(sum(length(snapshot_yaml)), 0) AS aggregate_bytes
+            FROM durable_policy_snapshots
+            """
+        ).fetchone()
+        if (
+            int(row["snapshot_count"]) >= self._max_policy_versions
+            or int(row["aggregate_bytes"]) + additional_bytes > self._max_policy_history_bytes
+        ):
+            raise PolicyUnavailable("durable policy history capacity is exhausted")
+
     def _validate_stored(self, stored: _StoredPolicy) -> PolicySnapshot:
         if (
             not stored.applied
@@ -797,39 +966,37 @@ class SQLitePolicyPromotionBoundary:
         if not _same_digest(stored.snapshot_yaml, stored.file_sha256):
             raise PolicyDivergenceError("durable policy snapshot bytes are corrupted")
         snapshot = _parse_snapshot(stored.snapshot_yaml)
-        if (
-            snapshot.version != stored.version
-            or not _same_text(policy_config_hash(snapshot), stored.config_hash)
+        if snapshot.version != stored.version or not _same_text(
+            policy_config_hash(snapshot), stored.config_hash
         ):
             raise PolicyDivergenceError("durable policy snapshot metadata is inconsistent")
         return snapshot
 
     def _recover_pending_file(self, stored: _StoredPolicy) -> None:
+        current_missing = False
         try:
             current = _read_regular(self.policy_path)
         except FileNotFoundError:
+            current_missing = True
             current = b""
         if _same_digest(current, stored.file_sha256):
-            if self.pending_path.exists():
-                pending = _read_regular(self.pending_path)
-                if not _same_digest(pending, stored.file_sha256):
-                    raise PolicyDivergenceError(
-                        "pending policy file conflicts with committed state"
-                    )
-                self.pending_path.unlink()
-                _fsync_directory(self.policy_path.parent)
+            self._remove_untracked_pending()
             return
-        if not self.pending_path.exists():
-            raise PolicyDivergenceError("committed pending policy snapshot is unavailable")
-        pending = _read_regular(self.pending_path)
-        if not _same_digest(pending, stored.file_sha256):
-            raise PolicyDivergenceError("pending policy snapshot hash does not match the ledger")
-        if (
+        if not current_missing and (
             stored.previous_file_sha256 is None
             or not _same_digest(current, stored.previous_file_sha256)
         ):
             raise PolicyDivergenceError("current policy file changed before pending recovery")
-        self._replace_pending(expected_current_hash=stored.previous_file_sha256)
+        if self.pending_path.exists() or self.pending_path.is_symlink():
+            pending = _read_regular(self.pending_path)
+            if not _same_digest(pending, stored.file_sha256):
+                self._write_pending(stored.snapshot_yaml)
+        else:
+            self._write_pending(stored.snapshot_yaml)
+        self._replace_pending(
+            expected_current_hash=(None if current_missing else stored.previous_file_sha256),
+            expected_pending_hash=stored.file_sha256,
+        )
 
     def _require_current_policy(self, connection: Any, plan: _PromotionPlan) -> None:
         row = connection.execute(
@@ -913,11 +1080,19 @@ class SQLitePolicyPromotionBoundary:
                 os.unlink(temporary_name, dir_fd=parent_fd)
             os.close(parent_fd)
 
-    def _replace_pending(self, *, expected_current_hash: str | None = None) -> None:
+    def _replace_pending(
+        self,
+        *,
+        expected_current_hash: str | None = None,
+        expected_pending_hash: str,
+    ) -> None:
         if expected_current_hash is not None:
             current = _read_regular(self.policy_path)
             if not _same_digest(current, expected_current_hash):
                 raise PolicyDivergenceError("policy file changed before atomic writeback")
+        pending = _read_regular(self.pending_path)
+        if not _same_digest(pending, expected_pending_hash):
+            raise PolicyDivergenceError("pending policy changed before atomic writeback")
         parent_fd = _open_directory(self.policy_path.parent)
         try:
             os.replace(
@@ -931,11 +1106,15 @@ class SQLitePolicyPromotionBoundary:
             os.close(parent_fd)
 
     def _remove_untracked_pending(self) -> None:
+        parent_fd = _open_directory(self.policy_path.parent)
         try:
-            self.pending_path.unlink()
-        except FileNotFoundError:
-            return
-        _fsync_directory(self.policy_path.parent)
+            try:
+                os.unlink(self.pending_path.name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
 
     def _require_ready(self) -> None:
         if not self._ready:
@@ -947,14 +1126,38 @@ class SQLitePolicyPromotionBoundary:
             flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            descriptor = os.open(self.lock_path, flags, 0o600)
-            os.fchmod(descriptor, 0o600)
+            parent_fd = _open_directory(self.lock_path.parent)
+            descriptor = -1
+            acquired = False
             try:
+                descriptor = os.open(
+                    self.lock_path.name,
+                    flags,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                metadata = os.fstat(descriptor)
+                _require_secure_regular_metadata(metadata, label="policy lock")
+                os.fchmod(descriptor, 0o600)
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
+                acquired = True
+                path_metadata = os.stat(
+                    self.lock_path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    path_metadata.st_dev != metadata.st_dev
+                    or path_metadata.st_ino != metadata.st_ino
+                ):
+                    raise PolicyPersistenceError("policy lock changed while it was acquired")
                 yield
             finally:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
+                if acquired:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                if descriptor >= 0:
+                    os.close(descriptor)
+                os.close(parent_fd)
 
     def _fault(self, stage: str) -> None:
         if self._fault_injector is not None:
@@ -1006,8 +1209,7 @@ def _read_regular(path: Path) -> bytes:
     descriptor = os.open(path, flags)
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise PolicyDivergenceError("policy storage must be a single-link regular file")
+        _require_secure_regular_metadata(metadata, label="policy storage")
         chunks: list[bytes] = []
         remaining = _MAX_POLICY_BYTES + 1
         while remaining:
@@ -1028,7 +1230,47 @@ def _open_directory(path: Path) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    return os.open(path, flags)
+    descriptor = os.open(path, flags)
+    try:
+        _require_secure_directory_metadata(os.fstat(descriptor))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _require_secure_directory(path: Path) -> None:
+    descriptor = _open_directory(path)
+    try:
+        if not os.access(path, os.W_OK | os.X_OK):
+            raise PolicyPersistenceError("policy directory is not writable by the gateway")
+    finally:
+        os.close(descriptor)
+
+
+def _require_secure_directory_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid not in {0, os.geteuid()}
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise PolicyPersistenceError(
+            "policy directory must be trusted and not group/world writable"
+        )
+
+
+def _require_secure_regular_metadata(
+    metadata: os.stat_result,
+    *,
+    label: str,
+) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid not in {0, os.geteuid()}
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise PolicyDivergenceError(f"{label} must be a trusted, single-link regular file")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1081,3 +1323,45 @@ def _changed_aliases_from_latest(database: Database, version: int) -> frozenset[
     if not isinstance(value, dict) or not isinstance(value.get("alias"), str):
         raise PolicyDivergenceError("recovered policy audit diff lacks an alias")
     return frozenset({value["alias"]})
+
+
+def _validate_policy_transition(
+    previous: PolicySnapshot,
+    current: PolicySnapshot,
+    history_row: Any,
+) -> None:
+    try:
+        audit = json.loads(str(history_row["mode_diffs_json"]))
+    except (TypeError, ValueError):
+        raise PolicyDivergenceError("durable policy audit history is invalid") from None
+    if (
+        not isinstance(audit, dict)
+        or set(audit) != {"alias", "new_mode", "old_mode", "request_id", "tool"}
+        or not all(
+            isinstance(audit.get(field), str) and bool(audit[field])
+            for field in ("alias", "new_mode", "old_mode", "request_id", "tool")
+        )
+        or len(audit["request_id"]) > 256
+        or history_row["originating_event"] not in {"one_click_promotion", "request_tool_access"}
+    ):
+        raise PolicyDivergenceError("durable policy audit history is invalid")
+    alias = audit["alias"]
+    tool = audit["tool"]
+    previous_tool = previous.configured(alias, tool)
+    current_tool = current.configured(alias, tool)
+    if (
+        current.version != previous.version + 1
+        or previous_tool is None
+        or current_tool is None
+        or previous_tool.mode.value != audit["old_mode"]
+        or current_tool.mode.value != audit["new_mode"]
+        or previous_tool == current_tool
+        or previous_tool != replace(current_tool, mode=previous_tool.mode)
+    ):
+        raise PolicyDivergenceError("durable policy transition does not match its audit record")
+    previous_document = policy_document(previous)
+    current_document = policy_document(current)
+    current_document["version"] = previous.version
+    current_document["downstreams"][alias]["tools"][tool]["mode"] = previous_tool.mode.value
+    if current_document != previous_document:
+        raise PolicyDivergenceError("durable policy transition changed unreviewed fields")

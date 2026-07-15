@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from signet.db import Database, IntegrityError
 from signet.freezer import RequestFreezer
 from signet.gateway_tools import AccessRequestDraft
 from signet.mcp_mirror import SchemaMirror
+from signet.models import InvalidConfirmation
 from signet.policy import (
     PolicyEngine,
     PolicyMode,
@@ -29,6 +31,7 @@ from signet.policy import (
 )
 from signet.policy_persistence import (
     PolicyDivergenceError,
+    PolicyPersistenceError,
     SQLiteActionDraftRepository,
     SQLitePolicyPromotionBoundary,
 )
@@ -38,6 +41,7 @@ from signet.web_backend import (
     EncryptedPayloadReviewer,
     PolicyPromotionBoundary,
     WebActionDraft,
+    _totp_confirmation,
 )
 from signet.webauthn import SQLiteWebAuthnRepository, WebAuthnCredential
 from tests.test_web_backend import (
@@ -238,9 +242,7 @@ def test_sqlite_action_draft_is_immutable_and_survives_restart(
         "edit",
         expected_version=1,
         expected_payload_hash=str(row["current_payload_hash"]),
-        prospective_arguments_json=(
-            '{"recipient":"restart@example.test","body":"durable edit"}'
-        ),
+        prospective_arguments_json=('{"recipient":"restart@example.test","body":"durable edit"}'),
         http_method="POST",
         now=NOW + 1,
     )
@@ -338,16 +340,19 @@ def test_web_totp_promotion_is_atomic_distinct_audited_and_single_use(
     _, principal = bundle.session()
     payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
 
-    assert bundle.backend.complete_totp_action(
-        principal,
-        request_id,
-        "promote_approval",
-        "fake:410",
-        expected_version=1,
-        expected_payload_hash=payload_hash,
-        prospective_arguments_json=None,
-        now=NOW + 1,
-    ) == "policy_updated"
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "promote_approval",
+            "fake:410",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+        == "policy_updated"
+    )
 
     applied = load_policy(policy_path)
     assert applied.version == 2
@@ -417,17 +422,18 @@ def test_passkey_promotion_binds_exact_mode_and_consumes_durable_draft(
     assert challenge.binding.action == "promote_passthrough"
     assert SQLiteActionDraftRepository(bundle.database).find(options.challenge_id) is not None
 
-    assert bundle.backend.complete_passkey_action(
-        principal,
-        request_id,
-        options.challenge_id,
-        cast(dict[str, Any], bundle.assertion(options.challenge_id)),
-        http_method="POST",
-        now=NOW + 2,
-    ) == "policy_updated"
-    assert load_policy(policy_path).resolve(
-        "fake-service", "create_item"
-    ) is PolicyMode.PASSTHROUGH
+    assert (
+        bundle.backend.complete_passkey_action(
+            principal,
+            request_id,
+            options.challenge_id,
+            cast(dict[str, Any], bundle.assertion(options.challenge_id)),
+            http_method="POST",
+            now=NOW + 2,
+        )
+        == "policy_updated"
+    )
+    assert load_policy(policy_path).resolve("fake-service", "create_item") is PolicyMode.PASSTHROUGH
     consumed = bundle.webauthn.find_challenge(options.challenge_id)
     assert consumed is not None and consumed.consumed_at == NOW + 2
     assert bundle.adapter.downstream_calls == []
@@ -496,9 +502,7 @@ def test_mcp_totp_context_cannot_create_a_policy_confirmation(
             now=NOW + 1,
         )
     with bundle.database.read() as connection:
-        assert connection.execute(
-            "SELECT 1 FROM auth_proof_consumptions"
-        ).fetchone() is None
+        assert connection.execute("SELECT 1 FROM auth_proof_consumptions").fetchone() is None
 
 
 @pytest.mark.parametrize(
@@ -553,22 +557,28 @@ def test_gateway_access_request_chooses_guarded_mode_and_never_dispatches(
     challenge = bundle.webauthn.find_challenge(options.challenge_id)
     assert challenge is not None and challenge.binding.action == expected_binding
 
-    assert bundle.backend.complete_passkey_action(
-        principal,
-        request_id,
-        options.challenge_id,
-        cast(dict[str, Any], bundle.assertion(options.challenge_id)),
-        http_method="POST",
-        now=NOW + 2,
-    ) == "policy_updated"
+    assert (
+        bundle.backend.complete_passkey_action(
+            principal,
+            request_id,
+            options.challenge_id,
+            cast(dict[str, Any], bundle.assertion(options.challenge_id)),
+            http_method="POST",
+            now=NOW + 2,
+        )
+        == "policy_updated"
+    )
     result = bundle.state_machine.get_request(request_id)
     assert result["state"] == "succeeded"
     assert json.loads(str(result["safe_outcome_json"])) == {"status": "policy_updated"}
     assert load_policy(policy_path).resolve("fake-service", "create_item") is expected_mode
     with bundle.database.read() as connection:
-        assert connection.execute(
-            "SELECT 1 FROM execution_attempts WHERE request_id = ?", (request_id,)
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT 1 FROM execution_attempts WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            is None
+        )
     assert bundle.adapter.downstream_calls == []
 
 
@@ -628,16 +638,19 @@ def test_every_policy_crash_step_is_rollback_safe_or_restart_recoverable(
         assert state["sync_state"] == "synced"
         assert not installed.boundary.pending_path.exists()
         selected_stage[0] = None
-        assert bundle.backend.complete_totp_action(
-            principal,
-            request_id,
-            "promote_approval",
-            "fake:520",
-            expected_version=1,
-            expected_payload_hash=payload_hash,
-            prospective_arguments_json=None,
-            now=NOW + 2,
-        ) == "policy_updated"
+        assert (
+            bundle.backend.complete_totp_action(
+                principal,
+                request_id,
+                "promote_approval",
+                "fake:520",
+                expected_version=1,
+                expected_payload_hash=payload_hash,
+                prospective_arguments_json=None,
+                now=NOW + 2,
+            )
+            == "policy_updated"
+        )
         return
 
     assert versions == 2
@@ -651,9 +664,7 @@ def test_every_policy_crash_step_is_rollback_safe_or_restart_recoverable(
     assert load_policy(policy_path).version == 2
     assert recovered.notified == [frozenset({"fake-service"})]
     with bundle.database.read() as connection:
-        recovered_state = connection.execute(
-            "SELECT * FROM durable_policy_file_state"
-        ).fetchone()
+        recovered_state = connection.execute("SELECT * FROM durable_policy_file_state").fetchone()
     assert recovered_state["sync_state"] == "synced"
     assert recovered_state["publication_pending"] == 0
     assert not recovered.boundary.pending_path.exists()
@@ -689,9 +700,10 @@ def test_concurrent_policy_confirmations_have_one_stale_loser(
     assert load_policy(policy_path).version == 2
     with bundle.database.read() as connection:
         assert int(connection.execute("SELECT count(*) FROM policy_versions").fetchone()[0]) == 2
-        assert int(
-            connection.execute("SELECT count(*) FROM auth_proof_consumptions").fetchone()[0]
-        ) == 1
+        assert (
+            int(connection.execute("SELECT count(*) FROM auth_proof_consumptions").fetchone()[0])
+            == 1
+        )
     assert bundle.adapter.downstream_calls == []
 
 
@@ -770,9 +782,8 @@ def test_policy_ledger_rows_are_append_only(
         bundle.database.transaction() as connection,
         pytest.raises(IntegrityError, match="append-only"),
     ):
-        connection.execute(
-            "DELETE FROM durable_policy_snapshots WHERE policy_version_id = 1"
-        )
+        connection.execute("DELETE FROM durable_policy_snapshots WHERE policy_version_id = 1")
+
 
 def test_writeback_preserves_every_strict_security_field(
     durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
@@ -797,12 +808,304 @@ def test_writeback_preserves_every_strict_security_field(
     assert after_snapshot.version == 2
     assert after["mode_contracts"] == before["mode_contracts"]
     assert after["policy_changes"] == before["policy_changes"]
-    assert after["downstreams"]["fake-service"]["schema_review"] == before[
-        "downstreams"
-    ]["fake-service"]["schema_review"]
+    assert (
+        after["downstreams"]["fake-service"]["schema_review"]
+        == before["downstreams"]["fake-service"]["schema_review"]
+    )
     after_tool = after["downstreams"]["fake-service"]["tools"]["create_item"]
     before_tool = before["downstreams"]["fake-service"]["tools"]["create_item"]
     assert {key: value for key, value in after_tool.items() if key != "mode"} == {
         key: value for key, value in before_tool.items() if key != "mode"
     }
     assert policy_config_hash(after_snapshot) != policy_config_hash(_snapshot())
+
+
+def test_policy_lock_hardlink_is_rejected_without_chmodding_target(tmp_path: Path) -> None:
+    bundle = assemble(Database(tmp_path / "hardlink.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    initial = _write_policy(policy_path)
+    target = tmp_path / "do-not-touch"
+    target.write_text("operator data", encoding="utf-8")
+    target.chmod(0o644)
+    os.link(target, tmp_path / ".policy.yaml.lock")
+
+    with pytest.raises(PolicyDivergenceError, match="policy lock"):
+        SQLitePolicyPromotionBoundary(
+            bundle.database,
+            bundle.state_machine,
+            _reviewer(bundle),
+            PolicyEngine(initial),
+            policy_path,
+            clock=lambda: NOW,
+        )
+    assert target.stat().st_mode & 0o777 == 0o644
+    assert target.read_text(encoding="utf-8") == "operator data"
+
+
+@pytest.mark.parametrize("unsafe_mode", [0o620, 0o606])
+def test_policy_file_rejects_group_or_world_write_permissions(
+    tmp_path: Path,
+    unsafe_mode: int,
+) -> None:
+    bundle = assemble(Database(tmp_path / "permissions.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    initial = _write_policy(policy_path)
+    policy_path.chmod(unsafe_mode)
+
+    with pytest.raises(PolicyDivergenceError, match="policy storage"):
+        SQLitePolicyPromotionBoundary(
+            bundle.database,
+            bundle.state_machine,
+            _reviewer(bundle),
+            PolicyEngine(initial),
+            policy_path,
+            clock=lambda: NOW,
+        )
+
+
+def test_policy_directory_rejects_group_write_permissions(tmp_path: Path) -> None:
+    bundle = assemble(Database(tmp_path / "directory-permissions.sqlite3"))
+    policy_directory = tmp_path / "policy"
+    policy_directory.mkdir(mode=0o700)
+    policy_path = policy_directory / "policy.yaml"
+    initial = _write_policy(policy_path)
+    policy_directory.chmod(0o770)
+
+    with pytest.raises(PolicyPersistenceError, match="policy directory"):
+        SQLitePolicyPromotionBoundary(
+            bundle.database,
+            bundle.state_machine,
+            _reviewer(bundle),
+            PolicyEngine(initial),
+            policy_path,
+            clock=lambda: NOW,
+        )
+
+
+def test_bootstrap_rejects_an_unapplied_matching_legacy_version(tmp_path: Path) -> None:
+    database = Database(tmp_path / "unapplied.sqlite3")
+    database.initialize()
+    policy_path = tmp_path / "policy.yaml"
+    initial = _write_policy(policy_path)
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO policy_versions(
+                policy_version_id, actor, created_at, mode_diffs_json,
+                originating_event, config_hash, applied
+            ) VALUES (?, 'legacy:test', ?, '[]', 'file_change', ?, 0)
+            """,
+            (initial.version, NOW - 1, policy_config_hash(initial)),
+        )
+    bundle = assemble(database)
+
+    with pytest.raises(PolicyDivergenceError, match="cannot be reconciled"):
+        SQLitePolicyPromotionBoundary(
+            database,
+            bundle.state_machine,
+            _reviewer(bundle),
+            PolicyEngine(initial),
+            policy_path,
+            clock=lambda: NOW,
+        )
+
+
+def test_bootstrap_detects_policy_file_change_before_becoming_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import signet.policy_persistence as policy_persistence
+
+    bundle = assemble(Database(tmp_path / "bootstrap-race.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    initial = _write_policy(policy_path)
+    original_read = policy_persistence._read_regular
+    reads = 0
+
+    def racing_read(path: Path) -> bytes:
+        nonlocal reads
+        value = original_read(path)
+        if path == policy_path and reads == 1:
+            policy_path.write_bytes(value + b"# concurrent change\n")
+        reads += 1
+        return value
+
+    monkeypatch.setattr(policy_persistence, "_read_regular", racing_read)
+    with pytest.raises(PolicyDivergenceError, match="changed while"):
+        SQLitePolicyPromotionBoundary(
+            bundle.database,
+            bundle.state_machine,
+            _reviewer(bundle),
+            PolicyEngine(initial),
+            policy_path,
+            clock=lambda: NOW,
+        )
+    monkeypatch.setattr(policy_persistence, "_read_regular", original_read)
+    policy_path.write_bytes(dump_policy(initial))
+    recovered = SQLitePolicyPromotionBoundary(
+        bundle.database,
+        bundle.state_machine,
+        _reviewer(bundle),
+        PolicyEngine(initial),
+        policy_path,
+        clock=lambda: NOW + 1,
+    )
+    assert recovered.ready
+
+
+def test_policy_history_limits_refuse_staging_before_human_proof(tmp_path: Path) -> None:
+    bundle = _assemble_enrolled(Database(tmp_path / "history-cap.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    installed = _install(bundle, policy_path)
+    limited = SQLitePolicyPromotionBoundary(
+        bundle.database,
+        bundle.state_machine,
+        _reviewer(bundle),
+        PolicyEngine(load_policy(policy_path)),
+        policy_path,
+        max_policy_versions=1,
+        clock=lambda: NOW,
+    )
+    bundle.backend._policy_promotions = cast(PolicyPromotionBoundary, limited)
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+
+    with pytest.raises(WebConflict, match="staged safely"):
+        bundle.backend.begin_passkey_action(
+            principal,
+            request_id,
+            "promote_approval",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            http_method="POST",
+            now=NOW + 1,
+        )
+    with bundle.database.read() as connection:
+        assert connection.execute("SELECT 1 FROM auth_challenges").fetchone() is None
+        assert connection.execute("SELECT 1 FROM auth_proof_consumptions").fetchone() is None
+    assert installed.engine.snapshot.version == 1
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "current_missing"])
+def test_committed_policy_recovers_pending_bytes_from_durable_snapshot(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    bundle = _assemble_enrolled(Database(tmp_path / f"recover-{damage}.sqlite3"))
+    policy_path = tmp_path / f"policy-{damage}.yaml"
+    initial = _write_policy(policy_path)
+
+    def crash(stage: str) -> None:
+        if stage == "policy:db_committed":
+            raise InjectedPolicyCrash(stage)
+
+    installed = _install(bundle, policy_path, fault=crash)
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    with pytest.raises(InjectedPolicyCrash, match="db_committed"):
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "promote_approval",
+            "fake:880",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+    if damage == "missing":
+        installed.boundary.pending_path.unlink()
+    elif damage == "current_missing":
+        policy_path.unlink()
+    else:
+        installed.boundary.pending_path.write_bytes(b"corrupt pending policy")
+
+    restarted = assemble(Database(bundle.database.path), adapter=bundle.adapter)
+    if damage == "current_missing":
+        recovered_boundary = SQLitePolicyPromotionBoundary(
+            restarted.database,
+            restarted.state_machine,
+            _reviewer(restarted),
+            PolicyEngine(initial),
+            policy_path,
+            clock=lambda: NOW + 2,
+        )
+    else:
+        recovered_boundary = _install(restarted, policy_path).boundary
+    assert recovered_boundary.ready
+    assert load_policy(policy_path).version == 2
+    assert not recovered_boundary.pending_path.exists()
+
+
+def test_pending_file_swap_is_detected_before_rename_and_then_recovered(
+    tmp_path: Path,
+) -> None:
+    bundle = _assemble_enrolled(Database(tmp_path / "pending-swap.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    initial = _write_policy(policy_path)
+    boundary_ref: list[SQLitePolicyPromotionBoundary] = []
+
+    def swap_pending(stage: str) -> None:
+        if stage == "policy:before_rename":
+            boundary_ref[0].pending_path.write_bytes(b"swapped bytes")
+
+    installed = _install(bundle, policy_path, fault=swap_pending)
+    boundary_ref.append(installed.boundary)
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    with pytest.raises(WebConflict, match="safely"):
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "promote_approval",
+            "fake:881",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+    assert load_policy(policy_path) == initial
+    assert not installed.boundary.ready
+
+    restarted = assemble(Database(bundle.database.path), adapter=bundle.adapter)
+    recovered = _install(restarted, policy_path)
+    assert recovered.boundary.ready
+    assert load_policy(policy_path).version == 2
+
+
+def test_totp_policy_proof_cannot_be_swapped_to_another_mode(
+    durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
+) -> None:
+    bundle, policy_path, installed = durable_bundle
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    signed_binding = ActionBinding("promote_approval", request_id, 1, payload_hash)
+    proof = bundle.backend._totp.verify(
+        principal.user_id,
+        "fake:882",
+        binding=signed_binding,
+        source_id=f"web-action:{principal.session_id}",
+        session_id=principal.session_id,
+        http_method="POST",
+        now=NOW + 1,
+    )
+    swapped_binding = ActionBinding("promote_passthrough", request_id, 1, payload_hash)
+
+    with pytest.raises(InvalidConfirmation, match="binding"):
+        installed.boundary.promote_totp(
+            "promote_passthrough",
+            swapped_binding,
+            _totp_confirmation(proof),
+            actor="web:autumn",
+            now=NOW + 1,
+        )
+    with bundle.database.read() as connection:
+        assert connection.execute("SELECT 1 FROM auth_proof_consumptions").fetchone() is None
+    assert load_policy(policy_path).version == 1
+    assert not installed.boundary.pending_path.exists()
