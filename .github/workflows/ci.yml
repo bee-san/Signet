@@ -62,7 +62,10 @@ jobs:
             'import re,sys; assert re.fullmatch(r"sgt_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}\n", sys.stdin.read())'
           metadata="$(uv run --isolated --no-project --with "$wheel" \
             signet deployment token list --config "$root/disabled.json")"
-          ! grep -Eq 'sgt_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}' <<<"$metadata"
+          if grep -Eq 'sgt_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}' <<<"$metadata"; then
+            echo "token list exposed a raw token" >&2
+            exit 1
+          fi
           unset metadata
           rm -rf "$root"
       - name: Scan source
