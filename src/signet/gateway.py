@@ -14,6 +14,7 @@ import mcp.types as types
 from jsonschema.exceptions import SchemaError, ValidationError
 
 from signet.adapters.base import ApprovalAdapter, copy_json_object
+from signet.admission import ReviewedToolLimits
 from signet.downstream import validate_call_tool_result
 from signet.freezer import RequestFreezer
 from signet.mcp_mirror import (
@@ -22,7 +23,7 @@ from signet.mcp_mirror import (
     SchemaMirror,
     pending_call_result,
 )
-from signet.models import EnqueueRequest, EnqueueResult, IdempotencyConflict
+from signet.models import AdmissionRejected, EnqueueRequest, EnqueueResult, IdempotencyConflict
 from signet.policy import PolicyMode, ToolPolicy
 
 
@@ -41,7 +42,12 @@ class RawDownstreamClient(Protocol):
 
 
 class ApprovalEnqueuer(Protocol):
-    def enqueue(self, request: EnqueueRequest) -> EnqueueResult: ...
+    def enqueue(
+        self,
+        request: EnqueueRequest,
+        *,
+        reviewed_limits: ReviewedToolLimits,
+    ) -> EnqueueResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,9 +271,22 @@ class GatewayCallPipeline:
                 "The exact reviewed approval adapter is unavailable.",
             )
         try:
+            reviewed_limits = ReviewedToolLimits.from_policy(policy.limits)
+        except (TypeError, ValueError):
+            raise DomainToolError(
+                "policy_unavailable",
+                "The reviewed tool admission policy is unavailable.",
+            ) from None
+        try:
             adapter.validate(arguments)
             canonical = adapter.canonicalize(arguments)
             canonical_arguments = copy_json_object(canonical)
+            attachment_freezer = getattr(adapter, "freeze_attachments", None)
+            attachments = (
+                attachment_freezer(canonical_arguments)
+                if callable(attachment_freezer)
+                else ()
+            )
         except (TypeError, ValueError):
             raise DomainToolError(
                 "invalid_arguments",
@@ -288,6 +307,7 @@ class GatewayCallPipeline:
                 schema_version=self.mirror.captured_digest(policy.alias, policy.tool),
                 editor_actor=f"caller:{namespace}",
                 idempotency_key=identity.invocation_key,
+                attachments=attachments,
             )
         except (TypeError, ValueError):
             raise DomainToolError(
@@ -299,16 +319,32 @@ class GatewayCallPipeline:
         # transaction begins, it runs through commit before control is yielded.
         await asyncio.sleep(0)
         try:
-            stored = self._enqueuer.enqueue(frozen.enqueue_request)
+            stored = self._enqueuer.enqueue(
+                frozen.enqueue_request,
+                reviewed_limits=reviewed_limits,
+            )
         except IdempotencyConflict:
             raise DomainToolError(
                 "invocation_conflict",
                 "This invocation ID is already bound to a different payload.",
             ) from None
+        except AdmissionRejected as exc:
+            code, message = _admission_error(exc)
+            raise DomainToolError(code, message) from None
         return _stored_pending_call_result(stored)
 
 
 AliasGateway = GatewayCallPipeline
+
+
+def _admission_error(error: AdmissionRejected) -> tuple[str, str]:
+    if error.reason == "payload_limit":
+        return "request_rejected", "The request exceeds its reviewed payload limit."
+    if error.reason == "request_rate":
+        return "rate_limited", "This reviewed tool has reached its request-rate limit."
+    if error.reason == "queue_capacity":
+        return "queue_full", "The approval queue is at capacity; no request was stored."
+    return "storage_unavailable", "Durable storage has insufficient safe headroom."
 
 
 def _structured_success_result(value: Mapping[str, Any]) -> dict[str, Any]:

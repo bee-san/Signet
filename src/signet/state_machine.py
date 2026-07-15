@@ -6,10 +6,12 @@ import hmac
 import inspect
 import json
 import secrets
+import shutil
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from .admission import QueueAdmissionLimits, ReviewedToolLimits
 from .auth import (
     TOTP_PROOF_DOMAIN,
     WEBAUTHN_PROOF_DOMAIN,
@@ -22,6 +24,7 @@ from .auth import (
 )
 from .db import Database, IntegrityError
 from .models import (
+    AdmissionRejected,
     ApprovalConfirmation,
     AttachmentReference,
     ConfirmationKind,
@@ -80,6 +83,8 @@ class ApprovalStateMachine:
         web_session_idle_timeout: int = 30 * 60,
         capabilities: ProofCapability | None = None,
         notification_user_id: str | None = None,
+        admission_limits: QueueAdmissionLimits | None = None,
+        free_space_provider: Callable[[str], int] | None = None,
     ) -> None:
         if web_session_idle_timeout <= 0:
             raise ValueError("web session idle timeout must be positive")
@@ -88,6 +93,12 @@ class ApprovalStateMachine:
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
         self._web_session_idle_timeout = web_session_idle_timeout
         self._capabilities = capabilities
+        self._admission_limits = admission_limits or QueueAdmissionLimits()
+        if not isinstance(self._admission_limits, QueueAdmissionLimits):
+            raise TypeError("admission_limits must be queue admission limits")
+        if free_space_provider is not None and not callable(free_space_provider):
+            raise TypeError("free-space provider must be callable")
+        self._free_space_provider = free_space_provider or _filesystem_free_bytes
         self._notification_user_id = (
             canonical_user_id(notification_user_id)
             if notification_user_id is not None
@@ -98,7 +109,12 @@ class ApprovalStateMachine:
     def notifications_enabled(self) -> bool:
         return self._notification_user_id is not None
 
-    def enqueue(self, request: EnqueueRequest) -> EnqueueResult:
+    def enqueue(
+        self,
+        request: EnqueueRequest,
+        *,
+        reviewed_limits: ReviewedToolLimits | None = None,
+    ) -> EnqueueResult:
         """Durably enqueue or replay a caller-scoped invocation.
 
         The return happens only after the FULL-synchronous transaction context
@@ -107,6 +123,9 @@ class ApprovalStateMachine:
         """
 
         self._validate_enqueue(request)
+        selected_tool_limits = reviewed_limits or ReviewedToolLimits()
+        if not isinstance(selected_tool_limits, ReviewedToolLimits):
+            raise TypeError("reviewed_limits must be reviewed tool limits")
         replay: EnqueueResult | None = None
         with self.database.transaction() as connection:
             if request.idempotency_key is not None:
@@ -157,6 +176,18 @@ class ApprovalStateMachine:
                             "manual send-again requires a failed or unknown prior request"
                         )
                     duplicate_warning = int(prior["state"] == RequestState.OUTCOME_UNKNOWN.value)
+
+                self._expire_pending_batch(
+                    connection,
+                    now=request.created_at,
+                    limit=self._admission_limits.enqueue_expiry_sweep_limit,
+                    actor="system:enqueue-expiry-sweep",
+                )
+                self._enforce_enqueue_admission(
+                    connection,
+                    request=request,
+                    reviewed_limits=selected_tool_limits,
+                )
 
                 connection.execute(
                     """
@@ -1086,6 +1117,37 @@ class ApprovalStateMachine:
             now=now,
             require_expired=True,
         )
+
+    def sweep_expired(
+        self,
+        *,
+        now: int,
+        limit: int = 250,
+        actor: str = "system:expiry-sweeper",
+    ) -> int:
+        """Expire at most ``limit`` pending requests in one durable transaction."""
+
+        if (
+            not isinstance(now, int)
+            or isinstance(now, bool)
+            or now < 0
+            or not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit <= 0
+            or limit > 1_000
+            or not actor
+            or len(actor.encode("utf-8")) > 512
+        ):
+            raise ValueError("expiry sweep arguments are invalid")
+        with self.database.transaction() as connection:
+            expired = self._expire_pending_batch(
+                connection,
+                now=now,
+                limit=limit,
+                actor=actor,
+            )
+            self._fault("expiry_sweep:before_commit")
+        return expired
 
     def claim_execution(
         self,
@@ -2127,10 +2189,230 @@ class ApprovalStateMachine:
             "virtualize_local",
         }:
             raise ValueError(f"invalid policy mode: {request.policy_mode}")
+        if (
+            not isinstance(request.created_at, int)
+            or isinstance(request.created_at, bool)
+            or request.created_at < 0
+            or not isinstance(request.expires_at, int)
+            or isinstance(request.expires_at, bool)
+            or request.expires_at > 2**63 - 1
+            or request.canonical_size is not None
+            and (
+                not isinstance(request.canonical_size, int)
+                or isinstance(request.canonical_size, bool)
+                or request.canonical_size < 0
+            )
+        ):
+            raise ValueError("request timestamps and canonical size are invalid")
         if request.expires_at <= request.created_at:
             raise ValueError("request expiry must be after creation")
         self._validate_hash(request.payload_hash)
         self._validate_attachments(request.attachments)
+
+    def _enforce_enqueue_admission(
+        self,
+        connection: Any,
+        *,
+        request: EnqueueRequest,
+        reviewed_limits: ReviewedToolLimits,
+    ) -> None:
+        limits = self._admission_limits
+        canonical_size = request.canonical_size
+        if canonical_size is None:
+            if reviewed_limits.payload_bytes is not None:
+                raise AdmissionRejected("payload_limit")
+            canonical_size = len(request.encrypted_payload)
+        payload_limit = limits.maximum_payload_bytes
+        if reviewed_limits.payload_bytes is not None:
+            payload_limit = min(payload_limit, reviewed_limits.payload_bytes)
+        if canonical_size > payload_limit:
+            raise AdmissionRejected("payload_limit")
+
+        if reviewed_limits.requests_per_minute is not None:
+            recent = connection.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT 1 FROM approval_requests
+                    WHERE downstream_alias = ? AND tool_name = ?
+                      AND created_at > ?
+                    LIMIT ?
+                )
+                """,
+                (
+                    request.downstream_alias,
+                    request.tool_name,
+                    request.created_at - 60,
+                    reviewed_limits.requests_per_minute,
+                ),
+            ).fetchone()[0]
+            if int(recent) >= reviewed_limits.requests_per_minute:
+                raise AdmissionRejected("request_rate")
+
+        if self._pending_limit_reached(
+            connection,
+            where_sql="",
+            where_parameters=(),
+            now=request.created_at,
+            limit=limits.queue_limit,
+        ):
+            raise AdmissionRejected("queue_capacity")
+        if self._pending_limit_reached(
+            connection,
+            where_sql="AND origin_namespace = ?",
+            where_parameters=(request.origin_namespace,),
+            now=request.created_at,
+            limit=limits.origin_pending_limit,
+        ):
+            raise AdmissionRejected("queue_capacity")
+        tool_pending_limit = limits.tool_pending_limit
+        if reviewed_limits.pending_requests is not None:
+            tool_pending_limit = min(tool_pending_limit, reviewed_limits.pending_requests)
+        if self._pending_limit_reached(
+            connection,
+            where_sql="AND downstream_alias = ? AND tool_name = ?",
+            where_parameters=(request.downstream_alias, request.tool_name),
+            now=request.created_at,
+            limit=tool_pending_limit,
+        ):
+            raise AdmissionRejected("queue_capacity")
+
+        serialized_bytes = self._estimated_enqueue_bytes(request)
+        try:
+            free_bytes = self._free_space_provider(str(self.database.path.parent))
+        except Exception:
+            raise AdmissionRejected("storage_headroom") from None
+        if (
+            not isinstance(free_bytes, int)
+            or isinstance(free_bytes, bool)
+            or free_bytes < 0
+            or free_bytes - serialized_bytes < limits.minimum_free_bytes
+        ):
+            raise AdmissionRejected("storage_headroom")
+
+    @staticmethod
+    def _pending_limit_reached(
+        connection: Any,
+        *,
+        where_sql: str,
+        where_parameters: tuple[str, ...],
+        now: int,
+        limit: int,
+    ) -> bool:
+        count = connection.execute(
+            f"""
+            SELECT COUNT(*) FROM (
+                SELECT 1 FROM approval_requests
+                WHERE state = 'pending_approval' AND expires_at > ?
+                {where_sql}
+                LIMIT ?
+            )
+            """,
+            (now, *where_parameters, limit),
+        ).fetchone()[0]
+        return int(count) >= limit
+
+    def _estimated_enqueue_bytes(self, request: EnqueueRequest) -> int:
+        metadata = (
+            request.request_id,
+            request.downstream_alias,
+            request.tool_name,
+            request.policy_mode,
+            request.origin_namespace,
+            request.payload_hash,
+            request.payload_fingerprint,
+            request.policy_version,
+            request.adapter_version,
+            request.schema_version,
+            request.editor_actor,
+            request.encryption_key_ref or "",
+            request.idempotency_key or "",
+            request.retry_of_request_id or "",
+        )
+        attachment_bytes = sum(
+            len(value.encode("utf-8"))
+            for attachment in request.attachments
+            for value in (
+                attachment.attachment_id,
+                attachment.filename,
+                attachment.mime_type,
+                attachment.sha256,
+                attachment.storage_path,
+            )
+        )
+        encoded = (
+            len(request.encrypted_payload)
+            + len(request.pending_result)
+            + sum(len(value.encode("utf-8")) for value in metadata)
+            + attachment_bytes
+        )
+        # Reserve for SQLite pages, indexes, the WAL record, and a later checkpoint.
+        return self._admission_limits.write_reserve_bytes + (2 * encoded)
+
+    def _expire_pending_batch(
+        self,
+        connection: Any,
+        *,
+        now: int,
+        limit: int,
+        actor: str,
+    ) -> int:
+        rows = connection.execute(
+            """
+            SELECT request_id, current_version, current_payload_hash
+            FROM approval_requests
+            WHERE state = 'pending_approval' AND expires_at <= ?
+            ORDER BY expires_at, created_at, request_id
+            LIMIT ?
+            """,
+            (now, limit),
+        ).fetchall()
+        expired = 0
+        for row in rows:
+            updated = connection.execute(
+                """
+                UPDATE approval_requests
+                SET state = 'expired', completed_at = ?, revision = revision + 1
+                WHERE request_id = ? AND state = 'pending_approval'
+                  AND expires_at <= ?
+                """,
+                (now, row["request_id"], now),
+            ).rowcount
+            if updated != 1:  # pragma: no cover - BEGIN IMMEDIATE excludes a competing writer
+                continue
+            connection.execute(
+                """
+                UPDATE approval_challenges SET invalidated_at = ?
+                WHERE request_id = ? AND consumed_at IS NULL
+                  AND invalidated_at IS NULL
+                """,
+                (now, row["request_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE auth_challenges SET invalidated_at = ?
+                WHERE request_id = ? AND consumed_at IS NULL
+                  AND invalidated_at IS NULL
+                """,
+                (now, row["request_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE browser_views SET invalidated_at = ?
+                WHERE request_id = ? AND invalidated_at IS NULL
+                """,
+                (now, row["request_id"]),
+            )
+            self._event(
+                connection,
+                row["request_id"],
+                actor,
+                RequestState.EXPIRED.value,
+                now,
+                int(row["current_version"]),
+                str(row["current_payload_hash"]),
+            )
+            expired += 1
+        return expired
 
     @staticmethod
     def _validate_attachments(attachments: tuple[AttachmentReference, ...]) -> None:
@@ -2279,3 +2561,7 @@ class ReadOnlyMCPClient:
 
 
 StateMachine = ApprovalStateMachine
+
+
+def _filesystem_free_bytes(path: str) -> int:
+    return int(shutil.disk_usage(path).free)

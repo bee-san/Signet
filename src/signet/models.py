@@ -187,6 +187,20 @@ class StateMachineError(RuntimeError):
     """Base class for lifecycle rejections."""
 
 
+class AdmissionRejected(StateMachineError):
+    """A new durable request exceeded a fail-closed admission boundary."""
+
+    _REASONS = frozenset(
+        {"payload_limit", "request_rate", "queue_capacity", "storage_headroom"}
+    )
+
+    def __init__(self, reason: str) -> None:
+        if reason not in self._REASONS:
+            raise ValueError("invalid admission rejection reason")
+        self.reason = reason
+        super().__init__(reason)
+
+
 class RequestNotFound(StateMachineError):
     pass
 

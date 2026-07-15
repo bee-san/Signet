@@ -13,6 +13,7 @@ from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from signet.adapters.base import ApprovalAdapter
+from signet.admission import ReviewedToolLimits
 from signet.credential_broker import Secret
 from signet.crypto import PayloadCipher
 from signet.db import Database
@@ -128,8 +129,13 @@ class LostOnceEnqueuer:
         self.machine = machine
         self.lost = False
 
-    def enqueue(self, request: EnqueueRequest) -> EnqueueResult:
-        result = self.machine.enqueue(request)
+    def enqueue(
+        self,
+        request: EnqueueRequest,
+        *,
+        reviewed_limits: ReviewedToolLimits,
+    ) -> EnqueueResult:
+        result = self.machine.enqueue(request, reviewed_limits=reviewed_limits)
         if not self.lost:
             self.lost = True
             raise RuntimeError("simulated response loss after commit")
@@ -143,7 +149,15 @@ class GatewayHarness:
         *,
         local_result: object | None = None,
         lost_once: bool = False,
+        tool_limits: Mapping[str, int] | None = None,
     ) -> None:
+        send_policy: dict[str, Any] = {
+            "mode": "approval",
+            "adapter": "fake.send.v1",
+            "communication_send": True,
+        }
+        if tool_limits is not None:
+            send_policy["limits"] = dict(tool_limits)
         policy = parse_policy(
             {
                 "version": 7,
@@ -162,11 +176,7 @@ class GatewayHarness:
                                 "adapter": "fake.local.v1",
                                 "account_ref": "example-account",
                             },
-                            "send": {
-                                "mode": "approval",
-                                "adapter": "fake.send.v1",
-                                "communication_send": True,
-                            },
+                            "send": send_policy,
                             "blocked": {"mode": "deny"},
                         },
                     }
@@ -353,6 +363,20 @@ async def test_approval_requires_the_exact_policy_selected_adapter(tmp_path: Pat
         result = await client.call_tool("send", {"message": "safe"})
     assert result.isError is True
     assert result.structuredContent["error"]["code"] == "adapter_unavailable"
+    assert harness.request_count() == 0
+    assert harness.downstream.calls == []
+
+
+@pytest.mark.asyncio
+async def test_approval_pipeline_enforces_reviewed_tool_admission_limits(
+    tmp_path: Path,
+) -> None:
+    harness = GatewayHarness(tmp_path, tool_limits={"payload_bytes": 1})
+    async with create_connected_server_and_client_session(harness.surface.server) as client:
+        result = await client.call_tool("send", {"message": "too large"})
+
+    assert result.isError is True
+    assert result.structuredContent["error"]["code"] == "request_rejected"
     assert harness.request_count() == 0
     assert harness.downstream.calls == []
 
