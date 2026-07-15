@@ -27,6 +27,7 @@ from signet.attachment_crypto import (
     AttachmentEnvelopeError,
 )
 from signet.db import Database, IntegrityError
+from signet.private_paths import PrivatePathError, ensure_private_directory
 
 
 class StagingPathError(ValueError):
@@ -317,11 +318,10 @@ class StagingStore:
         self.database = database
         self._cipher = cipher
         requested_root = Path(root).absolute()
-        if requested_root.is_symlink():
-            raise StagingError("staging root must not be a symbolic link")
-        requested_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.root = requested_root.resolve(strict=True)
-        os.chmod(self.root, 0o700)
+        try:
+            self.root = ensure_private_directory(requested_root)
+        except PrivatePathError as exc:
+            raise StagingError("staging root must be an owned mode-0700 directory") from exc
         root_fd = os.open(self.root, _directory_flags())
         try:
             root_metadata = os.fstat(root_fd)
@@ -332,11 +332,13 @@ class StagingStore:
             os.close(root_fd)
 
         metadata_root = self.root / ".metadata"
-        if metadata_root.is_symlink():
-            raise StagingError("staging metadata root must not be a symbolic link")
-        metadata_root.mkdir(mode=0o700, exist_ok=True)
-        os.chmod(metadata_root, 0o700)
-        self._metadata_root = metadata_root
+        try:
+            self._metadata_root = ensure_private_directory(metadata_root)
+        except PrivatePathError as exc:
+            raise StagingError(
+                "staging metadata root must be an owned mode-0700 directory"
+            ) from exc
+        metadata_root = self._metadata_root
         metadata_fd = os.open(metadata_root, _directory_flags())
         try:
             self._metadata_identity = _identity(os.fstat(metadata_fd))
@@ -368,10 +370,7 @@ class StagingStore:
         try:
             lock_fd = os.open(
                 ".staging.lock",
-                os.O_RDWR
-                | os.O_CREAT
-                | os.O_NOFOLLOW
-                | getattr(os, "O_CLOEXEC", 0),
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                 0o600,
                 dir_fd=root_fd,
             )
@@ -901,9 +900,7 @@ class StagingStore:
         if (
             record.envelope_format != ATTACHMENT_ENVELOPE_FORMAT
             or len(envelope) != record.envelope_size
-            or not hmac.compare_digest(
-                hashlib.sha256(envelope).hexdigest(), record.envelope_sha256
-            )
+            or not hmac.compare_digest(hashlib.sha256(envelope).hexdigest(), record.envelope_sha256)
         ):
             raise StagingError("staged object envelope failed integrity verification")
         try:
@@ -1134,12 +1131,9 @@ class StagingStore:
                         content_fd,
                         maximum_bytes=self._cipher.maximum_envelope_bytes,
                     )
-                    if (
-                        len(envelope) != record.envelope_size
-                        or not hmac.compare_digest(
-                            hashlib.sha256(envelope).hexdigest(),
-                            record.envelope_sha256,
-                        )
+                    if len(envelope) != record.envelope_size or not hmac.compare_digest(
+                        hashlib.sha256(envelope).hexdigest(),
+                        record.envelope_sha256,
                     ):
                         raise StagingError("staged object failed purge integrity verification")
                     try:
@@ -1152,15 +1146,10 @@ class StagingStore:
                         raise StagingError(
                             "staged object failed purge integrity verification"
                         ) from exc
-                    if (
-                        len(plaintext) != expected_size
-                        or not hmac.compare_digest(
-                            hashlib.sha256(plaintext).hexdigest(), expected_sha256
-                        )
+                    if len(plaintext) != expected_size or not hmac.compare_digest(
+                        hashlib.sha256(plaintext).hexdigest(), expected_sha256
                     ):
-                        raise StagingError(
-                            "staged object failed purge integrity verification"
-                        )
+                        raise StagingError("staged object failed purge integrity verification")
                     named = os.stat(opaque_id, dir_fd=root_fd, follow_symlinks=False)
                     if (
                         not stat.S_ISREG(named.st_mode)

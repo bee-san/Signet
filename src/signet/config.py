@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from signet.private_paths import PrivatePathError, ensure_private_directory
 
 
 class DownstreamConfig(BaseModel):
@@ -85,8 +86,10 @@ class Settings(BaseSettings):
         return value
 
     def prepare_directories(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.data_dir, 0o700)
+        try:
+            ensure_private_directory(self.data_dir)
+        except PrivatePathError as exc:
+            raise ValueError("data_dir must be an owned mode-0700 directory") from exc
 
     def safe_dump(self) -> dict[str, object]:
         data = self.model_dump(mode="json")

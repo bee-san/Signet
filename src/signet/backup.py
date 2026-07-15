@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import io
 import json
 import os
 import re
@@ -19,12 +18,17 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from signet.db import Database
+from signet.private_paths import (
+    PrivatePathError,
+    ensure_owned_directory,
+    ensure_private_directory,
+)
 from signet.retention import BackupPins, RetentionError
 from signet.staging import (
     StagedFile,
@@ -35,7 +39,11 @@ from signet.staging import (
     read_verified_descriptor,
 )
 
-MAGIC = b"SIGNET-BACKUP-V1\n"
+MAGIC = b"SIGNET-BACKUP-V2\n"
+_BACKUP_CHUNK_BYTES = 4 * 1024 * 1024
+_BACKUP_HEADER_BYTES = len(MAGIC) + 12 + 8 + 4
+_AEAD_TAG_BYTES = 16
+_RECORD_LENGTH_BYTES = 4
 _OPAQUE_ID_RE = re.compile(r"stg_[A-Za-z0-9_]{20,64}\Z")
 
 
@@ -91,13 +99,19 @@ class BackupBundleManager:
         return f"BackupBundleManager(database={self.database.path!s}, encryption_key=<redacted>)"
 
     def create(self, destination: Path, *, created_at: int | None = None) -> Path:
-        destination = Path(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(destination.parent, 0o700)
+        destination = Path(destination).expanduser().absolute()
+        try:
+            ensure_owned_directory(destination.parent)
+        except PrivatePathError as exc:
+            raise BackupError("backup parent must be owned and not writable by others") from exc
         if destination.exists() or destination.is_symlink():
             raise BackupError("backup destination already exists")
         workspace = Path(tempfile.mkdtemp(prefix=".signet-backup-", dir=destination.parent))
-        os.chmod(workspace, 0o700)
+        try:
+            ensure_private_directory(workspace)
+        except PrivatePathError as exc:  # pragma: no cover - mkdtemp promises mode 0700
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise BackupError("backup workspace could not be secured") from exc
         pin_time = int(time.time())
         try:
             try:
@@ -148,22 +162,25 @@ class BackupBundleManager:
                     encoding="utf-8",
                 )
                 os.chmod(manifest_path, 0o600)
-                archive = _archive_workspace(workspace, manifest)
-                nonce = secrets.token_bytes(12)
-                ciphertext = AESGCM(self._encryption_key).encrypt(nonce, archive, MAGIC)
-                if len(ciphertext) + len(MAGIC) + len(nonce) > self.max_bundle_bytes:
+                members = _archive_members(workspace, manifest)
+                projected_archive_size = _projected_zip_size(members)
+                if _encrypted_bundle_size(projected_archive_size) > self.max_bundle_bytes:
                     raise BackupError("encrypted backup exceeds the configured size limit")
                 temporary = destination.with_name(f".{destination.name}.partial")
-                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                try:
-                    _write_all(descriptor, MAGIC + nonce + ciphertext)
-                    os.fsync(descriptor)
-                except BaseException:
-                    os.close(descriptor)
-                    temporary.unlink(missing_ok=True)
-                    raise
-                else:
-                    os.close(descriptor)
+                if temporary.exists() or temporary.is_symlink():
+                    raise BackupError("backup temporary destination already exists")
+                with tempfile.TemporaryFile(mode="w+b", dir=workspace) as archive:
+                    _archive_workspace(archive, members)
+                    archive_size = archive.seek(0, os.SEEK_END)
+                    if _encrypted_bundle_size(archive_size) > self.max_bundle_bytes:
+                        raise BackupError("encrypted backup exceeds the configured size limit")
+                    archive.seek(0)
+                    _encrypt_archive_to_path(
+                        archive,
+                        archive_size=archive_size,
+                        destination=temporary,
+                        encryption_key=self._encryption_key,
+                    )
                 os.replace(temporary, destination)
                 _fsync_directory(destination.parent)
                 return destination
@@ -179,37 +196,47 @@ class BackupBundleManager:
             shutil.rmtree(workspace, ignore_errors=True)
 
     def restore(self, bundle: Path, destination_root: Path) -> RestoredBundle:
-        bundle = Path(bundle)
+        bundle = Path(bundle).expanduser().absolute()
         try:
             flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
             descriptor = os.open(bundle, flags)
             try:
-                raw = read_verified_descriptor(
-                    descriptor,
-                    maximum_bytes=self.max_bundle_bytes,
-                )
+                with tempfile.TemporaryFile(mode="w+b") as archive:
+                    _decrypt_bundle_to_archive(
+                        descriptor,
+                        archive,
+                        encryption_key=self._encryption_key,
+                        maximum_bytes=self.max_bundle_bytes,
+                    )
+                    archive.seek(0)
+                    return self._restore_archive(archive, destination_root)
             finally:
                 os.close(descriptor)
-        except (OSError, StagingError) as exc:
+        except OSError as exc:
             raise BackupError("backup bundle is not a safe bounded regular file") from exc
-        if not raw.startswith(MAGIC) or len(raw) <= len(MAGIC) + 12:
-            raise BackupError("backup bundle header is invalid")
-        nonce = raw[len(MAGIC) : len(MAGIC) + 12]
-        try:
-            archive = AESGCM(self._encryption_key).decrypt(nonce, raw[len(MAGIC) + 12 :], MAGIC)
-        except InvalidTag as exc:
-            raise BackupError("backup authentication failed") from exc
 
+    def _restore_archive(
+        self,
+        archive: BinaryIO,
+        destination_root: Path,
+    ) -> RestoredBundle:
         destination_root = Path(destination_root).absolute()
         if destination_root.exists() or destination_root.is_symlink():
             raise BackupError("restore destination must not already exist")
-        destination_root.mkdir(parents=True, mode=0o700)
         try:
-            with zipfile.ZipFile(io.BytesIO(archive), mode="r") as zipped:
+            ensure_owned_directory(destination_root.parent)
+            destination_root.mkdir(mode=0o700)
+            destination_root = ensure_private_directory(destination_root)
+        except (OSError, PrivatePathError) as exc:
+            raise BackupError("restore destination could not be created privately") from exc
+        try:
+            with zipfile.ZipFile(archive, mode="r") as zipped:
                 _extract_archive(zipped, destination_root)
             attachments_root = destination_root / "attachments"
-            attachments_root.mkdir(mode=0o700, exist_ok=True)
-            os.chmod(attachments_root, 0o700)
+            try:
+                ensure_private_directory(attachments_root)
+            except PrivatePathError as exc:
+                raise BackupError("restored attachment directory is unsafe") from exc
             _fsync_directory(attachments_root)
             _fsync_directory(destination_root)
             manifest_path = destination_root / "manifest.json"
@@ -399,10 +426,9 @@ class BackupBundleManager:
                     raise BackupError("backup attachment manifest is incomplete")
                 path = destination.joinpath(*PurePosixPath(item["archive_path"]).parts)
                 restored_record = _record_with_path(record, path)
-                if (
-                    row["consumed_request_id"] != item["consumed_request_id"]
-                    or not _record_matches_manifest(record, item)
-                ):
+                if row["consumed_request_id"] != item[
+                    "consumed_request_id"
+                ] or not _record_matches_manifest(record, item):
                     raise BackupError("backup attachment manifest is inconsistent")
                 self._verify_restored_file(
                     destination,
@@ -541,9 +567,7 @@ class BackupBundleManager:
         try:
             descriptor = open_confined_readonly(destination, path)
             try:
-                envelope = read_verified_descriptor(
-                    descriptor, maximum_bytes=self.max_bundle_bytes
-                )
+                envelope = read_verified_descriptor(descriptor, maximum_bytes=self.max_bundle_bytes)
             finally:
                 os.close(descriptor)
         except StagingError as exc:
@@ -555,18 +579,202 @@ class BackupBundleManager:
         del plaintext
 
 
-def _archive_workspace(workspace: Path, manifest: dict[str, Any]) -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_STORED) as zipped:
-        zipped.write(workspace / "approvals.sqlite3", "approvals.sqlite3")
-        for item in manifest["attachments"]:
-            zipped.write(workspace / item["archive_path"], item["archive_path"])
-            zipped.write(
+def _archive_members(
+    workspace: Path,
+    manifest: dict[str, Any],
+) -> tuple[tuple[Path, str], ...]:
+    members: list[tuple[Path, str]] = [(workspace / "approvals.sqlite3", "approvals.sqlite3")]
+    for item in manifest["attachments"]:
+        members.append((workspace / item["archive_path"], item["archive_path"]))
+        members.append(
+            (
                 workspace / item["metadata_archive_path"],
                 item["metadata_archive_path"],
             )
-        zipped.write(workspace / "manifest.json", "manifest.json")
-    return buffer.getvalue()
+        )
+    members.append((workspace / "manifest.json", "manifest.json"))
+    return tuple(members)
+
+
+def _projected_zip_size(members: tuple[tuple[Path, str], ...]) -> int:
+    total = 22
+    for path, archive_name in members:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise BackupError("backup archive source is not a safe regular file")
+        name_bytes = archive_name.encode("utf-8")
+        if len(name_bytes) > 65_535 or metadata.st_size >= 2**32 or total >= 2**32:
+            raise BackupError("backup archive exceeds the supported ZIP size")
+        total += metadata.st_size + 30 + len(name_bytes) + 46 + len(name_bytes)
+    return total
+
+
+def _archive_workspace(
+    archive: BinaryIO,
+    members: tuple[tuple[Path, str], ...],
+) -> None:
+    with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_STORED) as zipped:
+        for path, archive_name in members:
+            zipped.write(path, archive_name)
+    archive.flush()
+
+
+def _encrypted_bundle_size(archive_size: int) -> int:
+    if archive_size <= 0:
+        return _BACKUP_HEADER_BYTES
+    chunks = (archive_size + _BACKUP_CHUNK_BYTES - 1) // _BACKUP_CHUNK_BYTES
+    return _BACKUP_HEADER_BYTES + archive_size + chunks * (_RECORD_LENGTH_BYTES + _AEAD_TAG_BYTES)
+
+
+def _encrypt_archive_to_path(
+    archive: BinaryIO,
+    *,
+    archive_size: int,
+    destination: Path,
+    encryption_key: bytes,
+) -> None:
+    seed = secrets.token_bytes(12)
+    header = MAGIC + seed + archive_size.to_bytes(8, "big") + _BACKUP_CHUNK_BYTES.to_bytes(4, "big")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        _write_all(descriptor, header)
+        cipher = AESGCM(encryption_key)
+        remaining = archive_size
+        index = 0
+        while remaining:
+            plaintext_length = min(remaining, _BACKUP_CHUNK_BYTES)
+            plaintext = _read_stream_exact(archive, plaintext_length)
+            ciphertext = cipher.encrypt(
+                _chunk_nonce(seed, index),
+                plaintext,
+                _chunk_aad(header, index, plaintext_length),
+            )
+            _write_all(descriptor, len(ciphertext).to_bytes(4, "big") + ciphertext)
+            remaining -= plaintext_length
+            index += 1
+        if archive.read(1):
+            raise BackupError("backup archive changed while it was encrypted")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def _decrypt_bundle_to_archive(
+    descriptor: int,
+    archive: BinaryIO,
+    *,
+    encryption_key: bytes,
+    maximum_bytes: int,
+) -> None:
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size < _BACKUP_HEADER_BYTES
+        or before.st_size > maximum_bytes
+    ):
+        raise BackupError("backup bundle is not a safe bounded regular file")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    header = _read_descriptor_exact(descriptor, _BACKUP_HEADER_BYTES)
+    if not header.startswith(MAGIC):
+        raise BackupError("backup bundle header is invalid")
+    offset = len(MAGIC)
+    seed = header[offset : offset + 12]
+    archive_size = int.from_bytes(header[offset + 12 : offset + 20], "big")
+    chunk_size = int.from_bytes(header[offset + 20 : offset + 24], "big")
+    if (
+        chunk_size != _BACKUP_CHUNK_BYTES
+        or archive_size <= 0
+        or _encrypted_bundle_size(archive_size) != before.st_size
+    ):
+        raise BackupError("backup bundle header is invalid")
+
+    cipher = AESGCM(encryption_key)
+    remaining = archive_size
+    index = 0
+    try:
+        while remaining:
+            plaintext_length = min(remaining, _BACKUP_CHUNK_BYTES)
+            ciphertext_length = int.from_bytes(
+                _read_descriptor_exact(descriptor, _RECORD_LENGTH_BYTES), "big"
+            )
+            if ciphertext_length != plaintext_length + _AEAD_TAG_BYTES:
+                raise BackupError("backup bundle record is invalid")
+            ciphertext = _read_descriptor_exact(descriptor, ciphertext_length)
+            plaintext = cipher.decrypt(
+                _chunk_nonce(seed, index),
+                ciphertext,
+                _chunk_aad(header, index, plaintext_length),
+            )
+            _write_stream_all(archive, plaintext)
+            remaining -= plaintext_length
+            index += 1
+    except InvalidTag as exc:
+        raise BackupError("backup authentication failed") from exc
+    if os.read(descriptor, 1):
+        raise BackupError("backup bundle has trailing data")
+    after = os.fstat(descriptor)
+    if _file_signature(before) != _file_signature(after):
+        raise BackupError("backup bundle changed while it was read")
+    archive.flush()
+
+
+def _chunk_nonce(seed: bytes, index: int) -> bytes:
+    if index < 0 or index > 0xFFFFFFFF:
+        raise BackupError("backup contains too many chunks")
+    tail = int.from_bytes(seed[8:], "big") ^ index
+    return seed[:8] + tail.to_bytes(4, "big")
+
+
+def _chunk_aad(header: bytes, index: int, plaintext_length: int) -> bytes:
+    return header + index.to_bytes(4, "big") + plaintext_length.to_bytes(4, "big")
+
+
+def _read_stream_exact(stream: BinaryIO, length: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise BackupError("backup archive ended unexpectedly")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_descriptor_exact(descriptor: int, length: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            raise BackupError("backup bundle is truncated")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _write_stream_all(stream: BinaryIO, content: bytes) -> None:
+    view = memoryview(content)
+    while view:
+        written = stream.write(view)
+        if written is None or written <= 0:
+            raise BackupError("backup archive write made no progress")
+        view = view[written:]
 
 
 def _extract_archive(zipped: zipfile.ZipFile, destination: Path) -> None:
@@ -684,8 +892,7 @@ def _attachment_manifest(
             len(archive.parts) != 2
             or archive.parts[0] != "attachments"
             or archive.parts[1] != attachment_id
-            or metadata_archive.parts
-            != ("attachments", ".metadata", f"{attachment_id}.json")
+            or metadata_archive.parts != ("attachments", ".metadata", f"{attachment_id}.json")
         ):
             raise BackupError("backup attachment archive path is invalid")
         if (
@@ -876,8 +1083,10 @@ def _valid_manifest_text(value: object, *, maximum: int) -> bool:
 
 
 def _valid_hash(value: object) -> bool:
-    return isinstance(value, str) and len(value) == 64 and all(
-        character in "0123456789abcdef" for character in value
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 

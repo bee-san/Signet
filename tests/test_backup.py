@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import signet.backup as backup_module
 from signet.backup import BackupBundleManager, BackupError, RestoredBundle
 from signet.db import Database
 from signet.models import AttachmentReference, EnqueueRequest, RequestState
@@ -114,9 +115,7 @@ def test_encrypted_bundle_restores_catalogued_envelopes_and_key_manifest(
     restored = manager.restore(bundle, tmp_path / "restored")
     assert restored.manifest["format"] == 2
     assert restored.manifest["created_at"] == 123
-    assert restored.manifest["key_references"] == sorted(
-        [FAKE_ATTACHMENT_KEY_REF, PAYLOAD_KEY_REF]
-    )
+    assert restored.manifest["key_references"] == sorted([FAKE_ATTACHMENT_KEY_REF, PAYLOAD_KEY_REF])
     restored_envelope = restored.attachments_root / staged.opaque_id
     assert b"sensitive attachment bytes" not in restored_envelope.read_bytes()
     assert (restored.attachments_root / ".metadata" / f"{staged.opaque_id}.json").is_file()
@@ -169,6 +168,44 @@ def test_bundle_tamper_and_wrong_backup_key_fail_before_restore(tmp_path: Path) 
     wrong = _manager(database, staging, key=b"w" * 32)
     with pytest.raises(BackupError, match="authentication"):
         wrong.restore(bundle, tmp_path / "wrong-restore")
+
+
+def test_backup_preflights_limit_before_archive_or_aead_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, staging, _ = _fixture(tmp_path, content=b"bounded fixture")
+    manager = BackupBundleManager(
+        database,
+        staging=staging,
+        encryption_key=b"k" * 32,
+        max_bundle_bytes=256,
+    )
+
+    def archive_must_not_run(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("archive allocation ran before size preflight")
+
+    monkeypatch.setattr(backup_module, "_archive_workspace", archive_must_not_run)
+
+    with pytest.raises(BackupError, match="size limit"):
+        manager.create(tmp_path / "too-small.signet")
+
+
+def test_chunked_backup_round_trip_crosses_aead_chunk_boundary(tmp_path: Path) -> None:
+    content = b"x" * (backup_module._BACKUP_CHUNK_BYTES + 1_024)
+    database, staging, staged = _fixture(tmp_path, content=content)
+    manager = _manager(database, staging)
+
+    bundle = manager.create(tmp_path / "chunked.signet")
+    assert bundle.read_bytes().startswith(backup_module.MAGIC)
+    restored = manager.restore(bundle, tmp_path / "chunked-restored")
+    _, plaintext = _restored_store(restored).read_verified(
+        staged.opaque_id,
+        adapter="fastmail",
+        account="primary",
+    )
+    assert plaintext == content
 
 
 def test_backup_preserves_unconsumed_virtual_staging_objects(tmp_path: Path) -> None:
