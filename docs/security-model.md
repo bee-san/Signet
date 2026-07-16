@@ -82,6 +82,12 @@ with `process_boundary_platform_unsupported`; `/dev/fd` is not treated as an
 equivalent security boundary. This restriction does not affect reviewed HTTPS
 downstreams or the downstream-disabled staging assembly.
 
+Linux private-directory recovery also uses the kernel-owned `/proc/self/fd` view
+to harden an already-held `O_PATH` descriptor when the directory mode is `000`.
+It verifies the descriptor identity before and after the change and fails closed
+if procfs is unavailable. macOS uses an `O_EVTONLY` descriptor for the same
+exact-object operation. Neither path falls back to chmodding the selected pathname.
+
 Reconciliation receives a structurally restricted read-only client with an exact
 allowlist. It cannot call an arbitrary mutation because an adapter labels the call
 "reconciliation." A missing or inconclusive lookup never proves no effect.

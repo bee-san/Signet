@@ -14,6 +14,10 @@ They cannot create a provider client or dispatch an action.
 - `hermes/` contains validated disposable and persistent disabled-profile
   configurators, reviewed route fragments, and redacted forward/reverse live
   route-diff examples.
+- `prepare-owned-directory.py` safely creates missing private path components;
+  `validate-private-paths.py` is the no-mutation, descriptor-based ancestry and
+  private-file preflight used at documented Hermes and launchd boundaries, including
+  a bounded recursive private-tree mode for isolated Hermes profile recovery.
 - `operations/` contains fail-closed inventory and human-evidence skeletons.
 
 Start with `docs/operator-runbook.md` for fake-only local verification, then use

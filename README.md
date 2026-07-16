@@ -62,15 +62,29 @@ browser sessions, webhooks, or other paths that bypass Signet. See
 
 ## Development
 
-Signet requires Python 3.12 and uses `uv`. The repository pins `uv`-managed Python
-3.12.13 because its bundled SQLite satisfies Signet's 3.51.3 safety floor.
+Signet requires Python 3.12 and exact `uv` version `0.11.28`. Install that version
+with `pipx install 'uv==0.11.28'` or the official versioned
+[`uv` installer](https://docs.astral.sh/uv/getting-started/installation/); inspect a
+downloaded installer before executing it and do not substitute the unversioned
+installer. The repository pins `uv`-managed Python 3.12.13 because its bundled
+SQLite satisfies Signet's 3.51.3 safety floor.
 
 ```console
-uv python install 3.12.13
-uv sync --frozen
-uv run pytest -q
-uv run ruff check .
-uv run mypy
+(
+  set -e
+  UV_VERSION="$(uv --version)"
+  case "$UV_VERSION" in
+    "uv 0.11.28"|"uv 0.11.28 "*) ;;
+    *) printf 'expected uv 0.11.28, received %s\n' "$UV_VERSION" >&2; exit 1 ;;
+  esac
+  uv python install 3.12.13
+  uv sync --frozen
+  uv lock --check --project deploy/hermes/runtime
+  uv run playwright install --with-deps chromium
+  uv run pytest -q
+  uv run ruff check .
+  uv run mypy
+)
 ```
 
 The generic reviewed local stdio boundary currently requires Linux with
@@ -80,15 +94,30 @@ closed with `process_boundary_platform_unsupported`. The sole reviewed `wacli`
 fixture pins a macOS Homebrew artifact, so `wacli` activation is blocked on every
 host until either a Linux artifact is reviewed or a secure native macOS descriptor
 boundary is implemented and characterized.
+On Linux, Signet also uses the kernel-owned `/proc/self/fd` view to change the mode
+of an already-held mode-`000` directory without reopening an attacker-controlled
+path. It fails closed if procfs is unavailable; macOS uses `O_EVTONLY` instead.
 
 The generic package entry point serves only an explicitly supplied application
-factory. After creating the disabled state below, its two shipped factories can be
-run explicitly with:
+factory. After creating the disabled state below, run its two shipped factories in
+separate terminals. In terminal A:
 
 ```console
-export SIGNET_DISABLED_CONFIG="$HOME/.hermes/services/signet/config/disabled.json"
+SIGNET_HOME="$(cd "$HOME" && pwd -P)" || exit 1
+export SIGNET_HOME
+export SIGNET_SERVICE_ROOT="$SIGNET_HOME/.hermes/services/signet"
+export SIGNET_DISABLED_CONFIG="$SIGNET_SERVICE_ROOT/config/disabled.json"
 uv run signet serve-mcp --factory signet.deployment:create_mcp_app \
   --host 127.0.0.1 --port 8789
+```
+
+In terminal B:
+
+```console
+SIGNET_HOME="$(cd "$HOME" && pwd -P)" || exit 1
+export SIGNET_HOME
+export SIGNET_SERVICE_ROOT="$SIGNET_HOME/.hermes/services/signet"
+export SIGNET_DISABLED_CONFIG="$SIGNET_SERVICE_ROOT/config/disabled.json"
 uv run signet serve-web --factory signet.deployment:create_web_app \
   --host 127.0.0.1 --port 8790
 ```
@@ -105,16 +134,21 @@ Create private, persistent staging state without enrolling a human credential or
 creating a downstream client:
 
 ```console
-export SIGNET_DISABLED_PROFILE=signet-disabled
-install -d -m 0700 "$HOME/.hermes/services/signet/config"
-uv run signet deployment init \
-  --config "$HOME/.hermes/services/signet/config/disabled.json" \
-  --data-dir "$HOME/.hermes/services/signet/data" \
-  --namespace "profile:$SIGNET_DISABLED_PROFILE"
-uv run signet deployment validate \
-  --config "$HOME/.hermes/services/signet/config/disabled.json"
-uv run signet deployment serve-mcp \
-  --config "$HOME/.hermes/services/signet/config/disabled.json"
+(
+  set -e
+  SIGNET_HOME="$(cd "$HOME" && pwd -P)"
+  export SIGNET_HOME
+  export SIGNET_SERVICE_ROOT="$SIGNET_HOME/.hermes/services/signet"
+  export SIGNET_DISABLED_PROFILE=signet-disabled
+  uv run signet deployment init \
+    --config "$SIGNET_SERVICE_ROOT/config/disabled.json" \
+    --data-dir "$SIGNET_SERVICE_ROOT/data" \
+    --namespace "profile:$SIGNET_DISABLED_PROFILE"
+  uv run signet deployment validate \
+    --config "$SIGNET_SERVICE_ROOT/config/disabled.json"
+  uv run signet deployment serve-mcp \
+    --config "$SIGNET_SERVICE_ROOT/config/disabled.json"
+)
 ```
 
 One initialized disabled state supports exactly that one dedicated Hermes profile;
@@ -146,18 +180,32 @@ schema review, provider readiness, or cutover authorization.
 From the repository root, the minimal fake-only path is:
 
 ```console
-export SIGNET_DEMO_DIR="$PWD/var/operator-demo"
-test ! -e "$SIGNET_DEMO_DIR"
-uv run signet demo init --data-dir "$SIGNET_DEMO_DIR"
-uv run signet demo smoke --data-dir "$SIGNET_DEMO_DIR"
-uv run signet demo serve --data-dir "$SIGNET_DEMO_DIR"
+(
+  set -e
+  SIGNET_HOME="$(cd "$HOME" && pwd -P)"
+  export SIGNET_HOME
+  export SIGNET_DEMO_DIR="$SIGNET_HOME/.signet-fake-demo"
+  test ! -e "$SIGNET_DEMO_DIR" && test ! -L "$SIGNET_DEMO_DIR" || exit 1
+  uv run signet demo init --data-dir "$SIGNET_DEMO_DIR"
+  uv run signet demo smoke --data-dir "$SIGNET_DEMO_DIR"
+  uv run signet demo seed-request --data-dir "$SIGNET_DEMO_DIR"
+  uv run signet demo serve --data-dir "$SIGNET_DEMO_DIR"
+)
 ```
 
-`demo init` refuses every existing path, `smoke` is offline unless `--live` is explicit,
-and `serve` binds both demo apps to numeric loopback. The generic `serve-*` factory
+The physical home path is required because private demo paths reject symlinked
+ancestors. `demo init` refuses every existing destination and never creates parent
+directories. `smoke` is offline unless `--live` is explicit, and
+`serve` binds both demo apps to numeric loopback. The generic `serve-*` factory
 interface remains deployment-owned. Hermes templates stay inert; the runbook uses a
 new blank profile and a validated structured merge instead of editing an existing
-profile.
+profile. Agents other than Hermes should follow the
+[provider-neutral MCP client guide](docs/mcp-client-integration.md); that guide does
+not turn the fake or downstream-disabled assembly into a live deployment.
+`seed-request` must run while the server is stopped. It admits a realistic fake
+email through the real gateway pipeline, returns only safe request metadata, and
+makes the complete context immediately reviewable without an LLM, Hermes profile,
+provider credential, or network call.
 
 ## Offline onboarding
 
@@ -191,6 +239,7 @@ The readiness report is advisory: it always keeps `ready` and
 ## Documentation
 
 - [MCP approval tools](docs/mcp-approval-tools.md)
+- [Provider-neutral MCP agent integration](docs/mcp-client-integration.md)
 - [Security model](docs/security-model.md)
 - [Policy and adapter onboarding](docs/policy-guide.md)
 - [Deployment, backup, restore, and rollback](docs/deployment.md)
