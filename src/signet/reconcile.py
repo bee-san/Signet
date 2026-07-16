@@ -16,10 +16,12 @@ from signet.adapters.base import (
     ReadOnlyMCPClient,
     Reconciliation,
 )
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.delivery import (
     DeliveryDispatcher,
     DispatchResult,
     FrozenRequestLoader,
+    LoadedFrozenRequest,
     result_aliases_from_metadata,
 )
 from signet.models import (
@@ -73,6 +75,14 @@ class _AttemptSnapshot:
             phase=ExecutionPhase.OUTCOME_UNKNOWN,
             downstream_idempotency_key=self.downstream_idempotency_key,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedReconciliation:
+    loaded: LoadedFrozenRequest
+    downstream: MCPClient
+    restricted: ReadOnlyMCPClient
+    attempt: ExecutionAttempt
 
 
 class ReconciliationCoordinator:
@@ -144,7 +154,8 @@ class ReconciliationCoordinator:
         limit: int | None = None,
     ) -> tuple[ReconciliationRun, ...]:
         results: list[ReconciliationRun] = []
-        for request_id in self.due_request_ids(now=now, limit=limit):
+        request_ids = await _run_sync(self.due_request_ids, now=now, limit=limit)
+        for request_id in request_ids:
             try:
                 results.append(await self.reconcile_once(request_id, worker_id=worker_id, now=now))
             except ReconciliationRejected:
@@ -159,24 +170,19 @@ class ReconciliationCoordinator:
         worker_id: str,
         now: int,
     ) -> ReconciliationRun:
-        snapshot = self._snapshot(request_id)
+        snapshot = await _run_sync(self._snapshot, request_id)
         if snapshot.reconciliation_next_at is None or snapshot.reconciliation_next_at > now:
             raise ReconciliationRejected("reconciliation is not due")
         loaded = None
         try:
-            loaded = self.loader.load(snapshot.lease())
-            downstream = self._downstream_clients[loaded.request.downstream_alias]
-            reviewed = loaded.adapter.reconciliation_tools & self._reviewed_tools.get(
-                (loaded.request.downstream_alias, loaded.request.tool_name), frozenset()
+            prepared = await _run_sync(self._prepare_reconciliation, snapshot)
+            loaded = prepared.loaded
+            self.loader.require_current_scope(loaded, prepared.downstream)
+            adapter_decision = await loaded.adapter.reconcile(
+                prepared.restricted,
+                loaded.request,
+                prepared.attempt,
             )
-            restricted = ReadOnlyMCPClient(downstream, reviewed)
-            attempt = ExecutionAttempt(
-                attempt_id=snapshot.attempt_id,
-                started_at=datetime.fromtimestamp(snapshot.started_at, tz=UTC),
-                downstream_result=snapshot.safe_completion or None,
-                error_code=snapshot.failure_reason,
-            )
-            adapter_decision = await loaded.adapter.reconcile(restricted, loaded.request, attempt)
             if not isinstance(adapter_decision, Reconciliation):
                 adapter_decision = Reconciliation.INCONCLUSIVE
             decision = _state_decision(adapter_decision)
@@ -189,6 +195,62 @@ class ReconciliationCoordinator:
             # or prevent later rows in the same batch from being considered.
             decision = ReconciliationDecision.INCONCLUSIVE
 
+        state_result = await _run_sync(
+            self._apply_reconciliation,
+            request_id,
+            snapshot,
+            decision,
+            loaded,
+            worker_id=worker_id,
+            now=now,
+        )
+        redispatch: DispatchResult | None = None
+        if state_result.action is ReconciliationAction.REDISPATCH:
+            if loaded is None:  # pragma: no cover - only confirmed-no-effect can redispatch
+                raise ReconciliationError("redispatch has no loaded frozen request")
+            if state_result.lease is None:
+                raise ReconciliationError("state machine omitted the authorized redispatch lease")
+            if not loaded.adapter.supports_idempotency:
+                raise ReconciliationError("non-idempotent adapter received a redispatch lease")
+            redispatch = await self.dispatcher.dispatch_claimed(state_result.lease, now=now)
+        return ReconciliationRun(
+            request_id=request_id,
+            decision=decision,
+            result=state_result,
+            redispatch=redispatch,
+        )
+
+    def _prepare_reconciliation(
+        self,
+        snapshot: _AttemptSnapshot,
+    ) -> _PreparedReconciliation:
+        loaded = self.loader.load(snapshot.lease())
+        downstream = self._downstream_clients[loaded.request.downstream_alias]
+        reviewed = loaded.adapter.reconciliation_tools & self._reviewed_tools.get(
+            (loaded.request.downstream_alias, loaded.request.tool_name), frozenset()
+        )
+        return _PreparedReconciliation(
+            loaded=loaded,
+            downstream=downstream,
+            restricted=ReadOnlyMCPClient(downstream, reviewed),
+            attempt=ExecutionAttempt(
+                attempt_id=snapshot.attempt_id,
+                started_at=datetime.fromtimestamp(snapshot.started_at, tz=UTC),
+                downstream_result=snapshot.safe_completion or None,
+                error_code=snapshot.failure_reason,
+            ),
+        )
+
+    def _apply_reconciliation(
+        self,
+        request_id: str,
+        snapshot: _AttemptSnapshot,
+        decision: ReconciliationDecision,
+        loaded: LoadedFrozenRequest | None,
+        *,
+        worker_id: str,
+        now: int,
+    ) -> ReconciliationResult:
         safe_outcome: Mapping[str, Any] | None = None
         aliases: tuple[ResultAlias, ...] = ()
         next_check_at: int | None = None
@@ -209,7 +271,7 @@ class ReconciliationCoordinator:
             if not exhausted:
                 next_check_at = now + self.schedule[completed_count]
 
-        state_result = self.state_machine.reconcile(
+        return self.state_machine.reconcile(
             request_id,
             expected_reconciliation_count=snapshot.reconciliation_attempt_count,
             decision=decision,
@@ -220,21 +282,6 @@ class ReconciliationCoordinator:
             lease_seconds=self.redispatch_lease_seconds,
             safe_outcome=safe_outcome,
             result_aliases=aliases,
-        )
-        redispatch: DispatchResult | None = None
-        if state_result.action is ReconciliationAction.REDISPATCH:
-            if loaded is None:  # pragma: no cover - only confirmed-no-effect can redispatch
-                raise ReconciliationError("redispatch has no loaded frozen request")
-            if state_result.lease is None:
-                raise ReconciliationError("state machine omitted the authorized redispatch lease")
-            if not loaded.adapter.supports_idempotency:
-                raise ReconciliationError("non-idempotent adapter received a redispatch lease")
-            redispatch = await self.dispatcher.dispatch_claimed(state_result.lease, now=now)
-        return ReconciliationRun(
-            request_id=request_id,
-            decision=decision,
-            result=state_result,
-            redispatch=redispatch,
         )
 
     def _snapshot(self, request_id: str) -> _AttemptSnapshot:

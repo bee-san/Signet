@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -9,7 +12,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from signet.db import Database
-from signet.mcp_mirror import AliasToolSurface, SchemaMirror, tool_schema_digest
+from signet.mcp_mirror import (
+    AliasToolSurface,
+    SchemaDriftError,
+    SchemaMirror,
+    tool_schema_digest,
+)
 from signet.policy import parse_policy
 from signet.schema_registry import (
     DurableSchemaRegistry,
@@ -40,8 +48,16 @@ def raw_tool(name: str = "read") -> dict[str, Any]:
     }
 
 
-def policy(*, digest: str | None = None) -> Any:
-    tool: dict[str, Any] = {"mode": "passthrough", "reviewed_read_only": True}
+def policy(*, digest: str | None = None, virtualize: bool = False) -> Any:
+    tool: dict[str, Any] = (
+        {
+            "mode": "virtualize_local",
+            "adapter": "example.local.v1",
+            "account_ref": "example-account",
+        }
+        if virtualize
+        else {"mode": "passthrough", "reviewed_read_only": True}
+    )
     if digest is not None:
         tool["schema_digest"] = digest
     return parse_policy(
@@ -63,12 +79,13 @@ def assembly(
     tmp_path: Path,
     *,
     configured_digest: str | None = None,
+    virtualize: bool = False,
     database: Database | None = None,
 ) -> tuple[Database, SchemaMirror, AliasToolSurface, DurableSchemaRegistry]:
     selected = database or Database(tmp_path / "approval.db")
     if database is None:
         selected.initialize()
-    mirror = SchemaMirror(policy(digest=configured_digest))
+    mirror = SchemaMirror(policy(digest=configured_digest, virtualize=virtualize))
     surface = AliasToolSurface(
         alias="example",
         mirror=mirror,
@@ -157,6 +174,50 @@ async def test_configured_digest_stays_disabled_when_list_notification_fails(
             "SELECT review_state, reviewed_at, present FROM schema_cache"
         ).fetchone()
     assert tuple(row) == ("disabled_drift", None, 1)
+
+
+@pytest.mark.asyncio
+async def test_virtualized_schema_without_object_output_cannot_be_durably_reviewed(
+    tmp_path: Path,
+) -> None:
+    database, mirror, _, registry = assembly(tmp_path, virtualize=True)
+    tool = raw_tool("read")
+    tool.pop("outputSchema")
+    await registry.refresh("example", [tool], discovered_at=NOW)
+
+    with pytest.raises(SchemaDriftError, match="object output schema"):
+        await registry.review_current(
+            "example",
+            "read",
+            tool_schema_digest(tool),
+            reviewed_at=NOW + 1,
+        )
+
+    assert mirror.list_tools("example") == []
+    with database.read() as connection:
+        row = connection.execute("SELECT review_state, reviewed_at FROM schema_cache").fetchone()
+    assert tuple(row) == ("unreviewed", None)
+
+
+@pytest.mark.asyncio
+async def test_configured_virtual_digest_is_not_persisted_as_reviewed_without_output_schema(
+    tmp_path: Path,
+) -> None:
+    tool = raw_tool("read")
+    tool.pop("outputSchema")
+    database, mirror, _, registry = assembly(
+        tmp_path,
+        configured_digest=tool_schema_digest(tool),
+        virtualize=True,
+    )
+
+    with pytest.raises(SchemaDriftError, match="object output schema"):
+        await registry.refresh("example", [tool], discovered_at=NOW)
+
+    assert mirror.list_tools("example") == []
+    with database.read() as connection:
+        count = int(connection.execute("SELECT count(*) FROM schema_cache").fetchone()[0])
+    assert count == 0
 
 
 @pytest.mark.asyncio
@@ -293,3 +354,70 @@ async def test_schema_publication_waits_for_parallel_calls_and_blocks_new_calls(
     release_writer.set()
     await asyncio.gather(publishing, late)
     assert late_reader_started.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["refresh", "review"])
+async def test_schema_registry_writer_contention_does_not_stall_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    database, _, _, registry = assembly(tmp_path)
+    tool = raw_tool()
+    digest = tool_schema_digest(tool)
+    entered = threading.Event()
+    original: Any
+    if operation == "review":
+        await registry.refresh("example", [tool], discovered_at=NOW)
+        original = registry._mark_reviewed
+
+        def blocked_operation(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "_mark_reviewed", blocked_operation)
+    else:
+        original = registry._capture
+
+        def blocked_operation(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "_capture", blocked_operation)
+
+    writer = sqlite3.connect(database.path, check_same_thread=False)
+    writer.execute("BEGIN IMMEDIATE")
+
+    def release_writer() -> None:
+        if writer.in_transaction:
+            writer.rollback()
+
+    safety_release = threading.Timer(3, release_writer)
+    safety_release.start()
+    waiting_started_at = time.monotonic()
+    try:
+        if operation == "review":
+            running = asyncio.create_task(
+                registry.review_current(
+                    "example",
+                    "read",
+                    digest,
+                    reviewed_at=NOW + 1,
+                )
+            )
+        else:
+            running = asyncio.create_task(registry.refresh("example", [tool], discovered_at=NOW))
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert time.monotonic() - waiting_started_at < 2
+        assert not running.done()
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        safety_release.cancel()
+        release_writer()
+        result = await running
+    finally:
+        safety_release.cancel()
+        release_writer()
+        writer.close()
+
+    assert result.changed_tools == ("read",)

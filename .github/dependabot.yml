@@ -7,8 +7,9 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      python:
+      python-minor-patch:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

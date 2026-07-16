@@ -165,6 +165,7 @@ def _rewrite_encrypted_archive(
 
 def _downgrade_catalog_to_schema_12(database: Database) -> None:
     with database.transaction() as connection:
+        connection.execute("DROP TABLE attachment_metadata_privacy_maintenance")
         connection.execute("DROP TRIGGER IF EXISTS request_events_structured_reason_insert")
         connection.execute("DROP TRIGGER IF EXISTS web_action_drafts_structured_reason_insert")
         connection.execute("DROP TRIGGER staged_objects_immutable_context")
@@ -203,7 +204,7 @@ def _downgrade_catalog_to_schema_12(database: Database) -> None:
             """
         )
         connection.execute("DROP TABLE privacy_maintenance")
-        connection.execute("DELETE FROM schema_meta WHERE migration_id = 13")
+        connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14)")
         connection.execute("PRAGMA user_version = 12")
 
 

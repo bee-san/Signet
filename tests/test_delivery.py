@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import threading
+import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +22,7 @@ from signet.adapters.base import (
     Reconciliation,
     conservative_outcome,
 )
-from signet.canonical import payload_fingerprint
+from signet.canonical import canonical_json, payload_fingerprint
 from signet.db import Database
 from signet.delivery import (
     DeliveryDispatcher,
@@ -26,11 +30,40 @@ from signet.delivery import (
     FrozenRequestLoader,
     PayloadDecryptor,
 )
+from signet.execution_scope import (
+    ExecutionScope,
+    ExecutionScopeError,
+    StaticExecutionScopeResolver,
+)
 from signet.models import AttachmentReference, EnqueueRequest, InvalidTransition
 from signet.state_machine import ApprovalStateMachine
 from tests.attachment_fixtures import register_catalog_attachment
 
 NOW = 1_900_000_000
+ACCOUNT_REF = "primary"
+CREDENTIAL_DIGEST = "c" * 64
+SCHEMA_DIGEST = "d" * 64
+
+
+class MutableScopeResolver:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.scope = ExecutionScope(
+            account_ref=ACCOUNT_REF,
+            credential_identity_digest=CREDENTIAL_DIGEST,
+            schema_digest=SCHEMA_DIGEST,
+        )
+
+    def resolve(
+        self,
+        downstream_alias: str,
+        tool_name: str,
+        adapter: Any,
+        downstream_client: object | None = None,
+    ) -> ExecutionScope:
+        del downstream_alias, tool_name, adapter, downstream_client
+        self.calls += 1
+        return self.scope
 
 
 class FakeDecryptor(PayloadDecryptor):
@@ -56,9 +89,17 @@ class FakeDecryptor(PayloadDecryptor):
 
 
 class FakeClient(MCPClient):
-    def __init__(self, machine: ApprovalStateMachine, outcomes: list[object]) -> None:
+    def __init__(
+        self,
+        machine: ApprovalStateMachine,
+        outcomes: list[object],
+        *,
+        credential_identity_digest: str = CREDENTIAL_DIGEST,
+    ) -> None:
         self.machine = machine
         self.outcomes = outcomes
+        self.credential_ref = "keychain://Signet/fake-provider"
+        self.credential_identity_digest = credential_identity_digest
         self.calls: list[tuple[str, dict[str, Any], str]] = []
 
     async def call_tool(
@@ -81,6 +122,7 @@ class FakeClient(MCPClient):
 class BlockingClient(MCPClient):
     def __init__(self, machine: ApprovalStateMachine) -> None:
         self.machine = machine
+        self.credential_identity_digest = CREDENTIAL_DIGEST
         self.started = asyncio.Event()
         self.calls = 0
 
@@ -104,6 +146,7 @@ class BlockingClient(MCPClient):
 class CrashingClient(MCPClient):
     def __init__(self, machine: ApprovalStateMachine) -> None:
         self.machine = machine
+        self.credential_identity_digest = CREDENTIAL_DIGEST
         self.calls = 0
 
     async def call_tool(
@@ -136,8 +179,12 @@ class FakeAdapter:
         supports_idempotency: bool = False,
         fail_prepare: bool = False,
         attachments: tuple[AttachmentReference, ...] = (),
+        account: str = ACCOUNT_REF,
+        adapter_id: str = "fake.send",
     ) -> None:
+        self.adapter_id = adapter_id
         self.supports_idempotency = supports_idempotency
+        self.account = account
         self.fail_prepare = fail_prepare
         self.attachments = attachments
         self.prepared: list[AdapterRequest] = []
@@ -221,15 +268,35 @@ def enqueue_approved(
     *,
     arguments: Mapping[str, Any] | None = None,
     attachments: tuple[AttachmentReference, ...] = (),
+    legacy_envelope: bool = False,
 ) -> bytes:
-    frozen, payload_hash = payload_fingerprint(
-        alias="fake",
-        tool="send",
-        arguments=arguments or {"value": "private"},
-        staged_file_hashes=tuple(attachment.sha256 for attachment in attachments),
-        policy_version=1,
-        adapter_version="1",
-    )
+    selected_arguments = arguments or {"value": "private"}
+    if legacy_envelope:
+        frozen = canonical_json(
+            {
+                "adapter_version": "1",
+                "alias": "fake",
+                "arguments": dict(selected_arguments),
+                "policy_version": 1,
+                "staged_file_hashes": [attachment.sha256 for attachment in attachments],
+                "tool": "send",
+            }
+        )
+        payload_hash = hashlib.sha256(frozen).hexdigest()
+    else:
+        frozen, payload_hash = payload_fingerprint(
+            alias="fake",
+            tool="send",
+            account_ref=ACCOUNT_REF,
+            credential_identity_digest=CREDENTIAL_DIGEST,
+            schema_digest=SCHEMA_DIGEST,
+            caller_namespace="profile:test",
+            arguments=selected_arguments,
+            staged_file_hashes=tuple(attachment.sha256 for attachment in attachments),
+            policy_version=1,
+            adapter_id="fake.send",
+            adapter_version="1",
+        )
     machine.enqueue(
         EnqueueRequest(
             request_id=request_id,
@@ -245,7 +312,7 @@ def enqueue_approved(
             expires_at=NOW + 600,
             policy_version="1",
             adapter_version="1",
-            schema_version="1",
+            schema_version=SCHEMA_DIGEST,
             editor_actor="caller:test",
             canonical_size=len(frozen),
             encryption_key_ref="keychain://Signet/fake-payload",
@@ -304,12 +371,23 @@ def dispatcher(
     *,
     decryptor: FakeDecryptor | None = None,
     reconciliation_delay: int = 10,
+    scope: ExecutionScope | None = None,
 ) -> DeliveryDispatcher:
     loader = FrozenRequestLoader(
         machine,
         decryptor or FakeDecryptor(),
         {("fake", "send"): adapter},
-        {"fake": "primary"},
+        StaticExecutionScopeResolver(
+            {
+                ("fake", "send"): scope
+                or ExecutionScope(
+                    account_ref=ACCOUNT_REF,
+                    credential_identity_digest=CREDENTIAL_DIGEST,
+                    schema_digest=SCHEMA_DIGEST,
+                )
+            },
+            {"fake": client},
+        ),
     )
     return DeliveryDispatcher(
         machine,
@@ -317,6 +395,184 @@ def dispatcher(
         {"fake": client},
         initial_reconciliation_delay=reconciliation_delay,
     )
+
+
+def test_static_scope_resolver_validates_configured_client_without_explicit_selection(
+    machine: ApprovalStateMachine,
+) -> None:
+    adapter = FakeAdapter()
+    rotated_client = FakeClient(
+        machine,
+        [],
+        credential_identity_digest="e" * 64,
+    )
+    resolver = StaticExecutionScopeResolver(
+        {
+            ("fake", "send"): ExecutionScope(
+                account_ref=ACCOUNT_REF,
+                credential_identity_digest=CREDENTIAL_DIGEST,
+                schema_digest=SCHEMA_DIGEST,
+            )
+        },
+        {"fake": rotated_client},
+    )
+
+    with pytest.raises(ExecutionScopeError, match="identity"):
+        resolver.resolve("fake", "send", adapter)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["account", "credential", "schema"])
+async def test_restart_scope_drift_fails_before_network(
+    machine: ApprovalStateMachine,
+    drift: str,
+) -> None:
+    enqueue_approved(machine, f"restart-{drift}")
+    restarted_database = Database(machine.database.path)
+    restarted_database.initialize()
+    restarted_machine = ApprovalStateMachine(
+        restarted_database,
+        notification_user_id="human:test",
+    )
+    scope = ExecutionScope(
+        account_ref=ACCOUNT_REF,
+        credential_identity_digest=CREDENTIAL_DIGEST,
+        schema_digest=SCHEMA_DIGEST,
+    )
+    adapter = FakeAdapter(account="secondary" if drift == "account" else ACCOUNT_REF)
+    if drift == "account":
+        scope = replace(scope, account_ref="secondary")
+    elif drift == "credential":
+        scope = replace(scope, credential_identity_digest="e" * 64)
+    else:
+        scope = replace(scope, schema_digest="f" * 64)
+    client = FakeClient(restarted_machine, [{"status": "sent"}])
+
+    with pytest.raises(DeliveryPreparationError, match="before network"):
+        await dispatcher(restarted_machine, adapter, client, scope=scope).dispatch(
+            f"restart-{drift}",
+            worker_id="restarted-worker",
+            now=NOW + 2,
+        )
+
+    assert client.calls == []
+    assert restarted_machine.get_request(f"restart-{drift}")["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_legacy_envelope_without_execution_scope_fails_closed(
+    machine: ApprovalStateMachine,
+) -> None:
+    enqueue_approved(machine, "legacy-scope", legacy_envelope=True)
+    adapter = FakeAdapter()
+    client = FakeClient(machine, [{"status": "sent"}])
+
+    with pytest.raises(DeliveryPreparationError, match="before network"):
+        await dispatcher(machine, adapter, client).dispatch(
+            "legacy-scope",
+            worker_id="worker",
+            now=NOW + 2,
+        )
+
+    assert client.calls == []
+    assert machine.get_request("legacy-scope")["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_scope_is_rechecked_after_dispatch_started_before_provider_io(
+    machine: ApprovalStateMachine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enqueue_approved(machine, "last-boundary")
+    adapter = FakeAdapter()
+    client = FakeClient(machine, [{"status": "sent"}])
+    resolver = MutableScopeResolver()
+    loader = FrozenRequestLoader(
+        machine,
+        FakeDecryptor(),
+        {("fake", "send"): adapter},
+        resolver,
+    )
+    selected = DeliveryDispatcher(machine, loader, {"fake": client})
+    original_mark = machine.mark_dispatch_started
+
+    def mark_then_rotate_scope(*args: Any, **kwargs: Any) -> None:
+        original_mark(*args, **kwargs)
+        resolver.scope = replace(
+            resolver.scope,
+            credential_identity_digest="f" * 64,
+        )
+
+    monkeypatch.setattr(machine, "mark_dispatch_started", mark_then_rotate_scope)
+
+    with pytest.raises(DeliveryPreparationError, match="before network"):
+        await selected.dispatch(
+            "last-boundary",
+            worker_id="worker",
+            now=NOW + 2,
+        )
+
+    assert resolver.calls == 3
+    assert client.calls == []
+    request = machine.get_request("last-boundary")
+    assert request["state"] == "failed"
+    assert request["failure_reason"] == "execution_scope_changed_before_io"
+
+
+@pytest.mark.asyncio
+async def test_restart_same_credential_ref_new_generation_fails_before_provider_io(
+    machine: ApprovalStateMachine,
+) -> None:
+    enqueue_approved(machine, "credential-generation")
+    restarted_database = Database(machine.database.path)
+    restarted_database.initialize()
+    restarted_machine = ApprovalStateMachine(
+        restarted_database,
+        notification_user_id="human:test",
+    )
+    adapter = FakeAdapter()
+    client = FakeClient(
+        restarted_machine,
+        [{"status": "sent"}],
+        credential_identity_digest="e" * 64,
+    )
+
+    with pytest.raises(DeliveryPreparationError, match="before network"):
+        await dispatcher(restarted_machine, adapter, client).dispatch(
+            "credential-generation",
+            worker_id="restarted-worker",
+            now=NOW + 2,
+        )
+
+    assert client.credential_ref == "keychain://Signet/fake-provider"
+    assert client.calls == []
+    assert restarted_machine.get_request("credential-generation")["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_restart_replacement_adapter_with_same_version_fails_before_provider_io(
+    machine: ApprovalStateMachine,
+) -> None:
+    enqueue_approved(machine, "adapter-identity")
+    restarted_database = Database(machine.database.path)
+    restarted_database.initialize()
+    restarted_machine = ApprovalStateMachine(
+        restarted_database,
+        notification_user_id="human:test",
+    )
+    adapter = FakeAdapter(adapter_id="fake.replacement")
+    client = FakeClient(restarted_machine, [{"status": "sent"}])
+
+    with pytest.raises(DeliveryPreparationError, match="before network"):
+        await dispatcher(restarted_machine, adapter, client).dispatch(
+            "adapter-identity",
+            worker_id="restarted-worker",
+            now=NOW + 2,
+        )
+
+    assert adapter.adapter_version == "1"
+    assert client.calls == []
+    assert restarted_machine.get_request("adapter-identity")["state"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -507,3 +763,93 @@ async def test_second_initial_dispatch_loses_before_network(
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
+
+
+@pytest.mark.asyncio
+async def test_blocking_adapter_preparation_does_not_stall_event_loop(
+    machine: ApprovalStateMachine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enqueue_approved(machine, "blocking-preparation")
+    adapter = FakeAdapter()
+    client = FakeClient(machine, [{"status": "sent"}])
+    selected = dispatcher(machine, adapter, client)
+    started = threading.Event()
+    release = threading.Event()
+    original_prepare = adapter.prepare_for_execution
+
+    def blocking_prepare(request: AdapterRequest) -> dict[str, Any]:
+        started.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("blocking adapter preparation was not released")
+        return original_prepare(request)
+
+    monkeypatch.setattr(adapter, "prepare_for_execution", blocking_prepare)
+    safety_release = threading.Timer(3, release.set)
+    safety_release.start()
+    waiting_started_at = time.monotonic()
+    try:
+        dispatching = asyncio.create_task(
+            selected.dispatch(
+                "blocking-preparation",
+                worker_id="worker",
+                now=NOW + 2,
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        assert time.monotonic() - waiting_started_at < 2
+        assert not release.is_set()
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        release.set()
+        result = await dispatching
+    finally:
+        release.set()
+        safety_release.cancel()
+
+    assert result.outcome.value == "succeeded"
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_preparation_thread_finishes_before_cancellation_propagates(
+    machine: ApprovalStateMachine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enqueue_approved(machine, "cancel-blocking-preparation")
+    adapter = FakeAdapter()
+    client = FakeClient(machine, [{"status": "sent"}])
+    selected = dispatcher(machine, adapter, client)
+    started = threading.Event()
+    release = threading.Event()
+    original_prepare = adapter.prepare_for_execution
+
+    def blocking_prepare(request: AdapterRequest) -> dict[str, Any]:
+        started.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("cancelled adapter preparation was not released")
+        return original_prepare(request)
+
+    monkeypatch.setattr(adapter, "prepare_for_execution", blocking_prepare)
+    safety_release = threading.Timer(3, release.set)
+    safety_release.start()
+    try:
+        dispatching = asyncio.create_task(
+            selected.dispatch(
+                "cancel-blocking-preparation",
+                worker_id="worker",
+                now=NOW + 2,
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        dispatching.cancel()
+        await asyncio.sleep(0.05)
+        assert not dispatching.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await dispatching
+    finally:
+        release.set()
+        safety_release.cancel()
+
+    assert client.calls == []
+    assert machine.get_request("cancel-blocking-preparation")["state"] == "failed"

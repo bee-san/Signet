@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import threading
+import time
 import traceback
 from collections.abc import Mapping
 from dataclasses import replace
@@ -41,6 +44,37 @@ class FakeTransport:
             raise RuntimeError("explicit fake push failure")
 
 
+class BlockingRepository(InMemoryPushRepository):
+    def __init__(self, operation: str) -> None:
+        super().__init__()
+        self.operation = operation
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def _block(self, operation: str) -> None:
+        if self.operation != operation:
+            return
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise AssertionError("blocking notification repository call was not released")
+
+    def active_for(
+        self,
+        user_id: str,
+        kind: NotificationKind,
+    ) -> tuple[PushSubscription, ...]:
+        self._block("read")
+        return super().active_for(user_id, kind)
+
+    def mark_success(self, subscription_id: str, *, now: int) -> None:
+        self._block("success")
+        super().mark_success(subscription_id, now=now)
+
+    def mark_failure(self, subscription_id: str, *, now: int, disable_after: int) -> None:
+        self._block("failure")
+        super().mark_failure(subscription_id, now=now, disable_after=disable_after)
+
+
 def subscription(
     identifier: str,
     *,
@@ -64,14 +98,16 @@ def _encoded(value: bytes) -> str:
 
 
 @pytest.mark.parametrize("kind", tuple(NotificationKind)[:-1])
-def test_event_payloads_contain_only_safe_service_action_and_count(kind: NotificationKind) -> None:
+def test_event_payloads_exclude_request_and_downstream_metadata(kind: NotificationKind) -> None:
     message = PushMessage(kind, service="Fastmail", action="send_email")
     payload = message.payload()
     serialized = json.dumps(payload)
-    assert set(payload) == {"title", "kind", "tag", "url", "body", "service", "action"}
+    assert set(payload) == {"title", "kind", "tag", "url", "body"}
     assert payload["title"] == "Signet"
     assert payload["url"] == "/"
     for secret in (
+        "Fastmail",
+        "send_email",
         "person@example.test",
         "Viewing on Tuesday",
         "private message body",
@@ -108,8 +144,8 @@ def test_invalid_event_labels_degrade_to_privacy_safe_fallbacks(
         action=action,
     ).payload()
 
-    assert payload["service"] in {"provider", "Downstream service"}
-    assert payload["action"] == "requested action"
+    assert "service" not in payload
+    assert "action" not in payload
     assert "send:thing" not in str(payload)
 
 
@@ -168,6 +204,48 @@ async def test_categories_users_and_unsubscribe_are_enforced_before_transport() 
     )
     assert report.attempted == 0
     assert transport.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "transport_fails"),
+    [("read", False), ("success", False), ("failure", True)],
+)
+async def test_blocking_notification_repository_does_not_stall_event_loop(
+    operation: str,
+    transport_fails: bool,
+) -> None:
+    repository = BlockingRepository(operation)
+    repository.save(subscription("device"))
+    transport = FakeTransport(failing={"device"} if transport_fails else set())
+    dispatcher = NotificationDispatcher(repository, transport)
+    safety_release = threading.Timer(3, repository.release.set)
+    safety_release.start()
+    waiting_started_at = time.monotonic()
+    try:
+        notifying = asyncio.create_task(
+            dispatcher.notify(
+                "autumn",
+                PushMessage(
+                    NotificationKind.NEW_PENDING,
+                    service="Fastmail",
+                    action="send_email",
+                ),
+                now=1_800_000_001,
+            )
+        )
+        assert await asyncio.to_thread(repository.started.wait, 1)
+        assert time.monotonic() - waiting_started_at < 2
+        assert not repository.release.is_set()
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        repository.release.set()
+        report = await notifying
+    finally:
+        repository.release.set()
+        safety_release.cancel()
+
+    assert report.attempted == 1
+    assert (report.delivered, report.failed) == ((0, 1) if transport_fails else (1, 0))
 
 
 def test_subscription_validation_and_representations_redact_endpoint_and_keys() -> None:

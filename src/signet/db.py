@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - CPython's bundled driver is normal
 
 
 IntegrityError = sqlite3.IntegrityError
-LATEST_SCHEMA_VERSION = 13
+LATEST_SCHEMA_VERSION = 14
 MIN_SUPPORTED_SCHEMA_VERSION = 1
 MINIMUM_SQLITE_VERSION = (3, 51, 3)
 _MIGRATION_PATTERN = re.compile(r"^(\d{4})_[a-z0-9_]+\.sql$")
@@ -269,21 +269,36 @@ class Database:
         *,
         fault_injector: MigrationFaultInjector | None,
     ) -> None:
-        table = connection.execute(
-            """
-            SELECT 1 FROM sqlite_schema
-            WHERE type = 'table' AND name = 'privacy_maintenance'
-            """
-        ).fetchone()
-        if table is None:
-            return
-        row = connection.execute(
-            """
-            SELECT pending FROM privacy_maintenance
-            WHERE maintenance_name = 'structured_decision_reasons'
-            """
-        ).fetchone()
-        if row is None or int(row[0]) == 0:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_schema
+                WHERE type = 'table' AND name IN (
+                    'privacy_maintenance',
+                    'attachment_metadata_privacy_maintenance'
+                )
+                """
+            ).fetchall()
+        }
+        pending = False
+        if "privacy_maintenance" in tables:
+            row = connection.execute(
+                """
+                SELECT pending FROM privacy_maintenance
+                WHERE maintenance_name = 'structured_decision_reasons'
+                """
+            ).fetchone()
+            pending = row is not None and int(row[0]) != 0
+        if "attachment_metadata_privacy_maintenance" in tables:
+            row = connection.execute(
+                """
+                SELECT pending FROM attachment_metadata_privacy_maintenance
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            pending = pending or (row is not None and int(row[0]) != 0)
+        if not pending:
             return
         if fault_injector is not None:
             fault_injector("privacy-maintenance:before-vacuum")
@@ -295,12 +310,20 @@ class Database:
             fault_injector("privacy-maintenance:after-vacuum")
         connection.execute("BEGIN IMMEDIATE")
         try:
-            connection.execute(
-                """
-                UPDATE privacy_maintenance SET pending = 0
-                WHERE maintenance_name = 'structured_decision_reasons' AND pending = 1
-                """
-            )
+            if "privacy_maintenance" in tables:
+                connection.execute(
+                    """
+                    UPDATE privacy_maintenance SET pending = 0
+                    WHERE maintenance_name = 'structured_decision_reasons' AND pending = 1
+                    """
+                )
+            if "attachment_metadata_privacy_maintenance" in tables:
+                connection.execute(
+                    """
+                    UPDATE attachment_metadata_privacy_maintenance SET pending = 0
+                    WHERE singleton = 1 AND pending = 1
+                    """
+                )
             connection.commit()
         except BaseException:
             connection.rollback()

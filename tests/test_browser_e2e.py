@@ -12,7 +12,7 @@ import sys
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -158,6 +158,7 @@ class BrowserSignals:
     post_requests: int = 0
     exact_post_origins: bool = True
     expected_download_url: str | None = None
+    failed_request_details: list[str] = field(default_factory=list)
 
 
 def _available_ports() -> tuple[int, int]:
@@ -434,6 +435,10 @@ def _install_network_guards(page: Page, demo: LiveDemo, signals: BrowserSignals)
         ):
             return
         signals.failed_requests += 1
+        signals.failed_request_details.append(
+            f"{request.method} {request.url} ({request.failure or 'unknown failure'}; "
+            f"page={page.url})"
+        )
 
     page.context.route("**/*", route_request)
     page.on("request", observe_request)
@@ -774,6 +779,10 @@ def _submit_decision(
     with page.expect_navigation(wait_until="domcontentloaded"):
         form.locator(f"button[name='action'][value='{action}']").click()
     page.wait_for_url(re.compile(rf"{re.escape(demo.web_origin)}/audit#decision-{request_id}$"))
+    redirected_review = page.locator(
+        f'[data-decision-request-id="{request_id}"] [data-review-fragment] .request-review'
+    ).first
+    redirected_review.wait_for(state="visible")
 
 
 def _assert_passkey_note_routing(review: Locator) -> None:
@@ -1090,6 +1099,7 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
                 pytest.fail("mobile Audit navigation target is undersized", pytrace=False)
             audit_link.click()
             page.wait_for_url(f"{demo.web_origin}/audit")
+            page.wait_for_load_state("networkidle")
 
             context.close()
             browser.close()
@@ -1102,7 +1112,13 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
             or signals.external_requests != 0
         ):
             pytest.fail(
-                "browser workflow emitted a page, console, HTTP, or network error", pytrace=False
+                "browser workflow emitted a page, console, HTTP, or network error: "
+                f"console={signals.console_errors}, page={signals.page_errors}, "
+                f"failed_requests={signals.failed_requests}, "
+                f"error_responses={signals.error_responses}, "
+                f"external_requests={signals.external_requests}, "
+                f"request_failures={signals.failed_request_details!r}",
+                pytrace=False,
             )
         if signals.post_requests < 3 or not signals.exact_post_origins:
             pytest.fail(

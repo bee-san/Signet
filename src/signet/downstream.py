@@ -524,6 +524,7 @@ class DownstreamClient:
         self._alias = alias
         self._config = config
         self._credential_reference = SecretReference.parse(config.credential_ref)
+        self._credential_identity_digest = config.credential_identity_digest
         self._secret_store = secret_store
         self._http_connector = http_connector
         self._stdio_connector = stdio_connector
@@ -546,6 +547,12 @@ class DownstreamClient:
     @property
     def alias(self) -> str:
         return self._alias
+
+    @property
+    def credential_identity_digest(self) -> str:
+        """Return the inventory-issued provider credential generation identity."""
+
+        return self._credential_identity_digest
 
     @property
     def state(self) -> str:

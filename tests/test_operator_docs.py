@@ -298,6 +298,57 @@ def test_hermes_runtime_is_fully_locked_and_overrides_vulnerable_upstream_pins()
     assert 'hash = "sha256:' in lock
 
 
+def test_distribution_name_does_not_collide_with_signet_package() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+
+    assert project["project"]["name"] == "signet-gateway"
+    assert set(project["project"]["classifiers"]) >= {
+        "Operating System :: MacOS :: MacOS X",
+        "Operating System :: POSIX :: Linux",
+    }
+    declared: dict[str, str] = {}
+    for requirement in project["project"]["dependencies"]:
+        match = re.fullmatch(
+            r"(?P<name>[A-Za-z0-9_.-]+)(?:\[[A-Za-z0-9_,.-]+\])?"
+            r"==(?P<version>[^; ]+)(?:; .+)?",
+            requirement,
+        )
+        assert match is not None, requirement
+        declared[match.group("name").lower().replace("_", "-")] = match.group("version")
+
+    packages_by_name: dict[str, list[dict[str, object]]] = {}
+    locked_versions: dict[str, set[str]] = {}
+    for package in lock["package"]:
+        name = str(package["name"])
+        packages_by_name.setdefault(name, []).append(package)
+        if "version" in package:
+            locked_versions.setdefault(name, set()).add(str(package["version"]))
+
+    root = next(package for package in lock["package"] if package["name"] == "signet-gateway")
+    pending = list(root["dependencies"])
+    runtime_closure: set[str] = set()
+    while pending:
+        dependency = pending.pop()
+        marker = str(dependency.get("marker", ""))
+        if marker == "sys_platform == 'win32'":
+            continue
+        name = str(dependency["name"])
+        if name in runtime_closure:
+            continue
+        runtime_closure.add(name)
+        for package in packages_by_name[name]:
+            pending.extend(package.get("dependencies", []))
+
+    assert set(declared) == runtime_closure
+    for name, version in declared.items():
+        assert locked_versions[name] == {version}
+    for requirement in project["build-system"]["requires"]:
+        assert re.fullmatch(r"[A-Za-z0-9_.-]+==[^; ]+", requirement)
+    assert project["project"]["scripts"] == {"signet": "signet.app:main"}
+    assert project["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["src/signet"]
+
+
 def test_operator_commands_use_shipped_entrypoints_and_exact_paths() -> None:
     runbook = (ROOT / "docs" / "operator-runbook.md").read_text(encoding="utf-8")
 

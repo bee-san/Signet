@@ -63,18 +63,28 @@ def payload_fingerprint(
     *,
     alias: str,
     tool: str,
+    account_ref: str | None,
+    credential_identity_digest: str | None,
+    schema_digest: str,
+    caller_namespace: str,
     arguments: Mapping[str, Any],
     staged_file_hashes: Sequence[str] = (),
     policy_version: int,
+    adapter_id: str,
     adapter_version: str,
 ) -> tuple[bytes, str]:
     """Freeze an executable call and return its canonical bytes and SHA-256."""
 
     envelope = {
+        "account_ref": account_ref,
+        "adapter_id": adapter_id,
         "adapter_version": adapter_version,
         "alias": alias,
         "arguments": dict(arguments),
+        "caller_namespace": caller_namespace,
+        "credential_identity_digest": credential_identity_digest,
         "policy_version": policy_version,
+        "schema_digest": schema_digest,
         "staged_file_hashes": list(staged_file_hashes),
         "tool": tool,
     }

@@ -18,6 +18,9 @@ from signet.models import AttachmentReference
 FAKE_MASTER = "fake-freezer-master-key-material-00001"
 FAKE_KEY_REFERENCE = "keychain://Signet/fake-freezer-payload-key"
 FAKE_ATTACHMENT_HASH = "a" * 64
+FAKE_SCHEMA_DIGEST = "b" * 64
+FAKE_CREDENTIAL_DIGEST = "c" * 64
+FAKE_ACCOUNT_REF = "fake-account"
 NOW = datetime(2026, 7, 15, 12, 0, 0, 999_999, tzinfo=UTC)
 
 
@@ -90,7 +93,9 @@ def test_freezer_builds_complete_encrypted_enqueue_data_and_valid_pending_result
         {"name": "  private fake item  ", "count": 2},
         origin_namespace="profile:fake-test",
         policy_version=11,
-        schema_version="schema-v3",
+        schema_digest=FAKE_SCHEMA_DIGEST,
+        account_ref=FAKE_ACCOUNT_REF,
+        credential_identity_digest=FAKE_CREDENTIAL_DIGEST,
         editor_actor="caller:fake-test",
         idempotency_key="fake-upstream-call-001",
         retry_of_request_id="req_FakePrior01",
@@ -100,9 +105,14 @@ def test_freezer_builds_complete_encrypted_enqueue_data_and_valid_pending_result
     expected_payload, expected_hash = payload_fingerprint(
         alias=adapter.downstream_alias,
         tool=adapter.tool_name,
+        account_ref=FAKE_ACCOUNT_REF,
+        credential_identity_digest=FAKE_CREDENTIAL_DIGEST,
+        schema_digest=FAKE_SCHEMA_DIGEST,
+        caller_namespace="profile:fake-test",
         arguments={"count": 2, "name": "private fake item"},
         staged_file_hashes=(FAKE_ATTACHMENT_HASH,),
         policy_version=11,
+        adapter_id=adapter.adapter_id,
         adapter_version=adapter.adapter_version,
     )
 
@@ -118,7 +128,7 @@ def test_freezer_builds_complete_encrypted_enqueue_data_and_valid_pending_result
     assert request.canonical_size == len(expected_payload)
     assert request.policy_version == "11"
     assert request.adapter_version == "adapter-v7"
-    assert request.schema_version == "schema-v3"
+    assert request.schema_version == FAKE_SCHEMA_DIGEST
     assert request.editor_actor == "caller:fake-test"
     assert request.encryption_key_ref == FAKE_KEY_REFERENCE
     assert request.idempotency_key == "fake-upstream-call-001"
@@ -158,7 +168,9 @@ def test_freezer_generates_distinct_secure_ids_without_content_deduplication() -
     kwargs = {
         "origin_namespace": "profile:fake-test",
         "policy_version": 1,
-        "schema_version": "schema-v1",
+        "schema_digest": FAKE_SCHEMA_DIGEST,
+        "account_ref": FAKE_ACCOUNT_REF,
+        "credential_identity_digest": FAKE_CREDENTIAL_DIGEST,
         "editor_actor": "caller:fake-test",
     }
     first = selected.freeze(cast(ApprovalAdapter, adapter), {"name": "same", "count": 1}, **kwargs)
@@ -183,7 +195,9 @@ def test_freezer_uses_utc_and_rejects_naive_clock() -> None:
             {"name": "fake", "count": 1},
             origin_namespace="profile:fake-test",
             policy_version=1,
-            schema_version="schema-v1",
+            schema_digest=FAKE_SCHEMA_DIGEST,
+            account_ref=FAKE_ACCOUNT_REF,
+            credential_identity_digest=FAKE_CREDENTIAL_DIGEST,
             editor_actor="caller:fake-test",
         )
 
@@ -196,7 +210,9 @@ def test_freezer_rejects_attachment_hash_mismatch_before_canonicalization() -> N
             {"name": "fake", "count": 1},
             origin_namespace="profile:fake-test",
             policy_version=1,
-            schema_version="schema-v1",
+            schema_digest=FAKE_SCHEMA_DIGEST,
+            account_ref=FAKE_ACCOUNT_REF,
+            credential_identity_digest=FAKE_CREDENTIAL_DIGEST,
             editor_actor="caller:fake-test",
             attachments=(attachment(),),
             staged_file_hashes=("b" * 64,),
@@ -212,7 +228,9 @@ def test_freezer_rejects_oversized_canonical_payload_without_returning_partial_d
             {"name": "x" * 100, "count": 1},
             origin_namespace="profile:fake-test",
             policy_version=1,
-            schema_version="schema-v1",
+            schema_digest=FAKE_SCHEMA_DIGEST,
+            account_ref=FAKE_ACCOUNT_REF,
+            credential_identity_digest=FAKE_CREDENTIAL_DIGEST,
             editor_actor="caller:fake-test",
         )
 
@@ -224,7 +242,9 @@ def test_frozen_and_freezer_representations_redact_encrypted_request_data() -> N
         {"name": "private fake value", "count": 1},
         origin_namespace="profile:fake-test",
         policy_version=1,
-        schema_version="schema-v1",
+        schema_digest=FAKE_SCHEMA_DIGEST,
+        account_ref=FAKE_ACCOUNT_REF,
+        credential_identity_digest=FAKE_CREDENTIAL_DIGEST,
         editor_actor="caller:fake-test",
     )
     assert repr(frozen) == "FrozenRequest(enqueue_request=<redacted>)"
