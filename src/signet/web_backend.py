@@ -13,7 +13,8 @@ import hashlib
 import hmac
 import json
 import secrets
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
@@ -50,6 +51,7 @@ from signet.notifications import (
     PushRepository,
     PushSubscription,
 )
+from signet.policy import PolicyError
 from signet.staging import StagingError, StagingStore
 from signet.state_machine import ApprovalStateMachine
 from signet.totp import (
@@ -67,6 +69,7 @@ from signet.web import (
     DetailBlock,
     HumanAction,
     LoginOptions,
+    PolicyPromotionPreview,
     PushSubscriptionInput,
     QueueItem,
     QueuePage,
@@ -99,6 +102,9 @@ type ConfirmationAction = Literal[
     "promote_passthrough",
 ]
 type PolicyPromotion = Literal["promote_approval", "promote_passthrough"]
+type ConfirmationKey = tuple[str, int, str, int]
+type ConfirmationProof = tuple[str, str]
+type ConfirmationMatches = tuple[tuple[ConfirmationProof, ...], int]
 
 _ENVELOPE_FIELDS = frozenset(
     {
@@ -112,7 +118,20 @@ _ENVELOPE_FIELDS = frozenset(
 )
 _PREAUTH_PREFIX = "preauth:"
 _SHA256 = frozenset("0123456789abcdef")
+_AUDIT_DECISION_ACTIONS = frozenset(
+    {
+        "approved_via_web",
+        "approved_via_mcp",
+        "denied",
+        "policy_promoted_to_approval",
+        "policy_promoted_to_passthrough",
+    }
+)
 _MAX_QUEUE_PAGE_SIZE = 50
+_POLICY_PREVIEW_UNAVAILABLE = (
+    "Exact frozen policy proposal history is unavailable or failed integrity validation. "
+    "Approval is disabled; the frozen request context remains available."
+)
 
 
 class WebPayloadError(RuntimeError):
@@ -192,6 +211,14 @@ class PrivatePayloadReviewer(Protocol):
         payload_hash: str,
     ) -> ReviewedPayload: ...
 
+    def review_historical(
+        self,
+        request_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+    ) -> ReviewedPayload: ...
+
     def prepare_edit(
         self,
         request_id: str,
@@ -212,7 +239,7 @@ class PrivatePayloadReviewer(Protocol):
 
 
 class EncryptedPayloadReviewer:
-    """Decrypt, authenticate, and adapter-validate exact current revisions."""
+    """Decrypt, authenticate, and adapter-validate exact retained revisions."""
 
     def __init__(
         self,
@@ -245,9 +272,39 @@ class EncryptedPayloadReviewer:
         version: int,
         payload_hash: str,
     ) -> ReviewedPayload:
+        return self._review_revision(
+            request_id,
+            version=version,
+            payload_hash=payload_hash,
+            require_current=True,
+        )
+
+    def review_historical(
+        self,
+        request_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+    ) -> ReviewedPayload:
+        return self._review_revision(
+            request_id,
+            version=version,
+            payload_hash=payload_hash,
+            require_current=False,
+        )
+
+    def _review_revision(
+        self,
+        request_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+        require_current: bool,
+    ) -> ReviewedPayload:
         request = self._state_machine.get_request(request_id)
-        if request["current_version"] != version or not _same_hash(
-            request["current_payload_hash"], payload_hash
+        if require_current and (
+            request["current_version"] != version
+            or not _same_hash(request["current_payload_hash"], payload_hash)
         ):
             raise WebPayloadError("request revision is no longer current")
         payload = self._state_machine.get_payload_version(request_id, version)
@@ -504,6 +561,16 @@ class PolicyPromotionBoundary(Protocol):
     transaction.
     """
 
+    def preview(
+        self,
+        request_id: str,
+        action: HumanAction,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        now: int,
+    ) -> PolicyPromotionPreview: ...
+
     def binding_action(
         self,
         request_id: str,
@@ -561,6 +628,7 @@ class WebBackend:
         passkey_login_source_limit: int = 20,
         passkey_login_account_limit: int = 10,
         passkey_login_global_limit: int = 200,
+        clock: Callable[[], int] | None = None,
     ) -> None:
         if max_audit_entries <= 0 or max_audit_entries > 10_000:
             raise ValueError("audit read limit is invalid")
@@ -572,6 +640,8 @@ class WebBackend:
             raise ValueError("decision read limit is invalid")
         if max_queue_entries <= 0 or max_queue_entries > _MAX_QUEUE_PAGE_SIZE:
             raise ValueError("queue read limit is invalid")
+        if clock is not None and not callable(clock):
+            raise ValueError("web backend clock is invalid")
         if (
             passkey_login_window_seconds < 60
             or passkey_login_window_seconds > 60 * 60
@@ -603,6 +673,7 @@ class WebBackend:
         self._passkey_login_source_limit = passkey_login_source_limit
         self._passkey_login_account_limit = passkey_login_account_limit
         self._passkey_login_global_limit = passkey_login_global_limit
+        self._clock = clock or (lambda: int(time.time()))
 
     def authenticate(self, token: str | None, *, now: int) -> SessionPrincipal:
         principal = self._sessions.authenticate(token, now=now)
@@ -1041,8 +1112,83 @@ class WebBackend:
             events = self._state_machine.list_events(request_id)
         except RequestNotFound:
             raise WebConflict("request details are unavailable") from None
-        version = int(request["current_version"])
-        payload_hash = str(request["current_payload_hash"])
+        return self._get_revision_detail(
+            request,
+            events=events,
+            version=int(request["current_version"]),
+            payload_hash=str(request["current_payload_hash"]),
+            historical_event=None,
+        )
+
+    def get_historical_detail(
+        self,
+        principal: SessionPrincipal,
+        event_id: int,
+    ) -> RequestDetail:
+        self._require_ui_principal(principal)
+        if (
+            not isinstance(event_id, int)
+            or isinstance(event_id, bool)
+            or event_id < 1
+            or event_id > (2**63 - 1)
+        ):
+            raise WebConflict("decision event is invalid")
+        with self._database.read() as connection:
+            event = connection.execute(
+                """
+                SELECT event_id, request_id, actor, action, occurred_at,
+                       version, payload_hash, safe_details_json
+                FROM request_events
+                WHERE event_id = ? AND action IN (
+                    'approved_via_web', 'approved_via_mcp', 'denied',
+                    'policy_promoted_to_approval',
+                    'policy_promoted_to_passthrough'
+                )
+                """,
+                (event_id,),
+            ).fetchone()
+        if event is None or str(event["action"]) not in _AUDIT_DECISION_ACTIONS:
+            raise WebConflict("decision event is unavailable")
+        request_id = str(event["request_id"])
+        version = event["version"]
+        payload_hash = event["payload_hash"]
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+            or not isinstance(payload_hash, str)
+            or not _is_sha256(payload_hash)
+        ):
+            raise WebConflict("decision event binding is invalid")
+        try:
+            request = self._state_machine.get_request(request_id)
+            events = [
+                item
+                for item in self._state_machine.list_events(request_id)
+                if int(item["event_id"]) <= event_id
+            ]
+        except (RequestNotFound, KeyError, TypeError, ValueError):
+            raise WebConflict("decision event context is unavailable") from None
+        if not any(int(item["event_id"]) == event_id for item in events):
+            raise WebConflict("decision event context is unavailable")
+        return self._get_revision_detail(
+            request,
+            events=events,
+            version=version,
+            payload_hash=payload_hash,
+            historical_event=event,
+        )
+
+    def _get_revision_detail(
+        self,
+        request: Mapping[str, Any],
+        *,
+        events: Sequence[Mapping[str, Any]],
+        version: int,
+        payload_hash: str,
+        historical_event: Mapping[str, Any] | None,
+    ) -> RequestDetail:
+        request_id = str(request["request_id"])
         with self._database.read() as connection:
             payload_metadata = connection.execute(
                 """
@@ -1063,15 +1209,20 @@ class WebBackend:
                 LEFT JOIN staged_objects AS staged
                   ON staged.attachment_id = attachment.attachment_id
                 WHERE attachment.request_id = ? AND attachment.version = ?
+                  AND attachment.payload_hash = ?
                 ORDER BY attachment.attachment_id
                 """,
-                (request_id, version),
+                (request_id, version, payload_hash),
             ).fetchall()
             confirmation_rows = connection.execute(
                 """
-                SELECT kind, path, action, consumed_at, version, payload_hash
+                SELECT kind, path, action, consumed_at, version, payload_hash,
+                       prospective_payload_hash
                 FROM confirmation_consumptions
-                WHERE request_id = ? AND action IN ('approve', 'deny')
+                WHERE request_id = ? AND action IN (
+                    'approve', 'deny', 'human_cancel', 'edit',
+                    'promote_approval', 'promote_passthrough'
+                )
                 """,
                 (request_id,),
             ).fetchall()
@@ -1080,22 +1231,35 @@ class WebBackend:
         if payload_metadata is None:
             return _unavailable_request_detail(
                 request,
+                version=version,
+                payload_hash=payload_hash,
                 events=rendered_events,
                 payload_metadata=None,
                 attachment_rows=(),
+                historical_event=historical_event,
             )
         try:
-            reviewed = self._payloads.review(
-                request_id,
-                version=version,
-                payload_hash=payload_hash,
-            )
+            if historical_event is None:
+                reviewed = self._payloads.review(
+                    request_id,
+                    version=version,
+                    payload_hash=payload_hash,
+                )
+            else:
+                reviewed = self._payloads.review_historical(
+                    request_id,
+                    version=version,
+                    payload_hash=payload_hash,
+                )
         except (RequestNotFound, WebPayloadError):
             return _unavailable_request_detail(
                 request,
+                version=version,
+                payload_hash=payload_hash,
                 events=rendered_events,
                 payload_metadata=payload_metadata,
                 attachment_rows=attachment_rows,
+                historical_event=historical_event,
             )
         arguments_json = json.dumps(
             dict(reviewed.arguments),
@@ -1105,11 +1269,34 @@ class WebBackend:
             indent=2,
         )
         editable = None
-        if request["state"] == "pending_approval":
+        if (
+            historical_event is None
+            and request["state"] == "pending_approval"
+            and not bool(request["gateway_internal"])
+        ):
             editable = arguments_json
         account = getattr(reviewed.adapter, "account", None)
         if not isinstance(account, str) or not account:
             account = None
+        detail_now = self._clock()
+        decision_window_expired = (
+            historical_event is None
+            and request["state"] == "pending_approval"
+            and detail_now >= int(request["expires_at"])
+        )
+        policy_promotion_preview = None
+        policy_promotion_preview_unavailable = None
+        if bool(request["gateway_internal"]):
+            (
+                policy_promotion_preview,
+                policy_promotion_preview_unavailable,
+            ) = self._policy_preview(
+                request_id,
+                "approve",
+                expected_version=version,
+                expected_payload_hash=payload_hash,
+                now=detail_now,
+            )
         return RequestDetail(
             request_id=request_id,
             service=reviewed.summary.service,
@@ -1153,6 +1340,9 @@ class WebBackend:
             downstream_alias=str(request["downstream_alias"]),
             tool_name=str(request["tool_name"]),
             account_context=account,
+            policy_promotion_preview=policy_promotion_preview,
+            policy_promotion_preview_unavailable=policy_promotion_preview_unavailable,
+            decision_window_expired=decision_window_expired,
             policy_mode=str(request["policy_mode"]),
             policy_version=str(reviewed.policy_version),
             adapter_version=reviewed.adapter_version,
@@ -1174,6 +1364,18 @@ class WebBackend:
             duplicate_warning_required=bool(request["duplicate_warning_required"]),
             canonical_size=int(payload_metadata["canonical_size"]),
             editor_actor=str(payload_metadata["editor_actor"]),
+            historical_event_id=(
+                int(historical_event["event_id"]) if historical_event is not None else None
+            ),
+            historical_event_action=(
+                str(historical_event["action"]) if historical_event is not None else None
+            ),
+            historical_event_actor=(
+                str(historical_event["actor"]) if historical_event is not None else None
+            ),
+            historical_event_occurred_at=(
+                int(historical_event["occurred_at"]) if historical_event is not None else None
+            ),
         )
 
     def get_attachment(
@@ -1282,22 +1484,17 @@ class WebBackend:
                 """
                 SELECT event.event_id, event.occurred_at, event.actor, event.action,
                        event.request_id, event.version, event.payload_hash,
-                       request.state, request.downstream_alias, request.tool_name,
-                       confirmation.kind AS confirmation_kind,
-                       confirmation.path AS confirmation_path
+                       request.state, request.downstream_alias, request.tool_name
                 FROM request_events AS event
                 JOIN approval_requests AS request
                   ON request.request_id = event.request_id
-                LEFT JOIN confirmation_consumptions AS confirmation
-                  ON confirmation.request_id = event.request_id
-                 AND confirmation.version = event.version
-                 AND confirmation.payload_hash = event.payload_hash
-                 AND confirmation.consumed_at = event.occurred_at
-                 AND confirmation.action = CASE
-                       WHEN event.action = 'denied' THEN 'deny'
-                       ELSE 'approve'
-                     END
-                WHERE event.action IN ('denied', 'approved_via_web', 'approved_via_mcp')
+                WHERE (
+                    event.action IN ('denied', 'approved_via_web', 'approved_via_mcp')
+                    OR event.action IN (
+                        'policy_promoted_to_approval',
+                        'policy_promoted_to_passthrough'
+                    )
+                )
                   AND (? IS NULL OR event.event_id < ?)
                 ORDER BY event.event_id DESC
                 LIMIT ?
@@ -1308,18 +1505,76 @@ class WebBackend:
                     self.max_decision_entries + 1,
                 ),
             ).fetchall()
+            visible = rows[: self.max_decision_entries]
+            confirmation_rows: tuple[Any, ...] | list[Any] = ()
+            if visible:
+                request_ids = tuple(sorted({str(row["request_id"]) for row in visible}))
+                confirmation_rows = connection.execute(
+                    """
+                    SELECT kind, path, action, request_id, consumed_at, version,
+                           payload_hash, prospective_payload_hash
+                    FROM confirmation_consumptions
+                    WHERE request_id IN (SELECT value FROM json_each(?))
+                      AND action IN (
+                          'approve', 'deny',
+                          'promote_approval', 'promote_passthrough'
+                      )
+                    """,
+                    (json.dumps(request_ids),),
+                ).fetchall()
         visible = rows[: self.max_decision_entries]
         has_more = len(rows) > self.max_decision_entries
+        confirmation_rows_by_request: dict[str, list[Any]] = {}
+        for confirmation_row in confirmation_rows:
+            confirmation_rows_by_request.setdefault(str(confirmation_row["request_id"]), []).append(
+                confirmation_row
+            )
+        provenance_by_request = {
+            request_id: _confirmation_provenance(request_rows)
+            for request_id, request_rows in confirmation_rows_by_request.items()
+        }
         decisions: list[DecisionEntry] = []
         for row in visible:
             action = str(row["action"])
-            approved = action in {"approved_via_web", "approved_via_mcp"}
-            confirmation_path, confirmation_kind = _decision_provenance(row, action=action)
+            if action == "policy_promoted_to_approval":
+                decision: Literal["approved", "denied", "policy_change"] = "policy_change"
+                decision_label = "Policy change approved: approval"
+            elif action == "policy_promoted_to_passthrough":
+                decision = "policy_change"
+                decision_label = "Policy change approved: passthrough"
+            elif action in {"approved_via_web", "approved_via_mcp"}:
+                decision = "approved"
+                decision_label = "Request approved"
+            else:
+                decision = "denied"
+                decision_label = "Request denied"
+            confirmation_action = _event_confirmation_action(action)
+            provenance = provenance_by_request.get(str(row["request_id"]), {})
+            confirmation_matches = (
+                provenance.get(
+                    (
+                        confirmation_action,
+                        int(row["version"]),
+                        str(row["payload_hash"]),
+                        int(row["occurred_at"]),
+                    ),
+                    ((), 0),
+                )
+                if confirmation_action is not None
+                else ((), 0)
+            )
+            confirmation_path, confirmation_kind = _decision_provenance(
+                confirmation_matches,
+                action=action,
+            )
+            _proofs, confirmation_match_count = confirmation_matches
             decisions.append(
                 DecisionEntry(
+                    event_id=int(row["event_id"]),
                     occurred_at=int(row["occurred_at"]),
                     actor=str(row["actor"]),
-                    decision="approved" if approved else "denied",
+                    decision=decision,
+                    decision_label=decision_label,
                     confirmation_path=confirmation_path,
                     confirmation_kind=confirmation_kind,
                     request_id=str(row["request_id"]),
@@ -1328,6 +1583,8 @@ class WebBackend:
                     tool_name=str(row["tool_name"]),
                     version=int(row["version"]),
                     payload_hash_prefix=str(row["payload_hash"])[:12],
+                    confirmation_attribution_ambiguous=confirmation_match_count > 1,
+                    confirmation_match_count=confirmation_match_count,
                 )
             )
         return DecisionPage(
@@ -1782,6 +2039,37 @@ class WebBackend:
         except (RequestNotFound, StaleVersion, InvalidTransition, RequestExpired) as exc:
             raise WebConflict("request changed after review") from exc
 
+    def _policy_preview(
+        self,
+        request_id: str,
+        action: HumanAction,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        now: int,
+    ) -> tuple[PolicyPromotionPreview | None, str | None]:
+        try:
+            return (
+                self._policy_promotions.preview(
+                    request_id,
+                    action,
+                    expected_version=expected_version,
+                    expected_payload_hash=expected_payload_hash,
+                    now=now,
+                ),
+                None,
+            )
+        except (
+            PolicyPromotionError,
+            RequestNotFound,
+            StaleVersion,
+            InvalidTransition,
+            RequestExpired,
+            WebPayloadError,
+            PolicyError,
+        ):
+            return None, _POLICY_PREVIEW_UNAVAILABLE
+
     def _apply_request_action(
         self,
         action: HumanAction,
@@ -1856,9 +2144,12 @@ class WebBackend:
 def _unavailable_request_detail(
     request: Mapping[str, Any],
     *,
+    version: int,
+    payload_hash: str,
     events: tuple[dict[str, Any], ...],
     payload_metadata: Any | None,
     attachment_rows: tuple[Any, ...] | list[Any],
+    historical_event: Mapping[str, Any] | None,
 ) -> RequestDetail:
     purged = payload_metadata is not None and payload_metadata["purged_at"] is not None
     unavailable_message = (
@@ -1905,8 +2196,8 @@ def _unavailable_request_detail(
         state=str(request["state"]),
         created_at=int(request["created_at"]),
         expires_at=int(request["expires_at"]),
-        version=int(request["current_version"]),
-        payload_hash=str(request["current_payload_hash"]),
+        version=version,
+        payload_hash=payload_hash,
         detail_blocks=(),
         events=events,
         editable_arguments_json=None,
@@ -1956,35 +2247,51 @@ def _unavailable_request_detail(
             if payload_metadata is not None and payload_metadata["editor_actor"] is not None
             else None
         ),
+        historical_event_id=(
+            int(historical_event["event_id"]) if historical_event is not None else None
+        ),
+        historical_event_action=(
+            str(historical_event["action"]) if historical_event is not None else None
+        ),
+        historical_event_actor=(
+            str(historical_event["actor"]) if historical_event is not None else None
+        ),
+        historical_event_occurred_at=(
+            int(historical_event["occurred_at"]) if historical_event is not None else None
+        ),
     )
 
 
 def _render_request_event(
     event: Mapping[str, Any],
-    provenance: Mapping[tuple[str, int, str, int], tuple[str, str]],
+    provenance: Mapping[ConfirmationKey, ConfirmationMatches],
 ) -> dict[str, Any]:
     action = str(event["action"])
     details_json, decision_note = _event_details(event["safe_details_json"], action=action)
     confirmation_action = _event_confirmation_action(action)
-    confirmation = (
+    confirmation_matches = (
         provenance.get(
             (
                 confirmation_action,
                 int(event["version"]),
                 str(event["payload_hash"]),
                 int(event["occurred_at"]),
-            )
+            ),
+            ((), 0),
         )
         if confirmation_action is not None
-        else None
+        else ((), 0)
     )
-    confirmation_kind = confirmation[0] if confirmation is not None else None
-    confirmation_path = confirmation[1] if confirmation is not None else None
-    if confirmation_path is None and action in {"approved_via_web", "approved_via_mcp"}:
+    confirmation_proofs, confirmation_match_count = confirmation_matches
+    unambiguous = confirmation_match_count == 1
+    confirmation_kind = confirmation_proofs[0][0] if unambiguous else None
+    confirmation_path = confirmation_proofs[0][1] if unambiguous else None
+    if not confirmation_proofs and action in {"approved_via_web", "approved_via_mcp"}:
         candidate = action.removeprefix("approved_via_")
         if candidate in {"web", "mcp"}:
             confirmation_path = candidate
     return {
+        "event_id": int(event["event_id"]),
         "occurred_at": int(event["occurred_at"]),
         "actor": str(event["actor"]),
         "action": action,
@@ -1994,20 +2301,37 @@ def _render_request_event(
         "decision_note": decision_note,
         "confirmation_kind": confirmation_kind,
         "confirmation_path": confirmation_path,
-        "decision_confirmation": confirmation_action is not None,
+        "confirmation_proofs": tuple(
+            {"kind": kind, "path": path} for kind, path in confirmation_proofs
+        ),
+        "confirmation_match_count": confirmation_match_count,
+        "confirmation_attribution_ambiguous": confirmation_match_count > 1,
+        # Caller-originated cancellation has the same event action as a human cancel,
+        # but only the latter has a confirmation consumption to render.
+        "decision_confirmation": confirmation_action is not None
+        and (action != "cancelled" or bool(confirmation_proofs)),
     }
 
 
 def _confirmation_provenance(
     rows: tuple[Any, ...] | list[Any],
-) -> dict[tuple[str, int, str, int], tuple[str, str]]:
-    result: dict[tuple[str, int, str, int], tuple[str, str]] = {}
+) -> dict[ConfirmationKey, ConfirmationMatches]:
+    grouped: dict[ConfirmationKey, set[ConfirmationProof]] = {}
+    match_counts: dict[ConfirmationKey, int] = {}
     for row in rows:
         action = str(row["action"])
         kind = str(row["kind"])
         path = str(row["path"])
         if (
-            action not in {"approve", "deny"}
+            action
+            not in {
+                "approve",
+                "deny",
+                "human_cancel",
+                "edit",
+                "promote_approval",
+                "promote_passthrough",
+            }
             or kind not in {"totp", "webauthn"}
             or path
             not in {
@@ -2016,20 +2340,42 @@ def _confirmation_provenance(
             }
         ):
             raise WebConflict("request confirmation provenance is unavailable")
-        key = (
-            action,
-            int(row["version"]),
-            str(row["payload_hash"]),
-            int(row["consumed_at"]),
-        )
-        value = (kind, path)
-        if key in result and result[key] != value:
-            raise WebConflict("request confirmation provenance is ambiguous")
-        result[key] = value
-    return result
+        try:
+            version = int(row["version"])
+            consumed_at = int(row["consumed_at"])
+        except (TypeError, ValueError):
+            raise WebConflict("request confirmation provenance is unavailable") from None
+        payload_hash = str(row["payload_hash"])
+        prospective_payload_hash = row["prospective_payload_hash"]
+        if version < 1 or consumed_at < 0 or not _is_sha256(payload_hash):
+            raise WebConflict("request confirmation provenance is unavailable")
+        if action == "edit":
+            if not _is_sha256(prospective_payload_hash):
+                raise WebConflict("request confirmation provenance is unavailable")
+            version += 1
+            payload_hash = str(prospective_payload_hash)
+        elif prospective_payload_hash is not None:
+            raise WebConflict("request confirmation provenance is unavailable")
+        key = (action, version, payload_hash, consumed_at)
+        grouped.setdefault(key, set()).add((kind, path))
+        match_counts[key] = match_counts.get(key, 0) + 1
+    return {key: (tuple(sorted(proofs)), match_counts[key]) for key, proofs in grouped.items()}
 
 
-def _event_confirmation_action(action: str) -> Literal["approve", "deny"] | None:
+def _event_confirmation_action(action: str) -> ConfirmationAction | None:
+    actions: dict[str, ConfirmationAction] = {
+        "approved_via_web": "approve",
+        "approved_via_mcp": "approve",
+        "denied": "deny",
+        "cancelled": "human_cancel",
+        "payload_edited": "edit",
+        "policy_promoted_to_approval": "promote_approval",
+        "policy_promoted_to_passthrough": "promote_passthrough",
+    }
+    return actions.get(action)
+
+
+def _event_decision_action(action: str) -> Literal["approve", "deny"] | None:
     if action in {"approved_via_web", "approved_via_mcp"}:
         return "approve"
     if action == "denied":
@@ -2037,16 +2383,23 @@ def _event_confirmation_action(action: str) -> Literal["approve", "deny"] | None
     return None
 
 
-def _decision_provenance(row: Mapping[str, Any], *, action: str) -> tuple[str | None, str | None]:
-    raw_path = row["confirmation_path"]
-    raw_kind = row["confirmation_kind"]
-    path = str(raw_path) if raw_path in {"web", "mcp"} else None
-    kind = str(raw_kind) if raw_kind in {"totp", "webauthn"} else None
-    if path is None and action in {"approved_via_web", "approved_via_mcp"}:
+def _decision_provenance(
+    matches: ConfirmationMatches,
+    *,
+    action: str,
+) -> tuple[str | None, str | None]:
+    proofs, match_count = matches
+    if match_count > 1:
+        return None, None
+    if match_count == 1 and len(proofs) == 1:
+        kind, path = proofs[0]
+        return path, kind
+    fallback_path: str | None = None
+    if action in {"approved_via_web", "approved_via_mcp"}:
         candidate = action.removeprefix("approved_via_")
         if candidate in {"web", "mcp"}:
-            path = candidate
-    return path, kind
+            fallback_path = candidate
+    return fallback_path, None
 
 
 def _event_details(value: object, *, action: str) -> tuple[str | None, str | None]:
@@ -2066,7 +2419,7 @@ def _event_details(value: object, *, action: str) -> tuple[str | None, str | Non
             candidate = normalize_decision_note(note_value)
             if candidate is None or candidate != note_value:
                 raise ValueError
-            decision_action = _event_confirmation_action(action)
+            decision_action = _event_decision_action(action)
             if candidate == "legacy_unstructured_reason":
                 if decision_action is None:
                     raise ValueError

@@ -155,7 +155,10 @@ document.querySelectorAll(".request-expander").forEach((expander) => {
     if (!expander.open || !fragment || fragment.dataset.reviewLoaded === "true") return;
     const loading = fragment.querySelector(".review-loading");
     const fallback = fragment.querySelector(".review-fallback");
-    if (loading) loading.textContent = "Loading request context";
+    const historical = fragment.dataset.reviewUrl?.startsWith("/audit/events/");
+    if (loading) {
+      loading.textContent = historical ? "Loading exact event context" : "Loading request context";
+    }
     fallback?.classList.remove("review-fallback-visible");
     fragment.setAttribute("aria-busy", "true");
     try {
@@ -177,7 +180,9 @@ document.querySelectorAll(".request-expander").forEach((expander) => {
 });
 
 if (window.location.hash.startsWith("#decision-")) {
-  const target = document.getElementById(window.location.hash.slice(1));
+  const requestId = window.location.hash.slice("#decision-".length);
+  const target = document.getElementById(window.location.hash.slice(1))
+    || document.querySelector(`[data-decision-request-id="${CSS.escape(requestId)}"]`);
   const expander = target?.querySelector(".request-expander");
   if (expander) expander.open = true;
 }
