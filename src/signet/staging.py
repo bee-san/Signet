@@ -28,7 +28,11 @@ from signet.attachment_crypto import (
     AttachmentEnvelopeError,
 )
 from signet.db import Database, IntegrityError
-from signet.private_paths import PrivatePathError, ensure_private_directory
+from signet.private_paths import (
+    PrivatePathError,
+    ensure_private_directory,
+    require_no_acl_grants,
+)
 
 
 class StagingPathError(ValueError):
@@ -404,7 +408,20 @@ class StagingStore:
             )
             try:
                 lock_metadata = os.fstat(lock_fd)
-                if not stat.S_ISREG(lock_metadata.st_mode) or lock_metadata.st_nlink != 1:
+                current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+                if (
+                    not stat.S_ISREG(lock_metadata.st_mode)
+                    or lock_metadata.st_uid != current_uid
+                    or lock_metadata.st_nlink != 1
+                ):
+                    raise StagingError("staging lock is unsafe")
+                os.fchmod(lock_fd, 0o600)
+                try:
+                    require_no_acl_grants(lock_fd)
+                except PrivatePathError as exc:
+                    raise StagingError("staging lock is unsafe") from exc
+                lock_metadata = os.fstat(lock_fd)
+                if stat.S_IMODE(lock_metadata.st_mode) != 0o600:
                     raise StagingError("staging lock is unsafe")
                 self._lock_identity = _identity(lock_metadata)
             finally:

@@ -88,13 +88,16 @@ class ToolAccessAdapter:
         return ApprovalSummary(
             service="Signet",
             action=self.tool_name,
-            title="Tool access waiting for approval",
+            title="Tool access policy proposal",
             destination_summary=target,
             detail_blocks=(
                 DetailBlock("Requested tool", "text", target),
                 DetailBlock("Reason", "text", proposal["reason"]),
             ),
-            warnings=("Approval changes durable gateway policy; it does not call the tool.",),
+            warnings=(
+                "Approval changes durable gateway policy; it does not call the requested tool. "
+                "Review the exact target effect below before confirming.",
+            ),
         )
 
     def redact_for_audit(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
