@@ -7,9 +7,11 @@ import argparse
 import os
 import plistlib
 import stat
-from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from signet.private_paths import PrivatePathError, require_no_acl_grants
 
 MCP_NAME = "ai.hermes.signet.mcp.plist"
 WEB_NAME = "ai.hermes.signet.web.plist"
@@ -21,6 +23,15 @@ _TEMPLATES = {
 
 class RenderError(RuntimeError):
     """The selected paths or templates cannot produce reviewed private plists."""
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class CreatedOutput:
+    """A newly created output whose directory entry is bound to an identity."""
+
+    name: str
+    device: int
+    inode: int
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -98,7 +109,7 @@ def _existing_path(
     try:
         resolved = path.resolve(strict=True)
         metadata = path.lstat()
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise RenderError(f"{label} must already exist") from exc
     if path != resolved:
         raise RenderError(f"{label} path must be canonical and contain no symlinks")
@@ -184,8 +195,9 @@ def _validate_template(document: Any, *, service: str) -> None:
 
 def _write_outputs(directory_path: Path, rendered: dict[str, bytes]) -> None:
     directory: int | None = None
-    created: dict[str, tuple[int, int]] = {}
-    complete = False
+    created: dict[str, CreatedOutput] = {}
+    stage = "creating"
+    failure: RenderError | None = None
     try:
         directory = os.open(
             directory_path,
@@ -211,21 +223,61 @@ def _write_outputs(directory_path: Path, rendered: dict[str, bytes]) -> None:
             raise RenderError("a rendered launchd output already exists")
         for name, content in rendered.items():
             created[name] = _write_new_file(directory, name, content)
+        stage = "publication_unsynced"
         os.fsync(directory)
-        complete = True
-    except OSError as exc:
-        raise RenderError("launchd outputs could not be created safely") from exc
-    finally:
-        if directory is not None:
-            if not complete:
-                for name, identity in created.items():
-                    _unlink_created(directory, name, identity)
+        stage = "complete"
+    except RenderError as exc:
+        failure = exc
+    except OSError:
+        failure = _output_failure(stage)
+
+    cleanup_failed = False
+    if directory is not None and failure is not None and created:
+        for output in created.values():
+            try:
+                _unlink_created(directory, output)
+            except (OSError, RenderError):
+                cleanup_failed = True
+        try:
+            os.fsync(directory)
+        except OSError:
+            cleanup_failed = True
+    if directory is not None:
+        try:
             os.close(directory)
+        except OSError:
+            cleanup_failed = True
+
+    if cleanup_failed:
+        if stage == "complete" and failure is None:
+            raise RenderError(
+                "launchd outputs were published and synced, but descriptor cleanup could "
+                "not be confirmed; inspect the output directory before retrying"
+            ) from None
+        raise RenderError(
+            "launchd output cleanup could not be confirmed; inspect the output directory "
+            "before retrying"
+        ) from None
+    if failure is not None:
+        raise failure from None
 
 
-def _write_new_file(directory: int, name: str, content: bytes) -> tuple[int, int]:
+def _output_failure(stage: str) -> RenderError:
+    if stage == "publication_unsynced":
+        return RenderError(
+            "launchd output publication durability is unknown; inspect the output "
+            "directory before retrying"
+        )
+    return RenderError(
+        "launchd outputs could not be created safely; inspect the output directory before retrying"
+    )
+
+
+def _write_new_file(directory: int, name: str, content: bytes) -> CreatedOutput:
     descriptor: int | None = None
-    identity: tuple[int, int] | None = None
+    output: CreatedOutput | None = None
+    created = False
+    failed = False
     try:
         descriptor = os.open(
             name,
@@ -237,9 +289,20 @@ def _write_new_file(directory: int, name: str, content: bytes) -> tuple[int, int
             0o600,
             dir_fd=directory,
         )
+        created = True
+        initial = os.fstat(descriptor)
+        output = CreatedOutput(name=name, device=initial.st_dev, inode=initial.st_ino)
         os.fchmod(descriptor, 0o600)
         metadata = os.fstat(descriptor)
-        identity = metadata.st_dev, metadata.st_ino
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (metadata.st_dev, metadata.st_ino) != (output.device, output.inode)
+            or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+        ):
+            raise OSError("created output metadata changed")
+        require_no_acl_grants(descriptor)
         view = memoryview(content)
         while view:
             written = os.write(descriptor, view)
@@ -247,21 +310,59 @@ def _write_new_file(directory: int, name: str, content: bytes) -> tuple[int, int
                 raise OSError("short write")
             view = view[written:]
         os.fsync(descriptor)
-        return identity
-    except OSError:
-        if identity is not None:
-            _unlink_created(directory, name, identity)
-        raise
-    finally:
-        if descriptor is not None:
+    except (OSError, PrivatePathError):
+        failed = True
+
+    close_failed = False
+    if descriptor is not None:
+        try:
             os.close(descriptor)
+        except OSError:
+            close_failed = True
+
+    if failed or close_failed:
+        cleanup_failed = close_failed
+        if output is not None:
+            try:
+                _unlink_created(directory, output)
+            except (OSError, RenderError):
+                cleanup_failed = True
+            try:
+                os.fsync(directory)
+            except OSError:
+                cleanup_failed = True
+        elif created:
+            cleanup_failed = True
+        if cleanup_failed:
+            raise RenderError(
+                "launchd output cleanup could not be confirmed; inspect the output "
+                "directory before retrying"
+            ) from None
+        raise RenderError(
+            "launchd output could not be created safely; inspect the output directory "
+            "before retrying"
+        ) from None
+
+    if output is None:
+        raise RenderError(
+            "launchd output could not be created safely; inspect the output directory "
+            "before retrying"
+        ) from None
+    return output
 
 
-def _unlink_created(directory: int, name: str, identity: tuple[int, int]) -> None:
-    with suppress(OSError):
-        metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        if stat.S_ISREG(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == identity:
-            os.unlink(name, dir_fd=directory)
+def _unlink_created(directory: int, output: CreatedOutput) -> None:
+    try:
+        metadata = os.stat(output.name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or (metadata.st_dev, metadata.st_ino) != (output.device, output.inode)
+    ):
+        raise RenderError("launchd output identity changed during cleanup")
+    os.unlink(output.name, dir_fd=directory)
 
 
 if __name__ == "__main__":

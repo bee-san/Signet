@@ -191,7 +191,146 @@ def test_renderer_cleans_outputs_when_directory_fsync_fails(
         real_fsync(descriptor)
 
     monkeypatch.setattr(os, "fsync", fail_directory_fsync)
-    with pytest.raises(render_error, match="could not be created safely"):
+    with pytest.raises(render_error, match="publication durability is unknown"):
         write_outputs(output, {"one.plist": b"one", "two.plist": b"two"})
 
     assert not list(output.iterdir())
+
+
+def test_renderer_cleans_identity_bound_output_after_fchmod_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(RENDERER))
+    write_outputs = namespace["_write_outputs"]
+    render_error = namespace["RenderError"]
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+
+    def fail_fchmod(descriptor: int, mode: int) -> None:
+        del descriptor, mode
+        raise OSError("injected fchmod failure with a path")
+
+    monkeypatch.setattr(os, "fchmod", fail_fchmod)
+    with pytest.raises(render_error, match="could not be created safely") as captured:
+        write_outputs(output, {"one.plist": b"one"})
+
+    assert "injected" not in str(captured.value)
+    assert str(tmp_path) not in str(captured.value)
+    assert not list(output.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("regular_fstat", "cleanup_confirmed"),
+    ((1, False), (2, True)),
+    ids=("before-identity", "after-identity"),
+)
+def test_renderer_contains_created_output_fstat_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    regular_fstat: int,
+    cleanup_confirmed: bool,
+) -> None:
+    namespace = runpy.run_path(str(RENDERER))
+    write_outputs = namespace["_write_outputs"]
+    render_error = namespace["RenderError"]
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    real_fstat = os.fstat
+    regular_calls = 0
+
+    def fail_selected_fstat(descriptor: int) -> os.stat_result:
+        nonlocal regular_calls
+        metadata = real_fstat(descriptor)
+        if stat.S_ISREG(metadata.st_mode):
+            regular_calls += 1
+            if regular_calls == regular_fstat:
+                raise OSError("injected fstat failure")
+        return metadata
+
+    monkeypatch.setattr(os, "fstat", fail_selected_fstat)
+    with pytest.raises(render_error) as captured:
+        write_outputs(output, {"one.plist": b"one"})
+
+    assert "Traceback" not in str(captured.value)
+    assert "injected" not in str(captured.value)
+    remaining = list(output.iterdir())
+    if cleanup_confirmed:
+        assert "could not be created safely" in str(captured.value)
+        assert remaining == []
+    else:
+        assert "cleanup could not be confirmed" in str(captured.value)
+        assert len(remaining) == 1
+        assert remaining[0].read_bytes() == b""
+
+
+def test_renderer_reports_checked_unlink_failure_and_preserves_for_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(RENDERER))
+    write_outputs = namespace["_write_outputs"]
+    render_error = namespace["RenderError"]
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def fail_file_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 1:
+            raise OSError("injected file fsync failure")
+        real_fsync(descriptor)
+
+    def fail_unlink(path: str | bytes, *args: object, **kwargs: object) -> None:
+        del path, args, kwargs
+        raise OSError("injected unlink failure")
+
+    monkeypatch.setattr(os, "fsync", fail_file_fsync)
+    monkeypatch.setattr(os, "unlink", fail_unlink)
+    with pytest.raises(render_error, match="cleanup could not be confirmed") as captured:
+        write_outputs(output, {"one.plist": b"one"})
+
+    assert "injected" not in str(captured.value)
+    assert [path.read_bytes() for path in output.iterdir()] == [b"one"]
+
+
+@pytest.mark.parametrize(
+    ("failed_close", "message", "outputs_remain"),
+    (
+        (1, "output cleanup could not be confirmed", False),
+        (3, "published and synced", True),
+    ),
+    ids=("file-close", "directory-close"),
+)
+def test_renderer_contains_close_failures_with_inspect_before_retry_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_close: int,
+    message: str,
+    outputs_remain: bool,
+) -> None:
+    namespace = runpy.run_path(str(RENDERER))
+    write_outputs = namespace["_write_outputs"]
+    render_error = namespace["RenderError"]
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    real_close = os.close
+    close_calls = 0
+
+    def fail_selected_close(descriptor: int) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == failed_close:
+            real_close(descriptor)
+            raise OSError("injected close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "close", fail_selected_close)
+    with pytest.raises(render_error) as captured:
+        write_outputs(output, {"one.plist": b"one", "two.plist": b"two"})
+
+    assert message in str(captured.value)
+    assert "injected" not in str(captured.value)
+    assert bool(list(output.iterdir())) is outputs_remain

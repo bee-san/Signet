@@ -106,7 +106,7 @@ def _validate_argument_path(path: Path, *, label: str) -> None:
         raise ConfigurationError(f"{label} path must be absolute")
     try:
         resolved = path.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise ConfigurationError(f"{label} must be an existing file") from exc
     if path != resolved:
         raise ConfigurationError(f"{label} path must be canonical and contain no symlinks")
@@ -120,7 +120,10 @@ def _validate_profile_paths(config: Path, env_file: Path, profile: str) -> None:
     if config.name != "config.yaml" or env_file.name != ".env":
         raise ConfigurationError("Hermes profile files must be config.yaml and .env")
     parent = config.parent
-    metadata = parent.stat()
+    try:
+        metadata = parent.stat()
+    except OSError:
+        raise ConfigurationError("Hermes profile parent is unavailable") from None
     if not stat.S_ISDIR(metadata.st_mode):
         raise ConfigurationError("Hermes profile parent must be a directory")
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
