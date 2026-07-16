@@ -33,6 +33,9 @@ _ONE_DAY = 24 * 60 * 60
 _DEFAULT_SCHEDULE_PAGE_SIZE = 256
 _SAFE_ERROR_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,255}$")
+_REDACTED_ATTACHMENT_TEXT = "<redacted>"
+_REDACTED_ATTACHMENT_MIME = "application/octet-stream"
+_REDACTED_ATTACHMENT_SHA256 = "0" * 64
 
 _NONTERMINAL_STATES = frozenset(
     {
@@ -786,12 +789,17 @@ class RetentionManager:
                 self._ensure_claim(connection, claim)
                 updated = connection.execute(
                     """
-                    UPDATE attachments SET storage_path = NULL, purged_at = ?
+                    UPDATE attachments
+                    SET filename = ?, mime_type = ?, size_bytes = 0, sha256 = ?,
+                        storage_path = NULL, purged_at = ?
                     WHERE attachment_id = ? AND request_id = ? AND version = ?
                       AND size_bytes = ? AND sha256 = ? AND storage_path = ?
                       AND purged_at IS NULL
                     """,
                     (
+                        _REDACTED_ATTACHMENT_TEXT,
+                        _REDACTED_ATTACHMENT_MIME,
+                        _REDACTED_ATTACHMENT_SHA256,
                         now,
                         row["attachment_id"],
                         claim.request_id,
@@ -811,6 +819,35 @@ class RetentionManager:
                     ).fetchone()
                     if current is None or current["purged_at"] is None:
                         raise _JobFailure("attachment_database_conflict")
+                catalog_updated = connection.execute(
+                    """
+                    UPDATE staged_objects
+                    SET adapter = ?, account = ?, filename = ?, declared_mime = ?,
+                        detected_mime = ?, size_bytes = 0, sha256 = ?,
+                        envelope_size = 1, envelope_sha256 = ?
+                    WHERE attachment_id = ? AND consumed_request_id = ?
+                      AND storage_path IS NULL AND purged_at IS NOT NULL
+                    """,
+                    (
+                        _REDACTED_ATTACHMENT_TEXT,
+                        _REDACTED_ATTACHMENT_TEXT,
+                        _REDACTED_ATTACHMENT_TEXT,
+                        _REDACTED_ATTACHMENT_MIME,
+                        _REDACTED_ATTACHMENT_MIME,
+                        _REDACTED_ATTACHMENT_SHA256,
+                        _REDACTED_ATTACHMENT_SHA256,
+                        row["attachment_id"],
+                        claim.request_id,
+                    ),
+                ).rowcount
+                if catalog_updated != 1:
+                    raise _JobFailure("attachment_catalog_redaction_failed")
+                connection.execute(
+                    """
+                    UPDATE attachment_metadata_privacy_maintenance SET pending = 1
+                    WHERE singleton = 1
+                    """
+                )
         with self.database.transaction() as connection:
             self._ensure_claim(connection, claim)
             self._complete_claim(connection, claim, now=now)

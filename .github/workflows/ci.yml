@@ -266,8 +266,14 @@ jobs:
       - name: Smoke-test the isolated wheel
         shell: bash
         run: |
-          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          wheel="$(find dist -maxdepth 1 -type f -name 'signet_gateway-*.whl' -print -quit)"
           test -n "$wheel"
+          case "$wheel" in
+            *-none-any.whl)
+              echo "POSIX-only Signet was built as a universal wheel" >&2
+              exit 1
+              ;;
+          esac
           uv run --isolated --no-project --with "$wheel" signet --help
           temporary_root="$(mktemp -d)"
           root="$(cd "$temporary_root" && pwd -P)"

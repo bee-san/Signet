@@ -103,6 +103,7 @@ def test_stdio_configuration_reports_unsupported_process_boundary(
     config = DownstreamConfig(
         transport="stdio",
         credential_ref="keychain://Signet/example",
+        credential_identity_digest="c" * 64,
         command=("/opt/signet/bin/provider-mcp",),
         working_directory=working_directory,
         executable_sha256="a" * 64,

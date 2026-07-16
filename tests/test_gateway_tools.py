@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -484,6 +486,41 @@ async def test_list_pending_is_caller_scoped_masked_and_omits_expired(
         "has_more": False,
     }
     assert harness.summaries.calls == [("req_Own", 1, digest("body-one"))]
+
+
+@pytest.mark.asyncio
+async def test_blocking_gateway_queue_read_does_not_stall_the_event_loop(
+    machine: ApprovalStateMachine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = make_harness(machine)
+    original = harness.tools._pending_requests
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_pending_requests(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("blocking queue read test was not released")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(harness.tools, "_pending_requests", blocking_pending_requests)
+    safety_release = threading.Timer(3, release.set)
+    safety_release.start()
+    try:
+        calling = asyncio.create_task(
+            harness.tools.call_tool("list_pending_approvals", {}, principal=own_principal())
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        assert not release.is_set()
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        release.set()
+        result = await calling
+    finally:
+        release.set()
+        safety_release.cancel()
+
+    assert structured(result) == {"requests": [], "next_cursor": None, "has_more": False}
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 from typing import Any
 
@@ -74,7 +75,13 @@ class RegistryTokenVerifier:
 
     async def verify_token(self, token: str) -> AccessToken | None:
         try:
-            principal = self._registry.authenticate(f"Bearer {token}", alias=self._alias)
+            principal = await anyio.to_thread.run_sync(
+                partial(
+                    self._registry.authenticate,
+                    f"Bearer {token}",
+                    alias=self._alias,
+                )
+            )
         except CredentialError:
             return None
         return AccessToken(

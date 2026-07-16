@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import threading
+import time
 import urllib.request
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -35,7 +38,7 @@ from signet.mcp_mirror import (
     raw_model,
     validate_lossless_tool,
 )
-from signet.policy import parse_policy
+from signet.policy import parse_policy, policy_document
 
 
 def _policy() -> Any:
@@ -114,10 +117,15 @@ def test_mirror_is_unlisted_until_schema_review_and_fails_closed_on_drift() -> N
         "send",
         "delete",
     ]
+    reviewed = mirror.reviewed_execution_snapshot("example", "read")
+    assert reviewed.tool.mode.value == "passthrough"
+    assert reviewed.schema_digest == mirror.captured_digest("example", "read")
     drifted = copy.deepcopy(tools)
     drifted[0]["description"] = "changed"
     assert mirror.capture("example", drifted) == {"read"}
     assert "read" not in [tool["name"] for tool in mirror.list_tools("example")]
+    with pytest.raises(MirrorError, match="execution snapshot"):
+        mirror.reviewed_execution_snapshot("example", "read")
 
 
 def test_approval_schema_is_deliberately_replaced_but_other_contracts_are_lossless() -> None:
@@ -146,6 +154,35 @@ def test_unconfigured_tool_uses_protocol_error_and_explicit_deny_is_callable() -
         mirror.require_callable("example", "unknown")
     assert error.value.error.code == types.INVALID_PARAMS
     assert mirror.require_callable("example", "delete").value == "deny"
+
+
+def test_pending_policy_publication_is_discoverable_but_not_callable() -> None:
+    original = _policy()
+    mirror = SchemaMirror(original)
+    mirror.capture("example", [_raw_tool(name) for name in ("read", "stage", "send", "delete")])
+    _review_all(mirror)
+    updated_document = policy_document(original)
+    updated_document["version"] = 2
+    read_policy = updated_document["downstreams"]["example"]["tools"]["read"]
+    read_policy["mode"] = "approval"
+    read_policy["adapter"] = "example.read"
+    updated = parse_policy(updated_document)
+
+    aliases = frozenset({"example"})
+    mirror.gate_publication(aliases)
+    mirror.apply_policy(updated)
+
+    listed = {tool["name"]: tool for tool in mirror.list_tools("example")}
+    assert "read" in listed
+    assert listed["read"]["outputSchema"] == PENDING_RESULT_SCHEMA
+    assert mirror.is_publication_pending("example")
+    with pytest.raises(DomainToolError) as unavailable:
+        mirror.require_callable("example", "read")
+    assert unavailable.value.code == "policy_unavailable"
+
+    mirror.ungate_publication(aliases)
+    assert not mirror.is_publication_pending("example")
+    assert mirror.require_callable("example", "read").value == "approval"
 
 
 def test_pending_and_domain_error_wire_shapes() -> None:
@@ -177,6 +214,31 @@ def test_virtual_result_validates_against_captured_output_schema() -> None:
     mirror.validate_virtual_result("example", "stage", {"id": "stg_123"})
     with pytest.raises(ValidationError):
         mirror.validate_virtual_result("example", "stage", {"wrong": True})
+
+
+@pytest.mark.parametrize(
+    "output_schema",
+    [None, {"type": "array", "items": {"type": "string"}}],
+)
+def test_virtualization_requires_a_reviewed_object_output_schema(
+    output_schema: dict[str, Any] | None,
+) -> None:
+    raw = _raw_tool("stage")
+    if output_schema is None:
+        raw.pop("outputSchema")
+    else:
+        raw["outputSchema"] = output_schema
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [raw])
+    digest = mirror.captured_digest("example", "stage")
+
+    with pytest.raises(SchemaDriftError, match="object output schema"):
+        mirror.approve_schema("example", "stage", digest)
+
+    assert mirror.list_tools("example") == []
+    with pytest.raises(DomainToolError) as error:
+        mirror.require_callable("example", "stage")
+    assert error.value.code == "schema_unreviewed"
 
 
 def test_schema_capture_rejects_remote_refs_without_network_retrieval(
@@ -410,6 +472,46 @@ def test_capture_aggregate_pattern_budget_fails_atomically(
         mirror.captured_digest("example", "stage")
 
 
+def test_atomic_call_admission_blocks_captured_schema_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mirror = SchemaMirror(_policy())
+    original = _raw_tool("read")
+    mirror.capture("example", [original])
+    original_digest = mirror.captured_digest("example", "read")
+    mirror.approve_schema("example", "read", original_digest)
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    original_validate = mirror._validate_input_locked
+
+    def blocking_validate(alias: str, tool: str, arguments: Mapping[str, Any]) -> None:
+        validation_started.set()
+        if not release_validation.wait(timeout=5):
+            raise AssertionError("atomic admission validation was not released")
+        original_validate(alias, tool, arguments)
+
+    monkeypatch.setattr(mirror, "_validate_input_locked", blocking_validate)
+    drifted = copy.deepcopy(original)
+    drifted["description"] = "changed during atomic admission"
+    safety_release = threading.Timer(3, release_validation.set)
+    safety_release.start()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            admitting = pool.submit(mirror.admit_call, "example", "read", {})
+            assert validation_started.wait(timeout=1)
+            capturing = pool.submit(mirror.capture, "example", [drifted])
+            time.sleep(0.05)
+            assert not capturing.done()
+            release_validation.set()
+            assert admitting.result(timeout=2).mode.value == "passthrough"
+            assert capturing.result(timeout=2) == {"read"}
+    finally:
+        release_validation.set()
+        safety_release.cancel()
+
+    assert not mirror.is_enabled("example", "read")
+
+
 def test_capture_budget_allows_the_supported_tool_count() -> None:
     tools = [_raw_tool(f"tool_{index}") for index in range(512)]
     mirror = SchemaMirror(_policy())
@@ -488,6 +590,38 @@ def test_runtime_validation_rejects_oversized_instances_before_jsonschema() -> N
             "example",
             "read",
             {"isError": False, "structuredContent": oversized},
+        )
+
+
+def test_virtual_result_has_an_unconditional_canonical_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _raw_tool("stage")
+    raw["outputSchema"] = {"type": "object"}
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [raw])
+    mirror.approve_schema("example", "stage", mirror.captured_digest("example", "stage"))
+    monkeypatch.setattr(mcp_mirror_module, "_MAX_VIRTUAL_RESULT_BYTES", 32)
+
+    with pytest.raises(MirrorError, match="byte limit"):
+        mirror.validate_virtual_result("example", "stage", {"value": "x" * 64})
+
+
+def test_virtual_result_has_an_unconditional_depth_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _raw_tool("stage")
+    raw["outputSchema"] = {"type": "object"}
+    mirror = SchemaMirror(_policy())
+    mirror.capture("example", [raw])
+    mirror.approve_schema("example", "stage", mirror.captured_digest("example", "stage"))
+    monkeypatch.setattr(mcp_mirror_module, "_MAX_INSTANCE_DEPTH", 2)
+
+    with pytest.raises(MirrorError, match="complexity"):
+        mirror.validate_virtual_result(
+            "example",
+            "stage",
+            {"first": {"second": {"third": "too deep"}}},
         )
 
 

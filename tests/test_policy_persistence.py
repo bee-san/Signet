@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,6 +17,7 @@ from signet.adapters.base import ApprovalAdapter
 from signet.adapters.tool_access import ToolAccessAdapter
 from signet.auth import ActionBinding
 from signet.db import Database, IntegrityError
+from signet.execution_scope import ExecutionScope, StaticExecutionScopeResolver
 from signet.freezer import RequestFreezer
 from signet.gateway_tools import AccessRequestDraft
 from signet.mcp_mirror import SchemaMirror
@@ -33,6 +36,7 @@ from signet.policy import (
 from signet.policy_persistence import (
     PolicyDivergenceError,
     PolicyPersistenceError,
+    PolicyUnavailable,
     SQLiteActionDraftRepository,
     SQLitePolicyPromotionBoundary,
 )
@@ -46,7 +50,9 @@ from signet.web_backend import (
 )
 from signet.webauthn import SQLiteWebAuthnRepository, WebAuthnCredential
 from tests.test_web_backend import (
+    CREDENTIAL_DIGEST,
     NOW,
+    SCHEMA_DIGEST,
     TOTP_REFERENCE,
     USER_ID,
     WEB_CREDENTIAL_ID,
@@ -184,6 +190,15 @@ def _reviewer(bundle: BackendBundle) -> EncryptedPayloadReviewer:
             ),
             (access.downstream_alias, access.tool_name): cast(ApprovalAdapter, access),
         },
+        StaticExecutionScopeResolver(
+            {
+                (bundle.adapter.downstream_alias, bundle.adapter.tool_name): ExecutionScope(
+                    account_ref=bundle.adapter.account,
+                    credential_identity_digest=CREDENTIAL_DIGEST,
+                    schema_digest=SCHEMA_DIGEST,
+                )
+            }
+        ),
     )
 
 
@@ -192,6 +207,7 @@ def _install(
     policy_path: Path,
     *,
     fault: Any = None,
+    notify: Any = None,
 ) -> InstalledBoundary:
     engine = PolicyEngine(load_policy(policy_path))
     mirror = SchemaMirror(engine.snapshot)
@@ -209,7 +225,8 @@ def _install(
         engine,
         policy_path,
         apply_policy=apply,
-        notify_list_changed=notified.append,
+        publication_gate=mirror,
+        notify_list_changed=notified.append if notify is None else notify,
         fault_injector=fault,
         clock=lambda: NOW,
     )
@@ -217,6 +234,43 @@ def _install(
     bundle.backend._policy_promotions = cast(PolicyPromotionBoundary, boundary)
     bundle.backend._action_drafts = SQLiteActionDraftRepository(bundle.database)
     return InstalledBoundary(boundary, engine, mirror, applied, notified)
+
+
+def _publication_pending(database: Database) -> int:
+    with database.read() as connection:
+        row = connection.execute(
+            "SELECT publication_pending FROM durable_policy_file_state WHERE singleton = 1"
+        ).fetchone()
+    assert row is not None
+    return int(row["publication_pending"])
+
+
+def _commit_policy_with_async_publication(
+    tmp_path: Path,
+    notify: Any,
+) -> tuple[BackendBundle, Path, InstalledBoundary]:
+    bundle = _assemble_enrolled(Database(tmp_path / "policy.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    installed = _install(bundle, policy_path, notify=notify)
+    installed.applied.clear()
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "promote_approval",
+            "fake:490",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+        == "policy_updated"
+    )
+    return bundle, policy_path, installed
 
 
 @pytest.fixture
@@ -461,6 +515,283 @@ def test_web_totp_promotion_is_atomic_distinct_audited_and_single_use(
         )
     assert load_policy(policy_path).version == 2
     assert not installed.boundary.pending_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_async_policy_publication_is_awaited_before_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    attempts: list[frozenset[str]] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def publish(aliases: frozenset[str]) -> None:
+        entered.set()
+        await release.wait()
+        attempts.append(aliases)
+
+    bundle, _, installed = _commit_policy_with_async_publication(tmp_path, publish)
+    assert attempts == []
+    assert _publication_pending(bundle.database) == 1
+    assert installed.mirror.is_publication_pending("fake-service")
+
+    task = asyncio.create_task(installed.boundary.publish_pending(now=NOW + 2))
+    await entered.wait()
+    assert _publication_pending(bundle.database) == 1
+    assert installed.mirror.is_publication_pending("fake-service")
+    release.set()
+    assert await task
+    assert attempts == [frozenset({"fake-service"})]
+    assert _publication_pending(bundle.database) == 0
+    assert not installed.mirror.is_publication_pending("fake-service")
+    assert not await installed.boundary.publish_pending(now=NOW + 3)
+
+
+def test_pending_async_publication_preserves_stale_preview_and_blocks_approval(
+    tmp_path: Path,
+) -> None:
+    async def publish(aliases: frozenset[str]) -> None:
+        del aliases
+
+    bundle = _assemble_enrolled(Database(tmp_path / "pending-preview.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    installed = _install(bundle, policy_path, notify=publish)
+    factory = FrozenAccessRequestFactory(
+        RequestFreezer(
+            bundle.cipher,
+            pending_ttl_seconds=900,
+            clock=lambda: datetime.fromtimestamp(NOW, tz=UTC),
+        ),
+        policy_version=lambda: 1,
+    )
+
+    requests = tuple(
+        factory.freeze(
+            AccessRequestDraft(
+                origin_namespace="profile:agent",
+                alias="fake-service",
+                tool="create_item",
+                reason=reason,
+                actor="mcp:profile:agent",
+                created_at=NOW,
+            )
+        )
+        for reason in ("Apply this proposal.", "Retain this stale proposal for review.")
+    )
+    for request in requests:
+        bundle.state_machine.enqueue(request)
+
+    _, principal = bundle.session()
+    promoted, stale = requests
+    payload_hash = str(
+        bundle.state_machine.get_request(promoted.request_id)["current_payload_hash"]
+    )
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            promoted.request_id,
+            "approve",
+            "fake:492",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+        == "policy_updated"
+    )
+    assert _publication_pending(bundle.database) == 1
+    assert installed.mirror.is_publication_pending("fake-service")
+
+    detail = bundle.backend.get_detail(principal, stale.request_id)
+    preview = detail.policy_promotion_preview
+    assert detail.policy_promotion_preview_unavailable is None
+    assert preview is not None
+    assert (preview.current_policy_version, preview.active_policy_version) == (1, 2)
+    assert preview.stale
+    assert not preview.can_approve
+
+
+def test_sync_policy_publication_gates_before_callback_and_ungates_after_ack(
+    tmp_path: Path,
+) -> None:
+    bundle = _assemble_enrolled(Database(tmp_path / "sync-publication.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path)
+    mirror_ref: list[SchemaMirror] = []
+    observations: list[tuple[frozenset[str], bool, int]] = []
+
+    def publish(aliases: frozenset[str]) -> None:
+        observations.append(
+            (
+                aliases,
+                mirror_ref[0].is_publication_pending("fake-service"),
+                _publication_pending(bundle.database),
+            )
+        )
+
+    installed = _install(bundle, policy_path, notify=publish)
+    mirror_ref.append(installed.mirror)
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "promote_approval",
+            "fake:491",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+        == "policy_updated"
+    )
+    assert observations == [(frozenset({"fake-service"}), True, 1)]
+    assert _publication_pending(bundle.database) == 0
+    assert not installed.mirror.is_publication_pending("fake-service")
+
+
+@pytest.mark.asyncio
+async def test_async_policy_publication_failure_and_cancellation_remain_pending(
+    tmp_path: Path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    fail = True
+    attempts = 0
+
+    async def publish(aliases: frozenset[str]) -> None:
+        nonlocal attempts, fail
+        assert aliases == frozenset({"fake-service"})
+        attempts += 1
+        await asyncio.sleep(0)
+        if fail:
+            raise RuntimeError("strict publication failed")
+        entered.set()
+        await release.wait()
+
+    bundle, _, installed = _commit_policy_with_async_publication(tmp_path, publish)
+    with pytest.raises(RuntimeError, match="strict publication failed"):
+        await installed.boundary.publish_pending(now=NOW + 2)
+    assert attempts == 1
+    assert _publication_pending(bundle.database) == 1
+    assert installed.mirror.is_publication_pending("fake-service")
+
+    fail = False
+    task = asyncio.create_task(installed.boundary.publish_pending(now=NOW + 3))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert attempts == 2
+    assert _publication_pending(bundle.database) == 1
+    assert installed.mirror.is_publication_pending("fake-service")
+
+    release.set()
+    assert await installed.boundary.publish_pending(now=NOW + 4)
+    assert attempts == 3
+    assert _publication_pending(bundle.database) == 0
+    assert not installed.mirror.is_publication_pending("fake-service")
+
+
+@pytest.mark.asyncio
+async def test_pending_async_policy_publication_retries_after_restart(tmp_path: Path) -> None:
+    async def unavailable(aliases: frozenset[str]) -> None:
+        del aliases
+        raise RuntimeError("old runtime unavailable")
+
+    bundle, policy_path, installed = _commit_policy_with_async_publication(
+        tmp_path,
+        unavailable,
+    )
+    assert installed.boundary.ready
+    assert _publication_pending(bundle.database) == 1
+    assert installed.mirror.is_publication_pending("fake-service")
+
+    unavailable_bundle = assemble(Database(bundle.database.path), adapter=bundle.adapter)
+    unavailable_boundary = SQLitePolicyPromotionBoundary(
+        unavailable_bundle.database,
+        unavailable_bundle.state_machine,
+        _reviewer(unavailable_bundle),
+        PolicyEngine(load_policy(policy_path)),
+        policy_path,
+        clock=lambda: NOW + 2,
+    )
+    with pytest.raises(PolicyUnavailable, match="callback is unavailable"):
+        await unavailable_boundary.publish_pending(now=NOW + 2)
+    assert _publication_pending(unavailable_bundle.database) == 1
+
+    attempts: list[frozenset[str]] = []
+
+    async def recovered_publish(aliases: frozenset[str]) -> None:
+        await asyncio.sleep(0)
+        attempts.append(aliases)
+
+    restarted_bundle = assemble(Database(bundle.database.path), adapter=bundle.adapter)
+    recovered = _install(restarted_bundle, policy_path, notify=recovered_publish)
+    assert recovered.boundary.ready
+    assert attempts == []
+    assert _publication_pending(restarted_bundle.database) == 1
+    assert recovered.mirror.is_publication_pending("fake-service")
+
+    assert await recovered.boundary.publish_pending(now=NOW + 2)
+    assert attempts == [frozenset({"fake-service"})]
+    assert _publication_pending(restarted_bundle.database) == 0
+    assert not recovered.mirror.is_publication_pending("fake-service")
+
+
+@pytest.mark.asyncio
+async def test_publish_pending_keeps_event_loop_responsive_during_writer_contention(
+    tmp_path: Path,
+) -> None:
+    callback_entered = asyncio.Event()
+
+    async def publish(aliases: frozenset[str]) -> None:
+        assert aliases == frozenset({"fake-service"})
+        await asyncio.sleep(0)
+        callback_entered.set()
+
+    bundle, _, installed = _commit_policy_with_async_publication(tmp_path, publish)
+    writer_ready = threading.Event()
+    writer_release = threading.Event()
+    writer_errors: list[BaseException] = []
+
+    def hold_writer() -> None:
+        try:
+            with bundle.database.transaction() as connection:
+                connection.execute(
+                    "UPDATE durable_policy_file_state SET updated_at = updated_at "
+                    "WHERE singleton = 1"
+                )
+                writer_ready.set()
+                writer_release.wait(timeout=3)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            writer_errors.append(exc)
+
+    writer = threading.Thread(target=hold_writer, daemon=True)
+    writer.start()
+    assert await asyncio.to_thread(writer_ready.wait, 1)
+
+    started = asyncio.get_running_loop().time()
+    task = asyncio.create_task(installed.boundary.publish_pending(now=NOW + 2))
+    try:
+        await asyncio.wait_for(callback_entered.wait(), timeout=1)
+        assert asyncio.get_running_loop().time() - started < 1
+        assert not task.done()
+        assert _publication_pending(bundle.database) == 1
+        assert installed.mirror.is_publication_pending("fake-service")
+    finally:
+        writer_release.set()
+
+    assert await asyncio.wait_for(task, timeout=2)
+    await asyncio.to_thread(writer.join, 2)
+    assert not writer.is_alive()
+    assert writer_errors == []
+    assert _publication_pending(bundle.database) == 0
+    assert not installed.mirror.is_publication_pending("fake-service")
 
 
 def test_same_second_policy_proofs_are_all_visible_without_breaking_detail(
@@ -1178,6 +1509,8 @@ def test_every_policy_crash_step_is_rollback_safe_or_restart_recoverable(
     assert versions == 2
     assert consumptions == 1
     assert not installed.boundary.ready
+    if stage == "policy:published_callbacks":
+        assert installed.mirror.is_publication_pending("fake-service")
     restarted_bundle = assemble(Database(bundle.database.path), adapter=bundle.adapter)
     restarted_bundle.backend.authenticate(token, now=NOW + 2)
     recovered = _install(restarted_bundle, policy_path)
@@ -1189,6 +1522,7 @@ def test_every_policy_crash_step_is_rollback_safe_or_restart_recoverable(
         recovered_state = connection.execute("SELECT * FROM durable_policy_file_state").fetchone()
     assert recovered_state["sync_state"] == "synced"
     assert recovered_state["publication_pending"] == 0
+    assert not recovered.mirror.is_publication_pending("fake-service")
     assert not recovered.boundary.pending_path.exists()
     assert bundle.adapter.downstream_calls == []
 

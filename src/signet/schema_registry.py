@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -10,6 +11,7 @@ from typing import Any, Never
 
 import mcp.types as types
 
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.canonical import canonical_json
 from signet.db import Database
 from signet.mcp_mirror import (
@@ -38,6 +40,12 @@ class SchemaRefresh:
     changed_tools: tuple[str, ...]
     list_changed: bool
     notifications_sent: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewSnapshot:
+    review_state: str
+    reviewed_at: int | None
 
 
 class DurableSchemaRegistry:
@@ -127,19 +135,34 @@ class DurableSchemaRegistry:
             raise ValueError("schema discovery scope is invalid")
         surface = self._surface(alias)
         async with surface.schema_change_guard():
-            before = canonical_json(self._mirror.list_tools(alias))
-            changed = self._capture(alias, tools, discovered_at=discovered_at)
-            after = canonical_json(self._mirror.list_tools(alias))
-            list_changed = before != after
+            before = await _run_sync(self._listed_digest, alias)
+            try:
+                changed = await _run_sync(
+                    self._capture,
+                    alias,
+                    tools,
+                    discovered_at=discovered_at,
+                )
+            except asyncio.CancelledError:
+                await _run_sync(self._disable_alias, alias)
+                raise
             sent = 0
-            if list_changed:
-                try:
+            try:
+                after = await _run_sync(self._listed_digest, alias)
+                list_changed = before != after
+                if list_changed:
                     sent = await surface.notify_list_changed(strict=True)
-                except ListChangedNotificationError:
-                    self._disable_changed(alias, changed)
-                    raise SchemaPublicationError(
-                        "schema discovery was stored but its exposed tools remain disabled"
-                    ) from None
+            except asyncio.CancelledError:
+                await _run_sync(self._disable_changed, alias, changed)
+                raise
+            except ListChangedNotificationError:
+                await _run_sync(self._disable_changed, alias, changed)
+                raise SchemaPublicationError(
+                    "schema discovery was stored but its exposed tools remain disabled"
+                ) from None
+            except Exception:
+                await _run_sync(self._disable_changed, alias, changed)
+                raise
             return SchemaRefresh(
                 alias=alias,
                 changed_tools=tuple(sorted(changed)),
@@ -166,41 +189,32 @@ class DurableSchemaRegistry:
         surface = self._surface(alias)
         if not _valid_timestamp(reviewed_at):
             raise ValueError("schema review timestamp is invalid")
-        with self._database.read() as connection:
-            row = connection.execute(
-                """
-                SELECT schema_digest, review_state
-                FROM schema_cache
-                WHERE downstream_alias = ? AND tool_name = ? AND present = 1
-                """,
-                (alias, tool),
-            ).fetchone()
-        if row is None or row["schema_digest"] != digest:
-            raise SchemaRegistryError("only the current present schema digest can be reviewed")
+        snapshot = await _run_sync(self._review_snapshot, alias, tool, digest)
 
         async with surface.schema_change_guard():
-            before = canonical_json(self._mirror.list_tools(alias))
-            self._mirror.approve_schema(alias, tool, digest)
-            after = canonical_json(self._mirror.list_tools(alias))
-            list_changed = before != after
             sent = 0
             try:
+                before = await _run_sync(self._listed_digest, alias)
+                await _run_sync(self._mirror.approve_schema, alias, tool, digest)
+                after = await _run_sync(self._listed_digest, alias)
+                list_changed = before != after
                 if list_changed:
                     sent = await surface.notify_list_changed(strict=True)
-                with self._database.transaction() as connection:
-                    cursor = connection.execute(
-                        """
-                        UPDATE schema_cache
-                        SET review_state = 'approved', reviewed_at = ?
-                        WHERE downstream_alias = ? AND tool_name = ?
-                          AND schema_digest = ? AND present = 1
-                        """,
-                        (reviewed_at, alias, tool, digest),
-                    )
-                    if cursor.rowcount != 1:
-                        raise SchemaRegistryError("the schema changed during review")
-            except Exception as exc:
-                self._mirror.disable_schema(alias, tool)
+                await _run_sync(
+                    self._mark_reviewed,
+                    alias,
+                    tool,
+                    digest,
+                    reviewed_at=reviewed_at,
+                )
+            except BaseException as exc:
+                await _run_sync(
+                    self._restore_review,
+                    alias,
+                    tool,
+                    digest,
+                    snapshot,
+                )
                 if isinstance(exc, ListChangedNotificationError):
                     raise SchemaPublicationError(
                         "schema review remains disabled because list notification failed"
@@ -212,6 +226,77 @@ class DurableSchemaRegistry:
                 list_changed=list_changed,
                 notifications_sent=sent,
             )
+
+    def _listed_digest(self, alias: str) -> bytes:
+        return canonical_json(self._mirror.list_tools(alias))
+
+    def _review_snapshot(self, alias: str, tool: str, digest: str) -> _ReviewSnapshot:
+        with self._database.read() as connection:
+            row = connection.execute(
+                """
+                SELECT schema_digest, review_state, reviewed_at
+                FROM schema_cache
+                WHERE downstream_alias = ? AND tool_name = ? AND present = 1
+                """,
+                (alias, tool),
+            ).fetchone()
+        if row is None or row["schema_digest"] != digest:
+            raise SchemaRegistryError("only the current present schema digest can be reviewed")
+        return _ReviewSnapshot(
+            review_state=str(row["review_state"]),
+            reviewed_at=row["reviewed_at"],
+        )
+
+    def _mark_reviewed(
+        self,
+        alias: str,
+        tool: str,
+        digest: str,
+        *,
+        reviewed_at: int,
+    ) -> None:
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE schema_cache
+                SET review_state = 'approved', reviewed_at = ?
+                WHERE downstream_alias = ? AND tool_name = ?
+                  AND schema_digest = ? AND present = 1
+                """,
+                (reviewed_at, alias, tool, digest),
+            )
+            if cursor.rowcount != 1:
+                raise SchemaRegistryError("the schema changed during review")
+
+    def _restore_review(
+        self,
+        alias: str,
+        tool: str,
+        digest: str,
+        snapshot: _ReviewSnapshot,
+    ) -> None:
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE schema_cache
+                SET review_state = ?, reviewed_at = ?
+                WHERE downstream_alias = ? AND tool_name = ?
+                  AND schema_digest = ? AND present = 1
+                """,
+                (
+                    snapshot.review_state,
+                    snapshot.reviewed_at,
+                    alias,
+                    tool,
+                    digest,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise SchemaRegistryError("the schema changed during review rollback")
+        if snapshot.review_state == "approved":
+            self._mirror.approve_schema(alias, tool, digest)
+        else:
+            self._mirror.disable_schema(alias, tool)
 
     def _capture(
         self,
@@ -244,6 +329,12 @@ class DurableSchemaRegistry:
         # Validate the complete set before either the durable or live mirror changes.
         staging = SchemaMirror(self._mirror.policy)
         staging.capture(alias, raw_tools)
+        for raw in raw_tools:
+            name = str(raw["name"])
+            digest = tool_schema_digest(raw)
+            configured = self._mirror.policy.configured(alias, name)
+            if configured is not None and configured.schema_digest == digest:
+                staging.approve_schema(alias, name, digest)
 
         changed: set[str] = set()
         states: dict[str, tuple[str, str]] = {}
@@ -348,6 +439,26 @@ class DurableSchemaRegistry:
                     (alias, tool),
                 )
                 self._mirror.disable_schema(alias, tool)
+
+    def _disable_alias(self, alias: str) -> None:
+        with self._database.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT tool_name FROM schema_cache
+                WHERE downstream_alias = ? AND present = 1
+                """,
+                (alias,),
+            ).fetchall()
+            connection.execute(
+                """
+                UPDATE schema_cache
+                SET review_state = 'disabled_drift', reviewed_at = NULL
+                WHERE downstream_alias = ? AND present = 1
+                """,
+                (alias,),
+            )
+        for row in rows:
+            self._mirror.disable_schema(alias, str(row["tool_name"]))
 
     def _decode_row(self, row: Any) -> dict[str, Any]:
         blob = row["tool_schema_json"]

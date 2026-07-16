@@ -368,10 +368,14 @@ Example flow:
    mode, and confirms the exact policy change with a fresh web passkey or TOTP proof.
 4. The shipped `SQLitePolicyPromotionBoundary`, when explicitly injected with the
    deployment's policy path, shared engine/mirror, and publication callback,
-   durably records the policy version and publishes
-   `notifications/tools/list_changed` to affected MCP sessions. A deployment must
-   keep policy approval disabled until that exact wiring and its human proof paths
-   are reviewed; the class existing in the repository is not deployment readiness.
+   durably records the policy version and leaves publication pending until a retained
+   worker awaits a strict `notifications/tools/list_changed` attempt for every
+   affected MCP surface. Failure, cancellation, or restart leaves the durable marker
+   pending for retry. The new schema remains discoverable during that transition, but
+   calls for the affected alias fail closed until the marker is durably acknowledged.
+   A deployment must keep policy approval disabled until that exact wiring and its
+   human proof paths are reviewed; the class existing in the repository is not
+   deployment readiness.
 5. The client calls `tools/list` again. The tool appears only if its current schema
    digest is still reviewed and the applied policy permits exposure.
 

@@ -16,8 +16,26 @@ from signet.credential_broker import (
 
 
 def test_configuration_accepts_references_not_secret_values() -> None:
+    with pytest.raises(ValueError, match="credential_identity_digest"):
+        DownstreamConfig(
+            transport="http",
+            url="https://example.test",
+            credential_ref="keychain://Signet/example",
+        )
     with pytest.raises(ValueError, match="keychain"):
-        DownstreamConfig(transport="http", url="https://example.test", credential_ref="secret")
+        DownstreamConfig(
+            transport="http",
+            url="https://example.test",
+            credential_ref="secret",
+            credential_identity_digest="c" * 64,
+        )
+    with pytest.raises(ValueError, match="credential identity"):
+        DownstreamConfig(
+            transport="http",
+            url="https://example.test",
+            credential_ref="keychain://Signet/example",
+            credential_identity_digest="generation-1",
+        )
     settings = Settings()
     dump = repr(settings.safe_dump())
     assert "keychain://" not in dump

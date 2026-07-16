@@ -17,7 +17,8 @@ account. This document states those limits directly.
    acknowledgement before returning `pending_approval`; no downstream mutation,
    provider attachment upload, or provider draft occurs first.
 3. Approval is bound to request ID, immutable version, executable payload hash,
-   action, authentication path, human identity, and credential use.
+   frozen execution scope, action, authentication path, human identity, and
+   credential use.
 4. One confirmation can win one transition. Replay, stale version, stale edit,
    expired request, foreign namespace, and double submission perform zero calls.
 5. Dispatch crosses a durable fencing boundary before network I/O. A crash after
@@ -48,6 +49,14 @@ random request ID, alias, tool, state, timestamps, version, payload hash, and sa
 outcome classification. Payload bodies are encrypted, but database possession can
 still reveal activity patterns. Filesystem permissions and deployment isolation
 remain important.
+
+While an attachment is active, its catalog rows contain the account, filename,
+MIME type, size, hashes, and private storage path needed for authenticated staging
+and purge. Those fields are not encrypted independently from the database, so an
+approval database copied before retention runs is sensitive even without the
+payload key. The shipped assemblies remain fake-only or downstream-disabled; a
+future live assembly must encrypt or keyed-tokenize this active catalog before it
+can claim database-level metadata confidentiality.
 
 ## Trust boundaries
 
@@ -140,8 +149,10 @@ single-use challenge consumption. The private key stays in the authenticator.
 
 WebAuthn is web-only. Passing an assertion through the model would discard the
 browser/origin ceremony that provides its phishing-resistant context. Policy
-promotions are especially sensitive durable capability grants; the current backend
-requires passkey confirmation for them.
+promotions are especially sensitive durable capability grants. The current backend
+accepts either a fresh web passkey or a fresh web TOTP confirmation; passkeys are
+the primary flow, while accepting TOTP explicitly carries the weaker assurance
+described below.
 
 WebAuthn does not make the displayed review content trustworthy if the host or
 Signet process is compromised, and a syncable passkey has a different device
@@ -230,6 +241,18 @@ TOTP binding, hash prefix, and stale browser card fails against the new version.
 Attachment bytes are staged under gateway ownership, hashed, fsynced, confined,
 and reverified before dispatch.
 
+The canonical executable envelope freezes `alias`, `tool`, `account_ref`,
+`credential_identity_digest`, `schema_digest`, `adapter_id`, `adapter_version`,
+`policy_version`, `caller_namespace`, arguments, and staged attachment hashes. The
+credential identity is an inventory-issued, non-secret provider principal or
+credential-record generation digest; it must change when credential material is
+replaced even if its keychain reference stays the same. The review backend and
+delivery loader resolve the current execution scope independently and require exact
+account, credential/provider identity, schema, adapter, policy, and caller bindings.
+Restarting with an alias pointed at another account, credential, adapter, or schema
+therefore makes the old request unreviewable and undispatchable rather than
+retargeting an approval.
+
 ## Delivery ambiguity
 
 No local service can generally prove exactly once across SQLite and an arbitrary
@@ -282,6 +305,15 @@ request-bound human confirmation. Gateway-owned staged bytes can be purged throu
 descriptor-confined storage operations. Operators must use the release's explicit
 retention coordinator and verify its configured matrix; direct file deletion can
 break the database/manifest relationship.
+
+Schema 14 defines attachment metadata retention separately as zero additional
+seconds after the verified byte-purge boundary. The retention transaction that
+finalizes that purge replaces account, adapter, filename, MIME, size, plaintext
+and envelope hashes, and storage paths in both attachment catalogs with fixed
+non-identifying sentinels. A durable maintenance marker requests a WAL checkpoint
+and `VACUUM` on restart; the marker clears only after that maintenance completes.
+Opaque row identities, request association, and purge timestamps remain for
+integrity and audit ordering.
 
 The marker-guarded fake demo has one deliberate exception for fault-injection tests.
 After reconciliation is durably exhausted, `demo purge-unknown` requires the exact

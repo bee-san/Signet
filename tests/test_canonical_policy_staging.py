@@ -40,9 +40,14 @@ def test_payload_fingerprint_binds_every_execution_dimension() -> None:
     base = dict(
         alias="fastmail",
         tool="send_email",
+        account_ref="primary",
+        credential_identity_digest="b" * 64,
+        schema_digest="c" * 64,
+        caller_namespace="profile:test",
         arguments={"to": ["a@example.test"], "body": "hello"},
         staged_file_hashes=("a" * 64,),
         policy_version=1,
+        adapter_id="fastmail.send_email",
         adapter_version="1",
     )
     frozen, fingerprint = payload_fingerprint(**base)
@@ -50,9 +55,14 @@ def test_payload_fingerprint_binds_every_execution_dimension() -> None:
     for key, replacement in {
         "alias": "other",
         "tool": "other",
+        "account_ref": "secondary",
+        "credential_identity_digest": "d" * 64,
+        "schema_digest": "e" * 64,
+        "caller_namespace": "profile:other",
         "arguments": {"to": ["b@example.test"], "body": "hello"},
         "staged_file_hashes": ("b" * 64,),
         "policy_version": 2,
+        "adapter_id": "other.adapter",
         "adapter_version": "2",
     }.items():
         changed = dict(base)

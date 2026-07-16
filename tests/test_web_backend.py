@@ -38,6 +38,7 @@ from signet.auth import (
 from signet.credential_broker import MemorySecretStore, Secret
 from signet.crypto import PayloadCipher
 from signet.db import Database, IntegrityError
+from signet.execution_scope import ExecutionScope, StaticExecutionScopeResolver
 from signet.freezer import RequestFreezer
 from signet.models import ApprovalConfirmation, AttachmentReference
 from signet.notifications import NotificationKind, SQLitePushRepository
@@ -94,6 +95,8 @@ TOTP_REFERENCE = "keychain://Signet/web-backend-totp"
 WEB_CREDENTIAL_ID = base64.urlsafe_b64encode(b"fake-web-backend-credential").rstrip(b"=").decode()
 P256DH = base64.urlsafe_b64encode(b"\x04" + b"p" * 64).rstrip(b"=").decode()
 PUSH_AUTH = base64.urlsafe_b64encode(b"a" * 16).rstrip(b"=").decode()
+SCHEMA_DIGEST = "d" * 64
+CREDENTIAL_DIGEST = "e" * 64
 
 
 class VariableFakeTotpProvider:
@@ -120,7 +123,8 @@ class ReviewOnlyAdapter:
     reconciliation_tools: frozenset[str] = frozenset()
     input_schema: Mapping[str, Any] = {"type": "object"}
 
-    def __init__(self) -> None:
+    def __init__(self, *, account: str = "fake-service-account") -> None:
+        self.account = account
         self.downstream_calls: list[str] = []
 
     def canonicalize(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -345,7 +349,9 @@ class BackendBundle:
             {"recipient": recipient, "body": body},
             origin_namespace="profile:web-test",
             policy_version=3,
-            schema_version="schema-1",
+            schema_digest=SCHEMA_DIGEST,
+            account_ref=None if gateway_internal else self.adapter.account,
+            credential_identity_digest=None if gateway_internal else CREDENTIAL_DIGEST,
             editor_actor="caller:web-test",
             gateway_internal=gateway_internal,
         )
@@ -382,6 +388,7 @@ def password_verifier() -> Argon2PasswordVerifier:
 def downgrade_schema_13(connection: Any) -> None:
     """Restore the schema-12 shape after test-only schema-13 data injection."""
 
+    connection.execute("DROP TABLE attachment_metadata_privacy_maintenance")
     connection.execute("DROP TRIGGER IF EXISTS request_events_structured_reason_insert")
     connection.execute("DROP TRIGGER IF EXISTS web_action_drafts_structured_reason_insert")
     connection.execute("DROP TRIGGER staged_objects_immutable_context")
@@ -394,7 +401,7 @@ def downgrade_schema_13(connection: Any) -> None:
         """
     )
     connection.execute("DROP TABLE privacy_maintenance")
-    connection.execute("DELETE FROM schema_meta WHERE migration_id = 13")
+    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14)")
     connection.execute("PRAGMA user_version = 12")
 
 
@@ -406,6 +413,7 @@ def assemble(
     adapter: ApprovalAdapter | None = None,
     cipher: PayloadCipher | None = None,
     staging: StagingStore | None = None,
+    execution_scope: ExecutionScope | None = None,
     durable_sqlite_drafts: bool = False,
 ) -> BackendBundle:
     database.initialize()
@@ -453,6 +461,12 @@ def assemble(
         absolute_timeout=1_200,
     )
     state_machine = ApprovalStateMachine(database, capabilities=CAPABILITIES)
+    account_ref = getattr(selected_adapter, "account", "gateway-internal")
+    scope = execution_scope or ExecutionScope(
+        account_ref=account_ref,
+        credential_identity_digest=CREDENTIAL_DIGEST,
+        schema_digest=SCHEMA_DIGEST,
+    )
     payloads = EncryptedPayloadReviewer(
         state_machine,
         selected_cipher,
@@ -461,6 +475,9 @@ def assemble(
                 ApprovalAdapter, selected_adapter
             )
         },
+        StaticExecutionScopeResolver(
+            {(selected_adapter.downstream_alias, selected_adapter.tool_name): scope}
+        ),
         staging=staging,
     )
     action_drafts: ActionDraftRepository = (
@@ -1308,6 +1325,45 @@ def test_historical_decision_detail_stays_bound_to_event_revision_after_edit(
     assert still_current.detail_blocks[0].value == "mutable version two body"
 
 
+@pytest.mark.parametrize("drift", ["account", "credential", "schema"])
+def test_restart_scope_change_blocks_current_private_review(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    database_path = tmp_path / f"restart-{drift}.sqlite3"
+    original = assemble(
+        Database(database_path),
+        adapter=cast(ApprovalAdapter, ReviewOnlyAdapter(account="account-a")),
+        execution_scope=ExecutionScope(
+            account_ref="account-a",
+            credential_identity_digest=CREDENTIAL_DIGEST,
+            schema_digest=SCHEMA_DIGEST,
+        ),
+    )
+    request_id = original.enqueue(body="must remain bound to account A")
+    payload_hash = str(original.state_machine.get_request(request_id)["current_payload_hash"])
+
+    restarted_scope = ExecutionScope(
+        account_ref="account-b" if drift == "account" else "account-a",
+        credential_identity_digest=("f" * 64 if drift == "credential" else CREDENTIAL_DIGEST),
+        schema_digest="a" * 64 if drift == "schema" else SCHEMA_DIGEST,
+    )
+    restarted = assemble(
+        Database(database_path),
+        adapter=cast(
+            ApprovalAdapter,
+            ReviewOnlyAdapter(
+                account="account-b" if drift == "account" else "account-a",
+            ),
+        ),
+        execution_scope=restarted_scope,
+    )
+    reviewer = cast(EncryptedPayloadReviewer, cast(Any, restarted.backend)._payloads)
+
+    with pytest.raises(WebPayloadError, match="current execution scope does not match"):
+        reviewer.review(request_id, version=1, payload_hash=payload_hash)
+
+
 def test_historical_detail_rejects_invalid_or_nondecision_event_ids(
     bundle: BackendBundle,
 ) -> None:
@@ -2106,15 +2162,15 @@ def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
         )
     assert backups == [12]
     with bundle.database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         assert (
             connection.execute(
-                "SELECT count(*) FROM schema_meta WHERE migration_id = 13"
+                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14)"
             ).fetchone()[0]
-            == 1
+            == 2
         )
 
-    # Schema 13 is already committed, so recovery must not require or repeat a backup.
+    # Both privacy migrations are committed, so recovery must not repeat a backup.
     Database(bundle.database.path).initialize()
     with bundle.database.read() as connection:
         pending = connection.execute(
@@ -2332,7 +2388,9 @@ def test_attachment_edit_and_review_are_bound_to_exact_catalog_snapshot(
         arguments,
         origin_namespace="profile:web-attachment-test",
         policy_version=3,
-        schema_version="schema-1",
+        schema_digest=SCHEMA_DIGEST,
+        account_ref="primary",
+        credential_identity_digest=CREDENTIAL_DIGEST,
         editor_actor="caller:web-attachment-test",
         attachments=adapter.freeze_attachments(arguments),
     )

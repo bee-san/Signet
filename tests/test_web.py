@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import struct
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -9,6 +11,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from signet.auth import InvalidSession, SessionPrincipal
 from signet.web import (
@@ -467,6 +470,49 @@ class FakeBackend:
         self.push_endpoints.remove(endpoint)
 
 
+class BlockingBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.queue_started = threading.Event()
+        self.queue_release = threading.Event()
+        self.password_started = threading.Event()
+        self.password_release = threading.Event()
+
+    def list_queue(
+        self,
+        principal: SessionPrincipal,
+        *,
+        now: int,
+        cursor: str | None = None,
+    ) -> QueuePage:
+        self.queue_started.set()
+        if not self.queue_release.wait(timeout=5):
+            raise AssertionError("blocking queue test was not released")
+        return super().list_queue(principal, now=now, cursor=cursor)
+
+    def password_totp_login(
+        self,
+        user_id: str,
+        password: str,
+        totp_proof: str,
+        *,
+        source: str,
+        previous_token: str | None,
+        now: int,
+    ) -> str:
+        self.password_started.set()
+        if not self.password_release.wait(timeout=5):
+            raise AssertionError("blocking password test was not released")
+        return super().password_totp_login(
+            user_id,
+            password,
+            totp_proof,
+            source=source,
+            previous_token=previous_token,
+            now=now,
+        )
+
+
 @pytest.fixture
 def backend() -> FakeBackend:
     return FakeBackend()
@@ -503,6 +549,78 @@ def test_agent_listener_has_only_privacy_safe_health() -> None:
         health = client.get("/healthz")
     assert health.json() == {"status": "ok", "service": "signet"}
     assert "request" not in health.text and "target" not in health.text
+
+
+def _blocking_app(backend: FakeBackend) -> Any:
+    return create_web_app(
+        backend,
+        settings=WebSettings(
+            public_origin=ORIGIN,
+            allowed_hosts=("signet.test",),
+            vapid_public_key="fake-public-key",
+        ),
+        csrf=CsrfManager(b"c" * 32),
+        clock=lambda: NOW,
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocking_queue_storage_does_not_stall_event_loop_health() -> None:
+    backend = BlockingBackend()
+    transport = ASGITransport(app=_blocking_app(backend))
+    safety_release = threading.Timer(3, backend.queue_release.set)
+    safety_release.start()
+    try:
+        async with AsyncClient(transport=transport, base_url=ORIGIN) as client:
+            client.cookies.set("__Host-signet_session", "session-good")
+            queue_task = asyncio.create_task(client.get("/"))
+            assert await asyncio.to_thread(backend.queue_started.wait, 1)
+            assert not backend.queue_release.is_set()
+            health = await asyncio.wait_for(client.get("/healthz"), timeout=1)
+            backend.queue_release.set()
+            queue_response = await queue_task
+    finally:
+        backend.queue_release.set()
+        safety_release.cancel()
+
+    assert health.status_code == 200
+    assert queue_response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_blocking_password_verification_does_not_stall_event_loop_health() -> None:
+    backend = BlockingBackend()
+    transport = ASGITransport(app=_blocking_app(backend))
+    safety_release = threading.Timer(3, backend.password_release.set)
+    safety_release.start()
+    try:
+        async with AsyncClient(transport=transport, base_url=ORIGIN) as client:
+            login = await client.get("/login")
+            csrf_token = client.cookies.get("__Host-signet_login_csrf")
+            assert login.status_code == 200 and csrf_token
+            login_task = asyncio.create_task(
+                client.post(
+                    "/login/password",
+                    data={
+                        "user_id": "autumn",
+                        "password": "fake-password",
+                        "totp_proof": "fake:totp",
+                        "csrf_token": csrf_token,
+                    },
+                    headers={"Origin": ORIGIN},
+                )
+            )
+            assert await asyncio.to_thread(backend.password_started.wait, 1)
+            assert not backend.password_release.is_set()
+            health = await asyncio.wait_for(client.get("/healthz"), timeout=1)
+            backend.password_release.set()
+            login_response = await login_task
+    finally:
+        backend.password_release.set()
+        safety_release.cancel()
+
+    assert health.status_code == 200
+    assert login_response.status_code == 303
 
 
 def test_oversized_passkey_login_is_rejected_before_backend(

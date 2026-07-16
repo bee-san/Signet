@@ -62,6 +62,18 @@ browser sessions, webhooks, or other paths that bypass Signet. See
 
 ## Development
 
+The Python distribution is named `signet-gateway`; the import package and command
+remain `signet`. The complete supported-platform runtime dependency closure and
+build backend closure are pinned to the reviewed versions. The supported platforms
+are Linux and macOS; the CLI fails closed elsewhere.
+
+Version tags matching the project version wait for successful main-branch CI on the
+exact tagged commit, then trigger native Linux x86_64 and macOS arm64 wheel builds
+plus a source distribution. The release workflow emits a reproducible CycloneDX
+runtime SBOM and checksums, signs the artifacts with Sigstore OIDC, records GitHub
+provenance and SBOM attestations, and publishes only after those steps succeed.
+Release actions and release tooling are commit- or lock-pinned.
+
 Signet requires Python 3.12 and exact `uv` version `0.11.28`. Install that version
 with `pipx install 'uv==0.11.28'` or the official versioned
 [`uv` installer](https://docs.astral.sh/uv/getting-started/installation/); inspect a

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 
-from signet.app import main
+from signet.app import _supported_platform, main
 from signet.credential_broker import IssuedToken, TokenRegistry
 from signet.gateway_tools import GatewayPrincipal, GatewayToolSurface
 from signet.mcp_mirror import AliasToolSurface, InvocationIdentity, SchemaMirror
@@ -611,6 +612,39 @@ async def test_registry_verifier_redacts_raw_token_and_enforces_alias(auth: Auth
     )
 
 
+@pytest.mark.asyncio
+async def test_registry_verifier_does_not_block_the_event_loop() -> None:
+    class BlockingTokenRegistry(TokenRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def authenticate(self, authorization: str | None, *, alias: str) -> Any:
+            self.started.set()
+            if not self.release.wait(timeout=5):
+                raise AssertionError("blocking token verification test was not released")
+            return super().authenticate(authorization, alias=alias)
+
+    registry = BlockingTokenRegistry()
+    issued = registry.issue("profile:blocked", {"fastmail"})
+    verifier = RegistryTokenVerifier(registry, alias="fastmail")
+    safety_release = threading.Timer(3, registry.release.set)
+    safety_release.start()
+    try:
+        verification = asyncio.create_task(verifier.verify_token(issued.token))
+        assert await asyncio.to_thread(registry.started.wait, 1)
+        assert not registry.release.is_set()
+        registry.release.set()
+        verified = await verification
+    finally:
+        registry.release.set()
+        safety_release.cancel()
+
+    assert verified is not None
+    assert verified.subject == "profile:blocked"
+
+
 def test_cli_requires_explicit_factory_and_mcp_loopback() -> None:
     with pytest.raises(SystemExit):
         main([])
@@ -628,6 +662,14 @@ def test_cli_requires_explicit_factory_and_mcp_loopback() -> None:
         )
     with pytest.raises(SystemExit):
         main(["serve-web", "--factory", "not a factory"])
+
+
+def test_cli_platform_support_is_explicitly_posix_only() -> None:
+    assert _supported_platform("linux")
+    assert _supported_platform("linux-musl")
+    assert _supported_platform("darwin")
+    assert not _supported_platform("win32")
+    assert not _supported_platform("cygwin")
 
 
 @pytest.mark.parametrize(

@@ -1256,8 +1256,10 @@ or wait on these steps. A human runs them later under an explicit change record:
    repository currently has no enrollment CLI; supply and review that deployment
    procedure before proceeding. Optionally enroll TOTP without exposing its secret
    or any current code to logs/chat.
-3. Enroll downstream credentials in the intended Keychain boundary. Store only
-   references in policy/configuration.
+3. Enroll downstream credentials in the intended Keychain boundary. Store only the
+   reference in policy; the runtime client configuration must also carry a non-secret
+   credential-record generation digest. Replacing credential material at the same
+   reference must atomically issue a new digest so queued requests fail closed.
 4. Perform read-only live `tools/list` discovery through an authorized capture
    path, normalize the secret-free fixture offline, review every exact schema and
    digest, and keep sends denied.

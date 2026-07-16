@@ -17,6 +17,7 @@ class DownstreamConfig(BaseModel):
 
     transport: Literal["http", "stdio"]
     credential_ref: str
+    credential_identity_digest: str
     url: str | None = None
     command: tuple[str, ...] = ()
     working_directory: Path | None = None
@@ -30,6 +31,13 @@ class DownstreamConfig(BaseModel):
     def credential_is_reference_only(cls, value: str) -> str:
         if not value.startswith("keychain://"):
             raise ValueError("downstream credentials must use keychain:// references")
+        return value
+
+    @field_validator("credential_identity_digest")
+    @classmethod
+    def credential_identity_is_inventory_generation(cls, value: str) -> str:
+        if not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError("credential identity must be a lowercase SHA-256 inventory digest")
         return value
 
     @field_validator("executable_sha256")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from collections.abc import Callable, Sequence
 
 import uvicorn
@@ -28,6 +29,8 @@ def main(
     """Run an explicitly assembled MCP or web ASGI factory."""
 
     parser = _parser()
+    if not _supported_platform(sys.platform):
+        parser.error("Signet supports Linux and macOS only")
     args = parser.parse_args(argv)
     if args.command == "demo":
         try:
@@ -64,6 +67,10 @@ def main(
         server_header=False,
         limit_concurrency=args.limit_concurrency,
     )
+
+
+def _supported_platform(value: str) -> bool:
+    return value == "darwin" or value.startswith("linux")
 
 
 def _parser() -> argparse.ArgumentParser:

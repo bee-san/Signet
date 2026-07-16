@@ -35,6 +35,7 @@ from signet.auth import (
 from signet.canonical import CanonicalizationError, canonical_json
 from signet.db import Database
 from signet.decision_notes import decision_reason_label, normalize_decision_note, reason_for_action
+from signet.execution_scope import ExecutionScopeResolver
 from signet.models import (
     ApprovalConfirmation,
     AttachmentReference,
@@ -108,10 +109,15 @@ type ConfirmationMatches = tuple[tuple[ConfirmationProof, ...], int]
 
 _ENVELOPE_FIELDS = frozenset(
     {
+        "account_ref",
+        "adapter_id",
         "adapter_version",
         "alias",
         "arguments",
+        "caller_namespace",
+        "credential_identity_digest",
         "policy_version",
+        "schema_digest",
         "staged_file_hashes",
         "tool",
     }
@@ -173,7 +179,11 @@ class ReviewedPayload:
     adapter: ApprovalAdapter
     summary: ApprovalSummary
     arguments: Mapping[str, Any]
+    account_ref: str | None
+    credential_identity_digest: str | None
+    caller_namespace: str
     policy_version: int
+    adapter_id: str
     adapter_version: str
     schema_version: str
     staged_file_hashes: tuple[str, ...]
@@ -246,6 +256,7 @@ class EncryptedPayloadReviewer:
         state_machine: ApprovalStateMachine,
         codec: PayloadCodec,
         adapters: Mapping[tuple[str, str], ApprovalAdapter],
+        execution_scopes: ExecutionScopeResolver,
         *,
         staging: StagingStore | None = None,
         max_payload_bytes: int = 16 * 1024 * 1024,
@@ -259,9 +270,12 @@ class EncryptedPayloadReviewer:
             raise ValueError("adapter registry keys must match reviewed adapters")
         if not codec.key_reference:
             raise ValueError("payload codec key reference is required")
+        if not callable(getattr(execution_scopes, "resolve", None)):
+            raise ValueError("an execution scope resolver is required")
         self._state_machine = state_machine
         self._codec = codec
         self._adapters = dict(adapters)
+        self._execution_scopes = execution_scopes
         self._staging = staging
         self.max_payload_bytes = max_payload_bytes
 
@@ -354,8 +368,13 @@ class EncryptedPayloadReviewer:
 
         alias = envelope["alias"]
         tool = envelope["tool"]
+        account_ref = envelope["account_ref"]
+        adapter_id = envelope["adapter_id"]
         adapter_version = envelope["adapter_version"]
+        caller_namespace = envelope["caller_namespace"]
+        credential_identity_digest = envelope["credential_identity_digest"]
         policy_version = envelope["policy_version"]
+        schema_digest = envelope["schema_digest"]
         arguments = envelope["arguments"]
         staged_hashes = envelope["staged_file_hashes"]
         if (
@@ -363,12 +382,17 @@ class EncryptedPayloadReviewer:
             or alias != request["downstream_alias"]
             or not isinstance(tool, str)
             or tool != request["tool_name"]
+            or not isinstance(adapter_id, str)
             or not isinstance(adapter_version, str)
             or adapter_version != payload["adapter_version"]
             or not isinstance(policy_version, int)
             or isinstance(policy_version, bool)
             or policy_version < 1
             or str(policy_version) != str(payload["policy_version"])
+            or not isinstance(caller_namespace, str)
+            or caller_namespace != request["origin_namespace"]
+            or not _is_sha256(schema_digest)
+            or schema_digest != payload["schema_version"]
             or not isinstance(arguments, dict)
             or not isinstance(staged_hashes, list)
             or any(not _is_sha256(item) for item in staged_hashes)
@@ -378,8 +402,28 @@ class EncryptedPayloadReviewer:
             adapter = self._adapters[(alias, tool)]
         except KeyError:
             raise WebPayloadError("no reviewed adapter matches the private payload") from None
-        if adapter.adapter_version != adapter_version:
-            raise WebPayloadError("reviewed adapter version does not match the payload")
+        if adapter.adapter_id != adapter_id or adapter.adapter_version != adapter_version:
+            raise WebPayloadError("reviewed adapter identity does not match the payload")
+        gateway_internal = bool(request["gateway_internal"])
+        if gateway_internal:
+            if account_ref is not None or credential_identity_digest is not None:
+                raise WebPayloadError("gateway-internal payload has downstream execution scope")
+        elif not isinstance(account_ref, str) or not _is_sha256(credential_identity_digest):
+            raise WebPayloadError("private payload execution scope is invalid")
+        if require_current and not gateway_internal:
+            try:
+                current_scope = self._execution_scopes.resolve(alias, tool, adapter)
+            except Exception:
+                raise WebPayloadError("current execution scope is unavailable") from None
+            if (
+                current_scope.account_ref != account_ref
+                or not hmac.compare_digest(
+                    current_scope.credential_identity_digest,
+                    cast(str, credential_identity_digest),
+                )
+                or not hmac.compare_digest(current_scope.schema_digest, cast(str, schema_digest))
+            ):
+                raise WebPayloadError("current execution scope does not match the payload")
         try:
             canonical_arguments = adapter.canonicalize(cast(dict[str, Any], arguments))
             if canonical_json(canonical_arguments) != canonical_json(arguments):
@@ -409,7 +453,11 @@ class EncryptedPayloadReviewer:
             adapter=adapter,
             summary=summary,
             arguments=canonical_arguments,
+            account_ref=cast(str | None, account_ref),
+            credential_identity_digest=cast(str | None, credential_identity_digest),
+            caller_namespace=caller_namespace,
             policy_version=policy_version,
+            adapter_id=adapter_id,
             adapter_version=adapter_version,
             schema_version=schema_version,
             staged_file_hashes=tuple(cast(list[str], staged_hashes)),
@@ -438,10 +486,15 @@ class EncryptedPayloadReviewer:
             ) != tuple(_attachment_identity(attachment) for attachment in reviewed.attachments):
                 raise ValueError("attachment references cannot be changed by an edit")
             envelope = {
+                "account_ref": reviewed.account_ref,
+                "adapter_id": reviewed.adapter_id,
                 "adapter_version": reviewed.adapter_version,
                 "alias": reviewed.adapter.downstream_alias,
                 "arguments": arguments,
+                "caller_namespace": reviewed.caller_namespace,
+                "credential_identity_digest": reviewed.credential_identity_digest,
                 "policy_version": reviewed.policy_version,
+                "schema_digest": reviewed.schema_version,
                 "staged_file_hashes": [attachment.sha256 for attachment in edited_attachments],
                 "tool": reviewed.adapter.tool_name,
             }
@@ -491,7 +544,7 @@ class EncryptedPayloadReviewer:
         if len(matching) != 1 or self._staging is None:
             raise WebPayloadError("frozen attachment is unavailable for inspection")
         expected = matching[0]
-        account = getattr(reviewed.adapter, "account", None)
+        account = reviewed.account_ref
         if not isinstance(account, str) or not account:
             raise WebPayloadError("frozen attachment scope is unavailable")
         try:
@@ -1275,9 +1328,7 @@ class WebBackend:
             and not bool(request["gateway_internal"])
         ):
             editable = arguments_json
-        account = getattr(reviewed.adapter, "account", None)
-        if not isinstance(account, str) or not account:
-            account = None
+        account = reviewed.account_ref
         detail_now = self._clock()
         decision_window_expired = (
             historical_event is None

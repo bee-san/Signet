@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -18,11 +21,15 @@ from signet.adapters.base import (
 from signet.canonical import payload_fingerprint
 from signet.db import Database
 from signet.delivery import DeliveryDispatcher, FrozenRequestLoader, PayloadDecryptor
+from signet.execution_scope import ExecutionScope, StaticExecutionScopeResolver
 from signet.models import AttachmentReference, EnqueueRequest
 from signet.reconcile import ReconciliationCoordinator
 from signet.state_machine import ApprovalStateMachine
 
 NOW = 1_910_000_000
+ACCOUNT_REF = "primary"
+CREDENTIAL_DIGEST = "c" * 64
+SCHEMA_DIGEST = "d" * 64
 
 
 class FakeDecryptor(PayloadDecryptor):
@@ -45,8 +52,15 @@ class FakeDecryptor(PayloadDecryptor):
 
 
 class FakeProvider(MCPClient):
-    def __init__(self, send_outcomes: list[object]) -> None:
+    def __init__(
+        self,
+        send_outcomes: list[object],
+        *,
+        credential_identity_digest: str = CREDENTIAL_DIGEST,
+    ) -> None:
         self.send_outcomes = send_outcomes
+        self.credential_ref = "keychain://Signet/fake-provider"
+        self.credential_identity_digest = credential_identity_digest
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def call_tool(
@@ -83,6 +97,7 @@ class FakeAdapter:
         lookup_tool: str = "lookup",
     ) -> None:
         self.decisions = decisions
+        self.account = ACCOUNT_REF
         self.supports_idempotency = supports_idempotency
         self.lookup_tool = lookup_tool
         self.idempotency_keys: list[str | None] = []
@@ -159,8 +174,13 @@ def enqueue_approved(machine: ApprovalStateMachine, request_id: str) -> None:
     frozen, payload_hash = payload_fingerprint(
         alias="fake",
         tool="send",
+        account_ref=ACCOUNT_REF,
+        credential_identity_digest=CREDENTIAL_DIGEST,
+        schema_digest=SCHEMA_DIGEST,
+        caller_namespace="profile:test",
         arguments={"value": "private"},
         policy_version=1,
+        adapter_id="fake.send",
         adapter_version="1",
     )
     machine.enqueue(
@@ -178,7 +198,7 @@ def enqueue_approved(machine: ApprovalStateMachine, request_id: str) -> None:
             expires_at=NOW + 600,
             policy_version="1",
             adapter_version="1",
-            schema_version="1",
+            schema_version=SCHEMA_DIGEST,
             editor_actor="caller:test",
             canonical_size=len(frozen),
             encryption_key_ref="keychain://Signet/fake-payload",
@@ -199,6 +219,7 @@ def services(
     adapter: FakeAdapter,
     provider: FakeProvider,
     *,
+    scope_provider: FakeProvider | None = None,
     schedule: tuple[int, ...] = (1, 2),
     reviewed_tools: Mapping[tuple[str, str], frozenset[str]] | None = None,
     decryptor: FakeDecryptor | None = None,
@@ -207,7 +228,16 @@ def services(
         machine,
         decryptor or FakeDecryptor(),
         {("fake", "send"): adapter},
-        {"fake": "primary"},
+        StaticExecutionScopeResolver(
+            {
+                ("fake", "send"): ExecutionScope(
+                    account_ref=ACCOUNT_REF,
+                    credential_identity_digest=CREDENTIAL_DIGEST,
+                    schema_digest=SCHEMA_DIGEST,
+                )
+            },
+            {"fake": scope_provider or provider},
+        ),
     )
     dispatcher = DeliveryDispatcher(
         machine,
@@ -226,6 +256,78 @@ def services(
         ),
     )
     return dispatcher, coordinator
+
+
+@pytest.mark.asyncio
+async def test_restart_credential_generation_drift_blocks_reconciliation_lookup(
+    machine: ApprovalStateMachine,
+) -> None:
+    enqueue_approved(machine, "reconcile-generation")
+    adapter = FakeAdapter([], supports_idempotency=False)
+    original_provider = FakeProvider([TimeoutError("ambiguous")])
+    dispatcher, _coordinator = services(machine, adapter, original_provider)
+    await dispatcher.dispatch("reconcile-generation", worker_id="sender", now=NOW + 2)
+
+    restarted_database = Database(machine.database.path)
+    restarted_database.initialize()
+    restarted_machine = ApprovalStateMachine(
+        restarted_database,
+        notification_user_id="human:test",
+    )
+    restarted_adapter = FakeAdapter(
+        [Reconciliation.CONFIRMED_EFFECT],
+        supports_idempotency=False,
+    )
+    rotated_provider = FakeProvider([], credential_identity_digest="e" * 64)
+    _dispatcher, coordinator = services(
+        restarted_machine,
+        restarted_adapter,
+        rotated_provider,
+    )
+
+    run = await coordinator.reconcile_once(
+        "reconcile-generation",
+        worker_id="restarted-reader",
+        now=NOW + 3,
+    )
+
+    assert run.decision.value == "inconclusive"
+    assert run.result.action.value == "rescheduled"
+    assert rotated_provider.credential_ref == original_provider.credential_ref
+    assert rotated_provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_selected_unreviewed_client_instance_blocks_reconciliation_lookup(
+    machine: ApprovalStateMachine,
+) -> None:
+    enqueue_approved(machine, "reconcile-client")
+    adapter = FakeAdapter([], supports_idempotency=False)
+    original_provider = FakeProvider([TimeoutError("ambiguous")])
+    dispatcher, _coordinator = services(machine, adapter, original_provider)
+    await dispatcher.dispatch("reconcile-client", worker_id="sender", now=NOW + 2)
+    selected_provider = FakeProvider([])
+    restarted_adapter = FakeAdapter(
+        [Reconciliation.CONFIRMED_EFFECT],
+        supports_idempotency=False,
+    )
+    _dispatcher, coordinator = services(
+        machine,
+        restarted_adapter,
+        selected_provider,
+        scope_provider=original_provider,
+    )
+
+    run = await coordinator.reconcile_once(
+        "reconcile-client",
+        worker_id="reader",
+        now=NOW + 3,
+    )
+
+    assert run.decision.value == "inconclusive"
+    assert run.result.action.value == "rescheduled"
+    assert selected_provider.credential_identity_digest == CREDENTIAL_DIGEST
+    assert selected_provider.calls == []
 
 
 @pytest.mark.asyncio
@@ -429,3 +531,52 @@ async def test_corrupt_due_payload_is_bounded_and_does_not_block_later_rows(
     assert machine.get_request("bad")["state"] == "outcome_unknown"
     assert machine.get_request("good")["state"] == "succeeded"
     assert coordinator.due_request_ids(now=NOW + 3) == ()
+
+
+@pytest.mark.asyncio
+async def test_blocking_reconciliation_snapshot_does_not_stall_event_loop(
+    machine: ApprovalStateMachine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enqueue_approved(machine, "blocking-snapshot")
+    adapter = FakeAdapter(
+        [Reconciliation.CONFIRMED_EFFECT],
+        supports_idempotency=False,
+    )
+    provider = FakeProvider([TimeoutError("ambiguous")])
+    dispatcher, coordinator = services(machine, adapter, provider)
+    await dispatcher.dispatch("blocking-snapshot", worker_id="sender", now=NOW + 2)
+    started = threading.Event()
+    release = threading.Event()
+    original_snapshot = coordinator._snapshot
+
+    def blocking_snapshot(request_id: str) -> Any:
+        started.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("blocking reconciliation snapshot was not released")
+        return original_snapshot(request_id)
+
+    monkeypatch.setattr(coordinator, "_snapshot", blocking_snapshot)
+    safety_release = threading.Timer(3, release.set)
+    safety_release.start()
+    waiting_started_at = time.monotonic()
+    try:
+        reconciling = asyncio.create_task(
+            coordinator.reconcile_once(
+                "blocking-snapshot",
+                worker_id="reader",
+                now=NOW + 3,
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        assert time.monotonic() - waiting_started_at < 2
+        assert not release.is_set()
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        release.set()
+        run = await reconciling
+    finally:
+        release.set()
+        safety_release.cancel()
+
+    assert run.result.action.value == "succeeded"
+    assert [call[0] for call in provider.calls] == ["send", "lookup"]

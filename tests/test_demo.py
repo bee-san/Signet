@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, Timer
 from typing import Any
 
 import httpx
@@ -1790,6 +1790,43 @@ async def test_worker_supervision_retries_and_health_reports_persistent_failure(
 
     await asyncio.wait_for(task, timeout=2)
     assert calls == 4
+
+
+@pytest.mark.asyncio
+async def test_assembled_worker_lifespan_keeps_web_responsive_during_blocking_sweep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assembly = build_demo(new_demo(tmp_path))
+    started = Event()
+    release = Event()
+    original_sweep = assembly.state_machine.sweep_expired
+
+    def blocking_sweep(*, now: int, limit: int) -> int:
+        started.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("blocking demo sweep was not released")
+        return original_sweep(now=now, limit=limit)
+
+    monkeypatch.setattr(assembly.state_machine, "sweep_expired", blocking_sweep)
+    safety_release = Timer(3, release.set)
+    safety_release.start()
+    try:
+        async with assembly.web.router.lifespan_context(assembly.web):
+            waiting_started_at = time.monotonic()
+            assert await asyncio.to_thread(started.wait, 1)
+            assert time.monotonic() - waiting_started_at < 2
+            assert not release.is_set()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=assembly.web),
+                base_url="http://127.0.0.1:8790",
+            ) as client:
+                health = await asyncio.wait_for(client.get("/healthz"), timeout=1)
+            assert health.status_code == 200
+            release.set()
+    finally:
+        release.set()
+        safety_release.cancel()
 
 
 @pytest.mark.asyncio

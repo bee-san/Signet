@@ -25,6 +25,7 @@ import mcp.types as types
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from mcp.shared.exceptions import McpError
 
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.auth import (
     ActionBinding,
     AuthenticationRateLimited,
@@ -448,10 +449,7 @@ class GatewayTools:
     ) -> dict[str, Any]:
         """Call a gateway tool, reserving protocol errors for bad MCP requests."""
 
-        values = self._validate_call(name, arguments)
-        now = self._clock()
-        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
-            raise RuntimeError("the gateway clock returned an invalid Unix timestamp")
+        values, now = await _run_sync(self._prepare_call, name, arguments)
 
         if name == "check_approval_status":
             result = await self._check_status(cast(str, values["request_id"]), principal)
@@ -465,19 +463,29 @@ class GatewayTools:
         elif name == "approve_request":
             result = await self._approve(values, principal, now=now)
         elif name == "cancel_request":
-            result = self._cancel(cast(str, values["request_id"]), principal, now=now)
+            result = await _run_sync(
+                self._cancel,
+                cast(str, values["request_id"]),
+                principal,
+                now=now,
+            )
         elif name == "request_tool_access":
             result = await self._request_access(values, principal, now=now)
         else:  # pragma: no cover - guarded by _validate_call
             raise AssertionError("unreachable gateway tool dispatch")
 
-        if result.get("isError") is True:
-            types.CallToolResult.model_validate(result)
-            return result
-        structured = result.get("structuredContent")
-        _OUTPUT_VALIDATORS[name].validate(structured)
-        types.CallToolResult.model_validate(result)
-        return result
+        return await _run_sync(_validate_tool_result, name, result)
+
+    def _prepare_call(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], int]:
+        values = self._validate_call(name, arguments)
+        now = self._clock()
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise RuntimeError("the gateway clock returned an invalid Unix timestamp")
+        return values, now
 
     @staticmethod
     def _validate_call(name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -504,7 +512,7 @@ class GatewayTools:
 
     async def _check_status(self, request_id: str, principal: GatewayPrincipal) -> dict[str, Any]:
         try:
-            request = self._owned_request(request_id, principal.namespace)
+            request = await _run_sync(self._owned_request, request_id, principal.namespace)
         except RequestNotFound:
             return _not_found_result()
 
@@ -537,7 +545,8 @@ class GatewayTools:
         limit: int,
     ) -> dict[str, Any]:
         after = _decode_pending_cursor(cursor) if cursor is not None else None
-        requests, has_more = self._pending_requests(
+        requests, has_more = await _run_sync(
+            self._pending_requests,
             principal.namespace,
             now=now,
             after=after,
@@ -576,7 +585,7 @@ class GatewayTools:
     ) -> dict[str, Any]:
         request_id = cast(str, values["request_id"])
         try:
-            request = self._owned_request(request_id, principal.namespace)
+            request = await _run_sync(self._owned_request, request_id, principal.namespace)
         except RequestNotFound:
             return _not_found_result()
 
@@ -608,7 +617,8 @@ class GatewayTools:
             payload_hash=request.payload_hash,
         )
         try:
-            proof = self._totp.verify(
+            proof = await _run_sync(
+                self._totp.verify,
                 principal.user_id,
                 cast(str, values["totp_code"]),
                 binding=binding,
@@ -687,7 +697,8 @@ class GatewayTools:
             credential_user_id=proof.user_id,
         )
         try:
-            self._state_machine.approve(
+            await _run_sync(
+                self._state_machine.approve,
                 request.request_id,
                 expected_version=request.version,
                 expected_payload_hash=request.payload_hash,
@@ -724,7 +735,7 @@ class GatewayTools:
                 ),
             )
 
-        self._totp.record_consumed_success(proof, now=now)
+        await _run_sync(self._totp.record_consumed_success, proof, now=now)
         return _success_result(
             {
                 "status": "approved",
@@ -790,7 +801,7 @@ class GatewayTools:
             actor=principal.actor,
             created_at=now,
         )
-        request = await _resolve(self._access_requests.freeze(draft))
+        request = await _resolve(await _run_sync(self._access_requests.freeze, draft))
         if (
             not request.gateway_internal
             or request.origin_namespace != principal.namespace
@@ -802,7 +813,7 @@ class GatewayTools:
             or re.fullmatch(r"req_[A-Za-z0-9]+", request.request_id) is None
         ):
             raise RuntimeError("access request factory violated the gateway-internal contract")
-        self._state_machine.enqueue(request)
+        await _run_sync(self._state_machine.enqueue, request)
         return _success_result(
             {
                 "status": "pending_approval",
@@ -874,8 +885,8 @@ class GatewayTools:
         return [_snapshot(row) for row in visible], len(rows) > limit
 
     async def _review_summary(self, request: _RequestSnapshot) -> SafeRequestSummary:
-        summary = await _resolve(self._summary(request))
-        _require_safe_summary(request, summary)
+        summary = await _resolve(await _run_sync(self._summary, request))
+        await _run_sync(_require_safe_summary, request, summary)
         return summary
 
     async def _public_summary(self, request: _RequestSnapshot) -> tuple[SafeRequestSummary, bool]:
@@ -922,7 +933,7 @@ class GatewayToolSurface:
     async def _list_tools(self, request: types.ListToolsRequest) -> types.ServerResult:
         del request
         self.principal_provider()
-        return RawServerResult({"tools": self.tools.list_tools()})
+        return RawServerResult({"tools": await _run_sync(self.tools.list_tools)})
 
     async def _call_tool(self, request: types.CallToolRequest) -> types.ServerResult:
         principal = self.principal_provider()
@@ -1045,6 +1056,16 @@ async def _resolve[T](value: T | Awaitable[T]) -> T:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _validate_tool_result(name: str, result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("isError") is True:
+        types.CallToolResult.model_validate(result)
+        return result
+    structured = result.get("structuredContent")
+    _OUTPUT_VALIDATORS[name].validate(structured)
+    types.CallToolResult.model_validate(result)
+    return result
 
 
 def _timestamp(value: int) -> str:

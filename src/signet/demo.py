@@ -37,6 +37,7 @@ from signet.adapters.fastmail import FASTMAIL_SEND_SCHEMA, FastmailAdapter
 from signet.adapters.tool_access import ToolAccessAdapter
 from signet.adapters.whatsapp import WHATSAPP_TEXT_SCHEMA, WhatsAppAdapter, WhatsAppTextAdapter
 from signet.admission import QueueAdmissionLimits
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.attachment_crypto import AttachmentCipher
 from signet.auth import (
     Argon2PasswordVerifier,
@@ -70,6 +71,7 @@ from signet.credential_broker import (
 from signet.crypto import PayloadCipher
 from signet.db import Database, DatabaseError, DatabaseFinalizationStateUnknown
 from signet.delivery import DeliveryDispatcher, DeliveryError, FrozenRequestLoader
+from signet.execution_scope import PolicyExecutionScopeResolver
 from signet.freezer import RequestFreezer
 from signet.gateway import GatewayCallPipeline
 from signet.gateway_tools import (
@@ -308,8 +310,15 @@ class FakeOnlyProviderClient:
         if alias not in {"fastmail", "whatsapp"}:
             raise DemoError("fake provider alias is invalid")
         self.alias = alias
+        self._credential_identity_digest = hashlib.sha256(
+            (f"signet/fake-provider-identity/v1\x00{alias}\x00fake:{alias}-account").encode()
+        ).hexdigest()
         self._mutation_calls = 0
         self._sent_emails: dict[str, dict[str, Any]] = {}
+
+    @property
+    def credential_identity_digest(self) -> str:
+        return self._credential_identity_digest
 
     @property
     def mutation_calls(self) -> int:
@@ -477,12 +486,13 @@ class FakePushTransport:
 
 
 class DemoWorkers:
-    """Bounded recovery, delivery, maintenance, and notification workers."""
+    """Bounded recovery, publication, delivery, maintenance, and notification workers."""
 
     def __init__(
         self,
         database: Database,
         state_machine: ApprovalStateMachine,
+        policy_publications: SQLitePolicyPromotionBoundary,
         delivery: DeliveryDispatcher,
         reconciliation: ReconciliationCoordinator,
         retention: RetentionManager,
@@ -507,6 +517,7 @@ class DemoWorkers:
             raise ValueError("demo worker bounds are invalid")
         self.database = database
         self.state_machine = state_machine
+        self.policy_publications = policy_publications
         self.delivery = delivery
         self.reconciliation = reconciliation
         self.retention = retention
@@ -535,7 +546,7 @@ class DemoWorkers:
                     # Recovery is a serving-lifespan operation. Constructors and
                     # offline backup, restore, and smoke commands never cross this
                     # execution-fencing boundary.
-                    self.state_machine.recover_startup(now=selected_now)
+                    await _run_sync(self.state_machine.recover_startup, now=selected_now)
                     await self.run_once(now=selected_now)
                 except asyncio.CancelledError:
                     raise
@@ -572,30 +583,10 @@ class DemoWorkers:
         if not isinstance(selected_now, int) or isinstance(selected_now, bool) or selected_now < 0:
             raise ValueError("demo worker time is invalid")
 
-        self.state_machine.sweep_expired(now=selected_now, limit=100)
-        with self.database.read() as connection:
-            request_ids = tuple(
-                str(row["request_id"])
-                for row in connection.execute(
-                    """
-                    SELECT request.request_id
-                    FROM approval_requests AS request
-                    LEFT JOIN execution_attempts AS attempt
-                      ON attempt.request_id = request.request_id
-                     AND attempt.version = request.current_version
-                    WHERE request.state = 'approved'
-                       OR (
-                           request.state = 'executing'
-                           AND attempt.phase IN ('preparing', 'redispatch_preparing')
-                           AND attempt.lease_expires_at <= ?
-                       )
-                    ORDER BY COALESCE(request.approved_at, request.execution_started_at),
-                             request.request_id
-                    LIMIT ?
-                    """,
-                    (selected_now, self.delivery_batch),
-                ).fetchall()
-            )
+        await self.policy_publications.publish_pending(now=selected_now)
+        await _run_sync(self.state_machine.sweep_expired, now=selected_now, limit=100)
+        request_ids = await _run_sync(self._due_delivery_request_ids, selected_now)
+
         delivered = 0
         for request_id in request_ids:
             dispatch_now = max(selected_now, int(time.time()))
@@ -617,23 +608,51 @@ class DemoWorkers:
         )
         maintenance_due = selected_now >= self._next_maintenance_at
         if maintenance_due:
-            self.notifications.outbox.schedule_approaching_expiry(
-                user_id=DEMO_USER_ID,
-                now=selected_now,
-                limit=1_000,
-            )
-            self.notifications.outbox.schedule_daily_digest(
-                user_id=DEMO_USER_ID,
-                now=selected_now,
-            )
+            await _run_sync(self._schedule_notification_maintenance, selected_now)
         report = await self.notifications.run_due(
             now=selected_now,
             limit=self.notification_batch,
         )
         if maintenance_due:
-            await asyncio.to_thread(self.retention.run_due, now=selected_now, limit=100)
+            await _run_sync(self.retention.run_due, now=selected_now, limit=100)
             self._next_maintenance_at = selected_now + self.maintenance_interval_seconds
         return delivered, report.delivered
+
+    def _due_delivery_request_ids(self, now: int) -> tuple[str, ...]:
+        with self.database.read() as connection:
+            return tuple(
+                str(row["request_id"])
+                for row in connection.execute(
+                    """
+                    SELECT request.request_id
+                    FROM approval_requests AS request
+                    LEFT JOIN execution_attempts AS attempt
+                      ON attempt.request_id = request.request_id
+                     AND attempt.version = request.current_version
+                    WHERE request.state = 'approved'
+                       OR (
+                           request.state = 'executing'
+                           AND attempt.phase IN ('preparing', 'redispatch_preparing')
+                           AND attempt.lease_expires_at <= ?
+                       )
+                    ORDER BY COALESCE(request.approved_at, request.execution_started_at),
+                             request.request_id
+                    LIMIT ?
+                    """,
+                    (now, self.delivery_batch),
+                ).fetchall()
+            )
+
+    def _schedule_notification_maintenance(self, now: int) -> None:
+        self.notifications.outbox.schedule_approaching_expiry(
+            user_id=DEMO_USER_ID,
+            now=now,
+            limit=1_000,
+        )
+        self.notifications.outbox.schedule_daily_digest(
+            user_id=DEMO_USER_ID,
+            now=now,
+        )
 
 
 def _absolute_demo_path(root: Path) -> Path:
@@ -847,6 +866,14 @@ def build_demo(
         **adapters,
         (tool_access.downstream_alias, tool_access.tool_name): cast(ApprovalAdapter, tool_access),
     }
+    downstream_clients = {
+        "fastmail": FakeOnlyProviderClient("fastmail"),
+        "whatsapp": FakeOnlyProviderClient("whatsapp"),
+    }
+    execution_scopes = PolicyExecutionScopeResolver(
+        mirror,
+        downstream_clients,
+    )
     state_machine = ApprovalStateMachine(
         database,
         capabilities=capabilities,
@@ -862,19 +889,19 @@ def build_demo(
         state_machine,
         payload_cipher,
         reviewer_adapters,
+        execution_scopes,
         staging=staging,
     )
     surfaces: dict[str, AliasToolSurface] = {}
 
-    def notify_list_changed(aliases: frozenset[str]) -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        for alias in aliases:
+    async def notify_list_changed(aliases: frozenset[str]) -> None:
+        for alias in sorted(aliases):
             surface = surfaces.get(alias)
-            if surface is not None:
-                loop.create_task(surface.notify_list_changed(), name=f"list-changed:{alias}")
+            if surface is None:
+                raise PolicyPersistenceError(
+                    "policy publication target has no reviewed MCP surface"
+                )
+            await surface.notify_list_changed(strict=True)
 
     def apply_policy(updated: PolicySnapshot) -> None:
         mirror.apply_policy(updated)
@@ -886,6 +913,7 @@ def build_demo(
         engine,
         policy_path,
         apply_policy=apply_policy,
+        publication_gate=mirror,
         notify_list_changed=notify_list_changed,
     )
     limiter = SQLiteAttemptLimiter(database)
@@ -897,15 +925,12 @@ def build_demo(
         provider=DemoTotpProvider(database),
         allow_test_provider=True,
     )
-    downstream_clients = {
-        "fastmail": FakeOnlyProviderClient("fastmail"),
-        "whatsapp": FakeOnlyProviderClient("whatsapp"),
-    }
     pipeline = GatewayCallPipeline(
         mirror=mirror,
         downstream_clients=downstream_clients,
         local_handlers={},
         adapters={adapter.adapter_id: adapter for adapter in adapters.values()},
+        execution_scopes=execution_scopes,
         freezer=freezer,
         enqueuer=state_machine,
     )
@@ -1007,10 +1032,7 @@ def build_demo(
         state_machine,
         payload_cipher,
         adapters,
-        {
-            "fastmail": "fake:fastmail-account",
-            "whatsapp": "fake:whatsapp-account",
-        },
+        execution_scopes,
     )
     delivery = DeliveryDispatcher(
         state_machine,
@@ -1061,6 +1083,7 @@ def build_demo(
     workers = DemoWorkers(
         database,
         state_machine,
+        policy_promotions,
         delivery,
         reconciliation,
         retention,
