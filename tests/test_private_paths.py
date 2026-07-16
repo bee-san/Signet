@@ -154,6 +154,7 @@ def test_darwin_mode_zero_recovery_never_follows_a_symlink_swap(
         assert path == selected.name
         assert dir_fd is not None
         assert follow_symlinks is False
+        real_chmod(selected, 0o700)
         selected.rename(displaced)
         selected.symlink_to(outside, target_is_directory=True)
         swapped = True
@@ -203,6 +204,7 @@ def test_darwin_mode_zero_recovery_rejects_a_same_user_directory_swap(
         assert path == selected.name
         assert dir_fd is not None
         assert follow_symlinks is False
+        real_chmod(selected, 0o700)
         selected.rename(displaced)
         selected.mkdir(mode=0o700)
         (selected / "replacement-marker").write_text("preserve\n", encoding="utf-8")
@@ -224,7 +226,7 @@ def test_darwin_mode_zero_recovery_rejects_a_same_user_directory_swap(
     assert swapped
     assert (selected / "replacement-marker").read_text(encoding="utf-8") == "preserve\n"
     assert mode(selected) == 0o700
-    assert stat.S_IMODE(displaced.lstat().st_mode) == 0o000
+    assert stat.S_IMODE(displaced.lstat().st_mode) == 0o700
     real_chmod(displaced, 0o700)
 
 
