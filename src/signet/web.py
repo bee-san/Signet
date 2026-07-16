@@ -1186,7 +1186,7 @@ def _decision_note_input(
         if normalized is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         try:
-            return reason_for_action(cast(Literal["approve", "deny"], action), normalized)
+            return reason_for_action(action, normalized)
         except ValueError:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT) from None
     return normalized

@@ -2609,7 +2609,7 @@ def _decision_note_for_action(
         if normalized is None:
             raise WebConflict("a decision reason is required")
         try:
-            return reason_for_action(cast(Literal["approve", "deny"], action), normalized)
+            return reason_for_action(action, normalized)
         except ValueError:
             raise WebConflict("decision rationale is invalid") from None
     return normalized
