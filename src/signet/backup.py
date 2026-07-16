@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import hmac
 import json
@@ -11,23 +13,32 @@ import secrets
 import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 import zipfile
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, cast
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from signet.db import Database
+from signet.db import DATABASE_OPERATOR_RECOVERY_NOTES, Database, DatabaseRecoveryNoteCarrier
 from signet.private_paths import (
+    DirectoryIdentity,
     PrivatePathError,
+    capture_owned_directory_identity,
     ensure_owned_directory,
     ensure_private_directory,
+    harden_private_directory_descendant,
+    harden_private_directory_identity,
+    require_no_acl_grants,
+    require_owned_directory_identity,
+    require_private_directory_identity,
+    revalidate_directory_identity,
 )
 from signet.retention import BackupPins, RetentionError
 from signet.staging import (
@@ -45,10 +56,37 @@ _BACKUP_HEADER_BYTES = len(MAGIC) + 12 + 8 + 4
 _AEAD_TAG_BYTES = 16
 _RECORD_LENGTH_BYTES = 4
 _OPAQUE_ID_RE = re.compile(r"stg_[A-Za-z0-9_]{20,64}\Z")
+_PRIVATE_ARTIFACT_CLEANUP_NOTE = "One or more private backup artifacts could not be removed safely."
+_RMTREE_AVOIDS_SYMLINK_ATTACKS = bool(getattr(shutil.rmtree, "avoids_symlink_attacks", False))
 
 
 class BackupError(RuntimeError):
     pass
+
+
+class _OperatorVisibleBackupError(BackupError, DatabaseRecoveryNoteCarrier):
+    def operator_message(self) -> str:
+        parts = [str(self)]
+        for note in getattr(self, "__notes__", ()):
+            if note == _PRIVATE_ARTIFACT_CLEANUP_NOTE or note in DATABASE_OPERATOR_RECOVERY_NOTES:
+                parts.append(note)
+        return " ".join(parts)
+
+
+class BackupPublicationUnknown(_OperatorVisibleBackupError):
+    """A destination may exist, but durable publication was not confirmed."""
+
+
+class BackupPublishedWithWarnings(_OperatorVisibleBackupError):
+    """The destination is durable, but required post-publication work failed."""
+
+
+class BackupRetentionStateUnknown(_OperatorVisibleBackupError):
+    """No destination was published, but retention-pin state needs recovery."""
+
+
+class BackupCleanupStateUnknown(_OperatorVisibleBackupError):
+    """No destination was published, but private cleanup needs recovery."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +95,32 @@ class RestoredBundle:
     database_path: Path
     attachments_root: Path
     manifest: dict[str, Any]
+    root_identity: DirectoryIdentity
+    parent_identity: DirectoryIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class _BackupFileIdentity:
+    device: int
+    inode: int
+    owner_uid: int
+    size: int
+
+    @classmethod
+    def from_stat(cls, metadata: os.stat_result) -> _BackupFileIdentity:
+        return cls(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            owner_uid=metadata.st_uid,
+            size=metadata.st_size,
+        )
+
+    def same_object(self, metadata: os.stat_result) -> bool:
+        return (self.device, self.inode, self.owner_uid) == (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_uid,
+        )
 
 
 class BackupBundleManager:
@@ -99,25 +163,36 @@ class BackupBundleManager:
         return f"BackupBundleManager(database={self.database.path!s}, encryption_key=<redacted>)"
 
     def create(self, destination: Path, *, created_at: int | None = None) -> Path:
-        destination = Path(destination).expanduser().absolute()
+        requested = _absolute_backup_path(
+            destination,
+            message="backup destination path is unavailable or unsafe",
+        )
         try:
-            ensure_owned_directory(destination.parent)
+            parent = ensure_owned_directory(requested.parent)
+            parent_identity = require_owned_directory_identity(parent)
         except PrivatePathError as exc:
             raise BackupError("backup parent must be owned and not writable by others") from exc
+        destination = parent / requested.name
         if destination.exists() or destination.is_symlink():
             raise BackupError("backup destination already exists")
-        workspace = Path(tempfile.mkdtemp(prefix=".signet-backup-", dir=destination.parent))
-        try:
-            ensure_private_directory(workspace)
-        except PrivatePathError as exc:  # pragma: no cover - mkdtemp promises mode 0700
-            shutil.rmtree(workspace, ignore_errors=True)
-            raise BackupError("backup workspace could not be secured") from exc
+        workspace, workspace_identity = _create_backup_workspace(parent_identity)
+        temporary: Path | None = None
+        temporary_identity: _BackupFileIdentity | None = None
+        publication_observed = False
+        publication_durable = False
+        operation_error: BaseException | None = None
         pin_time = int(time.time())
         try:
             try:
                 pins = self._backup_pins.acquire(now=pin_time)
             except RetentionError as exc:
                 raise BackupError("backup could not acquire consistent retention pins") from exc
+            except BaseException as exc:
+                raise BackupRetentionStateUnknown(
+                    "backup was not published because retention pin acquisition could not be "
+                    "confirmed; inspect retention state before retrying"
+                ) from exc
+            pin_operation_error: BaseException | None = None
             try:
                 snapshot = self.database.create_snapshot(workspace / "approvals.sqlite3")
                 try:
@@ -126,6 +201,7 @@ class BackupBundleManager:
                     raise BackupError("backup snapshot pins could not be finalized") from exc
                 attachments_dir = workspace / "attachments"
                 attachments_dir.mkdir(mode=0o700)
+                _harden_private_directory(attachments_dir)
                 attachment_manifest = self._copy_attachments(snapshot, attachments_dir)
                 with _snapshot_connection(snapshot) as connection:
                     schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -152,83 +228,235 @@ class BackupBundleManager:
                     "key_references": key_references,
                 }
                 manifest_path = workspace / "manifest.json"
-                manifest_path.write_text(
+                _write_new_file(
+                    manifest_path,
                     json.dumps(
                         manifest,
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),
-                    ),
-                    encoding="utf-8",
+                    ).encode("utf-8"),
                 )
-                os.chmod(manifest_path, 0o600)
                 members = _archive_members(workspace, manifest)
                 projected_archive_size = _projected_zip_size(members)
                 if _encrypted_bundle_size(projected_archive_size) > self.max_bundle_bytes:
                     raise BackupError("encrypted backup exceeds the configured size limit")
-                temporary = destination.with_name(f".{destination.name}.partial")
-                if temporary.exists() or temporary.is_symlink():
-                    raise BackupError("backup temporary destination already exists")
+                temporary = destination.with_name(
+                    f".{destination.name}.partial-{secrets.token_urlsafe(12)}"
+                )
                 with tempfile.TemporaryFile(mode="w+b", dir=workspace) as archive:
                     _archive_workspace(archive, members)
                     archive_size = archive.seek(0, os.SEEK_END)
                     if _encrypted_bundle_size(archive_size) > self.max_bundle_bytes:
                         raise BackupError("encrypted backup exceeds the configured size limit")
                     archive.seek(0)
-                    _encrypt_archive_to_path(
-                        archive,
-                        archive_size=archive_size,
-                        destination=temporary,
-                        encryption_key=self._encryption_key,
-                    )
-                os.replace(temporary, destination)
-                _fsync_directory(destination.parent)
-                return destination
+                    try:
+                        temporary_identity = _encrypt_archive_to_path(
+                            archive,
+                            archive_size=archive_size,
+                            destination=temporary,
+                            encryption_key=self._encryption_key,
+                        )
+                    except FileExistsError as exc:
+                        raise BackupError("backup temporary destination already exists") from exc
+                _require_unchanged_backup_directory(parent_identity)
+                _require_private_backup_file(temporary, expected=temporary_identity)
+                if destination.exists() or destination.is_symlink():
+                    raise BackupError("backup destination already exists")
+            except BaseException as exc:
+                pin_operation_error = exc
+                raise
             finally:
                 try:
                     self._backup_pins.release(
                         pins,
                         now=max(pin_time, int(time.time())),
                     )
-                except RetentionError as exc:
-                    raise BackupError("backup retention pins could not be released") from exc
+                except BaseException as exc:
+                    if pin_operation_error is not None:
+                        failure = BackupRetentionStateUnknown(
+                            "backup was not published because backup construction failed and "
+                            "retention pin release could not be confirmed; inspect retention "
+                            "state before retrying"
+                        )
+                        if isinstance(pin_operation_error, BackupCleanupStateUnknown) or any(
+                            note == _PRIVATE_ARTIFACT_CLEANUP_NOTE
+                            for note in getattr(pin_operation_error, "__notes__", ())
+                        ):
+                            failure.add_note(_PRIVATE_ARTIFACT_CLEANUP_NOTE)
+                        raise failure from pin_operation_error
+                    raise BackupRetentionStateUnknown(
+                        "backup was not published because retention pin release could not be "
+                        "confirmed; inspect retention state before retrying"
+                    ) from exc
+
+            _require_unchanged_backup_directory(parent_identity)
+            _require_private_backup_file(temporary, expected=temporary_identity)
+            if destination.exists() or destination.is_symlink():
+                raise BackupError("backup destination already exists")
+            try:
+                _rename_backup_no_replace(temporary, destination)
+                publication_observed = True
+            except BaseException as exc:
+                try:
+                    _require_private_backup_file(temporary, expected=temporary_identity)
+                except BackupError:
+                    publication_observed = True
+                    raise _backup_publication_unknown() from exc
+                if isinstance(exc, FileExistsError):
+                    raise BackupError("backup destination already exists") from exc
+                raise
+            try:
+                published_identity = _require_private_backup_file(
+                    destination,
+                    expected=temporary_identity,
+                )
+                if published_identity != temporary_identity:
+                    raise BackupError("published backup file identity changed")
+                _require_unchanged_backup_directory(parent_identity)
+                _fsync_directory(parent)
+                _require_unchanged_backup_directory(parent_identity)
+                _require_private_backup_file(destination, expected=published_identity)
+            except BaseException as exc:
+                raise _backup_publication_unknown() from exc
+            publication_durable = True
+            return destination
+        except BaseException as exc:
+            operation_error = exc
+            raise
         finally:
-            shutil.rmtree(workspace, ignore_errors=True)
+            cleanup_errors: list[BaseException] = []
+            if (
+                temporary is not None
+                and temporary_identity is not None
+                and not publication_observed
+            ):
+                try:
+                    _cleanup_backup_temporary_file(
+                        temporary,
+                        identity=temporary_identity,
+                        parent_identity=parent_identity,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            try:
+                _cleanup_backup_workspace(
+                    workspace,
+                    parent_identity=parent_identity,
+                    workspace_identity=workspace_identity,
+                )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                if operation_error is not None:
+                    if isinstance(operation_error, _OperatorVisibleBackupError):
+                        operation_error.add_note(_PRIVATE_ARTIFACT_CLEANUP_NOTE)
+                    else:
+                        raise BackupCleanupStateUnknown(
+                            "backup was not published, but private backup artifact cleanup "
+                            "could not be confirmed; inspect the backup parent before continuing"
+                        ) from cleanup_errors[0]
+                elif publication_durable:
+                    raise BackupPublishedWithWarnings(
+                        "backup was published durably, but private backup artifacts could not "
+                        "be removed; inspect the backup parent before continuing"
+                    ) from cleanup_errors[0]
+                elif publication_observed:
+                    raise _backup_publication_unknown() from cleanup_errors[0]
+                else:
+                    raise BackupCleanupStateUnknown(
+                        "backup was not published, but private backup artifact cleanup could "
+                        "not be confirmed; inspect the backup parent before continuing"
+                    ) from cleanup_errors[0]
 
     def restore(self, bundle: Path, destination_root: Path) -> RestoredBundle:
-        bundle = Path(bundle).expanduser().absolute()
+        bundle = _absolute_backup_path(
+            bundle,
+            message="backup bundle path is unavailable or unsafe",
+        )
+        destination_root = _absolute_backup_path(
+            destination_root,
+            message="backup restore destination path is unavailable or unsafe",
+        )
         try:
-            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            flags = (
+                os.O_RDONLY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
             descriptor = os.open(bundle, flags)
-            try:
-                with tempfile.TemporaryFile(mode="w+b") as archive:
-                    _decrypt_bundle_to_archive(
-                        descriptor,
-                        archive,
-                        encryption_key=self._encryption_key,
-                        maximum_bytes=self.max_bundle_bytes,
-                    )
-                    archive.seek(0)
-                    return self._restore_archive(archive, destination_root)
-            finally:
-                os.close(descriptor)
         except OSError as exc:
             raise BackupError("backup bundle is not a safe bounded regular file") from exc
+
+        restored: RestoredBundle | None = None
+        try:
+            with tempfile.TemporaryFile(mode="w+b") as archive:
+                _decrypt_bundle_to_archive(
+                    descriptor,
+                    archive,
+                    encryption_key=self._encryption_key,
+                    maximum_bytes=self.max_bundle_bytes,
+                )
+                archive.seek(0)
+                restored = self._restore_archive(archive, destination_root)
+        except BaseException as operation_error:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                operation_error.add_note(
+                    "The backup bundle descriptor close outcome could not be confirmed."
+                )
+            if restored is not None:
+                try:
+                    remove_private_tree_checked(
+                        restored.root,
+                        parent_identity=restored.parent_identity,
+                        tree_identity=restored.root_identity,
+                    )
+                except BaseException as cleanup_error:
+                    raise BackupCleanupStateUnknown(
+                        "backup restore did not complete, and private restore-tree cleanup could "
+                        "not be confirmed; inspect the restore parent before continuing"
+                    ) from cleanup_error
+            if isinstance(operation_error, OSError):
+                raise BackupError("backup restore did not complete safely") from operation_error
+            raise
+
+        try:
+            os.close(descriptor)
+        except BaseException as close_error:
+            if restored is not None:
+                try:
+                    remove_private_tree_checked(
+                        restored.root,
+                        parent_identity=restored.parent_identity,
+                        tree_identity=restored.root_identity,
+                    )
+                except BaseException as cleanup_error:
+                    raise BackupCleanupStateUnknown(
+                        "backup restore did not complete after a bundle descriptor close failure, "
+                        "and private restore-tree cleanup could not be confirmed; inspect the "
+                        "restore parent before continuing"
+                    ) from cleanup_error
+            raise BackupError(
+                "backup restore did not complete because the bundle descriptor close outcome "
+                "could not be confirmed"
+            ) from close_error
+        if restored is None:  # pragma: no cover - guarded by the restore implementation
+            raise BackupError("backup restore did not produce a verified restore tree")
+        return restored
 
     def _restore_archive(
         self,
         archive: BinaryIO,
         destination_root: Path,
     ) -> RestoredBundle:
-        destination_root = Path(destination_root).absolute()
-        if destination_root.exists() or destination_root.is_symlink():
-            raise BackupError("restore destination must not already exist")
-        try:
-            ensure_owned_directory(destination_root.parent)
-            destination_root.mkdir(mode=0o700)
-            destination_root = ensure_private_directory(destination_root)
-        except (OSError, PrivatePathError) as exc:
-            raise BackupError("restore destination could not be created privately") from exc
+        destination_root = _absolute_backup_path(
+            destination_root,
+            message="backup restore destination path is unavailable or unsafe",
+        )
+        destination_root, parent_identity, root_identity = _create_restore_root(destination_root)
         try:
             with zipfile.ZipFile(archive, mode="r") as zipped:
                 _extract_archive(zipped, destination_root)
@@ -250,14 +478,36 @@ class BackupBundleManager:
             self._relocate_restored_attachments(destination_root, database_path, manifest)
             Database.verify_snapshot(database_path)
             self._verify_restored_attachments(destination_root, database_path, manifest)
+            current_root = require_private_directory_identity(destination_root)
+            if not root_identity.same_object(current_root):
+                raise BackupError("private restore tree identity changed")
+            _fsync_directory(destination_root)
+            parent = revalidate_directory_identity(parent_identity, private=False)
+            _fsync_directory(parent)
+            revalidate_directory_identity(parent_identity, private=False)
+            current_root = require_private_directory_identity(destination_root)
+            if not root_identity.same_object(current_root):
+                raise BackupError("private restore tree identity changed")
             return RestoredBundle(
                 root=destination_root,
                 database_path=database_path,
                 attachments_root=attachments_root,
                 manifest=manifest,
+                root_identity=root_identity,
+                parent_identity=parent_identity,
             )
         except BaseException:
-            shutil.rmtree(destination_root, ignore_errors=True)
+            try:
+                remove_private_tree_checked(
+                    destination_root,
+                    parent_identity=parent_identity,
+                    tree_identity=root_identity,
+                )
+            except BaseException as cleanup_error:
+                raise BackupCleanupStateUnknown(
+                    "backup restore did not complete, but private restore-tree cleanup could "
+                    "not be confirmed; inspect the restore parent before continuing"
+                ) from cleanup_error
             raise
 
     def create_pre_migration_callback(
@@ -274,11 +524,48 @@ class BackupBundleManager:
             )
             self.create(destination, created_at=timestamp)
             staged = backup_directory / f".verify-{timestamp}"
-            restored = self.restore(destination, staged)
-            if restored.manifest.get("schema_version") != current_version:
-                shutil.rmtree(staged, ignore_errors=True)
-                raise BackupError("pre-migration backup schema version is inconsistent")
-            shutil.rmtree(staged, ignore_errors=True)
+            restored: RestoredBundle | None = None
+            verification_error: BaseException | None = None
+            try:
+                restored = self.restore(destination, staged)
+                if restored.manifest.get("schema_version") != current_version:
+                    raise BackupError("pre-migration backup schema version is inconsistent")
+            except BaseException as exc:
+                verification_error = exc
+            if restored is not None:
+                try:
+                    remove_private_tree_checked(
+                        restored.root,
+                        parent_identity=restored.parent_identity,
+                        tree_identity=restored.root_identity,
+                    )
+                except BaseException as cleanup_error:
+                    if verification_error is not None:
+                        raise BackupPublishedWithWarnings(
+                            "pre-migration backup was published durably, but verification did not "
+                            "complete "
+                            "and private verification-tree cleanup could not be confirmed; "
+                            "do not migrate or recreate the backup; inspect the backup parent "
+                            "before continuing"
+                        ) from cleanup_error
+                    raise BackupPublishedWithWarnings(
+                        "pre-migration backup was published durably, but private "
+                        "verification-tree cleanup could not be confirmed; inspect the backup "
+                        "parent before continuing"
+                    ) from cleanup_error
+            if verification_error is not None:
+                if isinstance(verification_error, BackupCleanupStateUnknown):
+                    raise BackupPublishedWithWarnings(
+                        "pre-migration backup was published durably, but verification did not "
+                        "complete and private verification-tree cleanup could not be confirmed; "
+                        "do not migrate or recreate the backup; inspect the backup parent before "
+                        "continuing"
+                    ) from verification_error
+                raise BackupPublishedWithWarnings(
+                    "pre-migration backup was published durably, but verification did not "
+                    "complete; do not migrate or recreate the backup; inspect the published "
+                    "bundle before continuing"
+                ) from verification_error
 
         return backup
 
@@ -319,6 +606,7 @@ class BackupBundleManager:
             ).fetchall()
         metadata_destination = destination / ".metadata"
         metadata_destination.mkdir(mode=0o700)
+        _harden_private_directory(metadata_destination)
         manifest: list[dict[str, Any]] = []
         for row in rows:
             record = _record_from_catalog_row(row, root=self.staging_root)
@@ -336,11 +624,7 @@ class BackupBundleManager:
             target = destination / record.opaque_id
             target_descriptor: int | None = None
             try:
-                target_descriptor = os.open(
-                    target,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-                    0o600,
-                )
+                target_descriptor = _open_new_private_file(target)
                 size, digest = _copy_verified_descriptor(
                     source_descriptor,
                     target_descriptor,
@@ -639,10 +923,11 @@ def _encrypt_archive_to_path(
     archive_size: int,
     destination: Path,
     encryption_key: bytes,
-) -> None:
+) -> _BackupFileIdentity:
     seed = secrets.token_bytes(12)
     header = MAGIC + seed + archive_size.to_bytes(8, "big") + _BACKUP_CHUNK_BYTES.to_bytes(4, "big")
     descriptor: int | None = None
+    created_identity: _BackupFileIdentity | None = None
     try:
         descriptor = os.open(
             destination,
@@ -653,6 +938,16 @@ def _encrypt_archive_to_path(
             | getattr(os, "O_CLOEXEC", 0),
             0o600,
         )
+        created_metadata = os.fstat(descriptor)
+        _require_owned_backup_metadata(created_metadata)
+        created_identity = _BackupFileIdentity.from_stat(created_metadata)
+        os.fchmod(descriptor, 0o600)
+        try:
+            require_no_acl_grants(descriptor)
+        except PrivatePathError as exc:
+            raise BackupError("backup temporary file inherited an unsafe granting ACL") from exc
+        created_metadata = os.fstat(descriptor)
+        _require_private_backup_metadata(created_metadata)
         _write_all(descriptor, header)
         cipher = AESGCM(encryption_key)
         remaining = archive_size
@@ -671,13 +966,393 @@ def _encrypt_archive_to_path(
         if archive.read(1):
             raise BackupError("backup archive changed while it was encrypted")
         os.fsync(descriptor)
+        completed = os.fstat(descriptor)
+        _require_private_backup_metadata(completed)
+        completed_identity = _BackupFileIdentity.from_stat(completed)
         os.close(descriptor)
         descriptor = None
-    except BaseException:
+        return _require_private_backup_file(destination, expected=completed_identity)
+    except BaseException as operation_error:
+        cleanup_failed = False
+        if descriptor is not None:
+            if created_identity is None:
+                try:
+                    created_identity = _BackupFileIdentity.from_stat(os.fstat(descriptor))
+                except BaseException:
+                    cleanup_failed = True
+            try:
+                os.close(descriptor)
+            except BaseException:
+                cleanup_failed = True
+        if created_identity is not None and not _unlink_backup_file_if_same(
+            destination, created_identity
+        ):
+            cleanup_failed = True
+        if cleanup_failed:
+            raise BackupCleanupStateUnknown(
+                "backup was not published, but private backup temporary-file cleanup could not "
+                "be confirmed; inspect the backup parent before continuing"
+            ) from operation_error
+        raise
+
+
+def _rename_backup_no_replace(source: Path, destination: Path) -> None:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        if sys.platform == "linux":
+            function = cast(Any, getattr(library, "renameat2", None))
+            if function is None:
+                raise BackupError("atomic no-replace backup publication is unavailable")
+            function.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            arguments = (-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+        elif sys.platform == "darwin":
+            function = cast(Any, getattr(library, "renamex_np", None))
+            if function is None:
+                raise BackupError("atomic no-replace backup publication is unavailable")
+            function.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+            arguments = (os.fsencode(source), os.fsencode(destination), 0x00000004)
+        else:
+            raise BackupError("atomic no-replace backup publication is unavailable")
+    except (OSError, ValueError) as exc:
+        raise BackupError("atomic no-replace backup publication is unavailable") from exc
+
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if function(*arguments) != 0:
+        error = ctypes.get_errno() or errno.EIO
+        failure = OSError(error, os.strerror(error), destination)
+        if error in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination)
+        raise BackupError("atomic no-replace backup publication failed") from failure
+
+
+def _require_owned_backup_metadata(metadata: os.stat_result) -> None:
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != current_uid
+    ):
+        raise BackupError("backup temporary file changed or became unsafe")
+
+
+def _require_private_backup_metadata(metadata: os.stat_result) -> None:
+    _require_owned_backup_metadata(metadata)
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise BackupError("backup temporary file changed or became unsafe")
+
+
+def _require_private_backup_file(
+    path: Path,
+    *,
+    expected: _BackupFileIdentity | None = None,
+) -> _BackupFileIdentity:
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        require_no_acl_grants(descriptor)
+        after = path.lstat()
+    except (OSError, PrivatePathError, ValueError) as exc:
+        raise BackupError("backup temporary file changed or became unsafe") from exc
+    finally:
         if descriptor is not None:
             os.close(descriptor)
-        destination.unlink(missing_ok=True)
-        raise
+
+    _require_private_backup_metadata(before)
+    _require_private_backup_metadata(opened)
+    _require_private_backup_metadata(after)
+    observed = _BackupFileIdentity.from_stat(opened)
+    if (
+        not observed.same_object(before)
+        or not observed.same_object(after)
+        or before.st_size != observed.size
+        or after.st_size != observed.size
+        or (
+            expected is not None
+            and (not expected.same_object(opened) or expected.size != observed.size)
+        )
+    ):
+        raise BackupError("backup temporary file changed or became unsafe")
+    return observed
+
+
+def _require_unchanged_backup_directory(identity: DirectoryIdentity) -> Path:
+    try:
+        return revalidate_directory_identity(identity, private=False)
+    except PrivatePathError as exc:
+        raise BackupError("backup parent changed or became unsafe") from exc
+
+
+def _backup_publication_unknown() -> BackupPublicationUnknown:
+    return BackupPublicationUnknown(
+        "backup creation outcome is unknown because durable publication could not be "
+        "confirmed; inspect the destination before retrying"
+    )
+
+
+def _unlink_backup_file_if_same(path: Path, identity: _BackupFileIdentity) -> bool:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or not identity.same_object(metadata):
+            return False
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _cleanup_backup_temporary_file(
+    path: Path,
+    *,
+    identity: _BackupFileIdentity,
+    parent_identity: DirectoryIdentity,
+) -> None:
+    try:
+        parent = revalidate_directory_identity(parent_identity, private=False)
+        _require_private_backup_file(path, expected=identity)
+    except (BackupError, PrivatePathError) as exc:
+        raise BackupError(
+            "backup temporary file changed; refusing to remove a replacement"
+        ) from exc
+    if not _unlink_backup_file_if_same(path, identity):
+        raise BackupError("backup temporary file could not be removed safely")
+    try:
+        _fsync_directory(parent)
+        revalidate_directory_identity(parent_identity, private=False)
+    except (OSError, PrivatePathError) as exc:
+        raise BackupError("backup temporary file removal could not be confirmed durably") from exc
+
+
+def _cleanup_backup_workspace(
+    workspace: Path,
+    *,
+    parent_identity: DirectoryIdentity,
+    workspace_identity: DirectoryIdentity | None,
+) -> None:
+    remove_private_tree_checked(
+        workspace,
+        parent_identity=parent_identity,
+        tree_identity=workspace_identity,
+    )
+
+
+def remove_private_tree_checked(
+    tree: Path,
+    *,
+    parent_identity: DirectoryIdentity,
+    tree_identity: DirectoryIdentity | None,
+) -> None:
+    """Remove exactly one captured private tree and confirm durable absence."""
+
+    if tree_identity is None:
+        raise BackupError("private tree identity is unavailable for safe cleanup")
+    try:
+        parent = revalidate_directory_identity(parent_identity, private=False)
+        metadata = tree.lstat()
+    except FileNotFoundError:
+        try:
+            _fsync_directory(parent)
+            revalidate_directory_identity(parent_identity, private=False)
+        except (OSError, PrivatePathError) as exc:
+            raise BackupError("private tree absence could not be confirmed durably") from exc
+        return
+    except (OSError, PrivatePathError, ValueError) as exc:
+        raise BackupError("private tree could not be inspected for safe cleanup") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+    ) != (
+        tree_identity.device,
+        tree_identity.inode,
+        tree_identity.owner_uid,
+    ):
+        raise BackupError("private tree changed; refusing to remove a replacement")
+    try:
+        if not _RMTREE_AVOIDS_SYMLINK_ATTACKS:
+            raise BackupError("symlink-safe private tree removal is unavailable")
+        _chmod_captured_directory_for_cleanup(tree_identity)
+        _remove_private_tree_with_repairs(tree, tree_identity)
+        try:
+            tree.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise BackupError("private tree still exists after cleanup")
+        _fsync_directory(parent)
+        revalidate_directory_identity(parent_identity, private=False)
+    except (OSError, PrivatePathError) as exc:
+        raise BackupError("private tree could not be removed durably") from exc
+
+
+def _remove_private_tree_with_repairs(
+    tree: Path,
+    tree_identity: DirectoryIdentity,
+) -> None:
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    repaired: set[Path] = set()
+    while True:
+        try:
+            shutil.rmtree(tree)
+            return
+        except PermissionError as exc:
+            if exc.filename is None or len(repaired) >= 64:
+                raise
+            blocked = Path(exc.filename).absolute()
+            if blocked in repaired or not blocked.is_relative_to(tree):
+                raise
+            relative = blocked.relative_to(tree)
+            if not relative.parts:
+                hardened = harden_private_directory_identity(tree_identity)
+            else:
+                hardened = harden_private_directory_descendant(tree_identity, relative)
+            if hardened.owner_uid != current_uid:
+                raise
+            repaired.add(blocked)
+
+
+def _chmod_captured_directory_for_cleanup(
+    identity: DirectoryIdentity,
+) -> None:
+    try:
+        hardened = harden_private_directory_identity(identity)
+        if not identity.same_object(hardened):
+            raise BackupError("private tree changed; refusing to harden a replacement")
+    except PrivatePathError as exc:
+        raise BackupError("private tree could not be hardened safely") from exc
+
+
+def _create_backup_workspace(
+    parent_identity: DirectoryIdentity,
+) -> tuple[Path, DirectoryIdentity]:
+    parent = _require_unchanged_backup_directory(parent_identity)
+    for _attempt in range(8):
+        workspace = parent / f".signet-backup-{secrets.token_urlsafe(12)}"
+        workspace_identity: DirectoryIdentity | None = None
+        created = False
+        try:
+            os.mkdir(workspace, 0o700)
+            created = True
+            workspace_identity = _capture_backup_workspace_identity(workspace)
+            private_workspace = _harden_private_directory(
+                workspace,
+                expected=workspace_identity,
+            )
+            if not workspace_identity.same_object(private_workspace):
+                raise PrivatePathError("backup workspace identity changed")
+            _require_unchanged_backup_directory(parent_identity)
+            return workspace, private_workspace
+        except FileExistsError:
+            if not created:
+                continue
+            failure: BaseException = BackupError("backup workspace creation was interrupted")
+        except BaseException as exc:
+            failure = exc
+            if not created:
+                raise BackupCleanupStateUnknown(
+                    "backup was not published, and backup workspace creation cleanup could not "
+                    "be confirmed; inspect the backup parent before continuing"
+                ) from failure
+        if created:
+            try:
+                _cleanup_backup_workspace(
+                    workspace,
+                    parent_identity=parent_identity,
+                    workspace_identity=workspace_identity,
+                )
+            except BaseException as cleanup_error:
+                raise BackupCleanupStateUnknown(
+                    "backup was not published, but private backup workspace cleanup could not "
+                    "be confirmed; inspect the backup parent before continuing"
+                ) from cleanup_error
+        raise BackupError("backup workspace could not be secured") from failure
+    raise BackupError("a unique private backup workspace could not be created")
+
+
+def _create_restore_root(
+    destination: Path,
+) -> tuple[Path, DirectoryIdentity, DirectoryIdentity]:
+    try:
+        parent = ensure_owned_directory(destination.parent)
+        parent_identity = require_owned_directory_identity(parent)
+    except (OSError, PrivatePathError, ValueError) as exc:
+        raise BackupError("restore parent is unavailable or unsafe") from exc
+    if destination.exists() or destination.is_symlink():
+        raise BackupError("restore destination must not already exist")
+    root_identity: DirectoryIdentity | None = None
+    created = False
+    try:
+        os.mkdir(destination, 0o700)
+        created = True
+        root_identity = _capture_backup_workspace_identity(destination)
+        private_root = _harden_private_directory(destination, expected=root_identity)
+        if not root_identity.same_object(private_root):
+            raise PrivatePathError("restore destination identity changed")
+        _require_unchanged_backup_directory(parent_identity)
+        _fsync_directory(parent)
+        _require_unchanged_backup_directory(parent_identity)
+        return destination, parent_identity, private_root
+    except FileExistsError as exc:
+        if not created:
+            raise BackupError("restore destination must not already exist") from exc
+        failure: BaseException = exc
+    except BaseException as exc:
+        failure = exc
+        if not created:
+            raise BackupCleanupStateUnknown(
+                "backup restore did not complete, and restore-tree creation cleanup could not "
+                "be confirmed; inspect the restore parent before continuing"
+            ) from failure
+    if created:
+        try:
+            remove_private_tree_checked(
+                destination,
+                parent_identity=parent_identity,
+                tree_identity=root_identity,
+            )
+        except BaseException as cleanup_error:
+            raise BackupCleanupStateUnknown(
+                "backup restore did not complete, but private restore-tree cleanup could not be "
+                "confirmed; inspect the restore parent before continuing"
+            ) from cleanup_error
+    raise BackupError("restore destination could not be created privately") from failure
+
+
+def _capture_backup_workspace_identity(workspace: Path) -> DirectoryIdentity:
+    try:
+        return capture_owned_directory_identity(workspace)
+    except PrivatePathError as exc:
+        raise BackupError("backup workspace could not be inspected safely") from exc
+
+
+def _harden_private_directory(
+    path: Path,
+    *,
+    expected: DirectoryIdentity | None = None,
+) -> DirectoryIdentity:
+    before = expected or _capture_backup_workspace_identity(path)
+    try:
+        hardened = harden_private_directory_identity(before)
+        private = require_private_directory_identity(path)
+    except (OSError, PrivatePathError) as exc:
+        raise BackupError("private backup directory could not be hardened safely") from exc
+    if not before.same_object(hardened) or not before.same_object(private):
+        raise BackupError("private backup directory identity changed")
+    return private
 
 
 def _decrypt_bundle_to_archive(
@@ -801,9 +1476,13 @@ def _extract_archive(zipped: zipfile.ZipFile, destination: Path) -> None:
             raise BackupError("restored backup exceeds the extraction limit")
         target = destination.joinpath(*path.parts)
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        current = destination
+        for component in path.parts[:-1]:
+            current = current / component
+            _harden_private_directory(current)
         if info.is_dir():
             continue
-        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = _open_new_private_file(target)
         try:
             with zipped.open(info, "r") as source:
                 while chunk := source.read(1024 * 1024):
@@ -1197,16 +1876,45 @@ def _write_all(descriptor: int, data: bytes) -> None:
 
 
 def _write_new_file(path: Path, data: bytes) -> None:
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
+    descriptor = _open_new_private_file(path)
     try:
         _write_all(descriptor, data)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _open_new_private_file(path: Path) -> int:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        _require_owned_backup_metadata(os.fstat(descriptor))
+        os.fchmod(descriptor, 0o600)
+        require_no_acl_grants(descriptor)
+        _require_private_backup_metadata(os.fstat(descriptor))
+        return descriptor
+    except BaseException:
+        with suppress(OSError):
+            os.close(descriptor)
+        raise
+
+
+def _absolute_backup_path(path: Path, *, message: str) -> Path:
+    try:
+        selected = Path(path).expanduser().absolute()
+        encoded = os.fsencode(selected)
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        raise BackupError(message) from exc
+    if b"\x00" in encoded or selected.name in {"", ".", ".."}:
+        raise BackupError(message)
+    return selected
 
 
 def _fsync_directory(path: Path) -> None:
