@@ -30,7 +30,10 @@ Use for a reviewed operation whose object can remain entirely under gateway-owne
 local storage, such as staging an attachment or a local draft. It requires an
 `adapter`. It makes zero downstream calls and creates no standalone approval.
 The adapter result must validate against the captured provider output schema so a
-later gated send can refer to the local object through the reviewed contract.
+later gated send can refer to the local object through the reviewed contract. The
+captured tool must provide a reviewed top-level object `outputSchema`; a missing or
+non-object schema keeps virtualization disabled. Canonical output bytes, JSON nodes,
+and nesting depth are bounded before JSON Schema validation.
 
 Virtualized objects are scoped by adapter, account, and caller namespace. Staging
 uses bounded streaming, mode-0600 files, hashes and fsync, opaque IDs, no-follow
@@ -154,6 +157,10 @@ A tool is enabled only if:
 3. the current digest equals the configured or explicitly reviewed digest;
 4. its mode-specific classification and adapter requirements pass;
 5. it does not advertise unsupported MCP task execution.
+
+For `virtualize_local`, the mode-specific checks include a captured top-level object
+`outputSchema`. This requirement is rechecked when policy changes are applied and
+again before a local result is accepted.
 
 Removal or any definition change marks the tool drifted. Connected MCP sessions
 advertise `listChanged` capability, and `AliasToolSurface.notify_list_changed()` can

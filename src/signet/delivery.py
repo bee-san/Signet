@@ -20,7 +20,9 @@ from types import MappingProxyType
 from typing import Any, Protocol, cast
 
 from signet.adapters.base import AdapterRequest, ApprovalAdapter, MCPClient, Outcome
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.canonical import CanonicalizationError, canonical_json
+from signet.execution_scope import ExecutionScope, ExecutionScopeResolver
 from signet.models import (
     AttachmentReference,
     ExecutionLease,
@@ -64,6 +66,9 @@ class LoadedFrozenRequest:
 
     adapter: ApprovalAdapter
     request: AdapterRequest
+    adapter_id: str
+    adapter_version: str
+    execution_scope: ExecutionScope
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,12 +81,24 @@ class DispatchResult:
     redispatch: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedDispatch:
+    loaded: LoadedFrozenRequest
+    downstream: MCPClient
+    payload: Mapping[str, Any]
+
+
 _ENVELOPE_FIELDS = frozenset(
     {
+        "account_ref",
+        "adapter_id",
         "adapter_version",
         "alias",
         "arguments",
+        "caller_namespace",
+        "credential_identity_digest",
         "policy_version",
+        "schema_digest",
         "staged_file_hashes",
         "tool",
     }
@@ -112,7 +129,7 @@ class FrozenRequestLoader:
         state_machine: ApprovalStateMachine,
         decryptor: PayloadDecryptor,
         adapters: Mapping[tuple[str, str], ApprovalAdapter],
-        account_namespaces: Mapping[str, str],
+        execution_scopes: ExecutionScopeResolver,
         *,
         max_payload_bytes: int = 16 * 1024 * 1024,
     ) -> None:
@@ -125,12 +142,12 @@ class FrozenRequestLoader:
             for (alias, tool), adapter in adapters.items()
         ):
             raise ValueError("adapter registry keys must match adapter contracts")
-        if any(not alias or not account for alias, account in account_namespaces.items()):
-            raise ValueError("downstream account namespaces must not be empty")
+        if not callable(getattr(execution_scopes, "resolve", None)):
+            raise ValueError("an execution scope resolver is required")
         self.state_machine = state_machine
         self.decryptor = decryptor
         self._adapters = dict(adapters)
-        self._account_namespaces = dict(account_namespaces)
+        self._execution_scopes = execution_scopes
         self.max_payload_bytes = max_payload_bytes
 
     def adapter_for(self, downstream_alias: str, tool_name: str) -> ApprovalAdapter:
@@ -190,10 +207,15 @@ class FrozenRequestLoader:
         envelope = _parse_canonical_envelope(plaintext)
         alias = envelope["alias"]
         tool = envelope["tool"]
+        account_ref = envelope["account_ref"]
+        adapter_id = envelope["adapter_id"]
         adapter_version = envelope["adapter_version"]
+        caller_namespace = envelope["caller_namespace"]
+        credential_identity_digest = envelope["credential_identity_digest"]
         arguments = envelope["arguments"]
         staged_hashes = envelope["staged_file_hashes"]
         policy_version = envelope["policy_version"]
+        schema_digest = envelope["schema_digest"]
         if (
             not isinstance(alias, str)
             or alias != request_row["downstream_alias"]
@@ -202,14 +224,27 @@ class FrozenRequestLoader:
         ):
             raise FrozenPayloadError("canonical envelope targets a different downstream tool")
         if (
-            not isinstance(adapter_version, str)
+            not isinstance(adapter_id, str)
+            or not adapter_id
+            or not isinstance(adapter_version, str)
             or adapter_version != payload_row["adapter_version"]
         ):
-            raise FrozenPayloadError("canonical envelope has a stale adapter version")
+            raise FrozenPayloadError("canonical envelope has a stale adapter identity")
         if not _valid_policy_version(policy_version) or str(policy_version) != str(
             payload_row["policy_version"]
         ):
             raise FrozenPayloadError("canonical envelope has a stale policy version")
+        if (
+            not isinstance(caller_namespace, str)
+            or caller_namespace != request_row["origin_namespace"]
+        ):
+            raise FrozenPayloadError("canonical envelope has a different caller namespace")
+        if not _is_sha256(schema_digest) or not _same_text(
+            payload_row["schema_version"], cast(str, schema_digest)
+        ):
+            raise FrozenPayloadError("canonical envelope has a stale schema digest")
+        if not isinstance(account_ref, str) or not _is_sha256(credential_identity_digest):
+            raise FrozenPayloadError("canonical envelope execution identity is invalid")
         if not isinstance(arguments, dict):
             raise FrozenPayloadError("canonical envelope arguments are invalid")
         if not isinstance(staged_hashes, list) or any(
@@ -218,8 +253,15 @@ class FrozenRequestLoader:
             raise FrozenPayloadError("canonical envelope staged-file hashes are invalid")
 
         adapter = self.adapter_for(alias, tool)
-        if adapter.adapter_version != adapter_version:
-            raise FrozenPayloadError("reviewed adapter version does not match the frozen envelope")
+        if adapter.adapter_id != adapter_id or adapter.adapter_version != adapter_version:
+            raise FrozenPayloadError("reviewed adapter identity does not match the frozen envelope")
+        frozen_scope = ExecutionScope(
+            account_ref=account_ref,
+            credential_identity_digest=cast(str, credential_identity_digest),
+            schema_digest=cast(str, schema_digest),
+        )
+        if not self._scope_is_current(adapter, frozen_scope):
+            raise FrozenPayloadError("current execution scope does not match the frozen envelope")
         try:
             canonical_arguments = adapter.canonicalize(cast(dict[str, Any], arguments))
             if canonical_json(canonical_arguments) != canonical_json(arguments):
@@ -240,24 +282,64 @@ class FrozenRequestLoader:
             stored_attachments
         ):
             raise FrozenPayloadError("frozen payload attachment snapshot does not match")
-        try:
-            account = self._account_namespaces[alias]
-        except KeyError as exc:
-            raise DeliveryPreparationError("downstream account scope is not configured") from exc
-
         return LoadedFrozenRequest(
             adapter=adapter,
+            adapter_id=adapter_id,
+            adapter_version=adapter_version,
+            execution_scope=frozen_scope,
             request=AdapterRequest(
                 request_id=lease.request_id,
                 downstream_alias=alias,
                 tool_name=tool,
                 arguments=canonical_arguments,
-                account=account,
+                account=account_ref,
                 payload_hash=lease.payload_hash,
                 version=lease.version,
                 idempotency_key=lease.downstream_idempotency_key,
                 created_at=datetime.fromtimestamp(payload_row["created_at"], tz=UTC),
             ),
+        )
+
+    def require_current_scope(
+        self,
+        loaded: LoadedFrozenRequest,
+        downstream_client: object,
+    ) -> None:
+        """Recheck runtime identity at the last pre-dispatch boundary."""
+
+        if (
+            loaded.adapter.adapter_id != loaded.adapter_id
+            or loaded.adapter.adapter_version != loaded.adapter_version
+            or not self._scope_is_current(
+                loaded.adapter,
+                loaded.execution_scope,
+                downstream_client,
+            )
+        ):
+            raise FrozenPayloadError("current execution scope changed before dispatch")
+
+    def _scope_is_current(
+        self,
+        adapter: ApprovalAdapter,
+        frozen_scope: ExecutionScope,
+        downstream_client: object | None = None,
+    ) -> bool:
+        try:
+            current = self._execution_scopes.resolve(
+                adapter.downstream_alias,
+                adapter.tool_name,
+                adapter,
+                downstream_client,
+            )
+        except Exception:
+            return False
+        return (
+            current.account_ref == frozen_scope.account_ref
+            and hmac.compare_digest(
+                current.credential_identity_digest,
+                frozen_scope.credential_identity_digest,
+            )
+            and hmac.compare_digest(current.schema_digest, frozen_scope.schema_digest)
         )
 
 
@@ -310,6 +392,23 @@ class DeliveryDispatcher:
         now: int,
         lease_seconds: int = 30,
     ) -> DispatchResult:
+        lease = await _run_sync(
+            self._claim_execution,
+            request_id,
+            worker_id=worker_id,
+            now=now,
+            lease_seconds=lease_seconds,
+        )
+        return await self.dispatch_claimed(lease, now=now)
+
+    def _claim_execution(
+        self,
+        request_id: str,
+        *,
+        worker_id: str,
+        now: int,
+        lease_seconds: int,
+    ) -> ExecutionLease:
         request = self.state_machine.get_request(request_id)
         adapter = self.loader.adapter_for(request["downstream_alias"], request["tool_name"])
         downstream_key = (
@@ -321,38 +420,91 @@ class DeliveryDispatcher:
             if adapter.supports_idempotency
             else None
         )
-        lease = self.state_machine.claim_execution(
+        return self.state_machine.claim_execution(
             request_id,
             worker_id=worker_id,
             now=now,
             lease_seconds=lease_seconds,
             downstream_idempotency_key=downstream_key,
         )
-        return await self.dispatch_claimed(lease, now=now)
 
     async def dispatch_claimed(self, lease: ExecutionLease, *, now: int) -> DispatchResult:
         """Execute an initial or reconciliation-authorized redispatch lease once."""
 
         try:
-            loaded = self.loader.load(lease)
-            downstream = self._downstream_clients[loaded.request.downstream_alias]
-            prepared = loaded.adapter.prepare_for_execution(loaded.request)
+            prepared = await _run_sync(self._prepare_dispatch, lease)
+        except asyncio.CancelledError:
+            await _run_sync(self._record_pre_dispatch_failure, lease, now=now)
+            raise
         except Exception as exc:
-            self._record_pre_dispatch_failure(lease, now=now)
+            await _run_sync(self._record_pre_dispatch_failure, lease, now=now)
             raise DeliveryPreparationError(
                 "delivery preparation failed before network I/O"
             ) from exc
 
-        # This commit is the last operation before adapter code can touch the network.
-        self.state_machine.mark_dispatch_started(lease, now=now)
+        # Commit first, then revalidate the exact client with no await before provider I/O.
         try:
-            result_or_error: object = await loaded.adapter.execute(downstream, prepared)
+            await _run_sync(self.state_machine.mark_dispatch_started, lease, now=now)
         except asyncio.CancelledError:
-            self._record_unknown(lease, now=now, failure_reason="dispatch_cancelled")
+            await _run_sync(
+                self._record_unknown,
+                lease,
+                now=now,
+                failure_reason="dispatch_cancelled",
+            )
+            raise
+        try:
+            self.loader.require_current_scope(prepared.loaded, prepared.downstream)
+        except Exception as exc:
+            await _run_sync(
+                self.state_machine.record_outcome,
+                lease,
+                classification=OutcomeClassification.DEFINITE_FAILURE,
+                now=now,
+                failure_reason="execution_scope_changed_before_io",
+            )
+            raise DeliveryPreparationError(
+                "delivery execution scope changed before network I/O"
+            ) from exc
+        try:
+            result_or_error: object = await prepared.loaded.adapter.execute(
+                prepared.downstream,
+                prepared.payload,
+            )
+        except asyncio.CancelledError:
+            await _run_sync(
+                self._record_unknown,
+                lease,
+                now=now,
+                failure_reason="dispatch_cancelled",
+            )
             raise
         except Exception as exc:
             result_or_error = exc
 
+        return await _run_sync(
+            self._settle_dispatch,
+            lease,
+            prepared.loaded,
+            result_or_error,
+            now=now,
+        )
+
+    def _prepare_dispatch(self, lease: ExecutionLease) -> _PreparedDispatch:
+        loaded = self.loader.load(lease)
+        downstream = self._downstream_clients[loaded.request.downstream_alias]
+        payload = loaded.adapter.prepare_for_execution(loaded.request)
+        self.loader.require_current_scope(loaded, downstream)
+        return _PreparedDispatch(loaded=loaded, downstream=downstream, payload=payload)
+
+    def _settle_dispatch(
+        self,
+        lease: ExecutionLease,
+        loaded: LoadedFrozenRequest,
+        result_or_error: object,
+        *,
+        now: int,
+    ) -> DispatchResult:
         outcome = _classify(loaded.adapter, result_or_error)
         internal_metadata = (
             standardize_safe_metadata(loaded.adapter, result_or_error)

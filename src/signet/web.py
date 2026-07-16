@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -115,6 +116,22 @@ class RequestAttachment:
     detection_source: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PolicyPromotionPreview:
+    target_alias: str
+    target_tool: str
+    current_mode: str
+    proposed_mode: str
+    reviewed_read_only: bool
+    communication_send: bool
+    reviewed_classification: str | None
+    current_policy_version: int
+    proposed_policy_version: int
+    active_policy_version: int
+    can_approve: bool
+    stale: bool
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class AttachmentDownload:
     content: bytes
@@ -148,6 +165,9 @@ class RequestDetail:
     downstream_alias: str = ""
     tool_name: str = ""
     account_context: str | None = None
+    policy_promotion_preview: PolicyPromotionPreview | None = None
+    policy_promotion_preview_unavailable: str | None = None
+    decision_window_expired: bool = False
     policy_mode: str = ""
     policy_version: str = ""
     adapter_version: str = ""
@@ -167,6 +187,10 @@ class RequestDetail:
     content_purge_reason: str | None = None
     canonical_size: int | None = None
     editor_actor: str | None = None
+    historical_event_id: int | None = None
+    historical_event_action: str | None = None
+    historical_event_actor: str | None = None
+    historical_event_occurred_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,9 +204,11 @@ class AuditEntry:
 
 @dataclass(frozen=True, slots=True)
 class DecisionEntry:
+    event_id: int
     occurred_at: int
     actor: str
-    decision: Literal["approved", "denied"]
+    decision: Literal["approved", "denied", "policy_change"]
+    decision_label: str
     confirmation_path: str | None
     confirmation_kind: str | None
     request_id: str
@@ -191,6 +217,8 @@ class DecisionEntry:
     tool_name: str
     version: int
     payload_hash_prefix: str
+    confirmation_attribution_ambiguous: bool = False
+    confirmation_match_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +309,12 @@ class WebBackend(Protocol):
     ) -> QueuePage: ...
 
     def get_detail(self, principal: SessionPrincipal, request_id: str) -> RequestDetail: ...
+
+    def get_historical_detail(
+        self,
+        principal: SessionPrincipal,
+        event_id: int,
+    ) -> RequestDetail: ...
 
     def get_attachment(
         self,
@@ -624,6 +658,9 @@ def create_web_app(
         except (InvalidSession, WebUnauthorized):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED) from None
 
+    async def async_principal(request: Request) -> SessionPrincipal:
+        return await run_in_threadpool(principal, request)
+
     def require_csrf(
         request: Request,
         selected: SessionPrincipal,
@@ -670,12 +707,12 @@ def create_web_app(
         return JSONResponse({"status": "ok", "service": "signet-web"})
 
     @app.get("/manifest.webmanifest", include_in_schema=False)
-    async def manifest() -> Response:
+    def manifest() -> Response:
         path = package_root / "static" / "manifest.webmanifest"
         return Response(path.read_bytes(), media_type="application/manifest+json")
 
     @app.get("/service-worker.js", include_in_schema=False)
-    async def service_worker() -> Response:
+    def service_worker() -> Response:
         path = package_root / "static" / "service-worker.js"
         return Response(
             path.read_bytes(),
@@ -684,7 +721,7 @@ def create_web_app(
         )
 
     @app.get("/login", response_class=HTMLResponse)
-    async def login_page(request: Request) -> Response:
+    def login_page(request: Request) -> Response:
         token = csrf.login_token()
         response = cast(
             Response,
@@ -706,7 +743,7 @@ def create_web_app(
         return response
 
     @app.post("/login/password")
-    async def password_login(
+    def password_login(
         request: Request,
         user_id: Annotated[str, Form(min_length=1, max_length=256)],
         password: Annotated[str, Form(min_length=1, max_length=1024)],
@@ -749,7 +786,8 @@ def create_web_app(
         user_id = body.get("user_id")
         if not isinstance(user_id, str) or not user_id or len(user_id) > 256:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
-        return backend.begin_passkey_login(
+        return await run_in_threadpool(
+            backend.begin_passkey_login,
             user_id,
             source=source(request),
             http_method=request.method,
@@ -768,7 +806,8 @@ def create_web_app(
         assertion = body.get("assertion")
         if not isinstance(challenge_id, str) or not isinstance(assertion, dict):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
-        token = backend.complete_passkey_login(
+        token = await run_in_threadpool(
+            backend.complete_passkey_login,
             challenge_id,
             assertion,
             source=source(request),
@@ -792,7 +831,7 @@ def create_web_app(
         return response
 
     @app.post("/logout")
-    async def logout(request: Request, csrf_token: Annotated[str, Form()]) -> Response:
+    def logout(request: Request, csrf_token: Annotated[str, Form()]) -> Response:
         selected = principal(request)
         require_csrf(request, selected, "logout", csrf_token)
         backend.logout(request.cookies.get(settings.session_cookie), now=now_fn())
@@ -806,7 +845,7 @@ def create_web_app(
         return response
 
     @app.get("/", response_class=HTMLResponse)
-    async def queue(request: Request, after: str | None = None) -> Response:
+    def queue(request: Request, after: str | None = None) -> Response:
         selected = principal(request)
         page = backend.list_queue(selected, now=now_fn(), cursor=after)
         return cast(
@@ -827,7 +866,7 @@ def create_web_app(
         )
 
     @app.get("/requests/{request_id}", response_class=HTMLResponse)
-    async def detail(request: Request, request_id: str) -> Response:
+    def detail(request: Request, request_id: str) -> Response:
         selected = principal(request)
         value = backend.get_detail(selected, request_id)
         purpose = f"request:{request_id}"
@@ -873,7 +912,7 @@ def create_web_app(
         )
 
     @app.get("/requests/{request_id}/review", response_class=HTMLResponse)
-    async def review_fragment(request: Request, request_id: str) -> Response:
+    def review_fragment(request: Request, request_id: str) -> Response:
         selected = principal(request)
         value = backend.get_detail(selected, request_id)
         return cast(
@@ -893,8 +932,44 @@ def create_web_app(
             ),
         )
 
+    @app.get("/audit/events/{event_id}/review", response_class=HTMLResponse)
+    def historical_review_fragment(request: Request, event_id: int) -> Response:
+        selected = principal(request)
+        value = backend.get_historical_detail(selected, event_id)
+        return cast(
+            Response,
+            templates.TemplateResponse(
+                request,
+                "review_fragment.html",
+                {
+                    **context(request, selected),
+                    "item": value,
+                    "id_suffix": f"audit-event-{event_id}",
+                    "csrf_token": None,
+                },
+            ),
+        )
+
+    @app.get("/audit/events/{event_id}", response_class=HTMLResponse)
+    def historical_review_page(request: Request, event_id: int) -> Response:
+        selected = principal(request)
+        value = backend.get_historical_detail(selected, event_id)
+        return cast(
+            Response,
+            templates.TemplateResponse(
+                request,
+                "audit_event.html",
+                {
+                    **context(request, selected),
+                    "item": value,
+                    "csrf_token": None,
+                    "logout_csrf": csrf.session_token(selected.session_id, "logout"),
+                },
+            ),
+        )
+
     @app.get("/audit", response_class=HTMLResponse)
-    async def audit(request: Request, before: str | None = None) -> Response:
+    def audit(request: Request, before: str | None = None) -> Response:
         selected = principal(request)
         before_event_id = None
         if before is not None:
@@ -936,7 +1011,7 @@ def create_web_app(
         )
 
     @app.post("/requests/{request_id}/actions/totp")
-    async def totp_action(
+    def totp_action(
         request: Request,
         request_id: str,
         action: Annotated[HumanAction, Form()],
@@ -995,7 +1070,7 @@ def create_web_app(
 
     @app.post("/requests/{request_id}/actions/passkey/options")
     async def passkey_action_options(request: Request, request_id: str) -> ActionOptions:
-        selected = principal(request)
+        selected = await async_principal(request)
         require_csrf(request, selected, f"request:{request_id}", None)
         body = await _json_object(request)
         action = body.get("action")
@@ -1014,15 +1089,15 @@ def create_web_app(
             or (decision_note is not None and not isinstance(decision_note, str))
         ):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
-        policy_change = (
-            action == "approve" and backend.get_detail(selected, request_id).gateway_internal
-        )
+        detail_value = await run_in_threadpool(backend.get_detail, selected, request_id)
+        policy_change = action == "approve" and detail_value.gateway_internal
         normalized_note = _decision_note_input(
             action,
             decision_note,
             policy_change=policy_change,
         )
-        return backend.begin_passkey_action(
+        return await run_in_threadpool(
+            backend.begin_passkey_action,
             selected,
             request_id,
             action,
@@ -1036,14 +1111,15 @@ def create_web_app(
 
     @app.post("/requests/{request_id}/actions/passkey/complete")
     async def passkey_action_complete(request: Request, request_id: str) -> dict[str, str]:
-        selected = principal(request)
+        selected = await async_principal(request)
         require_csrf(request, selected, f"request:{request_id}", None)
         body = await _json_object(request)
         challenge_id = body.get("challenge_id")
         assertion = body.get("assertion")
         if not isinstance(challenge_id, str) or not isinstance(assertion, dict):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
-        final_state = backend.complete_passkey_action(
+        final_state = await run_in_threadpool(
+            backend.complete_passkey_action,
             selected,
             request_id,
             challenge_id,
@@ -1058,7 +1134,7 @@ def create_web_app(
         }
 
     @app.post("/push/subscriptions", status_code=status.HTTP_204_NO_CONTENT)
-    async def subscribe_push(request: Request, payload: PushSubscriptionInput) -> Response:
+    def subscribe_push(request: Request, payload: PushSubscriptionInput) -> Response:
         selected = principal(request)
         require_csrf(request, selected, "push", None)
         backend.subscribe_push(selected, payload, now=now_fn())
@@ -1066,13 +1142,13 @@ def create_web_app(
 
     @app.delete("/push/subscriptions", status_code=status.HTTP_204_NO_CONTENT)
     async def unsubscribe_push(request: Request) -> Response:
-        selected = principal(request)
+        selected = await async_principal(request)
         require_csrf(request, selected, "push", None)
         body = await _json_object(request)
         endpoint = body.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint or len(endpoint) > 4096:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
-        backend.unsubscribe_push(selected, endpoint, now=now_fn())
+        await run_in_threadpool(backend.unsubscribe_push, selected, endpoint, now=now_fn())
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     return app

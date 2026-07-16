@@ -150,7 +150,9 @@ class RequestFreezer:
         *,
         origin_namespace: str,
         policy_version: int,
-        schema_version: str,
+        schema_digest: str,
+        account_ref: str | None,
+        credential_identity_digest: str | None,
         editor_actor: str,
         idempotency_key: str | None = None,
         retry_of_request_id: str | None = None,
@@ -163,14 +165,18 @@ class RequestFreezer:
 
         downstream_alias = adapter.downstream_alias
         tool_name = adapter.tool_name
+        adapter_id = adapter.adapter_id
         adapter_version = adapter.adapter_version
         self._validate_request_metadata(
             downstream_alias=downstream_alias,
             tool_name=tool_name,
+            adapter_id=adapter_id,
             adapter_version=adapter_version,
             origin_namespace=origin_namespace,
             policy_version=policy_version,
-            schema_version=schema_version,
+            schema_digest=schema_digest,
+            account_ref=account_ref,
+            credential_identity_digest=credential_identity_digest,
             editor_actor=editor_actor,
             idempotency_key=idempotency_key,
             retry_of_request_id=retry_of_request_id,
@@ -196,9 +202,14 @@ class RequestFreezer:
         canonical_payload, fingerprint = payload_fingerprint(
             alias=downstream_alias,
             tool=tool_name,
+            account_ref=account_ref,
+            credential_identity_digest=credential_identity_digest,
+            schema_digest=schema_digest,
+            caller_namespace=origin_namespace,
             arguments=canonical_arguments,
             staged_file_hashes=staged_hashes,
             policy_version=policy_version,
+            adapter_id=adapter_id,
             adapter_version=adapter_version,
         )
         if len(canonical_payload) > self.max_canonical_bytes:
@@ -245,7 +256,7 @@ class RequestFreezer:
             expires_at=expires_at,
             policy_version=str(policy_version),
             adapter_version=adapter_version,
-            schema_version=schema_version,
+            schema_version=schema_digest,
             editor_actor=editor_actor,
             canonical_size=len(canonical_payload),
             encryption_key_ref=self._key_reference,
@@ -261,10 +272,13 @@ class RequestFreezer:
         *,
         downstream_alias: str,
         tool_name: str,
+        adapter_id: str,
         adapter_version: str,
         origin_namespace: str,
         policy_version: int,
-        schema_version: str,
+        schema_digest: str,
+        account_ref: str | None,
+        credential_identity_digest: str | None,
         editor_actor: str,
         idempotency_key: str | None,
         retry_of_request_id: str | None,
@@ -274,12 +288,25 @@ class RequestFreezer:
             raise ValueError("adapter downstream alias is invalid")
         if not _valid_bounded_text(tool_name):
             raise ValueError("adapter tool name is invalid")
+        if not _valid_bounded_text(adapter_id, maximum=256):
+            raise ValueError("adapter ID is invalid")
         if not _valid_bounded_text(adapter_version, maximum=256):
             raise ValueError("adapter version is invalid")
         if not _valid_bounded_text(origin_namespace):
             raise ValueError("origin namespace is invalid")
-        if not _valid_bounded_text(schema_version, maximum=256):
-            raise ValueError("schema version is invalid")
+        if not isinstance(schema_digest, str) or not _SHA256_RE.fullmatch(schema_digest):
+            raise ValueError("schema digest is invalid")
+        if not isinstance(gateway_internal, bool):
+            raise TypeError("gateway_internal must be a boolean")
+        if gateway_internal:
+            if account_ref is not None or credential_identity_digest is not None:
+                raise ValueError("gateway-internal requests cannot carry downstream identity")
+        elif (
+            not _valid_bounded_text(account_ref)
+            or not isinstance(credential_identity_digest, str)
+            or not _SHA256_RE.fullmatch(credential_identity_digest)
+        ):
+            raise ValueError("downstream execution identity is invalid")
         if not _valid_bounded_text(editor_actor):
             raise ValueError("editor actor is invalid")
         if (
@@ -297,8 +324,6 @@ class RequestFreezer:
             or not _REQUEST_ID_RE.fullmatch(retry_of_request_id)
         ):
             raise ValueError("retry request ID is invalid")
-        if not isinstance(gateway_internal, bool):
-            raise TypeError("gateway_internal must be a boolean")
 
 
 def _utc_now() -> datetime:

@@ -153,6 +153,13 @@ document.querySelectorAll(".request-expander").forEach((expander) => {
   expander.addEventListener("toggle", async () => {
     const fragment = expander.querySelector("[data-review-fragment]");
     if (!expander.open || !fragment || fragment.dataset.reviewLoaded === "true") return;
+    const loading = fragment.querySelector(".review-loading");
+    const fallback = fragment.querySelector(".review-fallback");
+    const historical = fragment.dataset.reviewUrl?.startsWith("/audit/events/");
+    if (loading) {
+      loading.textContent = historical ? "Loading exact event context" : "Loading request context";
+    }
+    fallback?.classList.remove("review-fallback-visible");
     fragment.setAttribute("aria-busy", "true");
     try {
       const response = await fetch(fragment.dataset.reviewUrl, {
@@ -163,7 +170,8 @@ document.querySelectorAll(".request-expander").forEach((expander) => {
       fragment.innerHTML = await response.text();
       fragment.dataset.reviewLoaded = "true";
     } catch (error) {
-      fragment.textContent = "Request context could not be loaded";
+      if (loading) loading.textContent = "Request context could not be loaded. Close and reopen to retry.";
+      fallback?.classList.add("review-fallback-visible");
       showMessage(error.message);
     } finally {
       fragment.removeAttribute("aria-busy");
@@ -172,7 +180,9 @@ document.querySelectorAll(".request-expander").forEach((expander) => {
 });
 
 if (window.location.hash.startsWith("#decision-")) {
-  const target = document.getElementById(window.location.hash.slice(1));
+  const requestId = window.location.hash.slice("#decision-".length);
+  const target = document.getElementById(window.location.hash.slice(1))
+    || document.querySelector(`[data-decision-request-id="${CSS.escape(requestId)}"]`);
   const expander = target?.querySelector(".request-expander");
   if (expander) expander.open = true;
 }

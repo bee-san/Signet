@@ -38,6 +38,7 @@ from signet.auth import (
 from signet.credential_broker import MemorySecretStore, Secret
 from signet.crypto import PayloadCipher
 from signet.db import Database, IntegrityError
+from signet.execution_scope import ExecutionScope, StaticExecutionScopeResolver
 from signet.freezer import RequestFreezer
 from signet.models import ApprovalConfirmation, AttachmentReference
 from signet.notifications import NotificationKind, SQLitePushRepository
@@ -51,6 +52,7 @@ from signet.totp import (
 )
 from signet.web import (
     AttachmentDownload,
+    PolicyPromotionPreview,
     PushSubscriptionInput,
     WebConflict,
     WebForbidden,
@@ -93,6 +95,8 @@ TOTP_REFERENCE = "keychain://Signet/web-backend-totp"
 WEB_CREDENTIAL_ID = base64.urlsafe_b64encode(b"fake-web-backend-credential").rstrip(b"=").decode()
 P256DH = base64.urlsafe_b64encode(b"\x04" + b"p" * 64).rstrip(b"=").decode()
 PUSH_AUTH = base64.urlsafe_b64encode(b"a" * 16).rstrip(b"=").decode()
+SCHEMA_DIGEST = "d" * 64
+CREDENTIAL_DIGEST = "e" * 64
 
 
 class VariableFakeTotpProvider:
@@ -119,7 +123,8 @@ class ReviewOnlyAdapter:
     reconciliation_tools: frozenset[str] = frozenset()
     input_schema: Mapping[str, Any] = {"type": "object"}
 
-    def __init__(self) -> None:
+    def __init__(self, *, account: str = "fake-service-account") -> None:
+        self.account = account
         self.downstream_calls: list[str] = []
 
     def canonicalize(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -162,6 +167,7 @@ class ReviewOnlyAdapter:
 class ReviewerSpy:
     delegate: PrivatePayloadReviewer
     review_calls: list[tuple[str, int, str]] = field(default_factory=list)
+    historical_review_calls: list[tuple[str, int, str]] = field(default_factory=list)
 
     def review(
         self,
@@ -172,6 +178,20 @@ class ReviewerSpy:
     ) -> ReviewedPayload:
         self.review_calls.append((request_id, version, payload_hash))
         return self.delegate.review(request_id, version=version, payload_hash=payload_hash)
+
+    def review_historical(
+        self,
+        request_id: str,
+        *,
+        version: int,
+        payload_hash: str,
+    ) -> ReviewedPayload:
+        self.historical_review_calls.append((request_id, version, payload_hash))
+        return self.delegate.review_historical(
+            request_id,
+            version=version,
+            payload_hash=payload_hash,
+        )
 
     def prepare_edit(
         self,
@@ -228,6 +248,31 @@ class FakePolicyPromotionBoundary:
     totp_calls: list[tuple[str, ActionBinding, ApprovalConfirmation, str, int]] = field(
         default_factory=list
     )
+
+    def preview(
+        self,
+        request_id: str,
+        action: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        now: int,
+    ) -> PolicyPromotionPreview:
+        del request_id, action, expected_version, expected_payload_hash, now
+        return PolicyPromotionPreview(
+            target_alias="fake-service",
+            target_tool="create_item",
+            current_mode="deny",
+            proposed_mode="approval",
+            reviewed_read_only=False,
+            communication_send=False,
+            reviewed_classification="destructive",
+            current_policy_version=1,
+            proposed_policy_version=2,
+            active_policy_version=1,
+            can_approve=True,
+            stale=False,
+        )
 
     def binding_action(
         self,
@@ -304,7 +349,9 @@ class BackendBundle:
             {"recipient": recipient, "body": body},
             origin_namespace="profile:web-test",
             policy_version=3,
-            schema_version="schema-1",
+            schema_digest=SCHEMA_DIGEST,
+            account_ref=None if gateway_internal else self.adapter.account,
+            credential_identity_digest=None if gateway_internal else CREDENTIAL_DIGEST,
             editor_actor="caller:web-test",
             gateway_internal=gateway_internal,
         )
@@ -341,6 +388,7 @@ def password_verifier() -> Argon2PasswordVerifier:
 def downgrade_schema_13(connection: Any) -> None:
     """Restore the schema-12 shape after test-only schema-13 data injection."""
 
+    connection.execute("DROP TABLE attachment_metadata_privacy_maintenance")
     connection.execute("DROP TRIGGER IF EXISTS request_events_structured_reason_insert")
     connection.execute("DROP TRIGGER IF EXISTS web_action_drafts_structured_reason_insert")
     connection.execute("DROP TRIGGER staged_objects_immutable_context")
@@ -353,7 +401,7 @@ def downgrade_schema_13(connection: Any) -> None:
         """
     )
     connection.execute("DROP TABLE privacy_maintenance")
-    connection.execute("DELETE FROM schema_meta WHERE migration_id = 13")
+    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14)")
     connection.execute("PRAGMA user_version = 12")
 
 
@@ -365,6 +413,7 @@ def assemble(
     adapter: ApprovalAdapter | None = None,
     cipher: PayloadCipher | None = None,
     staging: StagingStore | None = None,
+    execution_scope: ExecutionScope | None = None,
     durable_sqlite_drafts: bool = False,
 ) -> BackendBundle:
     database.initialize()
@@ -412,6 +461,12 @@ def assemble(
         absolute_timeout=1_200,
     )
     state_machine = ApprovalStateMachine(database, capabilities=CAPABILITIES)
+    account_ref = getattr(selected_adapter, "account", "gateway-internal")
+    scope = execution_scope or ExecutionScope(
+        account_ref=account_ref,
+        credential_identity_digest=CREDENTIAL_DIGEST,
+        schema_digest=SCHEMA_DIGEST,
+    )
     payloads = EncryptedPayloadReviewer(
         state_machine,
         selected_cipher,
@@ -420,6 +475,9 @@ def assemble(
                 ApprovalAdapter, selected_adapter
             )
         },
+        StaticExecutionScopeResolver(
+            {(selected_adapter.downstream_alias, selected_adapter.tool_name): scope}
+        ),
         staging=staging,
     )
     action_drafts: ActionDraftRepository = (
@@ -442,6 +500,7 @@ def assemble(
         action_drafts=action_drafts,
         policy_promotions=cast(PolicyPromotionBoundary, selected_promotions),
         pushes=SQLitePushRepository(database),
+        clock=lambda: NOW,
     )
     return BackendBundle(
         database,
@@ -624,6 +683,7 @@ def test_completed_second_user_is_rejected_from_login_reads_actions_and_push(
     for operation in (
         lambda: bundle.backend.list_queue(principal, now=NOW + 1),
         lambda: bundle.backend.get_detail(principal, request_id),
+        lambda: bundle.backend.get_historical_detail(principal, 1),
         lambda: bundle.backend.get_attachment(
             principal,
             request_id,
@@ -1143,6 +1203,349 @@ def test_decision_history_is_bounded_and_keyset_paginated(
             bundle.backend.list_decisions(principal, before_event_id=cast(Any, invalid))
 
 
+def test_historical_decision_detail_stays_bound_to_event_revision_after_edit(
+    bundle: BackendBundle,
+) -> None:
+    request_id = bundle.enqueue(
+        recipient="version-one@example.test",
+        body="immutable version one body",
+    )
+    _, principal = bundle.session()
+    original = bundle.state_machine.get_request(request_id)
+    version_one_hash = str(original["current_payload_hash"])
+    with bundle.database.transaction() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO request_events(
+                request_id, actor, action, occurred_at,
+                version, payload_hash, safe_details_json
+            ) VALUES (?, ?, 'policy_promoted_to_approval', ?, 1, ?, ?)
+            """,
+            (
+                request_id,
+                f"web:{USER_ID}",
+                NOW + 1,
+                version_one_hash,
+                json.dumps(
+                    {
+                        "alias": "fake",
+                        "config_hash": "c" * 64,
+                        "new_mode": "approval",
+                        "old_mode": "deny",
+                        "originating_event": "one_click_confirmation",
+                        "policy_version": 4,
+                        "tool": "create_item",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        event_id = int(cursor.lastrowid)
+
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "edit",
+            "fake:640",
+            expected_version=1,
+            expected_payload_hash=version_one_hash,
+            prospective_arguments_json=(
+                '{"recipient":"version-two@example.test","body":"mutable version two body"}'
+            ),
+            now=NOW + 2,
+            decision_note=None,
+        )
+        == "pending_approval"
+    )
+    current_request = bundle.state_machine.get_request(request_id)
+    version_two_hash = str(current_request["current_payload_hash"])
+    assert version_two_hash != version_one_hash
+
+    original_reviewer = cast(PrivatePayloadReviewer, cast(Any, bundle.backend)._payloads)
+    reviewer = ReviewerSpy(original_reviewer)
+    cast(Any, bundle.backend)._payloads = reviewer
+    decision = next(
+        item for item in bundle.backend.list_decisions(principal).items if item.event_id == event_id
+    )
+    historical = bundle.backend.get_historical_detail(principal, event_id)
+    current = bundle.backend.get_detail(principal, request_id)
+
+    assert decision.decision == "policy_change"
+    assert decision.decision_label == "Policy change approved: approval"
+    assert (decision.version, decision.payload_hash_prefix) == (1, version_one_hash[:12])
+    assert (historical.version, historical.payload_hash) == (1, version_one_hash)
+    assert historical.historical_event_id == event_id
+    assert historical.historical_event_action == "policy_promoted_to_approval"
+    assert historical.detail_blocks[0].value == "immutable version one body"
+    assert "version-one@example.test" in cast(str, historical.reviewed_arguments_json)
+    assert historical.editable_arguments_json is None
+    assert historical.events[-1]["event_id"] == event_id
+    assert all(event["action"] != "payload_edited" for event in historical.events)
+    assert '"new_mode": "approval"' in cast(str, historical.events[-1]["details_json"])
+    assert (current.version, current.payload_hash) == (2, version_two_hash)
+    assert current.detail_blocks[0].value == "mutable version two body"
+    assert reviewer.historical_review_calls == [(request_id, 1, version_one_hash)]
+    assert reviewer.review_calls == [(request_id, 2, version_two_hash)]
+
+    with pytest.raises(WebPayloadError, match="no longer current"):
+        original_reviewer.review(request_id, version=1, payload_hash=version_one_hash)
+    with pytest.raises(WebConflict, match="changed after review"):
+        bundle.backend.begin_passkey_action(
+            principal,
+            request_id,
+            "approve",
+            expected_version=1,
+            expected_payload_hash=version_one_hash,
+            prospective_arguments_json=None,
+            http_method="POST",
+            now=NOW + 3,
+            decision_note="exact_request_approved",
+        )
+
+    with bundle.database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE payload_versions
+            SET encrypted_payload = NULL, purged_at = ?, purge_reason = ?
+            WHERE request_id = ? AND version = 1 AND payload_hash = ?
+            """,
+            (NOW + 4, "retention_historical", request_id, version_one_hash),
+        )
+    unavailable = bundle.backend.get_historical_detail(principal, event_id)
+    still_current = bundle.backend.get_detail(principal, request_id)
+    assert (unavailable.version, unavailable.payload_hash) == (1, version_one_hash)
+    assert unavailable.historical_event_id == event_id
+    assert unavailable.review_available is False and unavailable.content_purged is True
+    assert unavailable.content_purge_reason == "retention_historical"
+    assert unavailable.reviewed_arguments_json is None
+    assert "mutable version two body" not in str(unavailable)
+    assert (still_current.version, still_current.payload_hash) == (2, version_two_hash)
+    assert still_current.detail_blocks[0].value == "mutable version two body"
+
+
+@pytest.mark.parametrize("drift", ["account", "credential", "schema"])
+def test_restart_scope_change_blocks_current_private_review(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    database_path = tmp_path / f"restart-{drift}.sqlite3"
+    original = assemble(
+        Database(database_path),
+        adapter=cast(ApprovalAdapter, ReviewOnlyAdapter(account="account-a")),
+        execution_scope=ExecutionScope(
+            account_ref="account-a",
+            credential_identity_digest=CREDENTIAL_DIGEST,
+            schema_digest=SCHEMA_DIGEST,
+        ),
+    )
+    request_id = original.enqueue(body="must remain bound to account A")
+    payload_hash = str(original.state_machine.get_request(request_id)["current_payload_hash"])
+
+    restarted_scope = ExecutionScope(
+        account_ref="account-b" if drift == "account" else "account-a",
+        credential_identity_digest=("f" * 64 if drift == "credential" else CREDENTIAL_DIGEST),
+        schema_digest="a" * 64 if drift == "schema" else SCHEMA_DIGEST,
+    )
+    restarted = assemble(
+        Database(database_path),
+        adapter=cast(
+            ApprovalAdapter,
+            ReviewOnlyAdapter(
+                account="account-b" if drift == "account" else "account-a",
+            ),
+        ),
+        execution_scope=restarted_scope,
+    )
+    reviewer = cast(EncryptedPayloadReviewer, cast(Any, restarted.backend)._payloads)
+
+    with pytest.raises(WebPayloadError, match="current execution scope does not match"):
+        reviewer.review(request_id, version=1, payload_hash=payload_hash)
+
+
+def test_historical_detail_rejects_invalid_or_nondecision_event_ids(
+    bundle: BackendBundle,
+) -> None:
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    queued_event_id = int(bundle.state_machine.list_events(request_id)[0]["event_id"])
+
+    for event_id in (0, 2**63, True, queued_event_id, queued_event_id + 10_000):
+        with pytest.raises(WebConflict, match="decision event|event context"):
+            bundle.backend.get_historical_detail(principal, cast(Any, event_id))
+
+
+def test_decision_labels_distinguish_requests_and_each_policy_mode(
+    bundle: BackendBundle,
+) -> None:
+    approval_request_id = bundle.enqueue(body="approval policy change")
+    passthrough_request_id = bundle.enqueue(body="passthrough policy change")
+    approved_request_id = bundle.enqueue(body="ordinary approved request")
+    _, principal = bundle.session()
+    approval_hash = str(
+        bundle.state_machine.get_request(approval_request_id)["current_payload_hash"]
+    )
+    passthrough_hash = str(
+        bundle.state_machine.get_request(passthrough_request_id)["current_payload_hash"]
+    )
+    approved_hash = str(
+        bundle.state_machine.get_request(approved_request_id)["current_payload_hash"]
+    )
+    with bundle.database.transaction() as connection:
+        for request_id, action, payload_hash, occurred_at in (
+            (
+                approval_request_id,
+                "policy_promoted_to_approval",
+                approval_hash,
+                NOW + 1,
+            ),
+            (
+                passthrough_request_id,
+                "policy_promoted_to_passthrough",
+                passthrough_hash,
+                NOW + 2,
+            ),
+        ):
+            connection.execute(
+                """
+                INSERT INTO request_events(
+                    request_id, actor, action, occurred_at,
+                    version, payload_hash, safe_details_json
+                ) VALUES (?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    request_id,
+                    f"web:{USER_ID}",
+                    action,
+                    occurred_at,
+                    payload_hash,
+                    json.dumps(
+                        {"new_mode": action.removeprefix("policy_promoted_to_")},
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            approved_request_id,
+            "approve",
+            "fake:641",
+            expected_version=1,
+            expected_payload_hash=approved_hash,
+            prospective_arguments_json=None,
+            now=NOW + 3,
+            decision_note="exact_request_approved",
+        )
+        == "approved"
+    )
+
+    labels = {
+        item.request_id: item.decision_label
+        for item in bundle.backend.list_decisions(principal).items
+    }
+    assert labels == {
+        approved_request_id: "Request approved",
+        passthrough_request_id: "Policy change approved: passthrough",
+        approval_request_id: "Policy change approved: approval",
+    }
+
+
+def test_same_second_decisions_are_event_paginated_and_provenance_is_ambiguous(
+    bundle: BackendBundle,
+) -> None:
+    request_id = bundle.enqueue(body="same-second decision")
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    occurred_at = NOW + 40
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "approve",
+            "fake:690",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=occurred_at,
+            decision_note="exact_request_approved",
+        )
+        == "approved"
+    )
+
+    with bundle.database.transaction() as connection:
+        event = connection.execute(
+            """
+            SELECT actor, safe_details_json FROM request_events
+            WHERE request_id = ? AND action = 'approved_via_web'
+            """,
+            (request_id,),
+        ).fetchone()
+        assert event is not None
+        connection.execute(
+            """
+            INSERT INTO request_events(
+                request_id, actor, action, occurred_at, version,
+                payload_hash, safe_details_json
+            ) VALUES (?, ?, 'approved_via_web', ?, 1, ?, ?)
+            """,
+            (
+                request_id,
+                str(event["actor"]),
+                occurred_at,
+                payload_hash,
+                str(event["safe_details_json"]),
+            ),
+        )
+        use_id = "synthetic-same-second-webauthn-proof"
+        connection.execute(
+            """
+            INSERT INTO auth_proof_consumptions(kind, use_id, purpose, consumed_at)
+            VALUES ('webauthn', ?, 'mutation', ?)
+            """,
+            (use_id, occurred_at),
+        )
+        connection.execute(
+            """
+            INSERT INTO confirmation_consumptions(
+                kind, use_id, request_id, version, payload_hash, path,
+                consumed_at, action, user_id, session_id, http_method,
+                prospective_payload_hash
+            ) VALUES ('webauthn', ?, ?, 1, ?, 'web', ?, 'approve', ?, ?, 'POST', NULL)
+            """,
+            (
+                use_id,
+                request_id,
+                payload_hash,
+                occurred_at,
+                USER_ID,
+                principal.session_id,
+            ),
+        )
+
+    full = bundle.backend.list_decisions(principal)
+    assert len(full.items) == 2
+    assert len({item.event_id for item in full.items}) == 2
+    assert all(
+        (item.confirmation_kind, item.confirmation_path) == (None, None) for item in full.items
+    )
+    assert all(item.confirmation_attribution_ambiguous for item in full.items)
+    assert all(item.confirmation_match_count == 2 for item in full.items)
+
+    cast(Any, bundle.backend).max_decision_entries = 1
+    first = bundle.backend.list_decisions(principal)
+    second = bundle.backend.list_decisions(principal, before_event_id=first.next_event_id)
+    assert len(first.items) == len(second.items) == 1
+    assert first.has_more is True and first.next_event_id is not None
+    assert second.has_more is False and second.next_event_id is None
+    assert first.items[0].event_id != second.items[0].event_id
+    assert (first.items[0].confirmation_kind, first.items[0].confirmation_path) == (None, None)
+    assert (second.items[0].confirmation_kind, second.items[0].confirmation_path) == (None, None)
+    assert first.items[0].confirmation_attribution_ambiguous is True
+    assert second.items[0].confirmation_attribution_ambiguous is True
+
+
 def test_passkey_decision_provenance_is_safe_and_visible(
     bundle: BackendBundle,
 ) -> None:
@@ -1182,6 +1585,69 @@ def test_passkey_decision_provenance_is_safe_and_visible(
         "web",
     )
     assert "credential" not in str(decision).lower()
+
+
+def test_legacy_approval_without_action_provenance_keeps_web_path_fallback(
+    bundle: BackendBundle,
+) -> None:
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "approve",
+            "fake:504",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+            decision_note="exact_request_approved",
+        )
+        == "approved"
+    )
+    with bundle.database.transaction() as connection:
+        connection.execute(
+            "UPDATE confirmation_consumptions SET action = NULL WHERE request_id = ?",
+            (request_id,),
+        )
+
+    detail = bundle.backend.get_detail(principal, request_id)
+    event = next(value for value in detail.events if value["action"] == "approved_via_web")
+
+    assert event["confirmation_proofs"] == ()
+    assert event["confirmation_match_count"] == 0
+    assert event["confirmation_attribution_ambiguous"] is False
+    assert event["confirmation_kind"] is None
+    assert event["confirmation_path"] == "web"
+    assert event["decision_confirmation"] is True
+
+
+def test_caller_cancellation_does_not_claim_missing_human_confirmation(
+    bundle: BackendBundle,
+) -> None:
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    request = bundle.state_machine.get_request(request_id)
+    bundle.state_machine.cancel_by_caller(
+        request_id,
+        expected_version=int(request["current_version"]),
+        expected_payload_hash=str(request["current_payload_hash"]),
+        actor="caller:web-test",
+        now=NOW + 1,
+        origin_namespace="profile:web-test",
+    )
+
+    detail = bundle.backend.get_detail(principal, request_id)
+    event = next(value for value in detail.events if value["action"] == "cancelled")
+
+    assert event["confirmation_proofs"] == ()
+    assert event["confirmation_match_count"] == 0
+    assert event["confirmation_attribution_ambiguous"] is False
+    assert event["confirmation_kind"] is None
+    assert event["confirmation_path"] is None
+    assert event["decision_confirmation"] is False
 
 
 @pytest.mark.parametrize("invalid_note", ["not_a_reason", "unsafe\x00control"])
@@ -1696,15 +2162,15 @@ def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
         )
     assert backups == [12]
     with bundle.database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         assert (
             connection.execute(
-                "SELECT count(*) FROM schema_meta WHERE migration_id = 13"
+                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14)"
             ).fetchone()[0]
-            == 1
+            == 2
         )
 
-    # Schema 13 is already committed, so recovery must not require or repeat a backup.
+    # Both privacy migrations are committed, so recovery must not repeat a backup.
     Database(bundle.database.path).initialize()
     with bundle.database.read() as connection:
         pending = connection.execute(
@@ -1922,7 +2388,9 @@ def test_attachment_edit_and_review_are_bound_to_exact_catalog_snapshot(
         arguments,
         origin_namespace="profile:web-attachment-test",
         policy_version=3,
-        schema_version="schema-1",
+        schema_digest=SCHEMA_DIGEST,
+        account_ref="primary",
+        credential_identity_digest=CREDENTIAL_DIGEST,
         editor_actor="caller:web-attachment-test",
         attachments=adapter.freeze_attachments(arguments),
     )
@@ -2055,11 +2523,22 @@ def test_totp_request_actions_are_exact_and_make_no_downstream_call(
     assert result == expected_state
     row = bundle.state_machine.get_request(request_id)
     assert row["state"] == expected_state
+    detail = None
     if action == "edit":
         assert row["current_version"] == 2
         detail = bundle.backend.get_detail(principal, request_id)
         assert detail.destination_summary == "edited@example.test"
         assert detail.detail_blocks[0].value == "edited private body"
+    elif action == "cancel":
+        detail = bundle.backend.get_detail(principal, request_id)
+    if detail is not None:
+        event_action = "payload_edited" if action == "edit" else "cancelled"
+        event = next(value for value in detail.events if value["action"] == event_action)
+        assert (event["confirmation_kind"], event["confirmation_path"]) == ("totp", "web")
+        assert event["confirmation_proofs"] == ({"kind": "totp", "path": "web"},)
+        assert event["confirmation_match_count"] == 1
+        assert event["confirmation_attribution_ambiguous"] is False
+        assert event["decision_confirmation"] is True
     assert bundle.adapter.downstream_calls == []
 
 
@@ -2136,7 +2615,7 @@ def test_passkey_actions_use_durable_drafts_and_exact_options(
                 credential_id=cast(str, confirmation.credential_id),
                 credential_user_id=cast(str, confirmation.credential_user_id),
                 user_id=cast(str, confirmation.user_id),
-                challenge_id=cast(str, confirmation.challenge_id),
+                challenge_id=confirmation.challenge_id,
                 use_id=confirmation.use_id,
                 binding=binding,
                 path=confirmation.path,

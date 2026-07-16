@@ -5,6 +5,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from typing import Any
 
 import pytest
 
@@ -16,10 +17,12 @@ from signet.auth import (
     totp_proof_claims,
     totp_rate_limit_key,
 )
+from signet.backup import BackupError, BackupPublishedWithWarnings
 from signet.db import (
     LATEST_SCHEMA_VERSION,
     Database,
     DatabaseError,
+    DatabaseFinalizationStateUnknown,
     IncompatibleSchemaError,
     MigrationIntegrityError,
 )
@@ -55,6 +58,20 @@ CORE_TABLES = {
     "schema_meta",
     "notification_outbox_deliveries",
 }
+
+
+class CloseFailingConnection:
+    def __init__(self, connection: Any, close_calls: list[None]):
+        self._connection = connection
+        self._close_calls = close_calls
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+    def close(self) -> None:
+        self._close_calls.append(None)
+        self._connection.close()
+        raise OSError("injected raw SQLite close failure")
 
 
 def totp_confirmation(
@@ -367,6 +384,257 @@ def test_upgrade_requires_and_runs_a_verified_pre_migration_backup(
             ).fetchone()[0]
             == 1
         )
+
+
+def test_pre_migration_publication_warning_survives_connection_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION - 1}")
+
+    original_connect = database._connect
+    close_calls: list[None] = []
+
+    monkeypatch.setattr(
+        database,
+        "_connect",
+        lambda: CloseFailingConnection(original_connect(), close_calls),
+    )
+    warning = BackupPublishedWithWarnings(
+        "backup published, but post-publication verification needs operator recovery"
+    )
+
+    def report_publication_warning(_database: Database, _version: int) -> None:
+        raise warning
+
+    with pytest.raises(BackupPublishedWithWarnings) as caught:
+        database.initialize(pre_migration_backup=report_publication_warning)
+
+    assert caught.value is warning
+    operator_message = caught.value.operator_message()
+    assert "backup published, but post-publication verification needs operator recovery" in (
+        operator_message
+    )
+    assert "SQLite connection close outcome could not be confirmed" in operator_message
+    assert "stop Signet processes and verify the database before retrying" in operator_message
+    assert "raw SQLite close failure" not in operator_message
+    assert len(close_calls) == 1
+    assert getattr(caught.value, "__notes__", ()) == [
+        "The SQLite connection close outcome could not be confirmed; stop Signet processes and "
+        "verify the database before retrying.",
+    ]
+
+
+def test_generic_pre_migration_failure_combined_with_connection_close_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION - 1}")
+
+    original_connect = database._connect
+    close_calls: list[None] = []
+    monkeypatch.setattr(
+        database,
+        "_connect",
+        lambda: CloseFailingConnection(original_connect(), close_calls),
+    )
+
+    def fail_before_publication(_database: Database, _version: int) -> None:
+        raise BackupError("injected raw pre-migration construction failure")
+
+    with pytest.raises(DatabaseFinalizationStateUnknown) as caught:
+        database.initialize(pre_migration_backup=fail_before_publication)
+
+    message = caught.value.operator_message()
+    assert "database maintenance failed" in message
+    assert "SQLite connection close outcome could not be confirmed" in message
+    assert "stop Signet processes and verify the database before retrying" in message
+    assert "injected raw" not in message
+    assert len(close_calls) == 1
+
+
+def test_successful_database_maintenance_reports_bounded_connection_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+    original_connect = database._connect
+    close_calls: list[None] = []
+
+    monkeypatch.setattr(
+        database,
+        "_connect",
+        lambda: CloseFailingConnection(original_connect(), close_calls),
+    )
+
+    with pytest.raises(DatabaseFinalizationStateUnknown) as caught:
+        database._initialize_locked(fault_injector=None, pre_migration_backup=None)
+
+    message = str(caught.value)
+    assert "database maintenance completed" in message
+    assert "SQLite connection close outcome could not be confirmed" in message
+    assert "stop Signet processes and verify the database before retrying" in message
+    assert "raw SQLite close failure" not in message
+    assert len(close_calls) == 1
+
+
+def test_pre_migration_publication_warning_survives_all_database_finalizer_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signet.db as db_module
+
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION - 1}")
+
+    original_connect = database._connect
+    real_flock = db_module.fcntl.flock
+    real_close = db_module.os.close
+    unlock_calls = 0
+    connection_close_calls: list[None] = []
+    lock_close_calls = 0
+    maintenance_descriptor: int | None = None
+
+    def failing_unlock(descriptor: int, operation: int) -> None:
+        nonlocal maintenance_descriptor, unlock_calls
+        if operation == db_module.fcntl.LOCK_EX:
+            maintenance_descriptor = descriptor
+        if operation == db_module.fcntl.LOCK_UN:
+            unlock_calls += 1
+            raise OSError("injected raw lock release failure")
+        real_flock(descriptor, operation)
+
+    def failing_close(descriptor: int) -> None:
+        nonlocal lock_close_calls
+        real_close(descriptor)
+        if descriptor == maintenance_descriptor:
+            lock_close_calls += 1
+            raise OSError("injected raw lock descriptor close failure")
+
+    monkeypatch.setattr(
+        database,
+        "_connect",
+        lambda: CloseFailingConnection(original_connect(), connection_close_calls),
+    )
+    monkeypatch.setattr(db_module.fcntl, "flock", failing_unlock)
+    monkeypatch.setattr(db_module.os, "close", failing_close)
+    warning = BackupPublishedWithWarnings(
+        "backup published, but post-publication verification needs operator recovery"
+    )
+
+    def report_publication_warning(_database: Database, _version: int) -> None:
+        raise warning
+
+    with pytest.raises(BackupPublishedWithWarnings) as caught:
+        database.initialize(pre_migration_backup=report_publication_warning)
+
+    assert caught.value is warning
+    operator_message = caught.value.operator_message()
+    assert "backup published, but post-publication verification needs operator recovery" in (
+        operator_message
+    )
+    assert "SQLite connection close outcome could not be confirmed" in operator_message
+    assert "maintenance-lock release outcome could not be confirmed" in operator_message
+    assert "maintenance-lock descriptor close outcome could not be confirmed" in operator_message
+    assert "injected raw" not in operator_message
+    assert unlock_calls == 1
+    assert len(connection_close_calls) == 1
+    assert lock_close_calls == 1
+    assert getattr(caught.value, "__notes__", ()) == [
+        "The SQLite connection close outcome could not be confirmed; stop Signet processes and "
+        "verify the database before retrying.",
+        "The database maintenance-lock release outcome could not be confirmed; stop Signet "
+        "processes and inspect the private maintenance lock before retrying.",
+        "The database maintenance-lock descriptor close outcome could not be confirmed; stop "
+        "Signet processes and inspect the private maintenance lock before retrying.",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("unlock_fails", "close_fails", "expected_detail"),
+    [
+        (True, False, "maintenance-lock release outcome"),
+        (False, True, "maintenance-lock descriptor close outcome"),
+        (True, True, "maintenance-lock release and descriptor close outcome"),
+    ],
+)
+def test_successful_database_maintenance_reports_bounded_lock_finalizer_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unlock_fails: bool,
+    close_fails: bool,
+    expected_detail: str,
+) -> None:
+    import signet.db as db_module
+
+    database = Database(tmp_path / "approvals.sqlite3")
+    real_flock = db_module.fcntl.flock
+    real_close = db_module.os.close
+    unlock_calls = 0
+    close_calls = 0
+
+    def injected_unlock(descriptor: int, operation: int) -> None:
+        nonlocal unlock_calls
+        if operation == db_module.fcntl.LOCK_UN:
+            unlock_calls += 1
+            if unlock_fails:
+                raise OSError("injected raw lock release failure")
+        real_flock(descriptor, operation)
+
+    def injected_close(descriptor: int) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        real_close(descriptor)
+        if close_fails:
+            raise OSError("injected raw lock descriptor close failure")
+
+    monkeypatch.setattr(db_module.fcntl, "flock", injected_unlock)
+    monkeypatch.setattr(db_module.os, "close", injected_close)
+
+    with pytest.raises(DatabaseFinalizationStateUnknown) as caught, database._maintenance_lock():
+        pass
+
+    message = str(caught.value)
+    assert "database maintenance completed" in message
+    assert expected_detail in message
+    assert "stop Signet processes and inspect the private maintenance lock" in message
+    assert "injected raw" not in message
+    assert unlock_calls == 1
+    assert close_calls == 1
+
+
+def test_generic_operation_failure_combined_with_lock_failure_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signet.db as db_module
+
+    database = Database(tmp_path / "approvals.sqlite3")
+    real_flock = db_module.fcntl.flock
+    unlock_calls = 0
+
+    def injected_unlock(descriptor: int, operation: int) -> None:
+        nonlocal unlock_calls
+        if operation == db_module.fcntl.LOCK_UN:
+            unlock_calls += 1
+            raise OSError("injected raw lock release failure")
+        real_flock(descriptor, operation)
+
+    monkeypatch.setattr(db_module.fcntl, "flock", injected_unlock)
+
+    with pytest.raises(DatabaseFinalizationStateUnknown) as caught, database._maintenance_lock():
+        raise BackupError("injected raw backup construction failure")
+
+    message = caught.value.operator_message()
+    assert "database operation failed" in message
+    assert "maintenance-lock finalization could not be confirmed" in message
+    assert "stop Signet processes and inspect the private maintenance lock" in message
+    assert "injected raw" not in message
+    assert unlock_calls == 1
 
 
 def test_newer_schema_is_refused_before_application_work(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.db import Database
 from signet.notifications import NotificationDispatcher, NotificationKind, PushMessage
 
@@ -360,19 +361,29 @@ class NotificationOutboxWorker:
         self.retry_max_seconds = retry_max_seconds
 
     async def run_due(self, *, now: int, limit: int = 100) -> OutboxRunReport:
-        intents = self.outbox.claim_due(worker_id=self.worker_id, now=now, limit=limit)
+        intents = await _run_sync(
+            self.outbox.claim_due,
+            worker_id=self.worker_id,
+            now=now,
+            limit=limit,
+        )
         delivered = 0
         deferred = 0
         for intent in intents:
             try:
+                delivered_subscription_ids = await _run_sync(
+                    self.outbox.delivered_subscription_ids,
+                    intent.outbox_id,
+                )
                 report = await self.dispatcher.notify(
                     intent.user_id,
                     intent.message,
                     now=now,
-                    skip_subscription_ids=self.outbox.delivered_subscription_ids(intent.outbox_id),
+                    skip_subscription_ids=delivered_subscription_ids,
                 )
             except asyncio.CancelledError:
-                self.outbox.defer(
+                await _run_sync(
+                    self.outbox.defer,
                     intent,
                     now=now,
                     error_code="worker_cancelled",
@@ -380,7 +391,8 @@ class NotificationOutboxWorker:
                 )
                 raise
             except Exception:
-                self.outbox.defer(
+                await _run_sync(
+                    self.outbox.defer,
                     intent,
                     now=now,
                     error_code="notification_dispatch_failed",
@@ -389,21 +401,25 @@ class NotificationOutboxWorker:
                 deferred += 1
             else:
                 if report.failed:
-                    if not self.outbox.defer(
+                    deferred_intent = await _run_sync(
+                        self.outbox.defer,
                         intent,
                         now=now,
                         error_code="push_delivery_incomplete",
                         retry_delay=self._retry_delay(intent.attempts),
                         delivered_subscription_ids=report.delivered_subscription_ids,
-                    ):
+                    )
+                    if not deferred_intent:
                         raise NotificationOutboxError("notification delivery claim was lost")
                     deferred += 1
                 else:
-                    if not self.outbox.mark_delivered(
+                    marked_delivered = await _run_sync(
+                        self.outbox.mark_delivered,
                         intent,
                         now=now,
                         delivered_subscription_ids=report.delivered_subscription_ids,
-                    ):
+                    )
+                    if not marked_delivered:
                         raise NotificationOutboxError("notification delivery claim was lost")
                     delivered += 1
         return OutboxRunReport(

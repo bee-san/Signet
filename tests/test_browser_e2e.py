@@ -12,7 +12,7 @@ import sys
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 import httpx
 import pytest
+import yaml
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from playwright.sync_api import ConsoleMessage, Locator, Page, Request, Route, sync_playwright
@@ -49,6 +50,16 @@ EMAIL_ARGUMENTS = {
 WHATSAPP_ARGUMENTS = {
     "to": "15555550123@s.whatsapp.net",
     "message": "Send the fake-only incident handoff after a human review.",
+}
+ACCESS_ARGUMENTS = {
+    "alias": "fastmail",
+    "tool": "search_email",
+    "reason": "Allow this reviewed read-only tool through Signet.",
+}
+APPROVAL_ACCESS_ARGUMENTS = {
+    "alias": "fastmail",
+    "tool": "send_email",
+    "reason": "Gate this reviewed communication tool behind per-call human approval.",
 }
 APPROVAL_NOTE = "exact_request_approved"
 APPROVAL_REASON = "Exact content, destination, and scope reviewed and approved"
@@ -147,6 +158,7 @@ class BrowserSignals:
     post_requests: int = 0
     exact_post_origins: bool = True
     expected_download_url: str | None = None
+    failed_request_details: list[str] = field(default_factory=list)
 
 
 def _available_ports() -> tuple[int, int]:
@@ -200,7 +212,11 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
 
 
 @contextmanager
-def _served_demo(tmp_path: Path) -> Iterator[LiveDemo]:
+def _served_demo(
+    tmp_path: Path,
+    *,
+    force_deny_tool: tuple[str, str, str] | None = None,
+) -> Iterator[LiveDemo]:
     private_parent = tmp_path / "browser-acceptance"
     private_parent.mkdir(mode=0o700)
     os.chmod(private_parent, 0o700)
@@ -208,6 +224,22 @@ def _served_demo(tmp_path: Path) -> Iterator[LiveDemo]:
     initialize_demo(root)
     if stat.S_IMODE(root.stat().st_mode) != 0o700:
         pytest.fail("browser demo state directory is not private", pytrace=False)
+    if force_deny_tool is not None:
+        alias, tool_name, expected_mode = force_deny_tool
+        policy_path = root / "policy.yaml"
+        document = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+        try:
+            tool_policy = document["downstreams"][alias]["tools"][tool_name]
+        except (KeyError, TypeError):
+            pytest.fail("browser access target is missing from demo policy", pytrace=False)
+        if tool_policy.get("mode") != expected_mode:
+            pytest.fail("browser access target has an unexpected starting mode", pytrace=False)
+        tool_policy["mode"] = "deny"
+        policy_path.write_text(
+            yaml.safe_dump(document, allow_unicode=False, sort_keys=False),
+            encoding="utf-8",
+        )
+        policy_path.chmod(0o600)
 
     mcp_port, web_port = _available_ports()
     mcp_origin = f"http://127.0.0.1:{mcp_port}"
@@ -330,6 +362,40 @@ def _enqueue_requests(demo: LiveDemo) -> tuple[str, str, dict[str, Any]]:
         pytest.fail("authenticated fake MCP enqueue failed", pytrace=False)
 
 
+async def _enqueue_access(demo: LiveDemo, arguments: Mapping[str, str]) -> str:
+    token = credential_value(demo.root, "mcp-token")
+    async with (
+        httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+            trust_env=False,
+        ) as client,
+        streamable_http_client(
+            f"{demo.mcp_origin}/mcp/approvals",
+            http_client=client,
+        ) as (read_stream, write_stream, _get_session_id),
+        ClientSession(read_stream, write_stream) as session,
+    ):
+        await session.initialize()
+        result = await session.call_tool("request_tool_access", dict(arguments))
+    content = result.structuredContent
+    if (
+        result.isError
+        or not isinstance(content, dict)
+        or content.get("status") != "pending_approval"
+        or not isinstance(content.get("request_id"), str)
+    ):
+        raise RuntimeError("fake MCP did not enqueue a tool-access request")
+    return content["request_id"]
+
+
+def _enqueue_access_request(demo: LiveDemo, arguments: Mapping[str, str]) -> str:
+    try:
+        return asyncio.run(_enqueue_access(demo, arguments))
+    except Exception:
+        pytest.fail("authenticated fake MCP tool-access request failed", pytrace=False)
+
+
 def _install_network_guards(page: Page, demo: LiveDemo, signals: BrowserSignals) -> None:
     def route_request(route: Route) -> None:
         parsed = urlsplit(route.request.url)
@@ -369,6 +435,10 @@ def _install_network_guards(page: Page, demo: LiveDemo, signals: BrowserSignals)
         ):
             return
         signals.failed_requests += 1
+        signals.failed_request_details.append(
+            f"{request.method} {request.url} ({request.failure or 'unknown failure'}; "
+            f"page={page.url})"
+        )
 
     page.context.route("**/*", route_request)
     page.on("request", observe_request)
@@ -384,7 +454,9 @@ def _install_network_guards(page: Page, demo: LiveDemo, signals: BrowserSignals)
 
 
 def _expand_request(page: Page, request_id: str) -> Locator:
-    fragment = page.locator(f'[data-review-url="/requests/{request_id}/review"]')
+    fragment = page.locator(f'[data-decision-request-id="{request_id}"] [data-review-fragment]')
+    if fragment.count() == 0:
+        fragment = page.locator(f'[data-review-url="/requests/{request_id}/review"]')
     if fragment.count() != 1:
         pytest.fail("expected request is missing from the current list", pytrace=False)
     expander = fragment.locator("..")
@@ -408,13 +480,14 @@ def _assert_context_sections(review: Locator) -> None:
             pytest.fail("expanded request context is incomplete", pytrace=False)
     context = review.locator(".context-band")
     context_text = context.text_content() or ""
+    historical = review.get_attribute("data-historical-event-id") is not None
     for label in (
         "Request",
-        "State",
+        "Current request state" if historical else "State",
         "Created",
         "Expires",
-        "Version",
-        "Payload hash",
+        "Selected payload version" if historical else "Version",
+        "Selected payload hash" if historical else "Payload hash",
         "Downstream",
         "Tool",
         "Policy mode",
@@ -437,11 +510,24 @@ def _context_definition(review: Locator, label: str) -> Locator:
         term = terms.nth(index)
         if (term.text_content() or "").strip() == label:
             return term.locator("xpath=following-sibling::dd[1]")
-    pytest.fail("expanded request context omitted a bound value", pytrace=False)
+    pytest.fail(f"expanded request context omitted {label!r}", pytrace=False)
 
 
 def _context_value(review: Locator, label: str) -> str:
     return _normalized_text(_context_definition(review, label))
+
+
+def _definition_value(container: Locator, label: str) -> str:
+    terms = container.locator("dt")
+    for index in range(terms.count()):
+        term = terms.nth(index)
+        if (term.text_content() or "").strip() == label:
+            return _normalized_text(term.locator("xpath=following-sibling::dd[1]"))
+    pytest.fail(f"expanded review omitted {label!r}", pytrace=False)
+
+
+def _decision_locator(page: Page, request_id: str) -> Locator:
+    return page.locator(f'[data-decision-request-id="{request_id}"]').first
 
 
 def _utc_datetime(value: str | None) -> datetime:
@@ -466,9 +552,10 @@ def _assert_bound_context(
     arguments: Mapping[str, object],
 ) -> None:
     _assert_context_sections(review)
+    historical = review.get_attribute("data-historical-event-id") is not None
     expected_values = {
         "Request": request_id,
-        "State": state.replace("_", " "),
+        "Current request state" if historical else "State": state.replace("_", " "),
         "Reviewed content": "Available",
         "Downstream": alias,
         "Tool": tool_name,
@@ -486,9 +573,11 @@ def _assert_bound_context(
                 "expanded request context contained an incorrect bound value", pytrace=False
             )
 
-    if re.fullmatch(r"[1-9][0-9]*", _context_value(review, "Version")) is None:
+    version_label = "Selected payload version" if historical else "Version"
+    payload_hash_label = "Selected payload hash" if historical else "Payload hash"
+    if re.fullmatch(r"[1-9][0-9]*", _context_value(review, version_label)) is None:
         pytest.fail("expanded request context included an invalid version", pytrace=False)
-    payload_hash = _context_value(review, "Payload hash")
+    payload_hash = _context_value(review, payload_hash_label)
     schema_version = _context_value(review, "Schema version")
     if (
         re.fullmatch(r"[a-f0-9]{64}", payload_hash) is None
@@ -547,9 +636,9 @@ def _assert_layout(page: Page) -> None:
           const horizontalOverflow =
             root.scrollWidth > root.clientWidth + 1 || body.scrollWidth > body.clientWidth + 1;
           const controls = document.querySelectorAll(
-            "button, input:not([type='hidden']), textarea, summary, a[href]"
+            "button, input:not([type='hidden']), select, textarea, summary, a[href]"
           );
-          const undersized = Array.from(controls).filter((element) => {
+          const undersized = Array.from(controls).flatMap((element) => {
             const style = getComputedStyle(element);
             const rect = element.getBoundingClientRect();
             const visible =
@@ -557,14 +646,108 @@ def _assert_layout(page: Page) -> None:
               style.visibility !== "hidden" &&
               rect.width > 0 &&
               rect.height > 0;
-            return visible && (rect.width < 43.5 || rect.height < 43.5);
-          }).length;
-          return { horizontalOverflow, undersized };
+            if (!visible || (rect.width >= 43.5 && rect.height >= 43.5)) {
+              return [];
+            }
+            return [{
+              tag: element.tagName.toLowerCase(),
+              id: element.id,
+              className: typeof element.className === "string" ? element.className : "",
+              label: (element.getAttribute("aria-label") || element.textContent || "")
+                .trim()
+                .replace(/\\s+/g, " ")
+                .slice(0, 120),
+              width: rect.width,
+              height: rect.height,
+            }];
+          });
+          return {
+            horizontalOverflow,
+            rootClientWidth: root.clientWidth,
+            rootScrollWidth: root.scrollWidth,
+            bodyClientWidth: body.clientWidth,
+            bodyScrollWidth: body.scrollWidth,
+            undersized,
+          };
         }
         """
     )
-    if metrics != {"horizontalOverflow": False, "undersized": 0}:
-        pytest.fail("browser layout overflowed or exposed an undersized control", pytrace=False)
+    if metrics["horizontalOverflow"] or metrics["undersized"]:
+        pytest.fail(
+            "browser layout overflowed or exposed an undersized control: "
+            f"{json.dumps(metrics, sort_keys=True)}",
+            pytrace=False,
+        )
+
+
+def _assert_truth_state_not_clipped(review: Locator) -> None:
+    metrics = review.locator(".truth-state span").evaluate(
+        """
+        (element) => {
+          const rect = element.getBoundingClientRect();
+          const parentRect = element.parentElement.getBoundingClientRect();
+          return {
+            rect: {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom},
+            parent: {
+              left: parentRect.left,
+              right: parentRect.right,
+              top: parentRect.top,
+              bottom: parentRect.bottom,
+            },
+            viewportWidth: document.documentElement.clientWidth,
+            scrollWidth: element.scrollWidth,
+            clientWidth: element.clientWidth,
+            whiteSpace: getComputedStyle(element).whiteSpace,
+          };
+        }
+        """
+    )
+    rect = metrics["rect"]
+    parent = metrics["parent"]
+    clipped = (
+        rect["left"] < parent["left"] - 1
+        or rect["right"] > parent["right"] + 1
+        or rect["top"] < parent["top"] - 1
+        or rect["bottom"] > parent["bottom"] + 1
+        or rect["left"] < -1
+        or rect["right"] > metrics["viewportWidth"] + 1
+        or metrics["scrollWidth"] > metrics["clientWidth"] + 1
+        or metrics["whiteSpace"] == "nowrap"
+    )
+    if clipped:
+        pytest.fail(
+            f"mobile truth-state text is clipped: {json.dumps(metrics, sort_keys=True)}",
+            pytrace=False,
+        )
+
+
+def _assert_identifier_wraps(locator: Locator) -> None:
+    metrics = locator.evaluate(
+        """
+        (element) => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return {
+            left: rect.left,
+            right: rect.right,
+            viewportWidth: document.documentElement.clientWidth,
+            scrollWidth: element.scrollWidth,
+            clientWidth: element.clientWidth,
+            overflowWrap: style.overflowWrap,
+          };
+        }
+        """
+    )
+    if (
+        metrics["left"] < -1
+        or metrics["right"] > metrics["viewportWidth"] + 1
+        or metrics["scrollWidth"] > metrics["clientWidth"] + 1
+        or metrics["overflowWrap"] != "anywhere"
+    ):
+        pytest.fail(
+            f"maximum-length identifier did not wrap: {json.dumps(metrics, sort_keys=True)}",
+            pytrace=False,
+        )
 
 
 def _login(page: Page, demo: LiveDemo) -> None:
@@ -596,6 +779,10 @@ def _submit_decision(
     with page.expect_navigation(wait_until="domcontentloaded"):
         form.locator(f"button[name='action'][value='{action}']").click()
     page.wait_for_url(re.compile(rf"{re.escape(demo.web_origin)}/audit#decision-{request_id}$"))
+    redirected_review = page.locator(
+        f'[data-decision-request-id="{request_id}"] [data-review-fragment] .request-review'
+    ).first
+    redirected_review.wait_for(state="visible")
 
 
 def _assert_passkey_note_routing(review: Locator) -> None:
@@ -671,7 +858,7 @@ def _wait_for_success(page: Page, demo: LiveDemo, request_id: str) -> None:
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         page.goto(f"{demo.web_origin}/audit", wait_until="domcontentloaded")
-        state = page.locator(f"#decision-{request_id} .state")
+        state = _decision_locator(page, request_id).locator(".state")
         if state.count() == 1 and state.inner_text().strip() == "succeeded":
             return
         page.wait_for_timeout(100)
@@ -883,7 +1070,7 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
                     pytest.fail("denied audit context is incomplete", pytrace=False)
 
             audit_summary = _normalized_text(
-                page.locator(f"#decision-{approved_id} > details > summary")
+                _decision_locator(page, approved_id).locator(":scope > details > summary")
             )
             if "TOTP via web" not in audit_summary or DEMO_USER_ID not in audit_summary:
                 pytest.fail("audit summary omitted confirmation provenance", pytrace=False)
@@ -912,6 +1099,7 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
                 pytest.fail("mobile Audit navigation target is undersized", pytrace=False)
             audit_link.click()
             page.wait_for_url(f"{demo.web_origin}/audit")
+            page.wait_for_load_state("networkidle")
 
             context.close()
             browser.close()
@@ -924,7 +1112,13 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
             or signals.external_requests != 0
         ):
             pytest.fail(
-                "browser workflow emitted a page, console, HTTP, or network error", pytrace=False
+                "browser workflow emitted a page, console, HTTP, or network error: "
+                f"console={signals.console_errors}, page={signals.page_errors}, "
+                f"failed_requests={signals.failed_requests}, "
+                f"error_responses={signals.error_responses}, "
+                f"external_requests={signals.external_requests}, "
+                f"request_failures={signals.failed_request_details!r}",
+                pytrace=False,
             )
         if signals.post_requests < 3 or not signals.exact_post_origins:
             pytest.fail(
@@ -932,9 +1126,644 @@ def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:
             )
 
 
+def test_fake_demo_audit_expansions_are_event_bound_read_only_and_unique(
+    tmp_path: Path,
+) -> None:
+    with _served_demo(tmp_path) as demo:
+        request_id, _other_request_id, version_one_arguments = _enqueue_requests(demo)
+        assembly = build_demo(demo.root)
+        version_one = assembly.state_machine.get_request(request_id)
+        version_one_hash = str(version_one["current_payload_hash"])
+        long_actor = "web:" + "maximum_identifier_" * 16
+        with assembly.database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO request_events(
+                    request_id, actor, action, occurred_at,
+                    version, payload_hash, safe_details_json
+                ) VALUES (?, ?, 'policy_promoted_to_approval', ?, 1, ?, ?)
+                """,
+                (
+                    request_id,
+                    long_actor,
+                    int(time.time()),
+                    version_one_hash,
+                    json.dumps(
+                        {
+                            "alias": "fastmail",
+                            "config_hash": "c" * 64,
+                            "new_mode": "approval",
+                            "old_mode": "deny",
+                            "originating_event": "one_click_confirmation",
+                            "policy_version": 2,
+                            "tool": "send_email",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            promotion_event_id = int(cursor.lastrowid)
+
+        signals = BrowserSignals()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                timezone_id="UTC",
+                service_workers="block",
+            )
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.set_default_navigation_timeout(15_000)
+            _install_network_guards(page, demo, signals)
+            _login(page, demo)
+
+            current_review = _expand_request(page, request_id)
+            version_two_arguments = {
+                **version_one_arguments,
+                "body": "This is the exact edited version two browser body.",
+            }
+            edit_form = current_review.locator(".edit-band form")
+            edit_form.locator("[data-edit-json]").fill(json.dumps(version_two_arguments))
+            edit_form.locator("input[name='totp_proof']").fill(
+                credential_value(demo.root, "web-action-proof")
+            )
+            with page.expect_navigation(wait_until="domcontentloaded"):
+                edit_form.get_by_role("button", name="Confirm edit").click()
+            page.wait_for_url(f"{demo.web_origin}/requests/{request_id}")
+
+            version_two = assembly.state_machine.get_request(request_id)
+            version_two_hash = str(version_two["current_payload_hash"])
+            if version_two_hash == version_one_hash or int(version_two["current_version"]) != 2:
+                pytest.fail("browser edit did not create a distinct second revision", pytrace=False)
+            _submit_decision(
+                page,
+                demo,
+                page.locator(".request-review"),
+                request_id,
+                action="deny",
+                note=DENIAL_NOTE,
+            )
+            with assembly.database.read() as connection:
+                denial = connection.execute(
+                    """
+                    SELECT event_id FROM request_events
+                    WHERE request_id = ? AND action = 'denied'
+                    ORDER BY event_id DESC LIMIT 1
+                    """,
+                    (request_id,),
+                ).fetchone()
+            if denial is None:
+                pytest.fail("browser denial did not retain its decision event", pytrace=False)
+            denial_event_id = int(denial["event_id"])
+
+            rows = page.locator(f'[data-decision-request-id="{request_id}"]')
+            if rows.count() != 2:
+                pytest.fail("Audit did not retain both decisions for one request", pytrace=False)
+            promotion_fragment = page.locator(
+                f'[data-review-url="/audit/events/{promotion_event_id}/review"]'
+            )
+            denial_fragment = page.locator(
+                f'[data-review-url="/audit/events/{denial_event_id}/review"]'
+            )
+            for fragment in (promotion_fragment, denial_fragment):
+                details = fragment.locator("..")
+                if details.get_attribute("open") is None:
+                    details.locator(":scope > summary").click()
+                fragment.locator(".request-review").wait_for(state="visible")
+
+            promotion_review = promotion_fragment.locator(".request-review")
+            denial_review = denial_fragment.locator(".request-review")
+            promotion_summary = _normalized_text(
+                promotion_fragment.locator("..").locator(":scope > summary")
+            )
+            denial_summary = _normalized_text(
+                denial_fragment.locator("..").locator(":scope > summary")
+            )
+            if "Policy change approved: approval" not in promotion_summary:
+                pytest.fail("Audit mislabeled the approval policy change", pytrace=False)
+            if "Request denied" not in denial_summary:
+                pytest.fail("Audit mislabeled the request denial", pytrace=False)
+
+            for review, event_id, version, payload_hash, expected_body in (
+                (
+                    promotion_review,
+                    promotion_event_id,
+                    "1",
+                    version_one_hash,
+                    str(version_one_arguments["body"]),
+                ),
+                (
+                    denial_review,
+                    denial_event_id,
+                    "2",
+                    version_two_hash,
+                    str(version_two_arguments["body"]),
+                ),
+            ):
+                text = _normalized_text(review)
+                if (
+                    expected_body not in text
+                    or _context_value(review, "Selected payload version") != version
+                    or _context_value(review, "Selected payload hash") != payload_hash
+                    or review.get_attribute("data-historical-event-id") != str(event_id)
+                ):
+                    pytest.fail(
+                        "Audit expansion was not bound to its exact event revision",
+                        pytrace=False,
+                    )
+                if review.locator("form, [data-passkey-action], [data-csrf]").count() != 0:
+                    pytest.fail(
+                        "historical Audit expansion exposed mutation controls",
+                        pytrace=False,
+                    )
+                if review.get_by_role("link", name="Download frozen bytes").count() != 0:
+                    pytest.fail(
+                        "historical Audit expansion exposed a current-only download",
+                        pytrace=False,
+                    )
+
+            promotion_timeline = _normalized_text(promotion_review.locator(".timeline"))
+            denial_timeline = _normalized_text(denial_review.locator(".timeline"))
+            if "payload_edited" in promotion_timeline or "denied" in promotion_timeline:
+                pytest.fail("earlier Audit event included later mutable history", pytrace=False)
+            if "payload_edited" not in denial_timeline or "denied" not in denial_timeline:
+                pytest.fail("later Audit event omitted its immutable prior context", pytrace=False)
+
+            document_ids = page.locator("[id]").evaluate_all("nodes => nodes.map(node => node.id)")
+            if len(document_ids) != len(set(document_ids)):
+                pytest.fail("expanded Audit events produced duplicate DOM IDs", pytrace=False)
+            if (
+                promotion_review.locator(f"#context-audit-event-{promotion_event_id}").count() != 1
+                or denial_review.locator(f"#context-audit-event-{denial_event_id}").count() != 1
+            ):
+                pytest.fail("expanded Audit events did not use event-derived IDs", pytrace=False)
+
+            page.set_viewport_size({"width": 320, "height": 720})
+            _assert_layout(page)
+            _assert_identifier_wraps(
+                promotion_fragment.locator("..").locator(".request-summary-meta > span").last
+            )
+            _assert_identifier_wraps(
+                promotion_review.locator(".timeline li").last.locator(".timeline-heading span")
+            )
+            _assert_identifier_wraps(promotion_review.locator(".historical-band .hash-value"))
+
+            failure_signals = BrowserSignals()
+            failure_page = context.new_page()
+            _install_network_guards(failure_page, demo, failure_signals)
+            failure_page.goto(f"{demo.web_origin}/audit", wait_until="domcontentloaded")
+            promotion_review_url = f"{demo.web_origin}/audit/events/{promotion_event_id}/review"
+            failure_page.route(
+                promotion_review_url,
+                lambda route: route.fulfill(
+                    status=503,
+                    content_type="text/plain; charset=utf-8",
+                    body="temporary exact-event review failure",
+                ),
+            )
+            failed_fragment = failure_page.locator(
+                f'[data-review-url="/audit/events/{promotion_event_id}/review"]'
+            )
+            failed_fragment.locator("..").locator(":scope > summary").click()
+            failed_fragment.get_by_text("Close and reopen to retry", exact=False).wait_for()
+            exact_fallback = failed_fragment.get_by_role("link", name="dedicated audit event view")
+            if exact_fallback.get_attribute("href") != f"/audit/events/{promotion_event_id}":
+                pytest.fail("failed Audit expansion lost its exact event route", pytrace=False)
+            exact_fallback.click()
+            failure_page.wait_for_url(f"{demo.web_origin}/audit/events/{promotion_event_id}")
+            exact_review = failure_page.locator(".request-review")
+            exact_review.wait_for(state="visible")
+            if (
+                _context_value(exact_review, "Selected payload version") != "1"
+                or _context_value(exact_review, "Selected payload hash") != version_one_hash
+                or str(version_one_arguments["body"]) not in _normalized_text(exact_review)
+                or exact_review.locator("form, [data-passkey-action], [data-csrf]").count() != 0
+            ):
+                pytest.fail(
+                    "failed Audit expansion fallback was not exact-event-bound and read-only",
+                    pytrace=False,
+                )
+            _assert_layout(failure_page)
+            failure_page.close()
+            if (
+                failure_signals.error_responses != 1
+                # Chromium reports the deliberately injected 503 as one console error.
+                or failure_signals.console_errors != 1
+                or failure_signals.page_errors != 0
+                or failure_signals.failed_requests != 0
+                or failure_signals.external_requests != 0
+            ):
+                pytest.fail(
+                    f"Unexpected Audit fallback browser signals: {failure_signals!r}",
+                    pytrace=False,
+                )
+
+            no_js_signals = BrowserSignals()
+            no_js_context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                locale="en-US",
+                timezone_id="UTC",
+                java_script_enabled=False,
+                service_workers="block",
+            )
+            no_js_page = no_js_context.new_page()
+            no_js_page.set_default_timeout(10_000)
+            no_js_page.set_default_navigation_timeout(15_000)
+            _install_network_guards(no_js_page, demo, no_js_signals)
+            _login(no_js_page, demo)
+            no_js_page.goto(f"{demo.web_origin}/audit", wait_until="domcontentloaded")
+            no_js_fragment = no_js_page.locator(
+                f'[data-review-url="/audit/events/{promotion_event_id}/review"]'
+            )
+            no_js_fragment.locator("..").locator(":scope > summary").click()
+            no_js_fallback = no_js_fragment.get_by_role("link", name="dedicated audit event view")
+            if (
+                not no_js_fallback.is_visible()
+                or no_js_fallback.get_attribute("href") != f"/audit/events/{promotion_event_id}"
+            ):
+                pytest.fail("no-JavaScript Audit omitted its exact event route", pytrace=False)
+            no_js_fallback.click()
+            no_js_page.wait_for_url(f"{demo.web_origin}/audit/events/{promotion_event_id}")
+            no_js_review = no_js_page.locator(".request-review")
+            if (
+                _context_value(no_js_review, "Selected payload version") != "1"
+                or _context_value(no_js_review, "Selected payload hash") != version_one_hash
+                or str(version_one_arguments["body"]) not in _normalized_text(no_js_review)
+                or no_js_review.locator("form, [data-passkey-action], [data-csrf]").count() != 0
+            ):
+                pytest.fail(
+                    "no-JavaScript Audit fallback was not exact-event-bound and read-only",
+                    pytrace=False,
+                )
+            _assert_layout(no_js_page)
+            no_js_context.close()
+            if (
+                no_js_signals.console_errors != 0
+                or no_js_signals.page_errors != 0
+                or no_js_signals.failed_requests != 0
+                or no_js_signals.error_responses != 0
+                or no_js_signals.external_requests != 0
+            ):
+                pytest.fail(
+                    f"no-JavaScript Audit workflow emitted a browser error: {no_js_signals!r}",
+                    pytrace=False,
+                )
+
+            context.close()
+            browser.close()
+
+        if (
+            signals.console_errors != 0
+            or signals.page_errors != 0
+            or signals.failed_requests != 0
+            or signals.error_responses != 0
+            or signals.external_requests != 0
+        ):
+            pytest.fail(
+                "event-bound Audit browser workflow emitted an application or network error",
+                pytrace=False,
+            )
+        if signals.post_requests < 3 or not signals.exact_post_origins:
+            pytest.fail("event-bound Audit POSTs were not exact same-origin", pytrace=False)
+
+
+@pytest.mark.parametrize(
+    (
+        "access_arguments",
+        "force_deny_tool",
+        "expected_mode",
+        "expected_read_only",
+        "expected_communication",
+        "expected_classification",
+        "expected_consequence",
+    ),
+    (
+        (
+            ACCESS_ARGUMENTS,
+            ("fastmail", "search_email", "passthrough"),
+            "passthrough",
+            "Yes",
+            "Not a communication send",
+            "None",
+            "Future calls will bypass approval.",
+        ),
+        (
+            APPROVAL_ACCESS_ARGUMENTS,
+            ("fastmail", "send_email", "approval"),
+            "approval",
+            "No",
+            "Communication send",
+            "None",
+            "Future calls will still require separate approval.",
+        ),
+    ),
+    ids=("passthrough", "approval"),
+)
+def test_fake_demo_browser_tool_access_approval_is_expandable(
+    tmp_path: Path,
+    access_arguments: Mapping[str, str],
+    force_deny_tool: tuple[str, str, str] | None,
+    expected_mode: str,
+    expected_read_only: str,
+    expected_communication: str,
+    expected_classification: str,
+    expected_consequence: str,
+) -> None:
+    with _served_demo(tmp_path, force_deny_tool=force_deny_tool) as demo:
+        request_id = _enqueue_access_request(demo, access_arguments)
+        signals = BrowserSignals()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                timezone_id="UTC",
+                service_workers="block",
+            )
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.set_default_navigation_timeout(15_000)
+            _install_network_guards(page, demo, signals)
+            _login(page, demo)
+
+            queue_fragment = page.locator(f'[data-review-url="/requests/{request_id}/review"]')
+            queue_summary = queue_fragment.locator("..").locator(":scope > summary")
+            queue_summary.focus()
+            page.keyboard.press("Enter")
+            queue_review = queue_fragment.locator(".request-review")
+            try:
+                queue_review.wait_for(state="visible")
+            except Exception:
+                pytest.fail(
+                    "tool-access review fragment did not load: "
+                    f"{_normalized_text(queue_fragment)!r}",
+                    pytrace=False,
+                )
+            queue_text = _normalized_text(queue_review)
+            for expected in (
+                "Tool access policy proposal",
+                f"{access_arguments['alias']}.{access_arguments['tool']}",
+                access_arguments["reason"],
+                "Approval changes durable gateway policy; it does not call the requested tool.",
+                "Exact policy change on approval",
+                expected_consequence,
+            ):
+                if expected not in queue_text:
+                    pytest.fail(
+                        "tool-access queue review omitted frozen context "
+                        f"{expected!r}: {queue_text!r}",
+                        pytrace=False,
+                    )
+            policy_preview = queue_review.locator("[data-policy-preview]")
+            expected_preview = {
+                "Exact target": f"{access_arguments['alias']}.{access_arguments['tool']}",
+                "Target mode at review": "deny",
+                "Proposed new mode": expected_mode,
+                "Reviewed read-only": expected_read_only,
+                "Communication classification": expected_communication,
+                "Reviewed classification": expected_classification,
+                "Policy version at review": "1",
+                "Expected next version at review": "2",
+                "Active policy version": "1",
+            }
+            for label, value in expected_preview.items():
+                if _definition_value(policy_preview, label) != value:
+                    pytest.fail(
+                        f"tool-access policy preview misstated {label}",
+                        pytrace=False,
+                    )
+            if _context_value(queue_review, "Gateway request") != "Yes":
+                pytest.fail("tool-access queue review lost its gateway provenance", pytrace=False)
+            if queue_review.locator("[data-approval-reason]").count() != 0:
+                pytest.fail("tool-access approval exposed an ordinary send reason", pytrace=False)
+            if queue_review.locator(".edit-band").count() != 0:
+                pytest.fail(
+                    "tool-access approval exposed an invalid retargeting form", pytrace=False
+                )
+
+            form = queue_review.locator("form[data-decision-form]")
+            form.locator("input[name='totp_proof']").fill(
+                credential_value(demo.root, "web-action-proof")
+            )
+            with page.expect_navigation(wait_until="domcontentloaded"):
+                form.locator("button[name='action'][value='approve']").click()
+            page.wait_for_url(f"{demo.web_origin}/requests/{request_id}")
+            detail_text = _normalized_text(page.locator("main"))
+            if (
+                "Gateway policy change confirmed; requested tool was not called" not in detail_text
+                or "Downstream effect confirmed" in detail_text
+            ):
+                pytest.fail("tool-access detail misstated the policy-only outcome", pytrace=False)
+
+            page.goto(f"{demo.web_origin}/audit", wait_until="domcontentloaded")
+            decision = _decision_locator(page, request_id)
+            if decision.count() != 1:
+                pytest.fail("approved tool-access request is missing from Audit", pytrace=False)
+            decision_summary = decision.locator(":scope > details > summary")
+            summary_text = _normalized_text(decision_summary)
+            for expected in (
+                f"Policy change approved: {expected_mode}",
+                "gateway / request_tool_access",
+                "succeeded",
+                f"web:{DEMO_USER_ID}",
+                "TOTP via web",
+            ):
+                if expected not in summary_text:
+                    pytest.fail("tool-access Audit summary omitted provenance", pytrace=False)
+
+            decision_summary.focus()
+            page.keyboard.press("Space")
+            audit_review = decision.locator("[data-review-fragment] .request-review")
+            audit_review.wait_for(state="visible")
+            audit_text = _normalized_text(audit_review)
+            for expected in (
+                "Tool access policy proposal",
+                "Gateway policy change confirmed; requested tool was not called",
+                access_arguments["reason"],
+                f"policy_promoted_to_{expected_mode}",
+                "Confirmation: TOTP via web",
+                f'"new_mode": "{expected_mode}"',
+                '"old_mode": "deny"',
+                '"status": "policy_updated"',
+            ):
+                if expected not in audit_text:
+                    pytest.fail("tool-access Audit expansion omitted bound context", pytrace=False)
+            if "Downstream effect confirmed" in audit_text:
+                pytest.fail("tool-access Audit expansion claimed a downstream call", pytrace=False)
+            if (
+                audit_review.locator("form, [data-passkey-action], [data-csrf]").count() != 0
+                or audit_review.get_by_role("link", name="Download frozen bytes").count() != 0
+            ):
+                pytest.fail("tool-access Audit expansion exposed mutation controls", pytrace=False)
+            _assert_layout(page)
+            page.set_viewport_size({"width": 320, "height": 720})
+            _assert_layout(page)
+            _assert_truth_state_not_clipped(audit_review)
+
+            audit_html = page.content()
+            for field in ("web-password", "web-login-proof", "web-action-proof", "mcp-token"):
+                if credential_value(demo.root, field) in audit_html:
+                    pytest.fail("tool-access Audit exposed a credential", pytrace=False)
+            context.close()
+            browser.close()
+
+        if (
+            signals.console_errors != 0
+            or signals.page_errors != 0
+            or signals.failed_requests != 0
+            or signals.error_responses != 0
+            or signals.external_requests != 0
+        ):
+            pytest.fail(
+                "tool-access browser workflow emitted an application or network error",
+                pytrace=False,
+            )
+        if signals.post_requests < 2 or not signals.exact_post_origins:
+            pytest.fail(
+                "tool-access browser POSTs did not carry the exact same-origin Origin",
+                pytrace=False,
+            )
+
+
+def test_fake_demo_browser_stale_tool_access_keeps_context_and_can_be_denied(
+    tmp_path: Path,
+) -> None:
+    with _served_demo(
+        tmp_path,
+        force_deny_tool=("fastmail", "search_email", "passthrough"),
+    ) as demo:
+        first_id = _enqueue_access_request(demo, ACCESS_ARGUMENTS)
+        stale_arguments = {
+            **ACCESS_ARGUMENTS,
+            "reason": "Keep this exact stale proposal visible so a human can deny it.",
+        }
+        stale_id = _enqueue_access_request(demo, stale_arguments)
+        signals = BrowserSignals()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                timezone_id="UTC",
+                service_workers="block",
+            )
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.set_default_navigation_timeout(15_000)
+            _install_network_guards(page, demo, signals)
+            _login(page, demo)
+
+            first_review = _expand_request(page, first_id)
+            first_form = first_review.locator("form[data-decision-form]")
+            first_form.locator("input[name='totp_proof']").fill(
+                credential_value(demo.root, "web-action-proof")
+            )
+            with page.expect_navigation(wait_until="domcontentloaded"):
+                first_form.locator("button[name='action'][value='approve']").click()
+            page.wait_for_url(f"{demo.web_origin}/requests/{first_id}")
+
+            page.goto(f"{demo.web_origin}/", wait_until="domcontentloaded")
+            stale_review = _expand_request(page, stale_id)
+            stale_text = _normalized_text(stale_review)
+            for expected in (
+                "Frozen policy proposal at review",
+                stale_arguments["reason"],
+                "reviewed against policy v1, but active policy is v2",
+                "It cannot be approved. Deny or cancel it, then request fresh access.",
+            ):
+                if expected not in stale_text:
+                    pytest.fail(
+                        f"stale tool-access review omitted {expected!r}: {stale_text!r}",
+                        pytrace=False,
+                    )
+            stale_preview = stale_review.locator("[data-policy-preview]")
+            for label, expected_value in {
+                "Policy version at review": "1",
+                "Expected next version at review": "2",
+                "Active policy version": "2",
+            }.items():
+                if _definition_value(stale_preview, label) != expected_value:
+                    pytest.fail(
+                        f"stale tool-access review misstated {label}",
+                        pytrace=False,
+                    )
+            if stale_review.locator("button[name='action'][value='approve']").count() != 0:
+                pytest.fail("stale tool-access review still offered approval", pytrace=False)
+            if stale_review.locator("button[name='action'][value='deny']").count() != 1:
+                pytest.fail("stale tool-access review omitted denial", pytrace=False)
+            if stale_review.locator("button[name='action'][value='cancel']").count() != 1:
+                pytest.fail("stale tool-access review omitted cancellation", pytrace=False)
+
+            page.set_viewport_size({"width": 320, "height": 720})
+            _assert_layout(page)
+            page.set_viewport_size({"width": 1280, "height": 900})
+            _submit_decision(
+                page,
+                demo,
+                stale_review,
+                stale_id,
+                action="deny",
+                note=DENIAL_NOTE,
+            )
+
+            decision = _decision_locator(page, stale_id)
+            if decision.count() != 1:
+                pytest.fail("denied stale tool-access request is missing from Audit", pytrace=False)
+            decision_details = decision.locator(":scope > details")
+            if decision_details.get_attribute("open") is None:
+                decision.locator(":scope > details > summary").click()
+            audit_review = decision.locator("[data-review-fragment] .request-review")
+            audit_review.wait_for(state="visible")
+            audit_text = _normalized_text(audit_review)
+            for expected in (
+                "denied",
+                "Nothing was executed downstream",
+                "Frozen policy proposal at review",
+                stale_arguments["reason"],
+            ):
+                if expected not in audit_text:
+                    pytest.fail(
+                        f"denied stale Audit expansion omitted {expected!r}",
+                        pytrace=False,
+                    )
+            audit_preview = audit_review.locator("[data-policy-preview]")
+            if (
+                _definition_value(audit_preview, "Target mode at review") != "deny"
+                or _definition_value(audit_preview, "Proposed new mode") != "passthrough"
+            ):
+                pytest.fail("denied stale Audit expansion misstated the proposal", pytrace=False)
+            if audit_review.locator(".action-band").count() != 0:
+                pytest.fail("terminal stale Audit expansion exposed action controls", pytrace=False)
+            if audit_review.locator("form, [data-passkey-action], [data-csrf]").count() != 0:
+                pytest.fail("denied stale Audit expansion was not read-only", pytrace=False)
+            _assert_layout(page)
+            context.close()
+            browser.close()
+
+        if (
+            signals.console_errors != 0
+            or signals.page_errors != 0
+            or signals.failed_requests != 0
+            or signals.error_responses != 0
+            or signals.external_requests != 0
+        ):
+            pytest.fail(
+                "stale tool-access browser workflow emitted an application or network error",
+                pytrace=False,
+            )
+        if signals.post_requests < 3 or not signals.exact_post_origins:
+            pytest.fail(
+                "stale tool-access browser POSTs did not carry the exact same-origin Origin",
+                pytrace=False,
+            )
+
+
 def test_fake_demo_browser_cancel_omits_shared_decision_rationale(tmp_path: Path) -> None:
     with _served_demo(tmp_path) as demo:
-        request_id, _other_request_id, _email_arguments = _enqueue_requests(demo)
+        request_id, _other_request_id, email_arguments = _enqueue_requests(demo)
         signals = BrowserSignals()
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
@@ -952,6 +1781,24 @@ def test_fake_demo_browser_cancel_omits_shared_decision_rationale(tmp_path: Path
             review = _expand_request(page, request_id)
             _assert_passkey_note_routing(review)
 
+            edited_arguments = {
+                **email_arguments,
+                "body": "Edited in the browser before cancellation.",
+            }
+            edit_form = review.locator(".edit-band form")
+            edit_form.locator("[data-edit-json]").fill(json.dumps(edited_arguments))
+            edit_form.locator("input[name='totp_proof']").fill(
+                credential_value(demo.root, "web-action-proof")
+            )
+            with page.expect_navigation(wait_until="domcontentloaded"):
+                edit_form.get_by_role("button", name="Confirm edit").click()
+            page.wait_for_url(f"{demo.web_origin}/requests/{request_id}")
+
+            review = page.locator(".request-review")
+            edited_event = review.locator(".timeline li").filter(has_text="payload_edited")
+            if "Confirmation: TOTP via web" not in _normalized_text(edited_event):
+                pytest.fail("browser edit omitted confirmation provenance", pytrace=False)
+
             rejected_note = "duplicate_request"
             review.locator("[data-denial-reason]").select_option(rejected_note)
             form = review.locator("form[data-decision-form]")
@@ -965,6 +1812,9 @@ def test_fake_demo_browser_cancel_omits_shared_decision_rationale(tmp_path: Path
             detail = _normalized_text(page.locator("main"))
             if "cancelled" not in detail or "Nothing was executed downstream" not in detail:
                 pytest.fail("browser cancellation did not preserve terminal truth", pytrace=False)
+            cancelled_event = page.locator(".timeline li").filter(has_text="cancelled")
+            if "Confirmation: TOTP via web" not in _normalized_text(cancelled_event):
+                pytest.fail("browser cancellation omitted confirmation provenance", pytrace=False)
             if rejected_note in detail:
                 pytest.fail("cancellation retained a decision-only rationale", pytrace=False)
             _assert_layout(page)
@@ -985,3 +1835,63 @@ def test_fake_demo_browser_cancel_omits_shared_decision_rationale(tmp_path: Path
             pytest.fail(
                 "browser cancellation did not carry the exact same-origin Origin", pytrace=False
             )
+
+
+def test_expand_failure_preserves_dedicated_link_and_retries(tmp_path: Path) -> None:
+    with _served_demo(tmp_path) as demo:
+        request_id, _other_request_id, email_arguments = _enqueue_requests(demo)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                locale="en-US",
+                timezone_id="UTC",
+                service_workers="block",
+            )
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.set_default_navigation_timeout(15_000)
+            _login(page, demo)
+            attempts = 0
+
+            def fail_once(route: Route) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    route.fulfill(
+                        status=503,
+                        content_type="text/plain; charset=utf-8",
+                        body="temporary review failure",
+                    )
+                    return
+                route.continue_()
+
+            review_url = f"{demo.web_origin}/requests/{request_id}/review"
+            page.route(review_url, fail_once)
+            fragment = page.locator(f'[data-review-url="/requests/{request_id}/review"]')
+            expander = fragment.locator("..")
+            summary = expander.locator(":scope > summary")
+            summary.click()
+            fragment.get_by_text("Close and reopen to retry", exact=False).wait_for()
+            fallback = fragment.get_by_role("link", name="dedicated request view")
+            if fallback.get_attribute("href") != f"/requests/{request_id}":
+                pytest.fail("failed expansion lost its dedicated review route", pytrace=False)
+            if fragment.get_attribute("aria-busy") is not None:
+                pytest.fail("failed expansion remained marked busy", pytrace=False)
+
+            summary.click()
+            summary.click()
+            review = fragment.locator(".request-review")
+            review.wait_for(state="visible")
+            _assert_bound_context(
+                review,
+                request_id=request_id,
+                state="pending_approval",
+                alias="fastmail",
+                tool_name="send_email",
+                arguments=email_arguments,
+            )
+            if attempts != 2:
+                pytest.fail("failed expansion did not retry exactly once", pytrace=False)
+            context.close()
+            browser.close()

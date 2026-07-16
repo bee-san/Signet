@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import secrets
 import stat
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import yaml
 
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.auth import ActionBinding
 from signet.db import Database, IntegrityError
 from signet.decision_notes import DecisionAction, normalize_decision_note, reason_for_action
@@ -41,16 +44,18 @@ from signet.policy import (
     policy_document,
 )
 from signet.state_machine import ApprovalStateMachine
+from signet.web import PolicyPromotionPreview
 from signet.web_backend import (
     PolicyPromotionError,
     PreparedEdit,
     PrivatePayloadReviewer,
     WebActionDraft,
+    WebPayloadError,
 )
 
 PolicyFaultInjector = Callable[[str], None]
 PolicyApplyCallback = Callable[[PolicySnapshot], None]
-ListChangedCallback = Callable[[frozenset[str]], None]
+ListChangedCallback = Callable[[frozenset[str]], Awaitable[None] | None]
 _POLICY_ACTIONS = frozenset({"promote_approval", "promote_passthrough"})
 _MAX_POLICY_BYTES = 4 * 1024 * 1024
 _DEFAULT_MAX_POLICY_VERSIONS = 10_000
@@ -86,6 +91,14 @@ class PolicyDivergenceError(PolicyPersistenceError):
 
 class PolicyUnavailable(PolicyPersistenceError):
     """Policy mutation is disabled until durable recovery succeeds."""
+
+
+class PolicyPublicationGate(Protocol):
+    """Call-admission gate for aliases with an unpublished policy change."""
+
+    def gate_publication(self, aliases: frozenset[str]) -> None: ...
+
+    def ungate_publication(self, aliases: frozenset[str]) -> None: ...
 
 
 class SQLiteActionDraftRepository:
@@ -258,6 +271,7 @@ class SQLitePolicyPromotionBoundary:
         policy_path: Path,
         *,
         apply_policy: PolicyApplyCallback | None = None,
+        publication_gate: PolicyPublicationGate | None = None,
         notify_list_changed: ListChangedCallback | None = None,
         fault_injector: PolicyFaultInjector | None = None,
         clock: Callable[[], int] | None = None,
@@ -273,6 +287,8 @@ class SQLitePolicyPromotionBoundary:
             or not 1 <= max_policy_history_bytes <= 8 * 1024 * 1024 * 1024
         ):
             raise ValueError("durable policy history limits are invalid")
+        if apply_policy is not None and publication_gate is None:
+            raise ValueError("policy application requires a publication gate")
         expanded = policy_path.expanduser()
         resolved_parent = expanded.parent.resolve(strict=True)
         _require_secure_directory(resolved_parent)
@@ -303,18 +319,52 @@ class SQLitePolicyPromotionBoundary:
         self.pending_path = resolved.with_name(f".{resolved.name}.pending")
         self.lock_path = resolved.with_name(f".{resolved.name}.lock")
         self._apply_policy = apply_policy
+        self._publication_gate = publication_gate
         self._notify_list_changed = notify_list_changed
         self._fault_injector = fault_injector
         self._clock = clock or (lambda: int(time.time()))
         self._max_policy_versions = max_policy_versions
         self._max_policy_history_bytes = max_policy_history_bytes
         self._thread_lock = threading.RLock()
+        self._publication_lock = asyncio.Lock()
         self._ready = False
         self.recover(now=self._clock())
 
     @property
     def ready(self) -> bool:
         return self._ready
+
+    async def publish_pending(self, *, now: int | None = None) -> bool:
+        """Attempt one durable list-change publication and acknowledge it on success."""
+
+        selected_now = self._clock() if now is None else now
+        if not isinstance(selected_now, int) or isinstance(selected_now, bool) or selected_now < 0:
+            raise ValueError("policy publication time is invalid")
+        async with self._publication_lock:
+            prepared = await _run_sync(self._prepare_pending_publication)
+            if prepared is None:
+                return False
+            stored, aliases = prepared
+            self._gate_publication(aliases)
+
+            callback = self._notify_list_changed
+            if callback is None:
+                raise PolicyUnavailable("list-change publication callback is unavailable")
+            result = callback(aliases)
+            if inspect.isawaitable(result):
+                await result
+            elif result is not None:
+                raise PolicyPersistenceError(
+                    "list-change publication callback returned an invalid result"
+                )
+            self._fault("policy:published_callbacks")
+            await _run_sync(
+                self._acknowledge_publication,
+                stored,
+                aliases,
+                now=selected_now,
+            )
+            return True
 
     def binding_action(
         self,
@@ -335,6 +385,114 @@ class SQLitePolicyPromotionBoundary:
                 now=now,
             )
             return plan.binding_action
+
+    def preview(
+        self,
+        request_id: str,
+        action: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        now: int,
+    ) -> PolicyPromotionPreview:
+        self._require_ready()
+        with self._locked():
+            request = self.state_machine.get_request(request_id)
+            if int(request["current_version"]) != expected_version or not _same_text(
+                str(request["current_payload_hash"]), expected_payload_hash
+            ):
+                raise StaleVersion(request_id)
+            if (
+                action != "approve"
+                or not bool(request["gateway_internal"])
+                or request["downstream_alias"] != "gateway"
+                or request["tool_name"] != "request_tool_access"
+            ):
+                raise InvalidTransition("request is not a gateway policy proposal")
+            try:
+                reviewed = self.payloads.review(
+                    request_id,
+                    version=expected_version,
+                    payload_hash=expected_payload_hash,
+                )
+            except WebPayloadError as exc:
+                raise PolicyPersistenceError(
+                    "gateway policy proposal content could not be authenticated"
+                ) from exc
+            alias = reviewed.arguments.get("alias")
+            tool = reviewed.arguments.get("tool")
+            if not isinstance(alias, str) or not alias or not isinstance(tool, str) or not tool:
+                raise PolicyPersistenceError("gateway policy proposal target is invalid")
+            historical, active_version, publication_pending = self._reviewed_policy_snapshot(
+                reviewed.policy_version
+            )
+            current = historical.configured(alias, tool)
+            if current is None:
+                raise PolicyPersistenceError(
+                    "gateway policy proposal target is absent from its reviewed policy"
+                )
+            mode = _gateway_promotion_mode(current)
+            proposed_version = reviewed.policy_version + 1
+            historical_change_valid = reviewed.policy_version < _SQLITE_MAX_INTEGER
+            expected_snapshot: PolicySnapshot | None = None
+            try:
+                expected_snapshot, previous, updated = PolicyEngine(historical).preview_promotion(
+                    alias, tool, mode
+                )
+            except PolicyError:
+                historical_change_valid = False
+                previous = current
+                updated = replace(current, mode=mode)
+
+            stale = reviewed.policy_version != active_version
+            can_approve = (
+                request["state"] == "pending_approval"
+                and now < int(request["expires_at"])
+                and not stale
+                and not publication_pending
+                and historical_change_valid
+                and expected_snapshot is not None
+            )
+            if can_approve:
+                try:
+                    live_plan = self._build_plan(
+                        request_id,
+                        action,
+                        expected_version=expected_version,
+                        expected_payload_hash=expected_payload_hash,
+                        now=now,
+                    )
+                except (
+                    PolicyPromotionError,
+                    RequestNotFound,
+                    StaleVersion,
+                    InvalidTransition,
+                    RequestExpired,
+                ):
+                    can_approve = False
+                else:
+                    can_approve = (
+                        live_plan.alias == alias
+                        and live_plan.tool == tool
+                        and live_plan.mode is mode
+                        and live_plan.previous == previous
+                        and live_plan.updated == updated
+                        and live_plan.snapshot == expected_snapshot
+                    )
+            return PolicyPromotionPreview(
+                target_alias=alias,
+                target_tool=tool,
+                current_mode=previous.mode.value,
+                proposed_mode=updated.mode.value,
+                reviewed_read_only=previous.reviewed_read_only,
+                communication_send=previous.communication_send,
+                reviewed_classification=previous.reviewed_classification,
+                current_policy_version=reviewed.policy_version,
+                proposed_policy_version=proposed_version,
+                active_policy_version=active_version,
+                can_approve=can_approve,
+                stale=stale,
+            )
 
     def promote(
         self,
@@ -393,14 +551,17 @@ class SQLitePolicyPromotionBoundary:
                     )
                 if self.pending_path.exists() or self.pending_path.is_symlink():
                     self._remove_untracked_pending()
+            aliases = (
+                _changed_aliases_from_latest(self.database, stored.version)
+                if stored.publication_pending
+                else frozenset()
+            )
+            self._gate_publication(aliases)
             self.engine.restore_durable_snapshot(snapshot)
             if self._apply_policy is not None:
                 self._apply_policy(snapshot)
-            if stored.publication_pending and self._notify_list_changed is not None:
-                aliases = _changed_aliases_from_latest(self.database, stored.version)
-                self._notify_list_changed(aliases)
             if stored.publication_pending:
-                self._mark_published(stored, now=now)
+                self._publish_synchronously_if_possible(stored, aliases=aliases, now=now)
             self._ready = True
 
     def _promote(
@@ -553,23 +714,24 @@ class SQLitePolicyPromotionBoundary:
                     now=now,
                 )
                 self._fault("policy:synced")
+                aliases = frozenset({plan.alias})
+                self._gate_publication(aliases)
                 self.engine.restore_durable_snapshot(plan.snapshot)
                 if self._apply_policy is not None:
                     self._apply_policy(plan.snapshot)
-                if self._notify_list_changed is not None:
-                    self._notify_list_changed(frozenset({plan.alias}))
-                self._fault("policy:published_callbacks")
-                self._mark_published(
-                    _StoredPolicy(
-                        plan.snapshot.version,
-                        plan.config_hash,
-                        plan.file_sha256,
-                        "synced",
-                        plan.snapshot_yaml,
-                        True,
-                        True,
-                        plan.previous_file_sha256,
-                    ),
+                published = _StoredPolicy(
+                    plan.snapshot.version,
+                    plan.config_hash,
+                    plan.file_sha256,
+                    "synced",
+                    plan.snapshot_yaml,
+                    True,
+                    True,
+                    plan.previous_file_sha256,
+                )
+                self._publish_synchronously_if_possible(
+                    published,
+                    aliases=aliases,
                     now=now,
                 )
                 self._ready = True
@@ -607,25 +769,26 @@ class SQLitePolicyPromotionBoundary:
                 or request["tool_name"] != "request_tool_access"
             ):
                 raise InvalidTransition("gateway policy proposals cannot be retargeted")
-            reviewed = self.payloads.review(
-                request_id,
-                version=expected_version,
-                payload_hash=expected_payload_hash,
-            )
+            try:
+                reviewed = self.payloads.review(
+                    request_id,
+                    version=expected_version,
+                    payload_hash=expected_payload_hash,
+                )
+            except WebPayloadError as exc:
+                raise PolicyPersistenceError(
+                    "gateway policy proposal content could not be authenticated"
+                ) from exc
             alias = reviewed.arguments.get("alias")
             tool = reviewed.arguments.get("tool")
             if not isinstance(alias, str) or not isinstance(tool, str):
-                raise PolicyError("gateway policy proposal target is invalid")
+                raise PolicyPersistenceError("gateway policy proposal target is invalid")
+            if reviewed.policy_version != self.engine.snapshot.version:
+                raise StaleVersion(request_id)
             current = self.engine.snapshot.configured(alias, tool)
             if current is None:
-                raise PolicyError("only a discovered, reviewed tool can be promoted")
-            mode = (
-                PolicyMode.PASSTHROUGH
-                if current.reviewed_read_only
-                and not current.communication_send
-                and current.reviewed_classification is None
-                else PolicyMode.APPROVAL
-            )
+                raise PolicyPersistenceError("only a discovered, reviewed tool can be promoted")
+            mode = _gateway_promotion_mode(current)
             origin = "request_tool_access"
         else:
             if action not in _POLICY_ACTIONS:
@@ -635,15 +798,10 @@ class SQLitePolicyPromotionBoundary:
             mode = PolicyMode.APPROVAL if action == "promote_approval" else PolicyMode.PASSTHROUGH
             origin = "one_click_promotion"
         binding_action = f"promote_{mode.value}"
-        stored = self._stored_policy()
-        if (
-            stored is None
-            or stored.sync_state != "synced"
-            or stored.publication_pending
-            or stored.version != self.engine.snapshot.version
-            or not _same_text(stored.config_hash, policy_config_hash(self.engine.snapshot))
-        ):
+        stored = self._stored_policy(verify_history=True)
+        if stored is None:
             raise PolicyUnavailable("durable policy is not ready for promotion")
+        self._require_active_policy(stored)
         if self.engine.snapshot.version >= _SQLITE_MAX_INTEGER:
             raise PolicyUnavailable("durable policy version space is exhausted")
         try:
@@ -687,6 +845,81 @@ class SQLitePolicyPromotionBoundary:
             file_sha256=hashlib.sha256(serialized).hexdigest(),
             previous_file_sha256=stored.file_sha256,
         )
+
+    def _reviewed_policy_snapshot(self, version: int) -> tuple[PolicySnapshot, int, bool]:
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or not 1 <= version <= _SQLITE_MAX_INTEGER
+        ):
+            raise PolicyDivergenceError("reviewed policy version is invalid")
+        try:
+            stored = self._stored_policy(verify_history=True)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PolicyDivergenceError("durable policy history metadata is invalid") from exc
+        if stored is None:
+            raise PolicyDivergenceError("durable policy history is unavailable")
+        self._require_active_policy(stored, require_published=False)
+
+        with self.database.read() as connection:
+            row = connection.execute(
+                """
+                SELECT snapshot.policy_version_id, snapshot.config_hash,
+                       snapshot.snapshot_yaml, snapshot.file_sha256,
+                       version.config_hash AS version_config_hash,
+                       version.applied
+                FROM durable_policy_snapshots AS snapshot
+                JOIN policy_versions AS version
+                  ON version.policy_version_id = snapshot.policy_version_id
+                WHERE snapshot.policy_version_id = ?
+                """,
+                (version,),
+            ).fetchone()
+        if row is None:
+            raise PolicyDivergenceError("reviewed durable policy snapshot is unavailable")
+        try:
+            row_version = int(row["policy_version_id"])
+            config_hash = str(row["config_hash"])
+            snapshot_yaml = bytes(row["snapshot_yaml"])
+            file_sha256 = str(row["file_sha256"])
+            version_config_hash = str(row["version_config_hash"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PolicyDivergenceError("reviewed durable policy metadata is invalid") from exc
+        snapshot = _parse_snapshot(snapshot_yaml)
+        if (
+            row_version != version
+            or not bool(row["applied"])
+            or not _same_text(config_hash, version_config_hash)
+            or not _same_digest(snapshot_yaml, file_sha256)
+            or snapshot.version != version
+            or not _same_text(policy_config_hash(snapshot), config_hash)
+        ):
+            raise PolicyDivergenceError("reviewed durable policy failed integrity review")
+        return snapshot, stored.version, stored.publication_pending
+
+    def _require_active_policy(
+        self,
+        stored: _StoredPolicy,
+        *,
+        require_published: bool = True,
+    ) -> PolicySnapshot:
+        active = self._validate_stored(stored)
+        if (
+            stored.sync_state != "synced"
+            or (require_published and stored.publication_pending)
+            or not stored.applied
+            or stored.version > _SQLITE_MAX_INTEGER
+            or active != self.engine.snapshot
+            or not _same_text(stored.config_hash, policy_config_hash(self.engine.snapshot))
+        ):
+            raise PolicyDivergenceError("active durable policy is not safely published")
+        try:
+            current_file = _read_regular(self.policy_path)
+        except OSError as exc:
+            raise PolicyDivergenceError("active durable policy file is unavailable") from exc
+        if not _same_digest(current_file, stored.file_sha256):
+            raise PolicyDivergenceError("active durable policy file failed integrity review")
+        return active
 
     def _record_request_policy_event(
         self,
@@ -1070,6 +1303,70 @@ class SQLitePolicyPromotionBoundary:
             if updated != 1:
                 raise PolicyUnavailable("applied policy publication marker changed")
 
+    def _prepare_pending_publication(
+        self,
+    ) -> tuple[_StoredPolicy, frozenset[str]] | None:
+        with self._locked():
+            stored = self._stored_policy(verify_history=True)
+            if stored is None:
+                raise PolicyUnavailable("durable policy state is unavailable")
+            self._validate_stored(stored)
+            if stored.sync_state != "synced":
+                raise PolicyUnavailable("durable policy file is not synchronized")
+            if not stored.publication_pending:
+                return None
+            aliases = _changed_aliases_from_latest(self.database, stored.version)
+            return stored, aliases
+
+    def _acknowledge_publication(
+        self,
+        stored: _StoredPolicy,
+        aliases: frozenset[str],
+        *,
+        now: int,
+    ) -> None:
+        with self._locked():
+            current = self._stored_policy(verify_history=True)
+            if current != stored:
+                raise PolicyUnavailable("durable policy changed during publication")
+            self._mark_published(stored, now=now)
+        self._ungate_publication(aliases)
+
+    def _publish_synchronously_if_possible(
+        self,
+        stored: _StoredPolicy,
+        *,
+        aliases: frozenset[str],
+        now: int,
+    ) -> bool:
+        self._gate_publication(aliases)
+        callback = self._notify_list_changed
+        if callback is None or _is_async_callback(callback):
+            return False
+        result = callback(aliases)
+        if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
+                result.close()
+            raise PolicyPersistenceError(
+                "list-change publication callback must declare asynchronous execution"
+            )
+        if result is not None:
+            raise PolicyPersistenceError(
+                "list-change publication callback returned an invalid result"
+            )
+        self._fault("policy:published_callbacks")
+        self._mark_published(stored, now=now)
+        self._ungate_publication(aliases)
+        return True
+
+    def _gate_publication(self, aliases: frozenset[str]) -> None:
+        if self._publication_gate is not None:
+            self._publication_gate.gate_publication(aliases)
+
+    def _ungate_publication(self, aliases: frozenset[str]) -> None:
+        if self._publication_gate is not None:
+            self._publication_gate.ungate_publication(aliases)
+
     def _write_pending(self, content: bytes) -> None:
         if len(content) > _MAX_POLICY_BYTES:
             raise PolicyPersistenceError("policy snapshot exceeds the writeback limit")
@@ -1331,6 +1628,22 @@ def _same_text(first: str, second: str) -> bool:
 
 def _same_digest(content: bytes, expected: str) -> bool:
     return _same_text(hashlib.sha256(content).hexdigest(), expected)
+
+
+def _is_async_callback(callback: ListChangedCallback) -> bool:
+    return inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
+        type(callback).__call__
+    )
+
+
+def _gateway_promotion_mode(current: ToolPolicy) -> PolicyMode:
+    if (
+        current.reviewed_read_only
+        and not current.communication_send
+        and current.reviewed_classification is None
+    ):
+        return PolicyMode.PASSTHROUGH
+    return PolicyMode.APPROVAL
 
 
 def _canonical_json(value: Any) -> str:

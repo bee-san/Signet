@@ -23,6 +23,7 @@ from signet.private_paths import (
     PrivatePathError,
     ensure_owned_directory,
     ensure_private_directory,
+    require_no_acl_grants,
 )
 
 try:  # pragma: no cover - selection depends on the runtime build
@@ -32,14 +33,53 @@ except ImportError:  # pragma: no cover - CPython's bundled driver is normal
 
 
 IntegrityError = sqlite3.IntegrityError
-LATEST_SCHEMA_VERSION = 13
+LATEST_SCHEMA_VERSION = 14
 MIN_SUPPORTED_SCHEMA_VERSION = 1
 MINIMUM_SQLITE_VERSION = (3, 51, 3)
 _MIGRATION_PATTERN = re.compile(r"^(\d{4})_[a-z0-9_]+\.sql$")
+_CONNECTION_CLOSE_FAILURE_NOTE = (
+    "The SQLite connection close outcome could not be confirmed; stop Signet processes and "
+    "verify the database before retrying."
+)
+_LOCK_RELEASE_FAILURE_NOTE = (
+    "The database maintenance-lock release outcome could not be confirmed; stop Signet "
+    "processes and inspect the private maintenance lock before retrying."
+)
+_LOCK_CLOSE_FAILURE_NOTE = (
+    "The database maintenance-lock descriptor close outcome could not be confirmed; stop "
+    "Signet processes and inspect the private maintenance lock before retrying."
+)
+DATABASE_OPERATOR_RECOVERY_NOTES = frozenset(
+    {
+        _CONNECTION_CLOSE_FAILURE_NOTE,
+        _LOCK_RELEASE_FAILURE_NOTE,
+        _LOCK_CLOSE_FAILURE_NOTE,
+    }
+)
+_BEGIN_STATEMENTS = {
+    "DEFERRED": "BEGIN DEFERRED",
+    "IMMEDIATE": "BEGIN IMMEDIATE",
+    "EXCLUSIVE": "BEGIN EXCLUSIVE",
+}
+_USER_VERSION_STATEMENTS = {
+    version: f"PRAGMA user_version={version}"
+    for version in range(MIN_SUPPORTED_SCHEMA_VERSION, LATEST_SCHEMA_VERSION + 1)
+}
 
 
 class DatabaseError(RuntimeError):
     pass
+
+
+class DatabaseRecoveryNoteCarrier:
+    """Marker for bounded operator errors that safely surface database recovery notes."""
+
+
+class DatabaseFinalizationStateUnknown(DatabaseError):
+    """Database work completed or failed, but required finalization is uncertain."""
+
+    def operator_message(self) -> str:
+        return str(self)
 
 
 class IncompatibleSchemaError(DatabaseError):
@@ -103,17 +143,36 @@ class Database:
         if self.path.is_symlink():
             raise DatabaseError("the approval database may not be a symbolic link")
         if not self.path.exists():
-            descriptor = os.open(
-                self.path,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-            )
-            os.fchmod(descriptor, 0o600)
-            os.close(descriptor)
+            try:
+                descriptor = os.open(
+                    self.path,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                )
+            except FileExistsError:
+                # Another initializer won the O_EXCL publication race.
+                descriptor = None
+            if descriptor is not None:
+                creation_error: BaseException | None = None
+                try:
+                    os.fchmod(descriptor, 0o600)
+                    require_no_acl_grants(descriptor)
+                except BaseException as exc:
+                    creation_error = exc
+                try:
+                    os.close(descriptor)
+                except BaseException as exc:
+                    if creation_error is None:
+                        creation_error = exc
+                if creation_error is not None:
+                    raise DatabaseFinalizationStateUnknown(
+                        "the new approval database could not be secured and finalized; stop "
+                        "Signet processes and inspect the database path before retrying"
+                    ) from creation_error
         _require_private_file(self.path, label="approval database")
 
         with self._maintenance_lock():
@@ -131,6 +190,7 @@ class Database:
         pre_migration_backup: PreMigrationBackup | None,
     ) -> None:
         connection = self._connect()
+        operation_error: BaseException | None = None
         try:
             journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             if str(journal_mode).lower() != "wal":
@@ -177,8 +237,31 @@ class Database:
                 fault_injector("migration:postcheck")
             if integrity != "ok" or foreign_keys:
                 raise MigrationIntegrityError("post-migration database integrity check failed")
-        finally:
+        except BaseException as exc:
+            operation_error = exc
+
+        close_error: BaseException | None = None
+        try:
             connection.close()
+        except BaseException as exc:
+            close_error = exc
+
+        if operation_error is not None:
+            if close_error is not None:
+                operation_error.add_note(_CONNECTION_CLOSE_FAILURE_NOTE)
+                if not isinstance(operation_error, DatabaseRecoveryNoteCarrier):
+                    raise DatabaseFinalizationStateUnknown(
+                        "database maintenance failed, and the SQLite connection close outcome "
+                        "could not be confirmed; stop Signet processes and verify the database "
+                        "before retrying"
+                    ) from operation_error
+            raise operation_error.with_traceback(operation_error.__traceback__)
+        if close_error is not None:
+            raise DatabaseFinalizationStateUnknown(
+                "database maintenance completed, but the SQLite connection close outcome "
+                "could not be confirmed; stop Signet processes and verify the database "
+                "before retrying"
+            ) from close_error
 
     @staticmethod
     def _complete_privacy_maintenance(
@@ -186,21 +269,36 @@ class Database:
         *,
         fault_injector: MigrationFaultInjector | None,
     ) -> None:
-        table = connection.execute(
-            """
-            SELECT 1 FROM sqlite_schema
-            WHERE type = 'table' AND name = 'privacy_maintenance'
-            """
-        ).fetchone()
-        if table is None:
-            return
-        row = connection.execute(
-            """
-            SELECT pending FROM privacy_maintenance
-            WHERE maintenance_name = 'structured_decision_reasons'
-            """
-        ).fetchone()
-        if row is None or int(row[0]) == 0:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_schema
+                WHERE type = 'table' AND name IN (
+                    'privacy_maintenance',
+                    'attachment_metadata_privacy_maintenance'
+                )
+                """
+            ).fetchall()
+        }
+        pending = False
+        if "privacy_maintenance" in tables:
+            row = connection.execute(
+                """
+                SELECT pending FROM privacy_maintenance
+                WHERE maintenance_name = 'structured_decision_reasons'
+                """
+            ).fetchone()
+            pending = row is not None and int(row[0]) != 0
+        if "attachment_metadata_privacy_maintenance" in tables:
+            row = connection.execute(
+                """
+                SELECT pending FROM attachment_metadata_privacy_maintenance
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            pending = pending or (row is not None and int(row[0]) != 0)
+        if not pending:
             return
         if fault_injector is not None:
             fault_injector("privacy-maintenance:before-vacuum")
@@ -212,12 +310,20 @@ class Database:
             fault_injector("privacy-maintenance:after-vacuum")
         connection.execute("BEGIN IMMEDIATE")
         try:
-            connection.execute(
-                """
-                UPDATE privacy_maintenance SET pending = 0
-                WHERE maintenance_name = 'structured_decision_reasons' AND pending = 1
-                """
-            )
+            if "privacy_maintenance" in tables:
+                connection.execute(
+                    """
+                    UPDATE privacy_maintenance SET pending = 0
+                    WHERE maintenance_name = 'structured_decision_reasons' AND pending = 1
+                    """
+                )
+            if "attachment_metadata_privacy_maintenance" in tables:
+                connection.execute(
+                    """
+                    UPDATE attachment_metadata_privacy_maintenance SET pending = 0
+                    WHERE singleton = 1 AND pending = 1
+                    """
+                )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -236,14 +342,79 @@ class Database:
             os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
             0o600,
         )
+        lock_acquired = False
+        operation_error: BaseException | None = None
         try:
+            metadata = os.fstat(descriptor)
+            current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != current_uid
+                or metadata.st_nlink != 1
+            ):
+                raise DatabaseError("the database maintenance lock is unsafe")
+            os.fchmod(descriptor, 0o600)
+            try:
+                require_no_acl_grants(descriptor)
+            except PrivatePathError as exc:
+                raise DatabaseError("the database maintenance lock is unsafe") from exc
             if not _private_file_metadata(os.fstat(descriptor)):
                 raise DatabaseError("the database maintenance lock is unsafe")
             fcntl.flock(descriptor, fcntl.LOCK_EX)
+            lock_acquired = True
             yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except BaseException as exc:
+            operation_error = exc
+
+        unlock_error: BaseException | None = None
+        if lock_acquired:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except BaseException as exc:
+                unlock_error = exc
+
+        close_error: BaseException | None = None
+        try:
             os.close(descriptor)
+        except BaseException as exc:
+            close_error = exc
+
+        if operation_error is not None:
+            if unlock_error is not None:
+                operation_error.add_note(_LOCK_RELEASE_FAILURE_NOTE)
+            if close_error is not None:
+                operation_error.add_note(_LOCK_CLOSE_FAILURE_NOTE)
+            if (unlock_error is not None or close_error is not None) and not isinstance(
+                operation_error, DatabaseRecoveryNoteCarrier
+            ):
+                primary = (
+                    operation_error.operator_message()
+                    if isinstance(operation_error, DatabaseFinalizationStateUnknown)
+                    else "database operation failed"
+                )
+                raise DatabaseFinalizationStateUnknown(
+                    f"{primary}; additionally, maintenance-lock finalization could not be "
+                    "confirmed; stop Signet processes and inspect the private maintenance lock "
+                    "before retrying"
+                ) from operation_error
+            raise operation_error.with_traceback(operation_error.__traceback__)
+
+        if unlock_error is not None or close_error is not None:
+            if unlock_error is not None and close_error is not None:
+                detail = "maintenance-lock release and descriptor close"
+                finalizer_error = unlock_error
+            elif unlock_error is not None:
+                detail = "maintenance-lock release"
+                finalizer_error = unlock_error
+            else:
+                detail = "maintenance-lock descriptor close"
+                assert close_error is not None
+                finalizer_error = close_error
+            raise DatabaseFinalizationStateUnknown(
+                f"database maintenance completed, but the {detail} outcome could not be "
+                "confirmed; stop Signet processes and inspect the private maintenance lock "
+                "before retrying"
+            ) from finalizer_error
 
     def connect(self) -> Any:
         """Return a configured caller-owned connection."""
@@ -260,11 +431,12 @@ class Database:
 
     @contextmanager
     def transaction(self, *, mode: str = "IMMEDIATE") -> Iterator[Any]:
-        if mode not in {"DEFERRED", "IMMEDIATE", "EXCLUSIVE"}:
+        begin = _BEGIN_STATEMENTS.get(mode)
+        if begin is None:
             raise ValueError(f"unsupported SQLite transaction mode: {mode}")
         connection = self._connect()
         try:
-            connection.execute(f"BEGIN {mode}")
+            connection.execute(begin)
             yield connection
             connection.commit()
         except BaseException:
@@ -388,7 +560,6 @@ class Database:
         try:
             connection.row_factory = sqlite3.Row
             expected_timeout = int(self.timeout * 1000)
-            connection.execute(f"PRAGMA busy_timeout={expected_timeout}")
             connection.execute("PRAGMA foreign_keys=ON")
             journal_mode = str(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
             connection.execute("PRAGMA synchronous=FULL")
@@ -460,7 +631,7 @@ class Database:
                     LATEST_SCHEMA_VERSION,
                 ),
             )
-            connection.execute(f"PRAGMA user_version={version}")
+            connection.execute(_USER_VERSION_STATEMENTS[version])
             if fault_injector is not None:
                 fault_injector(f"migration:{version}:before_commit")
             connection.commit()

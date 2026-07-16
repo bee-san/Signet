@@ -516,6 +516,77 @@ def test_attachment_retention_boundaries_match_each_terminal_state(
     assert not records[RequestState.FAILED].path.exists()
 
 
+def test_attachment_purge_redacts_database_metadata_and_requests_page_cleanup(
+    database: Database, staging: StagingStore
+) -> None:
+    staged = _stage(staging, "metadata-private", b"private attachment content")
+    _request(
+        database,
+        request_id="metadata-private",
+        state=RequestState.SUCCEEDED,
+        staged=staged,
+        key_reference="keychain://Signet/metadata-private",
+    )
+    manager = RetentionManager(database, staging, matrix=_matrix())
+
+    report = manager.run_due(now=COMPLETED_AT)
+
+    assert report.completed == 1
+    with database.read() as connection:
+        attachment = connection.execute(
+            """
+            SELECT filename, mime_type, size_bytes, sha256, storage_path, purged_at
+            FROM attachments WHERE request_id = 'metadata-private'
+            """
+        ).fetchone()
+        catalog = connection.execute(
+            """
+            SELECT adapter, account, filename, declared_mime, detected_mime,
+                   size_bytes, sha256, storage_path, envelope_size,
+                   envelope_sha256, purged_at
+            FROM staged_objects WHERE consumed_request_id = 'metadata-private'
+            """
+        ).fetchone()
+        maintenance = connection.execute(
+            """
+            SELECT pending FROM attachment_metadata_privacy_maintenance
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    assert tuple(attachment) == (
+        "<redacted>",
+        "application/octet-stream",
+        0,
+        "0" * 64,
+        None,
+        COMPLETED_AT,
+    )
+    assert tuple(catalog) == (
+        "<redacted>",
+        "<redacted>",
+        "<redacted>",
+        "application/octet-stream",
+        "application/octet-stream",
+        0,
+        "0" * 64,
+        None,
+        1,
+        "0" * 64,
+        COMPLETED_AT,
+    )
+    assert maintenance["pending"] == 1
+
+    Database(database.path).initialize()
+    with database.read() as connection:
+        maintenance = connection.execute(
+            """
+            SELECT pending FROM attachment_metadata_privacy_maintenance
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    assert maintenance["pending"] == 0
+
+
 def test_outcome_unknown_is_protected_even_from_a_preexisting_due_job(
     database: Database, staging: StagingStore
 ) -> None:

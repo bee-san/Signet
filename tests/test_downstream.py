@@ -44,6 +44,7 @@ def _http_config(**changes: Any) -> DownstreamConfig:
     values: dict[str, Any] = {
         "transport": "http",
         "credential_ref": "keychain://Signet/example",
+        "credential_identity_digest": "c" * 64,
         "url": "https://provider.test/mcp",
         "timeout_seconds": 2,
     }
@@ -55,14 +56,27 @@ def _stdio_config(**changes: Any) -> DownstreamConfig:
     values: dict[str, Any] = {
         "transport": "stdio",
         "credential_ref": "keychain://Signet/example",
+        "credential_identity_digest": "c" * 64,
         "command": ("/opt/signet/bin/provider-mcp", "--mode", "json"),
         "working_directory": Path.home().resolve(),
         "executable_sha256": "a" * 64,
-        "execution_snapshot_root": Path("/var/empty/signet-exec"),
+        "execution_snapshot_root": Path("/var/empty/signet-exec").resolve(),
         "timeout_seconds": 2,
     }
     values.update(changes)
     return DownstreamConfig(**values)
+
+
+def test_credential_generation_identity_is_explicit_and_rotates_with_inventory() -> None:
+    original = DownstreamClient("example", _http_config(), _store())
+    rotated = DownstreamClient(
+        "example",
+        _http_config(credential_identity_digest="d" * 64),
+        _store(),
+    )
+
+    assert original.credential_identity_digest == "c" * 64
+    assert rotated.credential_identity_digest == "d" * 64
 
 
 @asynccontextmanager

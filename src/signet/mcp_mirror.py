@@ -9,6 +9,7 @@ import json
 import math
 import re
 import secrets
+import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -25,8 +26,9 @@ from pydantic import PrivateAttr, model_serializer
 from referencing import Registry
 from referencing.exceptions import NoSuchResource
 
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.canonical import canonical_json, sha256_hex
-from signet.policy import PolicyMode, PolicySnapshot
+from signet.policy import DownstreamPolicy, PolicyMode, PolicySnapshot, ToolPolicy
 
 PENDING_RESULT_SCHEMA: dict[str, Any] = {
     "$id": "https://signet.local/schemas/pending-result-v1.json",
@@ -71,6 +73,7 @@ _MAX_INSTANCE_DEPTH = 64
 _MAX_INSTANCE_KEY_BYTES = 4 * 1024
 _MAX_INSTANCE_SCALAR_BYTES = 8 * 1024 * 1024
 _MAX_INSTANCE_SCALAR_BYTES_TOTAL = 16 * 1024 * 1024
+_MAX_VIRTUAL_RESULT_BYTES = 4 * 1024 * 1024
 
 _SCHEMA_SINGLE_KEYWORDS = frozenset(
     {
@@ -819,6 +822,13 @@ class CapturedTool:
     output_validator: Draft202012Validator | None
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewedExecutionSnapshot:
+    downstream: DownstreamPolicy
+    tool: ToolPolicy
+    schema_digest: str
+
+
 class SchemaMirror:
     """Capture raw downstream definitions and expose only reviewed exact policies."""
 
@@ -827,20 +837,40 @@ class SchemaMirror:
         self._captured: dict[tuple[str, str], CapturedTool] = {}
         self._reviewed_digests: dict[tuple[str, str], str] = {}
         self._drifted: set[tuple[str, str]] = set()
+        self._publication_lock = threading.RLock()
+        self._publication_pending_aliases: frozenset[str] = frozenset()
 
     @property
     def policy(self) -> PolicySnapshot:
-        return self._policy
+        with self._publication_lock:
+            return self._policy
 
     def apply_policy(self, policy: PolicySnapshot) -> set[str]:
-        aliases = set(self._policy.downstreams) | set(policy.downstreams)
-        changed = {
-            alias
-            for alias in aliases
-            if self._policy.downstreams.get(alias) != policy.downstreams.get(alias)
-        }
-        self._policy = policy
-        return changed
+        with self._publication_lock:
+            aliases = set(self._policy.downstreams) | set(policy.downstreams)
+            changed = {
+                alias
+                for alias in aliases
+                if self._policy.downstreams.get(alias) != policy.downstreams.get(alias)
+            }
+            self._policy = policy
+            return changed
+
+    def gate_publication(self, aliases: frozenset[str]) -> None:
+        """Expose changed schemas while refusing calls until publication is durable."""
+
+        _validate_publication_aliases(aliases)
+        with self._publication_lock:
+            self._publication_pending_aliases |= aliases
+
+    def ungate_publication(self, aliases: frozenset[str]) -> None:
+        _validate_publication_aliases(aliases)
+        with self._publication_lock:
+            self._publication_pending_aliases -= aliases
+
+    def is_publication_pending(self, alias: str) -> bool:
+        with self._publication_lock:
+            return alias in self._publication_pending_aliases
 
     def capture(self, alias: str, tools: Sequence[Mapping[str, Any] | types.Tool]) -> set[str]:
         seen: set[str] = set()
@@ -879,88 +909,122 @@ class SchemaMirror:
                 )
             )
 
-        changed: set[str] = set()
-        for captured in prepared:
-            key = (alias, captured.name)
-            previous = self._captured.get(key)
-            self._captured[key] = captured
-            reviewed = self._reviewed_digests.get(key)
-            if reviewed is not None and reviewed != captured.digest:
-                self._drifted.add(key)
-                changed.add(captured.name)
-            elif reviewed == captured.digest:
-                self._drifted.discard(key)
-            if previous is not None and previous.digest != captured.digest:
-                changed.add(captured.name)
-        for key in tuple(self._captured):
-            if key[0] == alias and key[1] not in seen:
-                del self._captured[key]
-                self._drifted.add(key)
-                changed.add(key[1])
-        return changed
+        with self._publication_lock:
+            changed: set[str] = set()
+            for captured in prepared:
+                key = (alias, captured.name)
+                previous = self._captured.get(key)
+                self._captured[key] = captured
+                reviewed = self._reviewed_digests.get(key)
+                if reviewed is not None and reviewed != captured.digest:
+                    self._drifted.add(key)
+                    changed.add(captured.name)
+                elif reviewed == captured.digest:
+                    self._drifted.discard(key)
+                if previous is not None and previous.digest != captured.digest:
+                    changed.add(captured.name)
+            for key in tuple(self._captured):
+                if key[0] == alias and key[1] not in seen:
+                    del self._captured[key]
+                    self._drifted.add(key)
+                    changed.add(key[1])
+            return changed
 
     def approve_schema(self, alias: str, tool: str, digest: str) -> None:
-        key = (alias, tool)
-        captured = self._captured.get(key)
-        if captured is None or captured.digest != digest:
-            raise SchemaDriftError("only the currently captured schema digest can be reviewed")
-        self._reviewed_digests[key] = digest
-        self._drifted.discard(key)
+        with self._publication_lock:
+            key = (alias, tool)
+            captured = self._captured.get(key)
+            if captured is None or captured.digest != digest:
+                raise SchemaDriftError("only the currently captured schema digest can be reviewed")
+            configured = self._policy.configured(alias, tool)
+            if (
+                configured is not None
+                and configured.mode is PolicyMode.VIRTUALIZE_LOCAL
+                and not _has_object_output_schema(captured)
+            ):
+                raise SchemaDriftError("virtualized tools require a reviewed object output schema")
+            self._reviewed_digests[key] = digest
+            self._drifted.discard(key)
 
     def disable_schema(self, alias: str, tool: str) -> None:
         """Fail one captured tool closed without discarding its review material."""
 
-        self._drifted.add((alias, tool))
+        with self._publication_lock:
+            self._drifted.add((alias, tool))
 
     def captured_digest(self, alias: str, tool: str) -> str:
-        try:
-            return self._captured[(alias, tool)].digest
-        except KeyError as exc:
-            raise MirrorError("tool has not been discovered") from exc
+        with self._publication_lock:
+            try:
+                return self._captured[(alias, tool)].digest
+            except KeyError as exc:
+                raise MirrorError("tool has not been discovered") from exc
 
     def is_enabled(self, alias: str, tool: str) -> bool:
+        with self._publication_lock:
+            return self._is_enabled_locked(alias, tool)
+
+    def _is_enabled_locked(self, alias: str, tool: str) -> bool:
         key = (alias, tool)
         captured = self._captured.get(key)
         configured = self._policy.configured(alias, tool)
         if captured is None or configured is None or key in self._drifted:
             return False
+        if configured.mode is PolicyMode.VIRTUALIZE_LOCAL and not _has_object_output_schema(
+            captured
+        ):
+            return False
         reviewed = configured.schema_digest or self._reviewed_digests.get(key)
         return reviewed == captured.digest
 
     def list_tools(self, alias: str) -> list[dict[str, Any]]:
-        downstream = self._policy.downstreams.get(alias)
-        if downstream is None:
-            return []
-        listed: list[dict[str, Any]] = []
-        for name in downstream.tools:
-            if not self.is_enabled(alias, name):
-                continue
-            captured = self._captured[(alias, name)]
-            configured = downstream.tools[name]
-            raw = copy.deepcopy(captured.raw)
-            if _advertises_task_support(raw):
-                continue
-            if configured.mode is PolicyMode.APPROVAL:
-                raw["outputSchema"] = copy.deepcopy(PENDING_RESULT_SCHEMA)
-                note = (
-                    "Human-gated by Signet. Returns pending_approval after durable queueing; "
-                    "the downstream action has not occurred."
-                )
-                description = raw.get("description")
-                raw["description"] = f"{description}\n\n{note}" if description else note
-                execution = raw.get("execution")
-                if isinstance(execution, dict):
-                    execution["taskSupport"] = "forbidden"
-            listed.append(raw)
-        return listed
+        with self._publication_lock:
+            downstream = self._policy.downstreams.get(alias)
+            if downstream is None:
+                return []
+            listed: list[dict[str, Any]] = []
+            for name in downstream.tools:
+                if not self._is_enabled_locked(alias, name):
+                    continue
+                captured = self._captured[(alias, name)]
+                configured = downstream.tools[name]
+                raw = copy.deepcopy(captured.raw)
+                if _advertises_task_support(raw):
+                    continue
+                if configured.mode is PolicyMode.APPROVAL:
+                    raw["outputSchema"] = copy.deepcopy(PENDING_RESULT_SCHEMA)
+                    note = (
+                        "Human-gated by Signet. Returns pending_approval after durable queueing; "
+                        "the downstream action has not occurred."
+                    )
+                    description = raw.get("description")
+                    raw["description"] = f"{description}\n\n{note}" if description else note
+                    execution = raw.get("execution")
+                    if isinstance(execution, dict):
+                        execution["taskSupport"] = "forbidden"
+                listed.append(raw)
+            return listed
 
     def require_callable(self, alias: str, tool: str) -> PolicyMode:
+        return self.require_callable_policy(alias, tool).mode
+
+    def require_callable_policy(self, alias: str, tool: str) -> ToolPolicy:
+        """Return the exact admitted policy under the publication gate lock."""
+
+        with self._publication_lock:
+            return self._require_callable_policy_locked(alias, tool)
+
+    def _require_callable_policy_locked(self, alias: str, tool: str) -> ToolPolicy:
+        if alias in self._publication_pending_aliases:
+            raise DomainToolError(
+                "policy_unavailable",
+                "The tool is unavailable until its policy change has been published.",
+            )
         configured = self._policy.configured(alias, tool)
         if configured is None:
             raise McpError(
                 types.ErrorData(code=types.INVALID_PARAMS, message=f"Unknown tool: {tool}")
             )
-        if not self.is_enabled(alias, tool):
+        if not self._is_enabled_locked(alias, tool):
             raise DomainToolError(
                 "schema_unreviewed",
                 "The tool is disabled until its current schema has been reviewed.",
@@ -970,11 +1034,53 @@ class SchemaMirror:
                 "task_execution_unsupported",
                 "The downstream tool advertises task execution, which this gateway does not proxy.",
             )
-        return configured.mode
+        return configured
+
+    def admit_call(
+        self,
+        alias: str,
+        tool: str,
+        arguments: Mapping[str, Any],
+    ) -> ToolPolicy:
+        """Atomically admit policy, reviewed schema, and exact input validation."""
+
+        with self._publication_lock:
+            configured = self._require_callable_policy_locked(alias, tool)
+            self._validate_input_locked(alias, tool, arguments)
+            return configured
+
+    def reviewed_execution_snapshot(
+        self,
+        alias: str,
+        tool: str,
+    ) -> ReviewedExecutionSnapshot:
+        """Return one coherent enabled policy and captured digest snapshot."""
+
+        with self._publication_lock:
+            try:
+                configured = self._require_callable_policy_locked(alias, tool)
+                downstream = self._policy.downstreams[alias]
+                digest = self._captured[(alias, tool)].digest
+            except (DomainToolError, KeyError, McpError) as exc:
+                raise MirrorError("tool has no enabled reviewed execution snapshot") from exc
+            return ReviewedExecutionSnapshot(
+                downstream=downstream,
+                tool=configured,
+                schema_digest=digest,
+            )
 
     def validate_input(self, alias: str, tool: str, arguments: Mapping[str, Any]) -> None:
         """Validate exact call arguments against the captured reviewed input schema."""
 
+        with self._publication_lock:
+            self._validate_input_locked(alias, tool, arguments)
+
+    def _validate_input_locked(
+        self,
+        alias: str,
+        tool: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
         captured = self._captured.get((alias, tool))
         if captured is None:
             raise DomainToolError(
@@ -1001,10 +1107,20 @@ class SchemaMirror:
             )
 
     def validate_virtual_result(self, alias: str, tool: str, result: Any) -> None:
-        validator = self._captured[(alias, tool)].output_validator
-        if validator is not None:
+        with self._publication_lock:
+            captured = self._captured[(alias, tool)]
+            if not _has_object_output_schema(captured) or captured.output_validator is None:
+                raise SchemaDriftError("virtualized tools require a reviewed object output schema")
             _validate_instance_complexity(result)
-            validator.validate(copy.deepcopy(result))
+            try:
+                encoded = canonical_json(result)
+            except Exception:
+                raise _ValidationComplexityError(
+                    "virtualized tool output is outside the JSON data model"
+                ) from None
+            if len(encoded) > _MAX_VIRTUAL_RESULT_BYTES:
+                raise _ValidationComplexityError("virtualized tool output exceeds its byte limit")
+            captured.output_validator.validate(copy.deepcopy(result))
 
     def validate_downstream_result(
         self,
@@ -1014,21 +1130,22 @@ class SchemaMirror:
     ) -> None:
         """Enforce a reviewed output schema for successful passthrough results."""
 
-        if result.get("isError", False) is True:
-            return
-        validator = self._captured[(alias, tool)].output_validator
-        if validator is None:
-            return
-        structured = result.get("structuredContent")
-        if not isinstance(structured, Mapping):
-            raise SchemaDriftError("a successful result omitted structured content")
-        try:
-            _validate_instance_complexity(structured)
-            validator.validate(copy.deepcopy(dict(structured)))
-        except Exception:
-            raise SchemaDriftError(
-                "the downstream result does not match the reviewed output schema"
-            ) from None
+        with self._publication_lock:
+            if result.get("isError", False) is True:
+                return
+            validator = self._captured[(alias, tool)].output_validator
+            if validator is None:
+                return
+            structured = result.get("structuredContent")
+            if not isinstance(structured, Mapping):
+                raise SchemaDriftError("a successful result omitted structured content")
+            try:
+                _validate_instance_complexity(structured)
+                validator.validate(copy.deepcopy(dict(structured)))
+            except Exception:
+                raise SchemaDriftError(
+                    "the downstream result does not match the reviewed output schema"
+                ) from None
 
 
 def _advertises_task_support(raw: Mapping[str, Any]) -> bool:
@@ -1037,6 +1154,23 @@ def _advertises_task_support(raw: Mapping[str, Any]) -> bool:
         return False
     task_support = execution.get("taskSupport")
     return task_support not in (None, "forbidden")
+
+
+def _has_object_output_schema(captured: CapturedTool) -> bool:
+    output_schema = captured.raw.get("outputSchema")
+    return (
+        captured.output_validator is not None
+        and isinstance(output_schema, Mapping)
+        and output_schema.get("type") == "object"
+    )
+
+
+def _validate_publication_aliases(aliases: frozenset[str]) -> None:
+    if not isinstance(aliases, frozenset) or any(
+        not isinstance(alias, str) or not alias or len(alias.encode("utf-8")) > 512
+        for alias in aliases
+    ):
+        raise ValueError("policy publication aliases are invalid")
 
 
 async def discover_all_tools(
@@ -1291,7 +1425,8 @@ class AliasToolSurface:
         async with self._schema_change_lock.read():
             self._namespace()
             self._remember_session()
-            return RawServerResult({"tools": self.mirror.list_tools(self.alias)})
+            tools = await _run_sync(self.mirror.list_tools, self.alias)
+            return RawServerResult({"tools": tools})
 
     async def _call_tool(self, request: types.CallToolRequest) -> types.ServerResult:
         async with self._schema_change_lock.read():
@@ -1300,17 +1435,27 @@ class AliasToolSurface:
             name = request.params.name
             arguments = request.params.arguments or {}
             try:
-                mode = self.mirror.require_callable(self.alias, name)
+                policy = await _run_sync(
+                    self.mirror.admit_call,
+                    self.alias,
+                    name,
+                    arguments,
+                )
+                mode = policy.mode
                 if request.params.task is not None:
                     raise DomainToolError(
                         "task_execution_unsupported",
                         "Task-augmented tool execution is not supported.",
                     )
                 invocation_identity = self._invocation_identity(namespace, name)
-                self.mirror.validate_input(self.alias, name, arguments)
                 if mode is PolicyMode.DENY:
                     if self.denied_event_handler:
-                        result = self.denied_event_handler(namespace, self.alias, name)
+                        result = await _run_sync(
+                            self.denied_event_handler,
+                            namespace,
+                            self.alias,
+                            name,
+                        )
                         if inspect.isawaitable(result):
                             await result
                     return RawServerResult(
@@ -1326,7 +1471,7 @@ class AliasToolSurface:
                     namespace,
                     invocation_identity,
                 )
-                types.CallToolResult.model_validate(raw_result)
+                await _run_sync(types.CallToolResult.model_validate, raw_result)
                 return RawServerResult(raw_result)
             except DomainToolError as exc:
                 return RawServerResult(

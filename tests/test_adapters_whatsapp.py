@@ -69,7 +69,6 @@ def make_fake_wacli(
     if fd_report is not None:
         fd_probe = f"""
 fd_root=/proc/self/fd
-if [ ! -d "$fd_root" ]; then fd_root=/dev/fd; fi
 for fd in "$fd_root"/*; do
   case "${{fd##*/}}" in 0|1|2) continue ;; esac
   target=$(/usr/bin/readlink "$fd") || continue
@@ -131,6 +130,38 @@ def _make_test_wrapper(
         staging_store=staging_store,
         _test_capability=_TEST_ONLY_SCRIPT_CAPABILITY,
     )
+
+
+def test_wacli_wrapper_closes_source_when_initial_fstat_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, _ = make_fake_wacli(tmp_path)
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path))
+    opened_descriptor = -1
+    real_open = os.open
+    real_fstat = os.fstat
+
+    def track_open(*args: Any, **kwargs: Any) -> int:
+        nonlocal opened_descriptor
+        opened_descriptor = real_open(*args, **kwargs)
+        return opened_descriptor
+
+    def fail_source_fstat(descriptor: int) -> os.stat_result:
+        if descriptor == opened_descriptor:
+            raise OSError("injected source fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr("signet.wacli_wrapper.os.open", track_open)
+    monkeypatch.setattr("signet.wacli_wrapper.os.fstat", fail_source_fstat)
+
+    with pytest.raises(WacliError) as captured:
+        wrapper._open_verified_executable()
+
+    assert captured.value.code == "executable_unavailable"
+    assert opened_descriptor >= 0
+    with pytest.raises(OSError):
+        real_fstat(opened_descriptor)
 
 
 @pytest.mark.asyncio
@@ -287,7 +318,7 @@ async def test_wacli_wrapper_is_pinned_no_shell_minimal_env_and_json_only(
     assert not marker.exists()
     assert "secret-environment-marker" not in logged
     assert logged.count("CALL") == 2  # version preflight and the send
-    assert "--store\n/proc/self/fd/" in logged or "--store\n/dev/fd/" in logged
+    assert "--store\n/proc/self/fd/" in logged
     assert "--json\n--timeout\n15s" in logged
     assert "send\ntext\n--to\n+15550102030" in logged
     assert f"--message\n{hostile_message}\n--no-preview" in logged
@@ -468,7 +499,7 @@ async def test_whatsapp_media_is_decrypted_only_to_an_inherited_anonymous_descri
 
     assert result["sent"] is True
     logged = log.read_text(encoding="utf-8")
-    assert "send\nfile\n--to\n+15550102030\n--file\n/dev/fd/" in logged
+    assert "send\nfile\n--to\n+15550102030\n--file\n/proc/self/fd/" in logged
     assert "--filename\nphoto.jpg\n--mime\nimage/jpeg" in logged
     inherited_targets = [line.split("=", 1)[1] for line in fd_report.read_text().splitlines()]
     assert str(store.root) not in inherited_targets

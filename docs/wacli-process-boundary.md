@@ -11,17 +11,27 @@ The owned wrapper pins the resolved, non-symlink Homebrew Cellar executable for
 `wacli` `0.12.0`, its SHA-256 digest, version, owner, mode, argument grammar,
 timeout, output bound, and native executable format. It never invokes a shell.
 Production configuration cannot enable script execution; tests use an opaque
-in-memory capability that cannot be represented in deployment configuration.
+in-memory capability that cannot be represented in deployment configuration. The
+generic reviewed local-process implementation activates only on Linux with a
+mounted `/proc/self/fd`. Every other host fails with
+`process_boundary_platform_unsupported` before creating an executable snapshot or
+starting a child process.
+
+The only reviewed `wacli` artifact in this no-live fixture is the macOS Homebrew
+Cellar build above. It cannot run on the Linux-only process boundary, while macOS
+does not satisfy that boundary. Consequently this fixture has no reviewed
+host/artifact pair and `wacli` activation is blocked on every host. A Linux build,
+path, owner/mode, digest, and version would require a new artifact review before it
+could use the invocation below.
 
 The wrapper does not use a named `--account` lookup. It opens one reviewed store
 directory without following a symbolic link, verifies its identity immediately
 before every spawn, inherits that descriptor, and invokes:
 
 ```text
-/dev/fd/EXECUTABLE_FD --store /dev/fd/STORE_FD --json --timeout 15s ...
+/proc/self/fd/EXECUTABLE_FD --store /proc/self/fd/STORE_FD --json --timeout 15s ...
 ```
 
-On Linux the descriptor prefix is `/proc/self/fd`; on macOS it is `/dev/fd`.
 The configured `account` remains the policy and adapter identity. It is not a
 second filesystem lookup. This matches the `v0.12.0` selection rule that
 `--store` chooses one exact store and cannot be combined with `--account`.
@@ -87,17 +97,23 @@ HOME merely to recover an old session. The upstream
 [`v0.12.0` account documentation](https://github.com/openclaw/wacli/blob/v0.12.0/docs/accounts.md)
 describes named stores, explicit `--store` selection, and re-authentication context.
 
-## macOS characterization gate
+## macOS local-process activation blocker
 
-CI runs the process-boundary and inert launchd tests on macOS using repository-owned
-fake executables. That proves Signet's `/dev/fd` cwd, HOME, store, executable, and
-swap-race behavior on the runner. It does not prove that the pinned Homebrew
-`wacli` `0.12.0` binary accepts the directory-descriptor store for every reviewed
-command on the target host.
+macOS exposes `/dev/fd`, but it does not provide the reviewed Linux semantics used
+here for an unlinked executable snapshot and descriptor-bound `cwd`, HOME, and
+store. Signet therefore refuses all reviewed local stdio and `wacli` process
+activation on macOS with `process_boundary_platform_unsupported`. CI runs that
+fail-closed assertion on macOS together with the portable backup-lock, configuration,
+operator-documentation, and inert launchd checks.
 
-Before a live assembly can be proposed, a human must record the exact target macOS
-version, resolved Cellar path, SHA-256 digest, `wacli version`, and successful
-descriptor-store characterization for version preflight and the exact send command
-shapes. Any real pairing or send remains a separate explicit authorization. Until
-that evidence exists, `must_not_dispatch` remains true and live activation is
-blocked.
+The reference macOS deployment can stage the downstream-disabled services and can
+later use separately reviewed HTTPS downstreams. It cannot activate a local stdio
+provider or `wacli`. Do not work around the block with `/dev/fd`, configured path
+names, a still-linked snapshot, a shell, or `preexec_fn`; each would weaken the
+reviewed execution or directory-swap boundary. macOS local-process support requires
+a separately reviewed native descriptor-exec/chdir implementation and target-host
+characterization. Any real pairing or send remains a separate explicit human
+authorization. Until both implementation and characterization exist,
+`must_not_dispatch` remains true and live local-process activation is blocked.
+The alternative Linux route remains equally blocked for `wacli` until a Linux
+artifact is captured and reviewed; the macOS Homebrew digest cannot be reused.

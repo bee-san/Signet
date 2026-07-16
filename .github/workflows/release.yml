@@ -1,0 +1,202 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  UV_MANAGED_PYTHON: "true"
+  UV_PYTHON: "3.12.13"
+
+jobs:
+  verify-ci:
+    name: Verify exact-source CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for successful main CI on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          for _ in $(seq 1 75); do
+            latest="$(
+              gh api --method GET \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+                -f head_sha="$GITHUB_SHA" -f event=push -f per_page=20 \
+                --jq '[.workflow_runs[] | select(.head_branch == "main")] | sort_by(.run_number) | last | if . == null then "missing" else (.status + ":" + (.conclusion // "pending")) end'
+            )"
+            case "$latest" in
+              completed:success)
+                exit 0
+                ;;
+              completed:*)
+                echo "CI failed for tagged commit ${GITHUB_SHA}: ${latest}" >&2
+                exit 1
+                ;;
+            esac
+            sleep 20
+          done
+          echo "No successful main CI completed for tagged commit ${GITHUB_SHA}" >&2
+          exit 1
+
+  wheel:
+    name: Build ${{ matrix.platform }} wheel
+    needs: verify-ci
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+          - platform: macos-arm64
+            runner: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+          version: "0.11.28"
+      - name: Install pinned managed Python
+        run: uv python install 3.12.13
+      - name: Verify release version and lock
+        shell: bash
+        run: |
+          test "${GITHUB_REF_NAME#v}" = "$(uv version --short)"
+          uv lock --check
+      - name: Build platform wheel
+        run: uv build --wheel --no-sources
+      - name: Smoke-test platform wheel
+        shell: bash
+        run: |
+          wheel="$(find dist -maxdepth 1 -type f -name 'signet_gateway-*.whl' -print -quit)"
+          test -n "$wheel"
+          case "$wheel" in *-none-any.whl) exit 1 ;; esac
+          uv run --isolated --no-project --with "$wheel" signet --help
+      - name: Upload platform wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    name: Build source and SBOM
+    needs: verify-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+          version: "0.11.28"
+      - name: Install pinned managed Python
+        run: uv python install 3.12.13
+      - name: Install locked release tooling
+        run: uv sync --frozen --group release
+      - name: Verify release version
+        shell: bash
+        run: test "${GITHUB_REF_NAME#v}" = "$(uv version --short)"
+      - name: Build source distribution
+        run: uv build --sdist --no-sources
+      - name: Generate reproducible runtime SBOM
+        shell: bash
+        run: |
+          uv export --quiet --frozen --no-dev --no-emit-project \
+            --format requirements-txt --output-file /tmp/runtime-requirements.txt
+          uv venv --python 3.12.13 /tmp/signet-runtime-sbom
+          uv pip install --python /tmp/signet-runtime-sbom/bin/python \
+            --require-hashes -r /tmp/runtime-requirements.txt
+          uv pip install --python /tmp/signet-runtime-sbom/bin/python \
+            --no-deps dist/*.tar.gz
+          uv run --frozen --group release cyclonedx-py environment \
+            /tmp/signet-runtime-sbom/bin/python --pyproject pyproject.toml \
+            --mc-type application --output-reproducible \
+            --spec-version 1.6 --output-format JSON \
+            --output-file dist/signet-gateway.cdx.json
+          uv run --frozen --group release python - <<'PY'
+          import json
+          from pathlib import Path
+
+          sbom = json.loads(Path("dist/signet-gateway.cdx.json").read_text())
+          root = sbom["metadata"]["component"]
+          assert root["name"] == "signet-gateway"
+          dependency = next(item for item in sbom["dependencies"] if item["ref"] == root["bom-ref"])
+          assert dependency["dependsOn"]
+          PY
+      - name: Upload source artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: source-and-sbom
+          path: |
+            dist/*.tar.gz
+            dist/*.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Sign, attest, and publish
+    needs: [wheel, source]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate artifact checksums
+        working-directory: dist
+        run: sha256sum -- * | sort -k2 > SHA256SUMS
+      - name: Sign release artifacts
+        uses: sigstore/gh-action-sigstore-python@5b79a39c381910c090341a2c9b0bf022c8b387e1 # v3.4.0
+        with:
+          inputs: dist/*
+          release-signing-artifacts: false
+          verify: true
+          verify-cert-identity: >-
+            https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+          verify-oidc-issuer: https://token.actions.githubusercontent.com
+      - name: Attest build provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+      - name: Attest runtime SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+          sbom-path: dist/signet-gateway.cdx.json
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --verify-tag --title "Signet ${GITHUB_REF_NAME}"
+          --generate-notes

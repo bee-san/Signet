@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import ipaddress
 import json
@@ -18,6 +17,7 @@ from urllib.parse import urlsplit
 from pywebpush import webpush  # type: ignore[import-untyped]
 from requests import Session
 
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.credential_broker import Secret
 from signet.db import Database
 
@@ -101,13 +101,7 @@ class PushMessage:
         else:
             if self.service is None or self.action is None:
                 raise ValueError("event notification labels are unavailable")
-            payload.update(
-                {
-                    "body": body_by_kind[self.kind],
-                    "service": self.service,
-                    "action": self.action,
-                }
-            )
+            payload["body"] = body_by_kind[self.kind]
         return payload
 
 
@@ -430,7 +424,7 @@ class WebPushTransport:
             except Exception:
                 raise PushDeliveryError("browser push delivery failed") from None
 
-        await asyncio.to_thread(deliver)
+        await _run_sync(deliver)
 
     def __repr__(self) -> str:
         return f"WebPushTransport(subject={self.subject!r}, vapid_private_key=<redacted>)"
@@ -476,9 +470,14 @@ class NotificationDispatcher:
     ) -> NotificationReport:
         if any(not identifier or len(identifier) > 256 for identifier in skip_subscription_ids):
             raise ValueError("notification skip identifiers are invalid")
+        active_subscriptions = await _run_sync(
+            self._repository.active_for,
+            user_id,
+            message.kind,
+        )
         subscriptions = tuple(
             subscription
-            for subscription in self._repository.active_for(user_id, message.kind)
+            for subscription in active_subscriptions
             if subscription.subscription_id not in skip_subscription_ids
         )
         payload = message.payload()
@@ -489,14 +488,19 @@ class NotificationDispatcher:
                 await self._transport.send(subscription, payload)
             except Exception:
                 failed_ids.append(subscription.subscription_id)
-                self._repository.mark_failure(
+                await _run_sync(
+                    self._repository.mark_failure,
                     subscription.subscription_id,
                     now=now,
                     disable_after=self.disable_after,
                 )
             else:
                 delivered_ids.append(subscription.subscription_id)
-                self._repository.mark_success(subscription.subscription_id, now=now)
+                await _run_sync(
+                    self._repository.mark_success,
+                    subscription.subscription_id,
+                    now=now,
+                )
         return NotificationReport(
             attempted=len(subscriptions),
             delivered=len(delivered_ids),

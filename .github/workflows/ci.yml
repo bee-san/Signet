@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  UV_MANAGED_PYTHON: "true"
+  UV_PYTHON: "3.12.13"
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -27,8 +31,224 @@ jobs:
         with:
           enable-cache: true
           version: "0.11.28"
+      - name: Install pinned managed Python
+        run: uv python install 3.12.13
       - name: Install locked environment
         run: uv sync --frozen
+      - name: Validate locked Hermes integration runtime
+        run: uv lock --check --project deploy/hermes/runtime
+      - name: Exercise configured profiles with locked Hermes integration runtime
+        shell: bash
+        run: |
+          set -e
+          set -u
+          set -o pipefail
+          umask 077
+          physical_home="$(cd "$HOME" && pwd -P)"
+          temporary_root="$(mktemp -d "$physical_home/.signet-hermes-ci.XXXXXX")"
+          root="$(cd "$temporary_root" && pwd -P)"
+          repo="$(pwd -P)"
+          server_pid=""
+
+          stop_server() {
+            require_clean="$1"
+            if test -z "$server_pid" || ! kill -0 "$server_pid" 2>/dev/null; then
+              server_pid=""
+              return 0
+            fi
+            selected_pid="$server_pid"
+            server_pid=""
+            kill -TERM "$selected_pid" 2>/dev/null || true
+            forced=0
+            if ! timeout --signal=TERM --kill-after=2s 15s \
+              tail --pid="$selected_pid" -f /dev/null; then
+              forced=1
+              kill -KILL "$selected_pid" 2>/dev/null || true
+            fi
+            if wait "$selected_pid"; then
+              server_status=0
+            else
+              server_status=$?
+            fi
+            if test "$require_clean" = true && \
+              { test "$forced" -ne 0 || \
+                { test "$server_status" -ne 0 && test "$server_status" -ne 143; }; }; then
+              return 1
+            fi
+          }
+
+          cleanup() {
+            stop_server false || true
+            chmod -R u+rwX "$root" 2>/dev/null || true
+            rm -rf "$root"
+          }
+          trap cleanup EXIT
+          chmod 700 "$root"
+          install -d -m 0700 "$root/.hermes/profiles" "$root/ci-logs"
+          : > "$root/.hermes/.env"
+          chmod 600 "$root/.hermes/.env"
+
+          hermes() {
+            timeout --signal=TERM --kill-after=5s 45s \
+              env -i PATH="$PATH" HOME="$root" HERMES_HOME="$root/.hermes" \
+              HERMES_MANAGED_DIR="$root/.no-managed-scope" \
+              uv run --locked --isolated --no-config \
+                --exclude-newer 2026-07-09T00:00:00Z --no-env-file \
+                --no-sources --no-build \
+                --project "$repo/deploy/hermes/runtime" hermes "$@"
+          }
+
+          hermes --version |
+            grep -Fx 'Hermes Agent v0.18.2 (2026.7.7.2)' >/dev/null
+          hermes mcp --help > "$root/ci-logs/mcp-help.log" 2>&1
+
+          "$repo/.venv/bin/signet" demo init \
+            --data-dir "$root/demo" > "$root/ci-logs/demo-init.log" 2>&1
+          "$repo/.venv/bin/signet" demo hermes-config \
+            --data-dir "$root/demo" --mcp-port 8789 > "$root/demo-fragment.yaml"
+          chmod 600 "$root/demo-fragment.yaml"
+          "$repo/.venv/bin/signet" demo serve --data-dir "$root/demo" \
+            --mcp-port 8789 --web-port 8790 \
+            > "$root/ci-logs/demo-server.log" 2>&1 &
+          server_pid=$!
+          demo_ready=false
+          for _ in $(seq 1 80); do
+            if "$repo/.venv/bin/signet" demo smoke --data-dir "$root/demo" \
+              --live --mcp-port 8789 --web-port 8790 >/dev/null 2>&1; then
+              demo_ready=true
+              break
+            fi
+            kill -0 "$server_pid" 2>/dev/null || break
+            sleep 0.25
+          done
+          test "$demo_ready" = true
+
+          hermes profile create signet-demo --no-alias --no-skills \
+            > "$root/ci-logs/demo-profile-create.log" 2>&1
+          demo_config="$(
+            hermes -p signet-demo config path \
+              2> "$root/ci-logs/demo-config-path.log"
+          )"
+          demo_env="$(
+            hermes -p signet-demo config env-path \
+              2> "$root/ci-logs/demo-env-path.log"
+          )"
+          test "$demo_config" = "$root/.hermes/profiles/signet-demo/config.yaml"
+          test "$demo_env" = "$root/.hermes/profiles/signet-demo/.env"
+          (set -o noclobber; : > "$demo_config")
+          chmod 600 "$demo_config"
+          "$repo/.venv/bin/signet" demo credentials --data-dir "$root/demo" \
+            --field mcp-token |
+            "$repo/.venv/bin/python" \
+              "$repo/deploy/hermes/configure-demo-profile.py" \
+              --config "$demo_config" --env-file "$demo_env" \
+              --fragment "$root/demo-fragment.yaml" \
+              > "$root/ci-logs/demo-configure.log" 2>&1
+          hermes -p signet-demo config check \
+            > "$root/ci-logs/demo-config-check.log" 2>&1
+          for test_case in \
+            signet_demo_fastmail:4 \
+            signet_demo_whatsapp:3 \
+            signet_demo_approvals:4; do
+            alias="${test_case%:*}"
+            expected="${test_case##*:}"
+            hermes -p signet-demo mcp test "$alias" \
+              > "$root/ci-logs/$alias.log" 2>&1
+            grep -F "Tools discovered: $expected" \
+              "$root/ci-logs/$alias.log" >/dev/null
+          done
+          hermes -p signet-demo mcp list \
+            > "$root/ci-logs/demo-mcp-list.log" 2>&1
+          "$repo/.venv/bin/python" "$repo/deploy/validate-private-paths.py" \
+            --directory "$root/.hermes/profiles/signet-demo" --private-tree
+          stop_server true
+          hermes profile delete signet-demo -y \
+            > "$root/ci-logs/demo-profile-delete.log" 2>&1
+          test ! -e "$root/.hermes/profiles/signet-demo"
+
+          "$repo/.venv/bin/signet" deployment init \
+            --config "$root/disabled/config/disabled.json" \
+            --data-dir "$root/disabled/data" \
+            --namespace profile:signet-disabled \
+            > "$root/ci-logs/disabled-init.log" 2>&1
+          hermes profile create signet-disabled --no-alias --no-skills \
+            > "$root/ci-logs/disabled-profile-create.log" 2>&1
+          disabled_config="$(
+            hermes -p signet-disabled config path \
+              2> "$root/ci-logs/disabled-config-path.log"
+          )"
+          disabled_env="$(
+            hermes -p signet-disabled config env-path \
+              2> "$root/ci-logs/disabled-env-path.log"
+          )"
+          test "$disabled_config" = \
+            "$root/.hermes/profiles/signet-disabled/config.yaml"
+          test "$disabled_env" = "$root/.hermes/profiles/signet-disabled/.env"
+          (set -o noclobber; : > "$disabled_config")
+          chmod 600 "$disabled_config"
+          test ! -e "$root/disabled-fragment.yaml"
+          cp "$repo/deploy/hermes/disabled-profile.mcp.yaml.example" \
+            "$root/disabled-fragment.yaml"
+          chmod 600 "$root/disabled-fragment.yaml"
+          "$repo/.venv/bin/signet" deployment token issue \
+            --config "$root/disabled/config/disabled.json" \
+            --namespace profile:signet-disabled |
+            "$repo/.venv/bin/python" \
+              "$repo/deploy/hermes/configure-disabled-profile.py" \
+              --profile signet-disabled --config "$disabled_config" \
+              --env-file "$disabled_env" \
+              --fragment "$root/disabled-fragment.yaml" \
+              > "$root/ci-logs/disabled-configure.log" 2>&1
+          "$repo/.venv/bin/signet" deployment serve-mcp \
+            --config "$root/disabled/config/disabled.json" \
+            > "$root/ci-logs/disabled-server.log" 2>&1 &
+          server_pid=$!
+          disabled_ready=false
+          for _ in $(seq 1 80); do
+            if "$repo/.venv/bin/python" -c \
+              'import socket; s=socket.create_connection(("127.0.0.1", 8789), 0.2); s.close()' \
+              >/dev/null 2>&1; then
+              disabled_ready=true
+              break
+            fi
+            kill -0 "$server_pid" 2>/dev/null || break
+            sleep 0.25
+          done
+          test "$disabled_ready" = true
+          hermes -p signet-disabled config check \
+            > "$root/ci-logs/disabled-config-check.log" 2>&1
+          hermes -p signet-disabled mcp test signet_disabled_approvals \
+            > "$root/ci-logs/signet_disabled_approvals.log" 2>&1
+          grep -F 'Tools discovered: 5' \
+            "$root/ci-logs/signet_disabled_approvals.log" >/dev/null
+          hermes -p signet-disabled mcp list \
+            > "$root/ci-logs/disabled-mcp-list.log" 2>&1
+          "$repo/.venv/bin/python" "$repo/deploy/validate-private-paths.py" \
+            --directory "$root/.hermes/profiles/signet-disabled" --private-tree
+          "$repo/.venv/bin/python" "$repo/deploy/validate-private-paths.py" \
+            --directory "$root/disabled/config" \
+            --private-file "$root/disabled/config/disabled.json"
+          "$repo/.venv/bin/python" "$repo/deploy/validate-private-paths.py" \
+            --directory "$root/disabled/data" --private-tree
+          stop_server true
+          hermes profile delete signet-disabled -y \
+            > "$root/ci-logs/disabled-profile-delete.log" 2>&1
+          test ! -e "$root/.hermes/profiles/signet-disabled"
+
+          if grep -R -q -E \
+            'fake:sgt_|sgt_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}' \
+            "$root/ci-logs"; then
+            echo "locked Hermes test output exposed a token-like value" >&2
+            exit 1
+          fi
+          "$repo/.venv/bin/python" "$repo/deploy/validate-private-paths.py" \
+            --directory "$root/ci-logs" --private-tree
+      - name: Verify Python and SQLite safety baseline
+        run: >-
+          uv run python -c 'import sqlite3, sys;
+          assert sys.version_info[:3] == (3, 12, 13), sys.version;
+          version = tuple(map(int, sqlite3.sqlite_version.split(".")));
+          assert version >= (3, 51, 3), sqlite3.sqlite_version'
       - name: Install Chromium for browser acceptance
         run: uv run playwright install --with-deps chromium
       - name: Lint
@@ -46,10 +266,17 @@ jobs:
       - name: Smoke-test the isolated wheel
         shell: bash
         run: |
-          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          wheel="$(find dist -maxdepth 1 -type f -name 'signet_gateway-*.whl' -print -quit)"
           test -n "$wheel"
+          case "$wheel" in
+            *-none-any.whl)
+              echo "POSIX-only Signet was built as a universal wheel" >&2
+              exit 1
+              ;;
+          esac
           uv run --isolated --no-project --with "$wheel" signet --help
-          root="$(mktemp -d)"
+          temporary_root="$(mktemp -d)"
+          root="$(cd "$temporary_root" && pwd -P)"
           chmod 700 "$root"
           uv run --isolated --no-project --with "$wheel" signet deployment init \
             --config "$root/disabled.json" --data-dir "$root/data" \
@@ -69,7 +296,7 @@ jobs:
           unset metadata
           rm -rf "$root"
       - name: Scan source
-        run: uv run --with bandit==1.9.4 bandit -r src/signet -ll
+        run: uv run --with bandit==1.9.4 bandit -r src/signet deploy -ll
       - name: Export runtime dependencies
         run: >-
           uv export --quiet --frozen --no-dev --no-emit-project
@@ -78,9 +305,20 @@ jobs:
         run: >-
           uv run --with pip-audit==2.10.1 pip-audit
           -r /tmp/signet-requirements.txt --strict
+          --disable-pip --require-hashes
+      - name: Export locked Hermes integration dependencies
+        run: >-
+          uv export --quiet --frozen --no-dev --no-emit-project
+          --project deploy/hermes/runtime --format requirements-txt
+          --output-file /tmp/signet-hermes-requirements.txt
+      - name: Audit locked Hermes integration dependencies
+        run: >-
+          uv run --with pip-audit==2.10.1 pip-audit
+          -r /tmp/signet-hermes-requirements.txt --strict
+          --disable-pip --require-hashes
 
   macos-boundaries:
-    name: macOS process and inert launchd boundaries
+    name: macOS fail-closed process and inert launchd boundaries
     runs-on: macos-15
     timeout-minutes: 15
     steps:
@@ -93,21 +331,64 @@ jobs:
         with:
           enable-cache: true
           version: "0.11.28"
+      - name: Install pinned managed Python
+        run: uv python install 3.12.13
       - name: Install locked environment
         run: uv sync --frozen
-      - name: Check process boundaries with fake executables
+      - name: Validate and smoke-test locked Hermes integration runtime
+        shell: bash
+        run: |
+          uv lock --check --project deploy/hermes/runtime
+          umask 077
+          temporary_root="$(mktemp -d)"
+          root="$(cd "$temporary_root" && pwd -P)"
+          trap 'chmod -R u+rwX "$root"; rm -rf "$root"' EXIT
+          chmod 700 "$root"
+          repo="$(pwd -P)"
+          hermes() {
+            env -i PATH="$PATH" HOME="$root" HERMES_HOME="$root/.hermes" \
+              HERMES_MANAGED_DIR="$root/.no-managed-scope" \
+              uv run --locked --isolated --no-config \
+                --exclude-newer 2026-07-09T00:00:00Z --no-env-file \
+                --no-sources --no-build \
+                --project "$repo/deploy/hermes/runtime" hermes "$@"
+          }
+          hermes --version |
+            grep -Fx 'Hermes Agent v0.18.2 (2026.7.7.2)' >/dev/null
+          hermes mcp --help >/dev/null
+          install -d -m 0700 "$root/.hermes/profiles"
+          : > "$root/.hermes/.env"
+          chmod 600 "$root/.hermes/.env"
+          hermes profile create signet-ci --no-alias --no-skills
+          test "$(hermes -p signet-ci config path)" = \
+            "$root/.hermes/profiles/signet-ci/config.yaml"
+          test "$(hermes -p signet-ci config env-path)" = \
+            "$root/.hermes/profiles/signet-ci/.env"
+          hermes -p signet-ci config check >/dev/null
+          hermes -p signet-ci mcp list >/dev/null
+          "$repo/.venv/bin/python" "$repo/deploy/validate-private-paths.py" \
+            --directory "$root/.hermes/profiles/signet-ci" --private-tree
+          hermes profile delete signet-ci -y
+          test ! -e "$root/.hermes/profiles/signet-ci"
+      - name: Verify Python and SQLite safety baseline
+        run: >-
+          uv run python -c 'import sqlite3, sys;
+          assert sys.version_info[:3] == (3, 12, 13), sys.version;
+          version = tuple(map(int, sqlite3.sqlite_version.split(".")));
+          assert version >= (3, 51, 3), sqlite3.sqlite_version'
+      - name: Check unsupported local process boundary fails closed
         run: >-
           uv run pytest -q
-          tests/test_reviewed_process.py
-          tests/test_downstream.py
-          tests/test_adapters_whatsapp.py
+          tests/test_process_platform.py
           tests/test_adapters_provider_fixtures.py
           tests/test_config_credentials.py
+          tests/test_hermes_demo_config.py
+          tests/test_hermes_disabled_config.py
+          tests/test_hermes_profile_transaction.py
           tests/test_launchd_render.py
-          -k 'not whatsapp_media_is_decrypted and
-          not wacli_wrapper_rehashes_open_descriptor and
-          not wacli_wrapper_rejects_media_outside and
-          not wacli_wrapper_rejects_symlinked_media'
+          tests/test_operator_docs.py
+          tests/test_private_paths.py
+          tests/test_validate_private_paths.py
       - name: Check demo backup lock boundaries
         run: >-
           uv run pytest -q
@@ -115,10 +396,28 @@ jobs:
           tests/test_demo.py::test_demo_backup_maintenance_lock_is_marker_guarded_safe_and_reusable
           tests/test_demo.py::test_active_backup_lock_blocks_abandoned_pin_release_atomically
           tests/test_demo.py::test_offline_operations_under_serve_lock_never_recover_execution
+          tests/test_demo.py::test_cli_initializes_private_state_and_prints_only_selected_credentials
+          tests/test_demo.py::test_demo_paths_reject_symlinked_ancestors_before_use
+          tests/test_demo.py::test_demo_init_rejects_parent_traversal_without_creating_state
+          tests/test_demo.py::test_demo_init_never_replaces_destination_created_at_publication
+          tests/test_demo.py::test_demo_paths_map_unexpandable_home_to_controlled_error
+          tests/test_demo.py::test_demo_init_failure_removes_only_its_temporary_tree
+          tests/test_demo.py::test_demo_init_retains_uncaptured_tree_when_mkdir_outcome_is_unknown
+          tests/test_demo.py::test_demo_init_preserves_replacement_when_mkdir_outcome_is_unknown
+          tests/test_demo.py::test_demo_init_cleans_up_restrictive_nested_directory_after_interruption
+          tests/test_demo.py::test_demo_init_hardens_every_artifact_against_restrictive_umask
+          tests/test_demo.py::test_demo_backup_restore_hardens_imports_and_secrets_under_restrictive_umask
+          tests/test_demo.py::test_demo_init_detects_same_path_parent_replacement_before_publish
+          tests/test_demo.py::test_demo_init_reports_unknown_outcome_and_preserves_publish_on_parent_fsync_failure
+          tests/test_demo.py::test_demo_init_reports_unknown_outcome_when_interrupted_immediately_after_replace
+          tests/test_demo.py::test_demo_lock_setup_failure_reports_unconfirmed_post_acquire_cleanup
+      - name: Check native backup publication boundaries
+        run: uv run pytest -q tests/test_backup.py
       - name: Render and lint inactive launchd plists without installing them
         shell: bash
         run: |
-          root="$(mktemp -d)"
+          temporary_root="$(mktemp -d)"
+          root="$(cd "$temporary_root" && pwd -P)"
           trap 'chmod -R u+rwX "$root"; rm -rf "$root"' EXIT
           chmod 700 "$root"
           install -d -m 0700 "$root/logs" "$root/output"

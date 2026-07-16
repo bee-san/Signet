@@ -1,9 +1,15 @@
 [build-system]
-requires = ["hatchling>=1.27,<2"]
+requires = [
+  "hatchling==1.31.0",
+  "packaging==26.2",
+  "pathspec==1.1.1",
+  "pluggy==1.6.0",
+  "trove-classifiers==2026.6.1.19",
+]
 build-backend = "hatchling.build"
 
 [project]
-name = "signet"
+name = "signet-gateway"
 version = "0.1.0"
 description = "Provider-neutral MCP human approval gateway"
 readme = "README.md"
@@ -12,29 +18,82 @@ license = { text = "MIT" }
 authors = [{ name = "Signet contributors" }]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
   "Typing :: Typed",
 ]
 dependencies = [
-  "aiosqlite>=0.20,<1",
-  "argon2-cffi>=23.1,<26",
-  "cryptography>=48.0.1,<49",
-  "fastapi>=0.115,<1",
-  "jinja2>=3.1,<4",
-  "jsonschema>=4.23,<5",
-  "keyring>=25.6,<27",
+  # Keep the complete Linux/macOS runtime closure exact so installing the wheel
+  # cannot resolve transitive versions outside the reviewed lock.
+  "aiohappyeyeballs==2.7.1",
+  "aiohttp==3.14.1",
+  "aiosignal==1.4.0",
+  "annotated-doc==0.0.4",
+  "annotated-types==0.7.0",
+  "anyio==4.14.2",
+  "argon2-cffi==25.1.0",
+  "argon2-cffi-bindings==25.1.0",
+  "attrs==26.1.0",
+  "cbor2==5.9.0",
+  "certifi==2026.6.17",
+  "cffi==2.1.0",
+  "charset-normalizer==3.4.9",
+  "click==8.4.2",
+  "cryptography==48.0.1",
+  "fastapi==0.139.0",
+  "frozenlist==1.8.0",
+  "h11==0.16.0",
+  "http-ece==1.2.1",
+  "httpcore==1.0.9",
+  "httptools==0.8.0",
+  "httpx==0.28.1",
+  "httpx-sse==0.4.3",
+  "idna==3.18",
+  "jaraco-classes==3.4.0",
+  "jaraco-context==6.1.2",
+  "jaraco-functools==4.6.0",
+  "jeepney==0.9.0; sys_platform == 'linux'",
+  "jinja2==3.1.6",
+  "jsonschema==4.26.0",
+  "jsonschema-specifications==2025.9.1",
+  "keyring==25.7.0",
+  "markupsafe==3.0.3",
   "mcp==1.28.1",
+  "more-itertools==11.1.0",
+  "multidict==6.7.1",
+  "propcache==0.5.2",
+  "py-vapid==1.9.4",
+  "pyasn1==0.6.4",
+  "pyasn1-modules==0.4.2",
+  "pycparser==3.0; implementation_name != 'PyPy'",
   "pydantic==2.13.4",
-  "pydantic-settings>=2.7,<3",
-  "pyotp>=2.9,<3",
+  "pydantic-core==2.46.4",
+  "pydantic-settings==2.14.2",
+  "pyjwt==2.13.0",
+  "pyopenssl==26.2.0",
+  "pyotp==2.10.0",
   "puremagic==2.2.0",
-  "python-multipart>=0.0.20,<1",
-  "pywebpush>=2.0,<3",
-  "pyyaml>=6.0,<7",
-  "requests>=2.34,<3",
-  "uvicorn[standard]>=0.34,<1",
-  "webauthn>=2.2,<3",
+  "python-dotenv==1.2.2",
+  "python-multipart==0.0.32",
+  "pywebpush==2.3.0",
+  "pyyaml==6.0.3",
+  "referencing==0.37.0",
+  "requests==2.34.2",
+  "rpds-py==2026.6.3",
+  "secretstorage==3.5.0; sys_platform == 'linux'",
+  "sse-starlette==3.4.5",
+  "starlette==1.3.1",
+  "typing-extensions==4.16.0",
+  "typing-inspection==0.4.2",
+  "urllib3==2.7.0",
+  "uvicorn[standard]==0.51.0",
+  "uvloop==0.22.1; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'",
+  "watchfiles==1.2.0",
+  "webauthn==2.8.0",
+  "websockets==16.1",
+  "yarl==1.24.2",
 ]
 
 [project.urls]
@@ -57,9 +116,14 @@ dev = [
   "types-jsonschema>=4.23,<5",
   "types-pyyaml>=6.0,<7",
 ]
+release = [
+  "cyclonedx-bom==7.3.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/signet"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"

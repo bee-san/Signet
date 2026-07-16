@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import struct
+import threading
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from signet.auth import InvalidSession, SessionPrincipal
 from signet.web import (
@@ -20,6 +23,7 @@ from signet.web import (
     DecisionPage,
     DetailBlock,
     LoginOptions,
+    PolicyPromotionPreview,
     PushSubscriptionInput,
     QueueItem,
     QueuePage,
@@ -53,6 +57,12 @@ class FakeBackend:
     event_decision_note: str | None = None
     attachment_detection_source: str | None = "content_signature_v1"
     gateway_internal: bool = False
+    gateway_proposed_mode: str = "passthrough"
+    gateway_active_policy_version: int = 3
+    gateway_can_approve: bool | None = None
+    gateway_stale: bool = False
+    gateway_preview_unavailable: bool = False
+    decision_window_expired: bool = False
     attachment_calls: list[tuple[str, str, int, str]] = field(default_factory=list)
 
     def authenticate(self, token: str | None, *, now: int) -> SessionPrincipal:
@@ -218,6 +228,37 @@ class FakeBackend:
             downstream_alias="fastmail",
             tool_name="send_email",
             account_context="primary-account",
+            policy_promotion_preview=(
+                PolicyPromotionPreview(
+                    target_alias="fastmail",
+                    target_tool="search_email",
+                    current_mode="deny",
+                    proposed_mode=self.gateway_proposed_mode,
+                    reviewed_read_only=self.gateway_proposed_mode == "passthrough",
+                    communication_send=False,
+                    reviewed_classification=(
+                        None if self.gateway_proposed_mode == "passthrough" else "destructive"
+                    ),
+                    current_policy_version=3,
+                    proposed_policy_version=4,
+                    active_policy_version=self.gateway_active_policy_version,
+                    can_approve=(
+                        self.detail_state == "pending_approval"
+                        if self.gateway_can_approve is None
+                        else self.gateway_can_approve
+                    ),
+                    stale=self.gateway_stale,
+                )
+                if self.gateway_internal and not self.gateway_preview_unavailable
+                else None
+            ),
+            policy_promotion_preview_unavailable=(
+                "Exact frozen policy proposal history is unavailable or failed integrity "
+                "validation. Approval is disabled; the frozen request context remains available."
+                if self.gateway_internal and self.gateway_preview_unavailable
+                else None
+            ),
+            decision_window_expired=self.decision_window_expired,
             policy_mode="approval",
             policy_version="3",
             adapter_version="7",
@@ -225,6 +266,49 @@ class FakeBackend:
             origin_namespace="profile:web-test",
             review_available=self.review_available,
             gateway_internal=self.gateway_internal,
+        )
+
+    def get_historical_detail(
+        self,
+        principal: SessionPrincipal,
+        event_id: int,
+    ) -> RequestDetail:
+        if event_id not in {101, 102}:
+            raise WebConflict("decision event is unavailable")
+        detail = self.get_detail(principal, "req_test")
+        request_id = "req_approved" if event_id == 102 else "req_test"
+        payload_hash = "b" * 64 if event_id == 102 else HASH
+        action = "approved_via_web" if event_id == 102 else "denied"
+        event = {
+            "event_id": event_id,
+            "occurred_at": NOW + (1 if event_id == 102 else 0),
+            "action": action,
+            "actor": "web:autumn",
+            "version": 1,
+            "payload_hash": payload_hash,
+            "details_json": '{\n  "decision_note": "exact_request_approved"\n}',
+            "decision_note": ("exact_request_approved" if event_id == 102 else "wrong_destination"),
+            "confirmation_kind": "webauthn" if event_id == 102 else "totp",
+            "confirmation_path": "web",
+            "confirmation_proofs": (),
+            "confirmation_match_count": 1,
+            "confirmation_attribution_ambiguous": False,
+            "decision_confirmation": True,
+        }
+        return replace(
+            detail,
+            request_id=request_id,
+            version=1,
+            payload_hash=payload_hash,
+            events=(event,),
+            editable_arguments_json=None,
+            policy_promotion_preview=None,
+            policy_promotion_preview_unavailable=None,
+            decision_window_expired=False,
+            historical_event_id=event_id,
+            historical_event_action=action,
+            historical_event_actor="web:autumn",
+            historical_event_occurred_at=NOW + (1 if event_id == 102 else 0),
         )
 
     def get_attachment(
@@ -265,9 +349,11 @@ class FakeBackend:
         return DecisionPage(
             items=(
                 DecisionEntry(
+                    102,
                     NOW + 1,
                     "web:autumn",
                     "approved",
+                    "Request approved",
                     "web",
                     "webauthn",
                     "req_approved",
@@ -278,9 +364,11 @@ class FakeBackend:
                     "b" * 12,
                 ),
                 DecisionEntry(
+                    101,
                     NOW,
                     "web:autumn",
                     "denied",
+                    "Request denied",
                     "web",
                     "totp",
                     "req_test",
@@ -382,6 +470,49 @@ class FakeBackend:
         self.push_endpoints.remove(endpoint)
 
 
+class BlockingBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.queue_started = threading.Event()
+        self.queue_release = threading.Event()
+        self.password_started = threading.Event()
+        self.password_release = threading.Event()
+
+    def list_queue(
+        self,
+        principal: SessionPrincipal,
+        *,
+        now: int,
+        cursor: str | None = None,
+    ) -> QueuePage:
+        self.queue_started.set()
+        if not self.queue_release.wait(timeout=5):
+            raise AssertionError("blocking queue test was not released")
+        return super().list_queue(principal, now=now, cursor=cursor)
+
+    def password_totp_login(
+        self,
+        user_id: str,
+        password: str,
+        totp_proof: str,
+        *,
+        source: str,
+        previous_token: str | None,
+        now: int,
+    ) -> str:
+        self.password_started.set()
+        if not self.password_release.wait(timeout=5):
+            raise AssertionError("blocking password test was not released")
+        return super().password_totp_login(
+            user_id,
+            password,
+            totp_proof,
+            source=source,
+            previous_token=previous_token,
+            now=now,
+        )
+
+
 @pytest.fixture
 def backend() -> FakeBackend:
     return FakeBackend()
@@ -420,6 +551,78 @@ def test_agent_listener_has_only_privacy_safe_health() -> None:
     assert "request" not in health.text and "target" not in health.text
 
 
+def _blocking_app(backend: FakeBackend) -> Any:
+    return create_web_app(
+        backend,
+        settings=WebSettings(
+            public_origin=ORIGIN,
+            allowed_hosts=("signet.test",),
+            vapid_public_key="fake-public-key",
+        ),
+        csrf=CsrfManager(b"c" * 32),
+        clock=lambda: NOW,
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocking_queue_storage_does_not_stall_event_loop_health() -> None:
+    backend = BlockingBackend()
+    transport = ASGITransport(app=_blocking_app(backend))
+    safety_release = threading.Timer(3, backend.queue_release.set)
+    safety_release.start()
+    try:
+        async with AsyncClient(transport=transport, base_url=ORIGIN) as client:
+            client.cookies.set("__Host-signet_session", "session-good")
+            queue_task = asyncio.create_task(client.get("/"))
+            assert await asyncio.to_thread(backend.queue_started.wait, 1)
+            assert not backend.queue_release.is_set()
+            health = await asyncio.wait_for(client.get("/healthz"), timeout=1)
+            backend.queue_release.set()
+            queue_response = await queue_task
+    finally:
+        backend.queue_release.set()
+        safety_release.cancel()
+
+    assert health.status_code == 200
+    assert queue_response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_blocking_password_verification_does_not_stall_event_loop_health() -> None:
+    backend = BlockingBackend()
+    transport = ASGITransport(app=_blocking_app(backend))
+    safety_release = threading.Timer(3, backend.password_release.set)
+    safety_release.start()
+    try:
+        async with AsyncClient(transport=transport, base_url=ORIGIN) as client:
+            login = await client.get("/login")
+            csrf_token = client.cookies.get("__Host-signet_login_csrf")
+            assert login.status_code == 200 and csrf_token
+            login_task = asyncio.create_task(
+                client.post(
+                    "/login/password",
+                    data={
+                        "user_id": "autumn",
+                        "password": "fake-password",
+                        "totp_proof": "fake:totp",
+                        "csrf_token": csrf_token,
+                    },
+                    headers={"Origin": ORIGIN},
+                )
+            )
+            assert await asyncio.to_thread(backend.password_started.wait, 1)
+            assert not backend.password_release.is_set()
+            health = await asyncio.wait_for(client.get("/healthz"), timeout=1)
+            backend.password_release.set()
+            login_response = await login_task
+    finally:
+        backend.password_release.set()
+        safety_release.cancel()
+
+    assert health.status_code == 200
+    assert login_response.status_code == 303
+
+
 def test_oversized_passkey_login_is_rejected_before_backend(
     client: TestClient,
     backend: FakeBackend,
@@ -445,7 +648,12 @@ def test_oversized_passkey_login_is_rejected_before_backend(
 
 def test_queue_and_detail_require_session_and_ignore_mcp_bearer(client: TestClient) -> None:
     assert client.get("/").status_code == 401
-    for path in ("/requests/req_test", "/requests/req_test/review"):
+    for path in (
+        "/requests/req_test",
+        "/requests/req_test/review",
+        "/audit/events/101",
+        "/audit/events/101/review",
+    ):
         response = client.get(
             path,
             headers={"Authorization": "Bearer valid-agent-token"},
@@ -541,6 +749,49 @@ def test_expanded_review_fragment_contains_complete_bound_context(client: TestCl
     assert "&lt;script" in response.text
 
 
+def test_review_fragment_renders_all_distinct_confirmation_proofs(
+    client: TestClient,
+    backend: FakeBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_get_detail = backend.get_detail
+
+    def get_detail(principal: SessionPrincipal, request_id: str) -> RequestDetail:
+        detail = original_get_detail(principal, request_id)
+        event = {
+            "occurred_at": NOW,
+            "action": "policy_promoted_to_approval",
+            "actor": "web:autumn",
+            "version": 1,
+            "payload_hash": HASH,
+            "details_json": None,
+            "decision_note": None,
+            "confirmation_kind": None,
+            "confirmation_path": None,
+            "confirmation_proofs": (
+                {"kind": "totp", "path": "web"},
+                {"kind": "webauthn", "path": "web"},
+            ),
+            "confirmation_match_count": 2,
+            "confirmation_attribution_ambiguous": True,
+            "decision_confirmation": True,
+        }
+        return replace(detail, events=(event,))
+
+    monkeypatch.setattr(backend, "get_detail", get_detail)
+    authenticate(client)
+
+    response = client.get("/requests/req_test/review")
+
+    assert response.status_code == 200
+    normalized = " ".join(response.text.split())
+    assert (
+        "2 same-second matching proofs (per-event attribution unavailable): "
+        "TOTP via web; Passkey via web"
+    ) in normalized
+    assert "method unavailable" not in normalized
+
+
 def test_legacy_attachment_filename_guess_is_never_labeled_as_byte_detection(
     client: TestClient,
     backend: FakeBackend,
@@ -594,11 +845,17 @@ def test_audit_decisions_are_private_when_collapsed_and_terminal_review_expands(
     audit = client.get("/audit")
 
     assert audit.status_code == 200
-    assert "Recent approvals and denials" in audit.text
+    assert "Recent request decisions and policy changes" in audit.text
     assert 'class="request-expander decision-approved"' in audit.text
     assert 'class="request-expander decision-denied"' in audit.text
-    assert 'data-review-url="/requests/req_approved/review"' in audit.text
-    assert 'data-review-url="/requests/req_test/review"' in audit.text
+    assert 'data-review-url="/audit/events/102/review"' in audit.text
+    assert 'data-review-url="/audit/events/101/review"' in audit.text
+    assert 'href="/audit/events/102">dedicated audit event view</a>' in audit.text
+    assert 'href="/audit/events/101">dedicated audit event view</a>' in audit.text
+    assert 'href="/requests/req_approved">request view</a>' not in audit.text
+    assert 'href="/requests/req_test">request view</a>' not in audit.text
+    assert "Request approved" in audit.text
+    assert "Request denied" in audit.text
     assert "person@example.test" not in audit.text
     assert "Requested for the Tuesday release" not in audit.text
     assert "Append-only events" in audit.text
@@ -607,14 +864,92 @@ def test_audit_decisions_are_private_when_collapsed_and_terminal_review_expands(
     assert "via web" in audit.text
     assert '<time datetime="2027-01-15T08:00:00Z">2027-01-15 08:00:00 UTC</time>' in audit.text
 
-    backend.detail_state = "denied"
-    expanded = client.get("/requests/req_test/review")
+    backend.detail_state = "pending_approval"
+    expanded = client.get("/audit/events/101/review")
     assert expanded.status_code == 200
     assert "person@example.test" in expanded.text
     assert "Requested for the Tuesday release" in expanded.text
+    assert "Selected audit event" in expanded.text
+    assert "Payload hash at event" in expanded.text
+    assert 'data-historical-event-id="101"' in expanded.text
+    assert "Current request state: pending approval" in " ".join(expanded.text.split())
+    assert "wrong_destination" in expanded.text
+    assert "Unavailable in read-only history" in expanded.text
+    assert "Open current request view" in expanded.text
+    assert "data-csrf" not in expanded.text
+    assert "<form" not in expanded.text
     assert 'class="totp-action"' not in expanded.text
     assert "data-passkey-action" not in expanded.text
-    assert "Nothing was executed downstream" in expanded.text
+    assert "Download frozen bytes" not in expanded.text
+    assert "Edit frozen arguments" not in expanded.text
+    assert ">Policy<" not in expanded.text
+    assert "No downstream execution" in expanded.text
+
+    full_page = client.get("/audit/events/101")
+    assert full_page.status_code == 200
+    assert "Exact audit event" in full_page.text
+    assert "person@example.test" in full_page.text
+    assert "Requested for the Tuesday release" in full_page.text
+    assert 'data-historical-event-id="101"' in full_page.text
+    assert "Payload hash at event" in full_page.text
+    assert "wrong_destination" in full_page.text
+    assert "Open current request view" in full_page.text
+    assert "data-csrf" not in full_page.text
+    assert full_page.text.count("<form") == 1
+    assert 'form action="/logout"' in full_page.text
+    assert "/requests/req_test/actions" not in full_page.text
+    assert "data-passkey-action" not in full_page.text
+    assert "Download frozen bytes" not in full_page.text
+    assert full_page.headers["cache-control"] == "no-store, max-age=0"
+
+
+def test_repeated_request_decisions_have_unique_event_anchors(
+    client: TestClient,
+    backend: FakeBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_list_decisions = backend.list_decisions
+
+    def list_decisions(
+        principal: SessionPrincipal,
+        *,
+        before_event_id: int | None = None,
+    ) -> DecisionPage:
+        page = original_list_decisions(principal, before_event_id=before_event_id)
+        first = replace(
+            page.items[0],
+            confirmation_kind=None,
+            confirmation_path=None,
+            confirmation_attribution_ambiguous=True,
+            confirmation_match_count=2,
+        )
+        repeated = replace(page.items[1], request_id=page.items[0].request_id)
+        return replace(page, items=(first, repeated))
+
+    monkeypatch.setattr(backend, "list_decisions", list_decisions)
+    authenticate(client)
+
+    audit = client.get("/audit")
+
+    assert audit.status_code == 200
+    ids = re.findall(r'id="(decision-event-[0-9]+)"', audit.text)
+    assert ids == ["decision-event-102", "decision-event-101"]
+    assert len(ids) == len(set(ids))
+    assert audit.text.count('data-decision-request-id="req_approved"') == 2
+    assert 'id="decision-req_approved"' not in audit.text
+    assert 'data-review-url="/audit/events/102/review"' in audit.text
+    assert 'data-review-url="/audit/events/101/review"' in audit.text
+    assert "2 same-second matching proofs; expand for proof details" in " ".join(audit.text.split())
+
+    first_fragment = client.get("/audit/events/102/review")
+    second_fragment = client.get("/audit/events/101/review")
+    assert first_fragment.status_code == second_fragment.status_code == 200
+    assert 'id="context-audit-event-102"' in first_fragment.text
+    assert 'id="context-audit-event-101"' in second_fragment.text
+    first_ids = set(re.findall(r'\bid="([^"]+)"', first_fragment.text))
+    second_ids = set(re.findall(r'\bid="([^"]+)"', second_fragment.text))
+    assert first_ids.isdisjoint(second_ids)
+    assert "<form" not in first_fragment.text + second_fragment.text
 
 
 def test_decision_history_cursor_is_session_bound_and_tamper_resistant(
@@ -647,6 +982,31 @@ def test_mobile_styles_preserve_audit_navigation(client: TestClient) -> None:
     assert 'class="primary-audit-link" href="/audit"' in page.text
     assert "nav .primary-audit-link" in stylesheet
     assert "nav a { display: none; }" not in stylesheet
+
+
+def test_keyboard_focus_outline_meets_non_text_contrast() -> None:
+    stylesheet = (ROOT / "src" / "signet" / "static" / "app.css").read_text()
+    match = re.search(
+        r"\.table-scroll:focus-visible \{ outline: 3px solid (#[0-9a-f]{6});",
+        stylesheet,
+    )
+    assert match is not None
+
+    def luminance(color: str) -> float:
+        channels = [int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [
+            channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    def contrast(first: str, second: str) -> float:
+        lighter, darker = sorted((luminance(first), luminance(second)), reverse=True)
+        return (lighter + 0.05) / (darker + 0.05)
+
+    focus = match.group(1)
+    assert contrast(focus, "#ffffff") >= 3
+    assert contrast(focus, "#f7f8f5") >= 3
 
 
 def test_no_javascript_hides_inert_controls_and_keeps_login_fallback(
@@ -778,18 +1138,45 @@ def test_javascript_free_totp_decisions_submit_action_specific_reasons(
     assert backend.decision_notes == [reason]
 
 
-def test_javascript_free_gateway_policy_approval_has_no_ordinary_reason(
+@pytest.mark.parametrize(
+    ("proposed_mode", "expected_consequence", "expected_read_only"),
+    (
+        ("passthrough", "Future calls will bypass approval.", "Yes"),
+        ("approval", "Future calls will still require separate approval.", "No"),
+    ),
+)
+def test_javascript_free_gateway_policy_approval_has_full_exact_preview(
     client: TestClient,
     backend: FakeBackend,
     csrf: CsrfManager,
+    proposed_mode: str,
+    expected_consequence: str,
+    expected_read_only: str,
 ) -> None:
     backend.gateway_internal = True
+    backend.gateway_proposed_mode = proposed_mode
     authenticate(client)
     review = client.get("/requests/req_test/review")
     assert review.status_code == 200
     assert 'data-gateway-internal="true"' in review.text
     assert "data-approval-reason" not in review.text
     assert "data-denial-reason" in review.text
+    assert "Edit frozen arguments" not in review.text
+    assert "data-edit-json" not in review.text
+    assert "data-policy-preview" in review.text
+    assert "Exact policy change on approval" in review.text
+    assert "fastmail.search_email" in review.text
+    assert "Target mode at review" in review.text and "deny" in review.text
+    assert "Proposed new mode" in review.text and proposed_mode in review.text
+    assert "Reviewed read-only" in review.text and expected_read_only in review.text
+    assert "Communication classification" in review.text
+    assert "Not a communication send" in review.text
+    assert "Reviewed classification" in review.text
+    assert "Policy version at review" in review.text and ">3<" in review.text
+    assert "Expected next version at review" in review.text and ">4<" in review.text
+    assert "Active policy version" in review.text
+    assert expected_consequence in review.text
+    assert "Approve policy change" in review.text
 
     token = csrf.session_token("session-id", "request:req_test")
     approved = client.post(
@@ -833,6 +1220,114 @@ def test_javascript_free_gateway_policy_approval_has_no_ordinary_reason(
         headers={"Origin": ORIGIN},
     )
     assert missing_denial.status_code == 422
+
+
+def test_stale_gateway_preview_keeps_full_context_and_deny_cancel_controls(
+    client: TestClient,
+    backend: FakeBackend,
+) -> None:
+    backend.gateway_internal = True
+    backend.gateway_active_policy_version = 4
+    backend.gateway_can_approve = False
+    backend.gateway_stale = True
+    authenticate(client)
+
+    review = client.get("/requests/req_test/review")
+
+    assert review.status_code == 200
+    assert "Frozen policy proposal at review" in review.text
+    assert "Requested for the Tuesday release" in review.text
+    assert "Frozen execution arguments" in review.text
+    assert "reviewed against policy v3, but active policy is v4" in review.text
+    assert 'name="action" value="approve"' not in review.text
+    assert 'data-passkey-action="approve"' not in review.text
+    assert 'name="action" value="deny"' in review.text
+    assert 'name="action" value="cancel"' in review.text
+    assert "Edit frozen arguments" not in review.text
+
+
+def test_expired_unswept_gateway_preview_has_context_without_resolution_controls(
+    client: TestClient,
+    backend: FakeBackend,
+) -> None:
+    backend.gateway_internal = True
+    backend.gateway_active_policy_version = 4
+    backend.gateway_can_approve = False
+    backend.gateway_stale = True
+    backend.decision_window_expired = True
+    authenticate(client)
+
+    review = client.get("/requests/req_test/review")
+
+    assert review.status_code == 200
+    assert "Frozen policy proposal at review" in review.text
+    assert "Requested for the Tuesday release" in review.text
+    assert "This proposal has expired" in review.text
+    assert "cannot be approved, denied, or cancelled" in review.text
+    assert "Deny or cancel it" not in review.text
+    assert "action-band" not in review.text
+    assert 'name="action" value="approve"' not in review.text
+    assert 'name="action" value="deny"' not in review.text
+    assert 'name="action" value="cancel"' not in review.text
+
+
+def test_expired_unswept_ordinary_request_hides_all_mutations(
+    client: TestClient,
+    backend: FakeBackend,
+) -> None:
+    backend.decision_window_expired = True
+    authenticate(client)
+
+    review = client.get("/requests/req_test/review")
+
+    assert review.status_code == 200
+    assert "Decision window expired" in review.text
+    assert "can no longer be approved, denied, edited, or cancelled" in review.text
+    assert "Requested for the Tuesday release" in review.text
+    assert "action-band" not in review.text
+    assert "edit-band" not in review.text
+
+
+def test_terminal_gateway_denial_retains_frozen_policy_reasoning(
+    client: TestClient,
+    backend: FakeBackend,
+) -> None:
+    backend.gateway_internal = True
+    backend.detail_state = "denied"
+    backend.gateway_can_approve = False
+    authenticate(client)
+
+    review = client.get("/requests/req_test/review")
+
+    assert review.status_code == 200
+    assert "Frozen policy proposal at review" in review.text
+    assert "Requested for the Tuesday release" in review.text
+    assert "Target mode at review" in review.text
+    assert "Expected next version at review" in review.text
+    assert "This historical view does not change policy" in review.text
+    assert 'name="action" value="approve"' not in review.text
+    assert 'name="action" value="deny"' not in review.text
+
+
+def test_unavailable_gateway_history_preserves_base_context_and_disables_only_approval(
+    client: TestClient,
+    backend: FakeBackend,
+) -> None:
+    backend.gateway_internal = True
+    backend.gateway_preview_unavailable = True
+    authenticate(client)
+
+    review = client.get("/requests/req_test/review")
+
+    assert review.status_code == 200
+    assert "Policy proposal history unavailable" in review.text
+    assert "failed integrity validation" in review.text
+    assert "frozen request context remains available" in review.text
+    assert "Requested for the Tuesday release" in review.text
+    assert "Frozen execution arguments" in review.text
+    assert 'name="action" value="approve"' not in review.text
+    assert 'name="action" value="deny"' in review.text
+    assert 'name="action" value="cancel"' in review.text
 
 
 def test_passkey_gateway_policy_approval_stages_and_completes_without_reason(
@@ -1116,7 +1611,7 @@ def test_web_settings_reject_unsafe_origin_host_and_cookie_combinations(
     kwargs: dict[str, Any],
 ) -> None:
     with pytest.raises(ValueError):
-        WebSettings(**kwargs)  # type: ignore[arg-type]
+        WebSettings(**kwargs)
 
 
 def test_hostile_detail_is_opaque_text_without_remote_fetch_surface(client: TestClient) -> None:

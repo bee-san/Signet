@@ -15,7 +15,9 @@ from jsonschema.exceptions import SchemaError, ValidationError
 
 from signet.adapters.base import ApprovalAdapter, copy_json_object
 from signet.admission import ReviewedToolLimits
+from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.downstream import validate_call_tool_result
+from signet.execution_scope import ExecutionScopeError, ExecutionScopeResolver
 from signet.freezer import RequestFreezer
 from signet.mcp_mirror import (
     DomainToolError,
@@ -25,6 +27,7 @@ from signet.mcp_mirror import (
 )
 from signet.models import (
     AdmissionRejected,
+    AttachmentReference,
     EnqueueRequest,
     EnqueueResult,
     IdempotencyConflict,
@@ -81,6 +84,7 @@ class GatewayCallPipeline:
         downstream_clients: Mapping[str, RawDownstreamClient],
         local_handlers: Mapping[str, LocalHandler],
         adapters: Mapping[str, ApprovalAdapter],
+        execution_scopes: ExecutionScopeResolver,
         freezer: RequestFreezer,
         enqueuer: ApprovalEnqueuer,
     ) -> None:
@@ -90,6 +94,8 @@ class GatewayCallPipeline:
             raise GatewayConfigurationError("a request freezer is required")
         if not callable(getattr(enqueuer, "enqueue", None)):
             raise GatewayConfigurationError("an approval enqueuer is required")
+        if not callable(getattr(execution_scopes, "resolve", None)):
+            raise GatewayConfigurationError("an execution scope resolver is required")
         if any(
             not _bounded_name(alias) or not callable(getattr(client, "call_tool_raw", None))
             for alias, client in downstream_clients.items()
@@ -112,6 +118,7 @@ class GatewayCallPipeline:
         self._downstream_clients = dict(downstream_clients)
         self._local_handlers = dict(local_handlers)
         self._adapters = dict(adapters)
+        self._execution_scopes = execution_scopes
         self._freezer = freezer
         self._enqueuer = enqueuer
 
@@ -143,23 +150,14 @@ class GatewayCallPipeline:
     ) -> dict[str, Any]:
         """Validate first, then execute exactly one reviewed mode."""
 
-        if not _bounded_name(alias) or not _bounded_name(tool) or not _bounded_namespace(namespace):
-            raise DomainToolError("invalid_invocation", "The tool invocation scope is invalid.")
-        if not isinstance(identity, InvocationIdentity):
-            raise DomainToolError("invalid_invocation", "The tool invocation identity is invalid.")
-        try:
-            detached_arguments = copy_json_object(arguments)
-        except (TypeError, ValueError):
-            raise DomainToolError(
-                "invalid_arguments",
-                "Tool arguments must be a JSON object.",
-            ) from None
-
-        mode = self.mirror.require_callable(alias, tool)
-        self.mirror.validate_input(alias, tool, detached_arguments)
-        policy = self.mirror.policy.configured(alias, tool)
-        if policy is None or policy.mode is not mode:  # pragma: no cover - mirror invariant
-            raise DomainToolError("policy_unavailable", "The reviewed tool policy is unavailable.")
+        mode, policy, detached_arguments = await _run_sync(
+            self._prepare_call,
+            alias,
+            tool,
+            arguments,
+            namespace,
+            identity,
+        )
 
         if mode is PolicyMode.PASSTHROUGH:
             return await self._passthrough(policy, detached_arguments)
@@ -179,6 +177,29 @@ class GatewayCallPipeline:
             )
         raise DomainToolError("policy_unavailable", "The reviewed tool policy is unavailable.")
 
+    def _prepare_call(
+        self,
+        alias: str,
+        tool: str,
+        arguments: Mapping[str, Any],
+        namespace: str,
+        identity: InvocationIdentity,
+    ) -> tuple[PolicyMode, ToolPolicy, dict[str, Any]]:
+        if not _bounded_name(alias) or not _bounded_name(tool) or not _bounded_namespace(namespace):
+            raise DomainToolError("invalid_invocation", "The tool invocation scope is invalid.")
+        if not isinstance(identity, InvocationIdentity):
+            raise DomainToolError("invalid_invocation", "The tool invocation identity is invalid.")
+        try:
+            detached_arguments = copy_json_object(arguments)
+        except (TypeError, ValueError):
+            raise DomainToolError(
+                "invalid_arguments",
+                "Tool arguments must be a JSON object.",
+            ) from None
+
+        policy = self.mirror.admit_call(alias, tool, detached_arguments)
+        return policy.mode, policy, detached_arguments
+
     async def _passthrough(
         self, policy: ToolPolicy, arguments: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -190,9 +211,7 @@ class GatewayCallPipeline:
             )
         try:
             raw_result = await client.call_tool_raw(policy.tool, arguments)
-            validated = validate_call_tool_result(raw_result)
-            self.mirror.validate_downstream_result(policy.alias, policy.tool, validated)
-            return validated
+            return await _run_sync(self._validate_downstream_result, policy, raw_result)
         except asyncio.CancelledError:
             raise
         except DomainToolError:
@@ -202,6 +221,15 @@ class GatewayCallPipeline:
                 "downstream_failed",
                 "The reviewed downstream call failed or returned an invalid result.",
             ) from None
+
+    def _validate_downstream_result(
+        self,
+        policy: ToolPolicy,
+        raw_result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        validated = validate_call_tool_result(raw_result)
+        self.mirror.validate_downstream_result(policy.alias, policy.tool, validated)
+        return validated
 
     async def _virtualize(
         self,
@@ -224,10 +252,10 @@ class GatewayCallPipeline:
             identity=identity,
         )
         try:
-            result = handler(copy.deepcopy(dict(arguments)), invocation)
+            result = await _run_sync(_invoke_local_handler, handler, arguments, invocation)
             if inspect.isawaitable(result):
                 result = await result
-            detached = copy_json_object(result)
+            detached = await _run_sync(copy_json_object, result)
         except asyncio.CancelledError:
             raise
         except (TypeError, ValueError):
@@ -243,7 +271,12 @@ class GatewayCallPipeline:
                 "The reviewed local tool handler failed.",
             ) from None
         try:
-            self.mirror.validate_virtual_result(policy.alias, policy.tool, detached)
+            await _run_sync(
+                self.mirror.validate_virtual_result,
+                policy.alias,
+                policy.tool,
+                detached,
+            )
         except (KeyError, SchemaError, ValidationError):
             raise DomainToolError(
                 "invalid_local_result",
@@ -254,7 +287,7 @@ class GatewayCallPipeline:
                 "invalid_local_result",
                 "The local tool result does not match the reviewed output schema.",
             ) from None
-        return _structured_success_result(detached)
+        return await _run_sync(_structured_success_result, detached)
 
     async def _enqueue_approval(
         self,
@@ -276,20 +309,31 @@ class GatewayCallPipeline:
                 "adapter_unavailable",
                 "The exact reviewed approval adapter is unavailable.",
             )
-        try:
-            reviewed_limits = ReviewedToolLimits.from_policy(policy.limits)
-        except (TypeError, ValueError):
+        downstream_client = self._downstream_clients.get(policy.alias)
+        if downstream_client is None:
             raise DomainToolError(
                 "policy_unavailable",
-                "The reviewed tool admission policy is unavailable.",
+                "The reviewed tool execution scope is unavailable.",
+            )
+        try:
+            scope = await _run_sync(
+                self._execution_scopes.resolve,
+                policy.alias,
+                policy.tool,
+                adapter,
+                downstream_client,
+            )
+            reviewed_limits = await _run_sync(ReviewedToolLimits.from_policy, policy.limits)
+        except (ExecutionScopeError, TypeError, ValueError):
+            raise DomainToolError(
+                "policy_unavailable",
+                "The reviewed tool execution scope is unavailable.",
             ) from None
         try:
-            adapter.validate(arguments)
-            canonical = adapter.canonicalize(arguments)
-            canonical_arguments = copy_json_object(canonical)
-            attachment_freezer = getattr(adapter, "freeze_attachments", None)
-            attachments = (
-                attachment_freezer(canonical_arguments) if callable(attachment_freezer) else ()
+            canonical_arguments, attachments = await _run_sync(
+                _prepare_approval_arguments,
+                adapter,
+                arguments,
             )
         except (TypeError, ValueError):
             raise DomainToolError(
@@ -303,12 +347,15 @@ class GatewayCallPipeline:
             ) from None
 
         try:
-            frozen = self._freezer.freeze(
+            frozen = await _run_sync(
+                self._freezer.freeze,
                 adapter,
                 canonical_arguments,
                 origin_namespace=namespace,
                 policy_version=self.mirror.policy.version,
-                schema_version=self.mirror.captured_digest(policy.alias, policy.tool),
+                schema_digest=scope.schema_digest,
+                account_ref=scope.account_ref,
+                credential_identity_digest=scope.credential_identity_digest,
                 editor_actor=f"caller:{namespace}",
                 idempotency_key=identity.invocation_key,
                 attachments=attachments,
@@ -323,7 +370,8 @@ class GatewayCallPipeline:
         # transaction begins, it runs through commit before control is yielded.
         await asyncio.sleep(0)
         try:
-            stored = self._enqueuer.enqueue(
+            stored = await _run_sync(
+                self._enqueuer.enqueue,
                 frozen.enqueue_request,
                 reviewed_limits=reviewed_limits,
             )
@@ -340,10 +388,30 @@ class GatewayCallPipeline:
                 "request_rejected",
                 "A staged object is unavailable, changed, or already consumed.",
             ) from None
-        return _stored_pending_call_result(stored)
+        return await _run_sync(_stored_pending_call_result, stored)
 
 
 AliasGateway = GatewayCallPipeline
+
+
+def _invoke_local_handler(
+    handler: LocalHandler,
+    arguments: Mapping[str, Any],
+    invocation: LocalInvocation,
+) -> LocalResult | Awaitable[LocalResult]:
+    return handler(copy.deepcopy(dict(arguments)), invocation)
+
+
+def _prepare_approval_arguments(
+    adapter: ApprovalAdapter,
+    arguments: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[AttachmentReference, ...]]:
+    adapter.validate(arguments)
+    canonical = adapter.canonicalize(arguments)
+    canonical_arguments = copy_json_object(canonical)
+    attachment_freezer = getattr(adapter, "freeze_attachments", None)
+    attachments = attachment_freezer(canonical_arguments) if callable(attachment_freezer) else ()
+    return canonical_arguments, attachments
 
 
 def _admission_error(error: AdmissionRejected) -> tuple[str, str]:

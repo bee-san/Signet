@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +19,7 @@ from signet.admission import ReviewedToolLimits
 from signet.credential_broker import Secret
 from signet.crypto import PayloadCipher
 from signet.db import Database
+from signet.execution_scope import PolicyExecutionScopeResolver
 from signet.freezer import RequestFreezer
 from signet.gateway import (
     GatewayCallPipeline,
@@ -41,6 +43,7 @@ from tests.attachment_fixtures import attachment_cipher
 
 MASTER_KEY = "gateway-test-master-key-material-000000000001"
 KEY_REFERENCE = "keychain://Signet/gateway-test-payload"
+CREDENTIAL_DIGEST = "c" * 64
 
 
 def _tool(
@@ -73,6 +76,7 @@ def _tool(
 
 class FakeDownstream:
     def __init__(self) -> None:
+        self.credential_identity_digest = CREDENTIAL_DIGEST
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.entered = asyncio.Event()
         self.gate: asyncio.Event | None = None
@@ -111,6 +115,7 @@ class FakeApprovalAdapter:
     }
 
     def __init__(self) -> None:
+        self.account = "example-account"
         self.validated: list[dict[str, Any]] = []
         self.canonicalized: list[dict[str, Any]] = []
         self.canonicalized_event = asyncio.Event()
@@ -144,6 +149,24 @@ class LostOnceEnqueuer:
             self.lost = True
             raise RuntimeError("simulated response loss after commit")
         return result
+
+
+class BlockingEnqueuer:
+    def __init__(self, machine: ApprovalStateMachine) -> None:
+        self.machine = machine
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def enqueue(
+        self,
+        request: EnqueueRequest,
+        *,
+        reviewed_limits: ReviewedToolLimits,
+    ) -> EnqueueResult:
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise AssertionError("blocking enqueue test was not released")
+        return self.machine.enqueue(request, reviewed_limits=reviewed_limits)
 
 
 class GatewayHarness:
@@ -229,6 +252,10 @@ class GatewayHarness:
             downstream_clients={"example": self.downstream},
             local_handlers={"fake.local.v1": local_handler},
             adapters={"fake.send.v1": cast(ApprovalAdapter, self.adapter)},
+            execution_scopes=PolicyExecutionScopeResolver(
+                self.mirror,
+                {"example": self.downstream},
+            ),
             freezer=freezer,
             enqueuer=enqueuer,
         )
@@ -288,6 +315,29 @@ async def test_end_to_end_routes_all_modes_and_never_mutates_before_approval(
         with pytest.raises(McpError) as unknown:
             await client.call_tool("unknown", {})
         assert unknown.value.error.code == types.INVALID_PARAMS
+
+
+@pytest.mark.asyncio
+async def test_publication_gate_lists_new_policy_but_prevents_downstream_calls(
+    tmp_path: Path,
+) -> None:
+    harness = GatewayHarness(tmp_path)
+    aliases = frozenset({"example"})
+    harness.mirror.gate_publication(aliases)
+
+    async with create_connected_server_and_client_session(harness.surface.server) as client:
+        listed = await client.list_tools()
+        assert [tool.name for tool in listed.tools] == ["read", "local", "send", "blocked"]
+
+        unavailable = await client.call_tool("read", {"query": "must not execute"})
+        assert unavailable.isError is True
+        assert unavailable.structuredContent["error"]["code"] == "policy_unavailable"
+        assert harness.downstream.calls == []
+
+        harness.mirror.ungate_publication(aliases)
+        successful = await client.call_tool("read", {"query": "published"})
+        assert successful.isError is False
+        assert harness.downstream.calls == [("read", {"query": "published"})]
 
 
 @pytest.mark.asyncio
@@ -353,11 +403,16 @@ async def test_gateway_atomically_claims_encrypted_attachment_catalog_object(
         "send_email",
         mirror.captured_digest("fastmail", "send_email"),
     )
+    downstream = FakeDownstream()
     pipeline = GatewayCallPipeline(
         mirror=mirror,
-        downstream_clients={},
+        downstream_clients={"fastmail": downstream},
         local_handlers={},
         adapters={adapter.adapter_id: adapter},
+        execution_scopes=PolicyExecutionScopeResolver(
+            mirror,
+            {"fastmail": downstream},
+        ),
         freezer=RequestFreezer(PayloadCipher(Secret(MASTER_KEY), KEY_REFERENCE)),
         enqueuer=ApprovalStateMachine(database),
     )
@@ -488,6 +543,22 @@ async def test_approval_requires_the_exact_policy_selected_adapter(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_approval_requires_the_exact_reviewed_downstream_client(tmp_path: Path) -> None:
+    harness = GatewayHarness(tmp_path)
+    replacement = FakeDownstream()
+    harness.pipeline._downstream_clients["example"] = replacement
+
+    async with create_connected_server_and_client_session(harness.surface.server) as client:
+        result = await client.call_tool("send", {"message": "safe"})
+
+    assert result.isError is True
+    assert result.structuredContent["error"]["code"] == "policy_unavailable"
+    assert replacement.credential_identity_digest == harness.downstream.credential_identity_digest
+    assert harness.request_count() == 0
+    assert replacement.calls == []
+
+
+@pytest.mark.asyncio
 async def test_approval_pipeline_enforces_reviewed_tool_admission_limits(
     tmp_path: Path,
 ) -> None:
@@ -581,6 +652,63 @@ async def test_schema_drift_disables_passthrough_before_downstream_call(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("read", {"query": "safe"}),
+        ("local", {"value": "draft"}),
+        ("send", {"message": "must not enqueue"}),
+    ],
+)
+async def test_schema_refresh_wins_surface_guard_before_any_tool_effect(
+    tmp_path: Path,
+    tool: str,
+    arguments: dict[str, str],
+) -> None:
+    harness = GatewayHarness(tmp_path)
+    drifted = copy.deepcopy(harness.raw_tools)
+    for candidate in drifted:
+        candidate["description"] = f"drifted {candidate['name']}"
+    capture_finished = threading.Event()
+    release_refresh = threading.Event()
+
+    def capture_then_pause() -> None:
+        harness.mirror.capture("example", drifted)
+        capture_finished.set()
+        if not release_refresh.wait(timeout=5):
+            raise AssertionError("schema refresh race was not released")
+
+    async def refresh() -> None:
+        async with harness.surface.schema_change_guard():
+            await asyncio.to_thread(capture_then_pause)
+
+    safety_release = threading.Timer(3, release_refresh.set)
+    safety_release.start()
+    try:
+        async with create_connected_server_and_client_session(harness.surface.server) as client:
+            refreshing = asyncio.create_task(refresh())
+            assert await asyncio.to_thread(capture_finished.wait, 1)
+            calling = asyncio.create_task(client.call_tool(tool, arguments))
+            await asyncio.sleep(0.05)
+            assert not calling.done()
+            assert harness.downstream.calls == []
+            assert harness.local_calls == []
+            assert harness.request_count() == 0
+            release_refresh.set()
+            await refreshing
+            result = await calling
+    finally:
+        release_refresh.set()
+        safety_release.cancel()
+
+    assert result.isError is True
+    assert result.structuredContent["error"]["code"] == "schema_unreviewed"
+    assert harness.downstream.calls == []
+    assert harness.local_calls == []
+    assert harness.request_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_passthrough_cancellation_propagates_to_downstream(tmp_path: Path) -> None:
     harness = GatewayHarness(tmp_path)
     harness.downstream.gate = asyncio.Event()
@@ -623,6 +751,88 @@ async def test_approval_cancellation_before_commit_enqueues_nothing(tmp_path: Pa
     with pytest.raises(asyncio.CancelledError):
         await calling
     assert harness.request_count() == 0
+    assert harness.downstream.calls == []
+
+
+@pytest.mark.asyncio
+async def test_blocking_approval_enqueue_does_not_stall_the_event_loop(tmp_path: Path) -> None:
+    harness = GatewayHarness(tmp_path)
+    enqueuer = BlockingEnqueuer(harness.machine)
+    harness.pipeline._enqueuer = enqueuer
+    identity = derive_invocation_identity(
+        namespace="profile:test",
+        alias="example",
+        tool="send",
+        explicit_id="blocking-enqueue",
+        explicit_id_present=True,
+        session_scope="blocking-session",
+        request_id=1,
+    )
+    safety_release = threading.Timer(3, enqueuer.release.set)
+    safety_release.start()
+    try:
+        calling = asyncio.create_task(
+            harness.pipeline.handle_call(
+                "example",
+                "send",
+                {"message": "queued off loop"},
+                "profile:test",
+                identity,
+            )
+        )
+        assert await asyncio.to_thread(enqueuer.started.wait, 1)
+        assert not enqueuer.release.is_set()
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        enqueuer.release.set()
+        result = await calling
+    finally:
+        enqueuer.release.set()
+        safety_release.cancel()
+
+    assert result["structuredContent"]["status"] == "pending_approval"
+    assert harness.request_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_approval_enqueue_finishes_commit_before_cancellation_propagates(
+    tmp_path: Path,
+) -> None:
+    harness = GatewayHarness(tmp_path)
+    enqueuer = BlockingEnqueuer(harness.machine)
+    harness.pipeline._enqueuer = enqueuer
+    identity = derive_invocation_identity(
+        namespace="profile:test",
+        alias="example",
+        tool="send",
+        explicit_id="cancel-during-enqueue",
+        explicit_id_present=True,
+        session_scope="cancel-enqueue-session",
+        request_id=1,
+    )
+    safety_release = threading.Timer(3, enqueuer.release.set)
+    safety_release.start()
+    try:
+        calling = asyncio.create_task(
+            harness.pipeline.handle_call(
+                "example",
+                "send",
+                {"message": "commit before cancellation"},
+                "profile:test",
+                identity,
+            )
+        )
+        assert await asyncio.to_thread(enqueuer.started.wait, 1)
+        calling.cancel()
+        await asyncio.sleep(0.05)
+        assert not calling.done()
+        enqueuer.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await calling
+    finally:
+        enqueuer.release.set()
+        safety_release.cancel()
+
+    assert harness.request_count() == 1
     assert harness.downstream.calls == []
 
 

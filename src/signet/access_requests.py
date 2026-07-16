@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Callable
 
 from signet.adapters.tool_access import ToolAccessAdapter
-from signet.canonical import canonical_json
+from signet.canonical import canonical_json, sha256_hex
 from signet.freezer import RequestFreezer
 from signet.gateway_tools import AccessRequestDraft
 from signet.models import EnqueueRequest
@@ -28,7 +28,14 @@ class FrozenAccessRequestFactory:
             raise ValueError("policy version provider and schema version are required")
         self._freezer = freezer
         self._policy_version = policy_version
-        self._schema_version = schema_version
+        self._schema_version = sha256_hex(
+            canonical_json(
+                {
+                    "domain": "signet/gateway-internal-schema/v1",
+                    "schema_version": schema_version,
+                }
+            )
+        )
         self.adapter = ToolAccessAdapter()
 
     def freeze(self, draft: AccessRequestDraft) -> EnqueueRequest:
@@ -87,7 +94,9 @@ class FrozenAccessRequestFactory:
             {"alias": draft.alias, "tool": draft.tool, "reason": draft.reason},
             origin_namespace=draft.origin_namespace,
             policy_version=policy_version,
-            schema_version=self._schema_version,
+            schema_digest=self._schema_version,
+            account_ref=None,
+            credential_identity_digest=None,
             editor_actor=draft.actor,
             idempotency_key=idempotency_key,
             gateway_internal=True,

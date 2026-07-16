@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -14,7 +15,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, Timer
 from typing import Any
 
 import httpx
@@ -24,10 +25,12 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
 
+import signet.backup as backup_module
 import signet.demo as demo_module
 from signet.app import main
 from signet.backup import BackupError
 from signet.credential_broker import CredentialError
+from signet.db import Database, DatabaseError, DatabaseFinalizationStateUnknown
 from signet.demo import (
     DEMO_ACTION_PROOF,
     DEMO_GRACEFUL_SHUTDOWN_SECONDS,
@@ -44,6 +47,7 @@ from signet.demo import (
     offline_smoke,
     restore_demo,
 )
+from signet.private_paths import PrivatePathError
 from signet.retention import BackupPins
 
 FASTMAIL_ARGUMENTS = {
@@ -234,7 +238,7 @@ def test_cli_initializes_private_state_and_prints_only_selected_credentials(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    root = tmp_path / "missing" / "demo"
+    root = tmp_path / "demo"
     main(["demo", "init", "--data-dir", str(root)])
     assert "fake-only" in capsys.readouterr().out
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
@@ -260,6 +264,661 @@ def test_cli_initializes_private_state_and_prints_only_selected_credentials(
     with pytest.raises(SystemExit):
         main(["demo", "init", "--data-dir", str(root)])
     assert offline_smoke(root)["network_provider_calls"] == 0
+
+
+@pytest.mark.parametrize(
+    "operator_message",
+    [
+        (
+            "database maintenance completed, but the SQLite connection close outcome could not "
+            "be confirmed; stop Signet processes and verify the database before retrying"
+        ),
+        (
+            "database maintenance completed, but the maintenance-lock release outcome could not "
+            "be confirmed; stop Signet processes and inspect the private maintenance lock before "
+            "retrying"
+        ),
+    ],
+)
+def test_demo_cli_preserves_bounded_database_finalization_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operator_message: str,
+) -> None:
+    root = new_demo(tmp_path, "database-finalization-message")
+
+    def report_finalization_state(_root: Path) -> dict[str, object]:
+        raise DatabaseFinalizationStateUnknown(operator_message) from OSError(
+            "injected raw finalizer detail"
+        )
+
+    monkeypatch.setattr(demo_module, "offline_smoke", report_finalization_state)
+
+    with pytest.raises(SystemExit) as caught:
+        main(["demo", "smoke", "--data-dir", str(root)])
+
+    assert caught.value.code == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert operator_message in output.err
+    assert "demo smoke failed safely" not in output.err
+    assert "injected raw" not in output.err
+
+
+def test_demo_cli_preserves_combined_backup_and_database_lock_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import signet.db as db_module
+
+    root = new_demo(tmp_path, "combined-database-lock-recovery")
+    database = Database(root / "approvals.sqlite3")
+    with database.transaction() as connection:
+        connection.execute(f"PRAGMA user_version={db_module.LATEST_SCHEMA_VERSION - 1}")
+
+    real_flock = db_module.fcntl.flock
+
+    def fail_maintenance_unlock(descriptor: int, operation: int) -> None:
+        if operation == db_module.fcntl.LOCK_UN:
+            raise OSError("injected raw maintenance unlock failure")
+        real_flock(descriptor, operation)
+
+    def fail_pre_migration_backup(*_args: object) -> None:
+        raise BackupError("injected raw pre-migration backup failure")
+
+    monkeypatch.setattr(db_module.fcntl, "flock", fail_maintenance_unlock)
+    monkeypatch.setattr(backup_module, "_archive_workspace", fail_pre_migration_backup)
+
+    with pytest.raises(SystemExit) as caught:
+        main(["demo", "smoke", "--data-dir", str(root)])
+
+    assert caught.value.code == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "maintenance-lock finalization could not be confirmed" in output.err
+    assert "stop Signet processes and inspect the private maintenance lock" in output.err
+    assert "demo smoke failed safely" not in output.err
+    assert "injected raw" not in output.err
+
+
+def test_seed_request_cli_uses_gateway_is_repeatable_and_prints_safe_metadata(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = new_demo(tmp_path, "seed-request")
+    calls: list[tuple[str, str, dict[str, Any], str, Any]] = []
+    original_handle_call = demo_module.GatewayCallPipeline.handle_call
+
+    async def observed_handle_call(
+        pipeline: Any,
+        alias: str,
+        tool: str,
+        arguments: dict[str, Any],
+        namespace: str,
+        identity: Any,
+    ) -> dict[str, Any]:
+        calls.append((alias, tool, dict(arguments), namespace, identity))
+        return await original_handle_call(
+            pipeline,
+            alias,
+            tool,
+            arguments,
+            namespace,
+            identity,
+        )
+
+    async def reject_provider_call(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("seed request must not invoke a provider")
+
+    monkeypatch.setattr(
+        demo_module.GatewayCallPipeline,
+        "handle_call",
+        observed_handle_call,
+    )
+    monkeypatch.setattr(
+        demo_module.FakeOnlyProviderClient,
+        "call_tool_raw",
+        reject_provider_call,
+    )
+    monkeypatch.setattr(
+        demo_module.FakeOnlyProviderClient,
+        "call_tool",
+        reject_provider_call,
+    )
+
+    command = ["demo", "seed-request", "--data-dir", str(root)]
+    main(command)
+    first_raw = capsys.readouterr().out
+    first = json.loads(first_raw)
+    assert first == {
+        "created": True,
+        "request_id": first["request_id"],
+        "service": "fastmail",
+        "state": "pending_approval",
+        "status": "ready_for_review",
+        "tool": "send_email",
+    }
+    assert str(root) not in first_raw
+    assert credential_value(root, "mcp-token") not in first_raw
+    assert "fake-customer-success@demo.invalid" not in first_raw
+    assert "Fake onboarding status follow-up" not in first_raw
+    assert "Reason for sending" not in first_raw
+    assert "payload" not in first_raw
+
+    assert len(calls) == 1
+    alias, tool, arguments, namespace, identity = calls[0]
+    assert (alias, tool, namespace) == ("fastmail", "send_email", DEMO_NAMESPACE)
+    assert arguments["to"] == ["fake-customer-success@demo.invalid"]
+    assert arguments["subject"] == "Fake onboarding status follow-up"
+    assert "Reason for sending" in arguments["body"]
+    assert identity.source == "explicit"
+
+    assembly = build_demo(root)
+    request_id = str(first["request_id"])
+    stored = assembly.state_machine.get_request(request_id)
+    assert stored["state"] == "pending_approval"
+    assert stored["downstream_alias"] == "fastmail"
+    assert stored["tool_name"] == "send_email"
+    assert stored["origin_namespace"] == DEMO_NAMESPACE
+    with assembly.database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM payload_versions WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT count(*) FROM request_events
+                WHERE request_id = ? AND action = 'pending_enqueued'
+                """,
+                (request_id,),
+            ).fetchone()[0]
+            == 1
+        )
+
+    main(command)
+    replay = json.loads(capsys.readouterr().out)
+    assert replay == {**first, "created": False}
+    with assembly.database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM approval_requests").fetchone()[0] == 1
+
+    denied = asyncio.run(web_action(assembly, request_id, "deny"))
+    assert denied.status_code == 303
+    main(command)
+    next_request = json.loads(capsys.readouterr().out)
+    assert next_request["created"] is True
+    assert next_request["request_id"] != request_id
+    assert next_request["state"] == "pending_approval"
+    with assembly.database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM approval_requests").fetchone()[0] == 2
+    assert len(calls) == 3
+
+
+def test_seed_request_cli_requires_valid_marker_and_stopped_server(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = new_demo(tmp_path, "guarded-seed")
+    command = ["demo", "seed-request", "--data-dir", str(root)]
+    marker = root / "demo-state.json"
+    original_marker = marker.read_text(encoding="utf-8")
+    invalid_marker = json.loads(original_marker)
+    invalid_marker["mode"] = "not-fake"
+    marker.write_text(json.dumps(invalid_marker), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as marker_exit:
+        main(command)
+    assert marker_exit.value.code == 2
+    marker_failure = capsys.readouterr()
+    assert marker_failure.out == ""
+    assert "fake-only marker is invalid" in marker_failure.err
+    assert "Traceback" not in marker_failure.err
+
+    marker.write_text(original_marker, encoding="utf-8")
+    with demo_module._demo_server_lock(root), pytest.raises(SystemExit) as lock_exit:
+        main(command)
+    assert lock_exit.value.code == 2
+    lock_failure = capsys.readouterr()
+    assert lock_failure.out == ""
+    assert "already being served" in lock_failure.err
+    assert "Traceback" not in lock_failure.err
+    with build_demo(root).database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_seed_request_cli_sanitizes_gateway_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = new_demo(tmp_path, "failed-seed")
+
+    async def fail_admission(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("private fake-customer-success@demo.invalid payload")
+
+    monkeypatch.setattr(demo_module.GatewayCallPipeline, "handle_call", fail_admission)
+    with pytest.raises(SystemExit) as failure:
+        main(["demo", "seed-request", "--data-dir", str(root)])
+    assert failure.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "could not be admitted safely" in captured.err
+    assert "fake-customer-success" not in captured.err
+    assert "payload" not in captured.err
+    assert "Traceback" not in captured.err
+    with build_demo(root).database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_demo_paths_reject_symlinked_ancestors_before_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path.resolve(strict=True)
+    direct_target = base / "direct-target"
+    direct_target.mkdir(mode=0o700)
+    direct_destination = base / "direct-demo"
+    direct_destination.symlink_to(direct_target, target_is_directory=True)
+    with pytest.raises(DemoError, match="must not already exist"):
+        initialize_demo(direct_destination)
+    assert direct_destination.is_symlink()
+    assert tuple(direct_target.iterdir()) == ()
+
+    physical_parent = base / "physical"
+    physical_parent.mkdir(mode=0o700)
+    linked_parent = base / "linked"
+    linked_parent.symlink_to(physical_parent, target_is_directory=True)
+
+    linked_destination = linked_parent / "new-demo"
+    with pytest.raises(DemoError, match="parent is unavailable or unsafe"):
+        initialize_demo(linked_destination)
+    assert not (physical_parent / "new-demo").exists()
+
+    nested_destination = linked_parent / "missing" / "new-demo"
+    with pytest.raises(DemoError, match="parent is unavailable or unsafe"):
+        initialize_demo(nested_destination)
+    assert not (physical_parent / "missing").exists()
+
+    missing_parent = base / "missing-parent"
+    with pytest.raises(DemoError, match="parent is unavailable or unsafe"):
+        initialize_demo(missing_parent / "new-demo")
+    assert not missing_parent.exists()
+
+    unsafe_parent = base / "unsafe-parent"
+    unsafe_parent.mkdir(mode=0o700)
+    unsafe_parent.chmod(0o777)
+    with pytest.raises(DemoError, match="parent is unavailable or unsafe"):
+        initialize_demo(unsafe_parent / "new-demo")
+    assert stat.S_IMODE(unsafe_parent.stat().st_mode) == 0o777
+    assert tuple(unsafe_parent.iterdir()) == ()
+
+    physical_root = physical_parent / "existing-demo"
+    initialize_demo(physical_root)
+    direct_root = base / "direct-root"
+    direct_root.symlink_to(physical_root, target_is_directory=True)
+    for selected in (direct_root, linked_parent / "existing-demo"):
+        with pytest.raises(DemoError, match="data directory is unavailable or unsafe"):
+            credential_value(selected, "mcp-token")
+
+    def fail_identity_verification(_path: Path) -> Path:
+        raise PrivatePathError("injected identity race")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(demo_module, "require_private_directory", fail_identity_verification)
+        with pytest.raises(DemoError, match="data directory is unavailable or unsafe"):
+            credential_value(physical_root, "mcp-token")
+
+
+def test_demo_init_rejects_parent_traversal_without_creating_state(tmp_path: Path) -> None:
+    base = tmp_path.resolve(strict=True)
+    outside = base / "outside"
+    nested = outside / "nested"
+    nested.mkdir(parents=True, mode=0o700)
+    linked = base / "linked"
+    linked.symlink_to(nested, target_is_directory=True)
+
+    for destination in (
+        linked / ".." / "demo",
+        base / "missing" / ".." / "demo",
+    ):
+        with pytest.raises(DemoError, match="parent is unavailable or unsafe"):
+            initialize_demo(destination)
+
+    assert not (base / "demo").exists()
+    assert not (outside / "demo").exists()
+    assert not (base / "missing").exists()
+
+
+def test_demo_init_never_replaces_destination_created_at_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path.resolve(strict=True)
+    destination = parent / "publication-race"
+    real_rename = demo_module._rename_directory_no_replace
+    raced_inode: int | None = None
+
+    def create_destination_then_rename(source: Path, target: Path) -> None:
+        nonlocal raced_inode
+        target.mkdir(mode=0o700)
+        raced_inode = target.stat().st_ino
+        real_rename(source, target)
+
+    monkeypatch.setattr(
+        demo_module,
+        "_rename_directory_no_replace",
+        create_destination_then_rename,
+    )
+    with pytest.raises(DemoError, match="must not already exist"):
+        initialize_demo(destination)
+
+    assert raced_inode is not None
+    assert destination.is_dir()
+    assert destination.stat().st_ino == raced_inode
+    assert tuple(destination.iterdir()) == ()
+    assert not any(path.name.startswith(".publication-race.init-") for path in parent.iterdir())
+
+
+def test_demo_paths_map_unexpandable_home_to_controlled_error() -> None:
+    selected = Path("~signet-user-that-must-not-exist-7f43d5/demo")
+
+    with pytest.raises(DemoError, match="path is unavailable or unsafe"):
+        initialize_demo(selected)
+
+    with pytest.raises(DemoError, match="path is unavailable or unsafe"):
+        initialize_demo(Path("invalid\ud800demo"))
+    with pytest.raises(DemoError, match="path is unavailable or unsafe"):
+        credential_value(selected, "mcp-token")
+
+
+def test_demo_created_files_are_rejected_when_acl_inspection_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "acl-rejected-demo"
+
+    def reject_acl(_descriptor: int) -> None:
+        raise PrivatePathError("injected unsafe granting ACL")
+
+    monkeypatch.setattr(demo_module, "require_no_acl_grants", reject_acl)
+
+    with pytest.raises(DemoError, match="inherited an unsafe granting ACL"):
+        initialize_demo(destination)
+
+    assert not destination.exists()
+    assert not any(path.name.startswith(".acl-rejected-demo.init-") for path in tmp_path.iterdir())
+
+
+def test_demo_init_failure_removes_only_its_temporary_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path.resolve(strict=True)
+    marker = parent / "keep"
+    marker.write_text("keep\n", encoding="utf-8")
+
+    def fail_initialization(self: Database, **kwargs: Any) -> None:
+        del self, kwargs
+        raise DatabaseError("injected demo initialization failure")
+
+    monkeypatch.setattr(Database, "initialize", fail_initialization)
+    previous_umask = os.umask(0o777)
+    try:
+        with pytest.raises(DatabaseError, match="injected demo initialization failure"):
+            initialize_demo(parent / "failed-demo")
+    finally:
+        os.umask(previous_umask)
+
+    assert {path.name for path in parent.iterdir()} == {marker.name}
+    assert marker.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_demo_init_retains_uncaptured_tree_when_mkdir_outcome_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path.resolve(strict=True)
+    destination = parent / "interrupted-create"
+    real_mkdir = Path.mkdir
+
+    def mkdir_then_interrupt(path: Path, *args: Any, **kwargs: Any) -> None:
+        real_mkdir(path, *args, **kwargs)
+        if path.name.startswith(".interrupted-create.init-"):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_then_interrupt)
+    previous_umask = os.umask(0o777)
+    try:
+        with pytest.raises(
+            DemoError,
+            match="creation cleanup could not be confirmed.*inspect the demo parent",
+        ):
+            initialize_demo(destination)
+    finally:
+        os.umask(previous_umask)
+
+    assert not destination.exists()
+    retained = tuple(
+        path for path in parent.iterdir() if path.name.startswith(".interrupted-create.init-")
+    )
+    assert len(retained) == 1
+    retained[0].rmdir()
+
+
+def test_demo_init_preserves_replacement_when_mkdir_outcome_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path.resolve(strict=True)
+    destination = parent / "uncaptured-replacement"
+    displaced = parent / "demo-created-before-interrupt"
+    replacement: Path | None = None
+    real_mkdir = Path.mkdir
+
+    def replace_then_interrupt(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal replacement
+        real_mkdir(path, *args, **kwargs)
+        if path.name.startswith(".uncaptured-replacement.init-"):
+            path.rename(displaced)
+            real_mkdir(path, mode=0o700)
+            (path / "replacement-marker").write_text("preserve\n", encoding="utf-8")
+            path.chmod(0o500)
+            replacement = path
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(Path, "mkdir", replace_then_interrupt)
+
+    with pytest.raises(
+        DemoError,
+        match="creation cleanup could not be confirmed.*inspect the demo parent",
+    ):
+        initialize_demo(destination)
+
+    assert replacement is not None
+    assert (replacement / "replacement-marker").read_text(encoding="utf-8") == "preserve\n"
+    assert stat.S_IMODE(replacement.stat().st_mode) == 0o500
+    replacement.chmod(0o700)
+    backup_module.shutil.rmtree(replacement)
+    displaced.rmdir()
+
+
+def test_demo_init_cleans_up_restrictive_nested_directory_after_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path.resolve(strict=True)
+    destination = parent / "interrupted-imports"
+    real_mkdir = Path.mkdir
+
+    def mkdir_then_interrupt(path: Path, *args: Any, **kwargs: Any) -> None:
+        real_mkdir(path, *args, **kwargs)
+        if path.name == "imports":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_then_interrupt)
+    previous_umask = os.umask(0o777)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            initialize_demo(destination)
+    finally:
+        os.umask(previous_umask)
+
+    assert not destination.exists()
+    assert not any(path.name.startswith(".interrupted-imports.init-") for path in parent.iterdir())
+
+
+def test_demo_init_cli_reports_unconfirmed_private_secret_tree_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    destination = tmp_path / "retained-initialization"
+    original_rmtree = backup_module.shutil.rmtree
+
+    def fail_before_publish(_source: Path, _destination: Path) -> None:
+        raise DemoError("injected private initialization failure")
+
+    def retain_initialization_tree(path: Path) -> None:
+        if path.name.startswith(".retained-initialization.init-"):
+            raise OSError("injected private cleanup failure")
+        original_rmtree(path)
+
+    monkeypatch.setattr(demo_module, "_rename_directory_no_replace", fail_before_publish)
+    monkeypatch.setattr(backup_module.shutil, "rmtree", retain_initialization_tree)
+
+    with pytest.raises(SystemExit):
+        main(["demo", "init", "--data-dir", str(destination)])
+
+    failure = capsys.readouterr().err
+    assert "initialization did not complete" in failure
+    assert "cleanup could not be confirmed" in failure
+    assert "injected" not in failure
+    assert str(destination) not in failure
+    assert "Traceback" not in failure
+    retained = tuple(tmp_path.glob(".retained-initialization.init-*"))
+    assert len(retained) == 1
+    secret_document = json.loads((retained[0] / "demo-secrets.json").read_text(encoding="utf-8"))
+    assert secret_document["mcp_token"] not in failure
+    monkeypatch.setattr(backup_module.shutil, "rmtree", original_rmtree)
+    original_rmtree(retained[0])
+
+
+def test_demo_init_hardens_every_artifact_against_restrictive_umask(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path.resolve(strict=True)
+    destination = parent / "restrictive-umask-demo"
+
+    previous_umask = os.umask(0o777)
+    try:
+        initialized = initialize_demo(destination, now=1_800_000_000)
+    finally:
+        os.umask(previous_umask)
+
+    assert initialized == destination
+    for path in (destination, *destination.rglob("*")):
+        expected_mode = 0o700 if path.is_dir() else 0o600
+        assert stat.S_IMODE(path.stat().st_mode) == expected_mode, path
+    assert not any(
+        path.name.startswith(".restrictive-umask-demo.init-") for path in parent.iterdir()
+    )
+
+
+def test_demo_init_detects_same_path_parent_replacement_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path.resolve(strict=True)
+    parent = base / "parent"
+    parent.mkdir(mode=0o700)
+    replacement = base / "replacement"
+    replacement.mkdir(mode=0o700)
+    replacement_marker = replacement / "keep"
+    replacement_marker.write_text("replacement\n", encoding="utf-8")
+    displaced = base / "displaced"
+    real_fsync_directory = demo_module._fsync_directory
+    swapped = False
+
+    def swap_parent_after_temporary_fsync(path: Path) -> None:
+        nonlocal swapped
+        real_fsync_directory(path)
+        if not swapped:
+            parent.rename(displaced)
+            replacement.rename(parent)
+            swapped = True
+
+    monkeypatch.setattr(demo_module, "_fsync_directory", swap_parent_after_temporary_fsync)
+    with pytest.raises(
+        DemoError,
+        match="initialization did not complete.*cleanup could not be confirmed",
+    ):
+        initialize_demo(parent / "demo")
+
+    assert swapped
+    assert (parent / replacement_marker.name).read_text(encoding="utf-8") == "replacement\n"
+    assert not (parent / "demo").exists()
+    assert not (displaced / "demo").exists()
+    temporary_trees = tuple(displaced.glob(".demo.init-*"))
+    assert len(temporary_trees) == 1
+    assert stat.S_IMODE(temporary_trees[0].stat().st_mode) == 0o700
+
+
+def test_demo_init_reports_unknown_outcome_and_preserves_publish_on_parent_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path.resolve(strict=True)
+    destination = parent / "published-before-fsync-failure"
+    real_fsync_directory = demo_module._fsync_directory
+    calls = 0
+
+    def fail_second_directory_fsync(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected parent fsync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(demo_module, "_fsync_directory", fail_second_directory_fsync)
+    with pytest.raises(DemoError, match="outcome is unknown.*durable publication"):
+        initialize_demo(destination, now=1_800_000_000)
+
+    assert calls == 2
+    assert destination.is_dir()
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+    assert credential_value(destination, "web-login-proof") == "fake:login"
+    assert not any(
+        path.name.startswith(".published-before-fsync-failure.init-") for path in parent.iterdir()
+    )
+
+
+def test_demo_init_reports_unknown_outcome_when_interrupted_immediately_after_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path.resolve(strict=True)
+    destination = parent / "interrupted-publication"
+    real_rename = demo_module._rename_directory_no_replace
+
+    def rename_then_interrupt(source: Path, target: Path) -> None:
+        real_rename(source, target)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(demo_module, "_rename_directory_no_replace", rename_then_interrupt)
+    with pytest.raises(DemoError, match="outcome is unknown.*durable publication"):
+        initialize_demo(destination, now=1_800_000_000)
+
+    assert destination.is_dir()
+    assert credential_value(destination, "web-login-proof") == "fake:login"
+    assert not any(
+        path.name.startswith(".interrupted-publication.init-") for path in parent.iterdir()
+    )
 
 
 def test_cli_fake_unknown_purge_preserves_uncertainty_and_redacts_content(
@@ -1134,6 +1793,43 @@ async def test_worker_supervision_retries_and_health_reports_persistent_failure(
 
 
 @pytest.mark.asyncio
+async def test_assembled_worker_lifespan_keeps_web_responsive_during_blocking_sweep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assembly = build_demo(new_demo(tmp_path))
+    started = Event()
+    release = Event()
+    original_sweep = assembly.state_machine.sweep_expired
+
+    def blocking_sweep(*, now: int, limit: int) -> int:
+        started.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("blocking demo sweep was not released")
+        return original_sweep(now=now, limit=limit)
+
+    monkeypatch.setattr(assembly.state_machine, "sweep_expired", blocking_sweep)
+    safety_release = Timer(3, release.set)
+    safety_release.start()
+    try:
+        async with assembly.web.router.lifespan_context(assembly.web):
+            waiting_started_at = time.monotonic()
+            assert await asyncio.to_thread(started.wait, 1)
+            assert time.monotonic() - waiting_started_at < 2
+            assert not release.is_set()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=assembly.web),
+                base_url="http://127.0.0.1:8790",
+            ) as client:
+                health = await asyncio.wait_for(client.get("/healthz"), timeout=1)
+            assert health.status_code == 200
+            release.set()
+    finally:
+        release.set()
+        safety_release.cancel()
+
+
+@pytest.mark.asyncio
 async def test_offline_operations_under_serve_lock_never_recover_execution(
     tmp_path: Path,
 ) -> None:
@@ -1246,6 +1942,72 @@ def test_demo_backup_maintenance_lock_is_marker_guarded_safe_and_reusable(
     with demo_module._demo_backup_maintenance_lock(root):
         pass
 
+
+def test_demo_lock_setup_failure_reports_unconfirmed_post_acquire_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = new_demo(tmp_path, "lock-setup-finalization")
+    original_open = demo_module.os.open
+    original_fstat = demo_module.os.fstat
+    original_close = demo_module.os.close
+    original_flock = demo_module.fcntl.flock
+    lock_descriptor: int | None = None
+    lock_fstats = 0
+    close_attempted = False
+    unlock_attempted = False
+
+    def capture_lock_open(path: Path, *args: Any, **kwargs: Any) -> int:
+        nonlocal lock_descriptor
+        descriptor = original_open(path, *args, **kwargs)
+        if Path(path).name == ".serve.lock":
+            lock_descriptor = descriptor
+        return descriptor
+
+    def fail_post_acquire_fstat(descriptor: int) -> os.stat_result:
+        nonlocal lock_fstats
+        if descriptor == lock_descriptor:
+            lock_fstats += 1
+            if lock_fstats == 3:
+                raise OSError("injected private post-acquire verification failure")
+        return original_fstat(descriptor)
+
+    def record_unlock(descriptor: int, operation: int) -> None:
+        nonlocal unlock_attempted
+        if descriptor == lock_descriptor and operation == demo_module.fcntl.LOCK_UN:
+            unlock_attempted = True
+        original_flock(descriptor, operation)
+
+    def fail_lock_close_once(descriptor: int) -> None:
+        nonlocal close_attempted
+        if descriptor == lock_descriptor and not close_attempted:
+            close_attempted = True
+            raise OSError("injected private lock close failure")
+        original_close(descriptor)
+
+    monkeypatch.setattr(demo_module.os, "open", capture_lock_open)
+    monkeypatch.setattr(demo_module.os, "fstat", fail_post_acquire_fstat)
+    monkeypatch.setattr(demo_module.fcntl, "flock", record_unlock)
+    monkeypatch.setattr(demo_module.os, "close", fail_lock_close_once)
+
+    with (
+        pytest.raises(
+            DemoError,
+            match=(
+                "lock setup failed.*lock release could not be confirmed.*stop all demo processes"
+            ),
+        ) as caught,
+        demo_module._demo_server_lock(root),
+    ):
+        pytest.fail("lock setup unexpectedly reached the protected operation")
+
+    assert "injected" not in str(caught.value)
+    assert unlock_attempted
+    assert close_attempted
+    assert lock_descriptor is not None
+    original_flock(lock_descriptor, demo_module.fcntl.LOCK_UN)
+    original_close(lock_descriptor)
+
     private = tmp_path / "backup-lock-output"
     private.mkdir(mode=0o700)
     blocked_destination = private / "blocked.signet-backup"
@@ -1277,6 +2039,81 @@ def test_demo_backup_maintenance_lock_is_marker_guarded_safe_and_reusable(
     marker.write_text(original_marker, encoding="utf-8")
     with demo_module._demo_backup_maintenance_lock(root):
         pass
+
+
+def test_demo_backup_lock_release_failure_preserves_durable_success_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = new_demo(tmp_path, "backup-lock-finalization-success")
+    assembly = build_demo(root)
+    private = tmp_path / "backup-lock-finalization-output"
+    private.mkdir(mode=0o700)
+    destination = private / "durable.signet-backup"
+    original_flock = demo_module.fcntl.flock
+
+    class UnlockFailure:
+        LOCK_EX = demo_module.fcntl.LOCK_EX
+        LOCK_NB = demo_module.fcntl.LOCK_NB
+        LOCK_UN = demo_module.fcntl.LOCK_UN
+
+        @staticmethod
+        def flock(descriptor: int, operation: int) -> None:
+            if operation == UnlockFailure.LOCK_UN:
+                raise OSError("injected private unlock failure")
+            original_flock(descriptor, operation)
+
+    monkeypatch.setattr(demo_module, "fcntl", UnlockFailure)
+
+    with pytest.raises(
+        DemoError,
+        match="operation completed.*lock release could not be confirmed.*destination result",
+    ) as caught:
+        assembly.backups.create(destination)
+
+    assert "injected" not in str(caught.value)
+    assert destination.is_file()
+
+
+def test_demo_backup_lock_release_failure_preserves_unknown_publication_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = new_demo(tmp_path, "backup-lock-finalization-unknown")
+    assembly = build_demo(root)
+    private = tmp_path / "backup-lock-unknown-output"
+    private.mkdir(mode=0o700)
+    destination = private / "unknown.signet-backup"
+    original_flock = demo_module.fcntl.flock
+    original_fsync = backup_module._fsync_directory
+
+    class UnlockFailure:
+        LOCK_EX = demo_module.fcntl.LOCK_EX
+        LOCK_NB = demo_module.fcntl.LOCK_NB
+        LOCK_UN = demo_module.fcntl.LOCK_UN
+
+        @staticmethod
+        def flock(descriptor: int, operation: int) -> None:
+            if operation == UnlockFailure.LOCK_UN:
+                raise OSError("injected private unlock failure")
+            original_flock(descriptor, operation)
+
+    def fail_publication_fsync(path: Path) -> None:
+        if path == private and destination.exists():
+            raise OSError("injected private fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(demo_module, "fcntl", UnlockFailure)
+    monkeypatch.setattr(backup_module, "_fsync_directory", fail_publication_fsync)
+
+    with pytest.raises(DemoError) as caught:
+        assembly.backups.create(destination)
+
+    message = str(caught.value)
+    assert "outcome is unknown" in message
+    assert "additionally, lock release could not be confirmed" in message
+    assert "injected" not in message
+    assert destination.is_file()
 
 
 def test_active_backup_lock_blocks_abandoned_pin_release_atomically(
@@ -1479,6 +2316,25 @@ async def test_encrypted_backup_restore_preserves_pending_request_and_attachment
     assert not failed_destination.exists()
 
 
+def test_demo_backup_restore_hardens_imports_and_secrets_under_restrictive_umask(
+    tmp_path: Path,
+) -> None:
+    root = new_demo(tmp_path, "restrictive-restore-source")
+    artifacts = tmp_path / "restrictive-restore-artifacts"
+    artifacts.mkdir(mode=0o700)
+    bundle = backup_demo(root, artifacts / "source.signet-backup")
+    destination = artifacts / "restored"
+    previous_umask = os.umask(0o777)
+    try:
+        restore_demo(root, bundle, destination)
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE((destination / "imports").stat().st_mode) == 0o700
+    assert stat.S_IMODE((destination / "demo-secrets.json").stat().st_mode) == 0o600
+    assert offline_smoke(destination)["status"] == "ok"
+
+
 def test_cli_backup_errors_are_bounded_and_hermes_shape_is_restrictive(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1520,6 +2376,326 @@ def test_cli_backup_errors_are_bounded_and_hermes_shape_is_restrictive(
             "sampling": {"enabled": False},
         }
         assert server["url"].startswith("http://127.0.0.1:18789/mcp/")
+
+
+def test_cli_backup_reports_unknown_publication_before_operator_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = new_demo(tmp_path, "cli-backup-unknown")
+    output_parent = tmp_path / "private-unknown-output"
+    output_parent.mkdir(mode=0o700)
+    destination = output_parent / "unknown.signet-backup"
+    original_fsync = backup_module._fsync_directory
+
+    def fail_destination_parent_fsync(path: Path) -> None:
+        if path == output_parent and destination.exists():
+            raise OSError("injected parent fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(backup_module, "_fsync_directory", fail_destination_parent_fsync)
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "demo",
+                "backup",
+                "--data-dir",
+                str(root),
+                "--output",
+                str(destination),
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert "outcome is unknown" in error
+    assert "inspect the destination before retrying" in error
+    assert "failed safely" not in error
+    assert "Traceback" not in error
+    assert credential_value(root, "mcp-token") not in error
+    assert destination.is_file()
+
+
+def test_demo_backup_and_restore_cli_paths_are_bounded(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = new_demo(tmp_path, "bounded-artifact-paths")
+    selected = "~signet-user-that-must-not-exist-7f43d5/private.signet"
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "demo",
+                "backup",
+                "--data-dir",
+                str(root),
+                "--output",
+                selected,
+            ]
+        )
+    backup_error = capsys.readouterr().err
+    assert "backup destination path is unavailable or unsafe" in backup_error
+    assert selected not in backup_error
+    assert "Traceback" not in backup_error
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "demo",
+                "restore",
+                "--data-dir",
+                str(root),
+                "--bundle",
+                selected,
+                "--destination",
+                str(tmp_path / "unused-restore"),
+            ]
+        )
+    restore_error = capsys.readouterr().err
+    assert "backup bundle path is unavailable or unsafe" in restore_error
+    assert selected not in restore_error
+    assert "Traceback" not in restore_error
+
+
+def test_cli_reports_combined_pin_release_and_private_cleanup_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = new_demo(tmp_path, "combined-backup-recovery")
+    private = tmp_path / "combined-backup-recovery-output"
+    private.mkdir(mode=0o700)
+    destination = private / "not-published.signet-backup"
+    original_rmtree = backup_module.shutil.rmtree
+
+    def fail_construction(*_args: object) -> None:
+        raise BackupError("injected private construction failure")
+
+    def fail_pin_release(_self: object, _pins: object, *, now: int) -> None:
+        del now
+        raise sqlite3.OperationalError("injected private pin release failure")
+
+    def retain_workspace(path: Path) -> None:
+        if path.name.startswith(".signet-backup-"):
+            raise OSError("injected private cleanup failure")
+        original_rmtree(path)
+
+    monkeypatch.setattr(backup_module, "_archive_workspace", fail_construction)
+    monkeypatch.setattr(backup_module.BackupPins, "release", fail_pin_release)
+    monkeypatch.setattr(backup_module.shutil, "rmtree", retain_workspace)
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "demo",
+                "backup",
+                "--data-dir",
+                str(root),
+                "--output",
+                str(destination),
+            ]
+        )
+
+    failure = capsys.readouterr().err
+    assert "retention pin release could not be confirmed" in failure
+    assert "private backup artifacts could not be removed safely" in failure.lower()
+    assert "injected" not in failure
+    assert credential_value(root, "mcp-token") not in failure
+    assert not destination.exists()
+    workspaces = tuple(private.glob(".signet-backup-*"))
+    assert len(workspaces) == 1
+    monkeypatch.setattr(backup_module.shutil, "rmtree", original_rmtree)
+    original_rmtree(workspaces[0])
+
+
+def test_cli_backup_pin_release_uncertainty_is_prepublication_and_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = new_demo(tmp_path, "cli-backup-pin-release")
+    output_parent = tmp_path / "private-pin-output"
+    output_parent.mkdir(mode=0o700)
+    destination = output_parent / "not-published.signet-backup"
+
+    def fail_pin_release(_self: object, _pins: object, *, now: int) -> None:
+        del now
+        raise sqlite3.OperationalError("injected sqlite pin release failure")
+
+    monkeypatch.setattr(backup_module.BackupPins, "release", fail_pin_release)
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "demo",
+                "backup",
+                "--data-dir",
+                str(root),
+                "--output",
+                str(destination),
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert "was not published" in error
+    assert "retention pin release could not be confirmed" in error
+    assert "inspect retention state before retrying" in error
+    assert "injected sqlite" not in error
+    assert "Traceback" not in error
+    assert credential_value(root, "mcp-token") not in error
+    assert not destination.exists()
+    assert tuple(output_parent.glob(".not-published.signet-backup.partial-*")) == ()
+    assert tuple(output_parent.glob(".signet-backup-*")) == ()
+
+
+def test_cli_backup_reports_retained_private_workspace_without_leaking_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = new_demo(tmp_path, "cli-backup-workspace-cleanup")
+    output_parent = tmp_path / "private-workspace-output"
+    output_parent.mkdir(mode=0o700)
+    destination = output_parent / "not-published.signet-backup"
+    original_rmtree = backup_module.shutil.rmtree
+
+    def fail_archive_after_plaintext_workspace(*_args: object) -> None:
+        raise BackupError("injected archive construction failure")
+
+    def retain_backup_workspace(path: Path) -> None:
+        if path.name.startswith(".signet-backup-"):
+            raise OSError("injected private workspace cleanup failure")
+        original_rmtree(path)
+
+    monkeypatch.setattr(backup_module, "_archive_workspace", fail_archive_after_plaintext_workspace)
+    monkeypatch.setattr(backup_module.shutil, "rmtree", retain_backup_workspace)
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "demo",
+                "backup",
+                "--data-dir",
+                str(root),
+                "--output",
+                str(destination),
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert "was not published" in error
+    assert "private backup artifact cleanup could not be confirmed" in error
+    assert "inspect the backup parent before continuing" in error
+    assert "injected" not in error
+    assert str(output_parent) not in error
+    assert "Traceback" not in error
+    assert credential_value(root, "mcp-token") not in error
+    assert not destination.exists()
+    workspaces = tuple(output_parent.glob(".signet-backup-*"))
+    assert len(workspaces) == 1
+    assert (workspaces[0] / "approvals.sqlite3").is_file()
+    monkeypatch.setattr(backup_module.shutil, "rmtree", original_rmtree)
+    original_rmtree(workspaces[0])
+
+
+def test_cli_backup_reports_durable_publish_with_private_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = new_demo(tmp_path, "cli-backup-cleanup")
+    output_parent = tmp_path / "private-cleanup-output"
+    output_parent.mkdir(mode=0o700)
+    destination = output_parent / "published.signet-backup"
+    original_rmtree = backup_module.shutil.rmtree
+    leaked_workspaces: list[Path] = []
+
+    def fail_backup_workspace_cleanup(path: Path) -> None:
+        if path.name.startswith(".signet-backup-"):
+            leaked_workspaces.append(path)
+            raise OSError("injected workspace cleanup failure")
+        original_rmtree(path)
+
+    monkeypatch.setattr(backup_module.shutil, "rmtree", fail_backup_workspace_cleanup)
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "demo",
+                "backup",
+                "--data-dir",
+                str(root),
+                "--output",
+                str(destination),
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert "published durably" in error
+    assert "private backup artifacts could not be removed" in error
+    assert "inspect the backup parent before continuing" in error
+    assert "failed safely" not in error
+    assert "Traceback" not in error
+    assert credential_value(root, "mcp-token") not in error
+    assert destination.is_file()
+    assert len(leaked_workspaces) == 1 and leaked_workspaces[0].is_dir()
+    monkeypatch.setattr(backup_module.shutil, "rmtree", original_rmtree)
+    original_rmtree(leaked_workspaces[0])
+
+
+def test_cli_demo_restore_reports_retained_rotated_secret_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = new_demo(tmp_path, "cli-restore-cleanup")
+    artifacts = tmp_path / "private-restore-artifacts"
+    artifacts.mkdir(mode=0o700)
+    bundle = backup_demo(root, artifacts / "source.signet-backup")
+    destination = artifacts / "retained-restore"
+    original_demo_fsync = demo_module._fsync_directory
+    original_rmtree = backup_module.shutil.rmtree
+
+    def fail_after_rotated_secrets(path: Path) -> None:
+        if path == destination and (destination / "demo-secrets.json").is_file():
+            raise OSError("injected post-secret restore failure")
+        original_demo_fsync(path)
+
+    def retain_restore_tree(path: Path) -> None:
+        if path == destination:
+            raise OSError("injected restore cleanup failure")
+        original_rmtree(path)
+
+    monkeypatch.setattr(demo_module, "_fsync_directory", fail_after_rotated_secrets)
+    monkeypatch.setattr(backup_module.shutil, "rmtree", retain_restore_tree)
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "demo",
+                "restore",
+                "--data-dir",
+                str(root),
+                "--bundle",
+                str(bundle),
+                "--destination",
+                str(destination),
+            ]
+        )
+
+    error = capsys.readouterr().err
+    assert "demo restore did not complete" in error
+    assert "private restore tree could not be removed" in error
+    assert "do not start that tree" in error
+    assert "injected" not in error
+    assert str(destination) not in error
+    assert "Traceback" not in error
+    assert credential_value(root, "mcp-token") not in error
+    assert (destination / "demo-secrets.json").is_file()
+    monkeypatch.setattr(backup_module.shutil, "rmtree", original_rmtree)
+    original_rmtree(destination)
 
 
 @pytest.mark.parametrize(

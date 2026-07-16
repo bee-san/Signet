@@ -1,7 +1,7 @@
 {% macro request_review(item, csrf_token, id_suffix, show_detail_link=false) %}
 {% set created_time = item.created_at|utc_time %}
 {% set expiry_time = item.expires_at|utc_time %}
-<div class="request-review" data-request-id="{{ item.request_id }}" data-csrf="{{ csrf_token }}" data-gateway-internal="{{ 'true' if item.gateway_internal else 'false' }}">
+<div class="request-review" data-request-id="{{ item.request_id }}"{% if item.historical_event_id is none %} data-csrf="{{ csrf_token }}"{% endif %} data-gateway-internal="{{ 'true' if item.gateway_internal else 'false' }}"{% if item.historical_event_id is not none %} data-historical-event-id="{{ item.historical_event_id }}"{% endif %}>
   <header class="detail-heading">
     <div>
       <p class="eyebrow">{{ item.service }} / {{ item.action }}</p>
@@ -9,9 +9,11 @@
       <p class="destination">{{ item.destination_summary }}</p>
     </div>
     <div class="truth-state">
-      <strong>{{ item.state|replace('_', ' ') }}</strong>
+      <strong>{% if item.historical_event_id is not none %}Current request state: {% endif %}{{ item.state|replace('_', ' ') }}</strong>
       {% if item.state in ['denied', 'cancelled', 'expired'] %}
       <span>Nothing was executed downstream</span>
+      {% elif item.gateway_internal and item.state == 'succeeded' %}
+      <span>Gateway policy change confirmed; requested tool was not called</span>
       {% elif item.state == 'succeeded' %}
       <span>Downstream effect confirmed</span>
       {% elif item.state in ['executing', 'outcome_unknown'] %}
@@ -25,6 +27,22 @@
       {% endif %}
     </div>
   </header>
+
+  {% if item.historical_event_id is not none %}
+  {% set historical_time = item.historical_event_occurred_at|utc_time %}
+  <section class="historical-band" aria-labelledby="historical-{{ id_suffix }}" data-historical-review>
+    <h3 id="historical-{{ id_suffix }}">Selected audit event</h3>
+    <p>This read-only view is bound to the immutable payload revision recorded by this event. Current request state is shown separately and may reflect later activity.</p>
+    <dl class="context-grid">
+      <div><dt>Event ID</dt><dd>{{ item.historical_event_id }}</dd></div>
+      <div class="context-wide"><dt>Event action</dt><dd>{{ item.historical_event_action }}</dd></div>
+      <div><dt>Event actor</dt><dd>{{ item.historical_event_actor }}</dd></div>
+      <div><dt>Event time</dt><dd><time datetime="{{ historical_time.iso }}">{{ historical_time.display }}</time></dd></div>
+      <div><dt>Payload version at event</dt><dd>{{ item.version }}</dd></div>
+      <div class="context-wide"><dt>Payload hash at event</dt><dd class="hash-value">{{ item.payload_hash }}</dd></div>
+    </dl>
+  </section>
+  {% endif %}
 
   {% if item.warnings or item.duplicate_warning_required %}
   <section class="warning-band" aria-labelledby="warnings-{{ id_suffix }}">
@@ -42,11 +60,11 @@
     <h3 id="context-{{ id_suffix }}">Request context</h3>
     <dl class="context-grid">
       <div><dt>Request</dt><dd class="hash-value">{{ item.request_id }}</dd></div>
-      <div><dt>State</dt><dd>{{ item.state|replace('_', ' ') }}</dd></div>
+      <div><dt>{{ 'Current request state' if item.historical_event_id is not none else 'State' }}</dt><dd>{{ item.state|replace('_', ' ') }}</dd></div>
       <div><dt>Created</dt><dd><time datetime="{{ created_time.iso }}">{{ created_time.display }}</time></dd></div>
       <div><dt>Expires</dt><dd><time datetime="{{ expiry_time.iso }}">{{ expiry_time.display }}</time></dd></div>
-      <div><dt>Version</dt><dd>{{ item.version }}</dd></div>
-      <div class="context-wide"><dt>Payload hash</dt><dd class="hash-value">{{ item.payload_hash }}</dd></div>
+      <div><dt>{{ 'Selected payload version' if item.historical_event_id is not none else 'Version' }}</dt><dd>{{ item.version }}</dd></div>
+      <div class="context-wide"><dt>{{ 'Selected payload hash' if item.historical_event_id is not none else 'Payload hash' }}</dt><dd class="hash-value">{{ item.payload_hash }}</dd></div>
       <div><dt>Reviewed content</dt><dd>{{ 'Available' if item.review_available else ('Purged' if item.content_purged else 'Unavailable') }}</dd></div>
       {% if item.canonical_size is not none %}<div><dt>Canonical bytes</dt><dd>{{ item.canonical_size }}</dd></div>{% endif %}
       {% if item.editor_actor %}<div><dt>Revision actor</dt><dd>{{ item.editor_actor }}</dd></div>{% endif %}
@@ -65,11 +83,66 @@
       {% if item.retry_of_request_id %}
       <div class="context-wide"><dt>Retry of request</dt><dd class="hash-value">{{ item.retry_of_request_id }}</dd></div>
       {% endif %}
-      {% if item.approved_at %}{% set approved_time = item.approved_at|utc_time %}<div><dt>Approved</dt><dd><time datetime="{{ approved_time.iso }}">{{ approved_time.display }}</time></dd></div>{% endif %}
-      {% if item.execution_started_at %}{% set execution_time = item.execution_started_at|utc_time %}<div><dt>Execution started</dt><dd><time datetime="{{ execution_time.iso }}">{{ execution_time.display }}</time></dd></div>{% endif %}
-      {% if item.completed_at %}{% set completed_time = item.completed_at|utc_time %}<div><dt>Completed</dt><dd><time datetime="{{ completed_time.iso }}">{{ completed_time.display }}</time></dd></div>{% endif %}
+      {% if item.approved_at %}{% set approved_time = item.approved_at|utc_time %}<div><dt>{{ 'Current approval time' if item.historical_event_id is not none else 'Approved' }}</dt><dd><time datetime="{{ approved_time.iso }}">{{ approved_time.display }}</time></dd></div>{% endif %}
+      {% if item.execution_started_at %}{% set execution_time = item.execution_started_at|utc_time %}<div><dt>{{ 'Current execution start' if item.historical_event_id is not none else 'Execution started' }}</dt><dd><time datetime="{{ execution_time.iso }}">{{ execution_time.display }}</time></dd></div>{% endif %}
+      {% if item.completed_at %}{% set completed_time = item.completed_at|utc_time %}<div><dt>{{ 'Current completion time' if item.historical_event_id is not none else 'Completed' }}</dt><dd><time datetime="{{ completed_time.iso }}">{{ completed_time.display }}</time></dd></div>{% endif %}
     </dl>
   </section>
+
+  {% if item.policy_promotion_preview %}
+  {% set preview = item.policy_promotion_preview %}
+  <section class="policy-preview-band policy-preview-{{ preview.proposed_mode }}" aria-labelledby="policy-preview-{{ id_suffix }}" data-policy-preview data-proposed-mode="{{ preview.proposed_mode }}">
+    <h3 id="policy-preview-{{ id_suffix }}">{{ 'Confirmed policy change' if item.state == 'succeeded' else ('Exact policy change on approval' if preview.can_approve else 'Frozen policy proposal at review') }}</h3>
+    {% if item.state == 'succeeded' %}
+    <p class="policy-consequence">This confirmed request durably changed <span class="hash-value">{{ preview.target_alias }}.{{ preview.target_tool }}</span> from {{ preview.current_mode }} to {{ preview.proposed_mode }}. The requested tool was not called by this confirmation.</p>
+    {% elif preview.can_approve and preview.proposed_mode == 'passthrough' %}
+    <p class="policy-consequence"><strong>Future calls will bypass approval.</strong> Approving durably changes <span class="hash-value">{{ preview.target_alias }}.{{ preview.target_tool }}</span> from {{ preview.current_mode }} to passthrough. Signet will run future calls immediately without another human confirmation until policy is changed. This confirmation does not call the requested tool now.</p>
+    {% elif preview.can_approve %}
+    <p class="policy-consequence"><strong>Future calls will still require separate approval.</strong> Approving durably changes <span class="hash-value">{{ preview.target_alias }}.{{ preview.target_tool }}</span> from {{ preview.current_mode }} to approval. Each future call remains blocked until a human confirms that exact call. This confirmation does not call the requested tool now.</p>
+    {% else %}
+    <p class="policy-consequence">This request proposed changing <span class="hash-value">{{ preview.target_alias }}.{{ preview.target_tool }}</span> from {{ preview.current_mode }} to {{ preview.proposed_mode }}. This historical view does not change policy or call the requested tool.</p>
+    {% endif %}
+    <dl class="context-grid policy-preview-grid">
+      <div class="context-wide"><dt>Exact target</dt><dd class="hash-value">{{ preview.target_alias }}.{{ preview.target_tool }}</dd></div>
+      <div><dt>Target mode at review</dt><dd>{{ preview.current_mode }}</dd></div>
+      <div><dt>Proposed new mode</dt><dd><strong>{{ preview.proposed_mode }}</strong></dd></div>
+      <div><dt>Reviewed read-only</dt><dd>{{ 'Yes' if preview.reviewed_read_only else 'No' }}</dd></div>
+      <div><dt>Communication classification</dt><dd>{{ 'Communication send' if preview.communication_send else 'Not a communication send' }}</dd></div>
+      <div><dt>Reviewed classification</dt><dd>{{ preview.reviewed_classification or 'None' }}</dd></div>
+      <div><dt>Policy version at review</dt><dd>{{ preview.current_policy_version }}</dd></div>
+      <div><dt>Expected next version at review</dt><dd>{{ preview.proposed_policy_version }}</dd></div>
+      <div><dt>Active policy version</dt><dd>{{ preview.active_policy_version }}</dd></div>
+    </dl>
+  </section>
+  {% endif %}
+
+  {% if item.policy_promotion_preview_unavailable %}
+  <section class="warning-band" aria-labelledby="policy-unavailable-{{ id_suffix }}" data-policy-preview-unavailable>
+    <h3 id="policy-unavailable-{{ id_suffix }}">Policy proposal history unavailable</h3>
+    <p>{{ item.policy_promotion_preview_unavailable }}</p>
+    {% if item.decision_window_expired and item.state == 'pending_approval' %}
+    <p>The request decision window has also expired, so no resolution controls are available.</p>
+    {% endif %}
+  </section>
+  {% elif item.policy_promotion_preview and item.state == 'pending_approval' and not item.policy_promotion_preview.can_approve %}
+  <section class="warning-band" aria-labelledby="policy-stale-{{ id_suffix }}" data-policy-preview-stale>
+    <h3 id="policy-stale-{{ id_suffix }}">Approval unavailable</h3>
+    {% if item.decision_window_expired %}
+    <p>This proposal has expired. It cannot be approved, denied, or cancelled. Request fresh access if the capability is still needed.</p>
+    {% elif item.policy_promotion_preview.stale %}
+    <p>This proposal was reviewed against policy v{{ item.policy_promotion_preview.current_policy_version }}, but active policy is v{{ item.policy_promotion_preview.active_policy_version }}. It cannot be approved. Deny or cancel it, then request fresh access.</p>
+    {% else %}
+    <p>This proposal is expired or no longer matches a safely applicable policy transition. It cannot be approved.</p>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {% if item.decision_window_expired and item.state == 'pending_approval' and not item.gateway_internal %}
+  <section class="warning-band" aria-labelledby="decision-expired-{{ id_suffix }}" data-decision-window-expired>
+    <h3 id="decision-expired-{{ id_suffix }}">Decision window expired</h3>
+    <p>This request can no longer be approved, denied, edited, or cancelled.</p>
+  </section>
+  {% endif %}
 
   {% if item.review_available %}
   <section class="detail-content" aria-labelledby="content-{{ id_suffix }}">
@@ -120,9 +193,11 @@
             </td>
             <td>{{ attachment.size_bytes }}</td>
             <td class="hash-value">{{ attachment.sha256 }}</td>
-            <td>{{ 'Purged' if attachment.purged else 'Retained (verified on download)' }}</td>
+            <td>{% if attachment.purged %}Purged{% elif item.historical_event_id is not none %}Retained metadata (download unavailable here){% else %}Retained (verified on download){% endif %}</td>
             <td>
-              {% if attachment.purged %}
+              {% if item.historical_event_id is not none %}
+              Unavailable in read-only history
+              {% elif attachment.purged %}
               Unavailable
               {% else %}
               <a href="/requests/{{ item.request_id }}/attachments/{{ attachment.attachment_id }}?version={{ item.version }}&amp;payload_hash={{ item.payload_hash }}">Download frozen bytes</a>
@@ -173,15 +248,17 @@
 
   {% if item.failure_reason or item.safe_outcome_json %}
   <section class="outcome-band" aria-labelledby="outcome-{{ id_suffix }}">
-    <h3 id="outcome-{{ id_suffix }}">Outcome context</h3>
+    <h3 id="outcome-{{ id_suffix }}">{{ 'Current outcome context' if item.historical_event_id is not none else 'Outcome context' }}</h3>
+    {% if item.historical_event_id is not none %}<p>These current outcome fields may postdate the selected audit event.</p>{% endif %}
     {% if item.failure_reason %}<h4>Failure reason</h4><pre>{{ item.failure_reason }}</pre>{% endif %}
     {% if item.safe_outcome_json %}<h4>Safe outcome</h4><pre>{{ item.safe_outcome_json }}</pre>{% endif %}
   </section>
   {% endif %}
 
-  {% if item.review_available and item.state == 'pending_approval' %}
+  {% if item.historical_event_id is none and item.review_available and item.state == 'pending_approval' and not item.decision_window_expired %}
+  {% set approval_available = not item.gateway_internal or (item.policy_promotion_preview and item.policy_promotion_preview.can_approve) %}
   <section class="action-band" aria-labelledby="action-{{ id_suffix }}">
-    <h3 id="action-{{ id_suffix }}">Confirm action</h3>
+    <h3 id="action-{{ id_suffix }}">{{ ('Confirm exact policy change' if approval_available else 'Resolve policy proposal') if item.gateway_internal else 'Confirm action' }}</h3>
     <div hidden aria-hidden="true">
       <input type="hidden" name="expected_version" value="{{ item.version }}">
       <input type="hidden" name="expected_payload_hash" value="{{ item.payload_hash }}">
@@ -210,7 +287,9 @@
     </div>
     {% if not fake_only_ui %}
     <div class="passkey-actions">
-      <button class="button button-primary" type="button" data-passkey-action="approve">Approve</button>
+      {% if approval_available %}
+      <button class="button button-primary" type="button" data-passkey-action="approve">{{ 'Approve policy change' if item.gateway_internal else 'Approve' }}</button>
+      {% endif %}
       <button class="button button-danger" type="button" data-passkey-action="deny">Deny</button>
       <button class="button button-quiet" type="button" data-passkey-action="cancel">Cancel</button>
     </div>
@@ -224,7 +303,9 @@
         <label for="totp-proof-{{ id_suffix }}">{{ 'Fake action proof' if fake_only_ui else 'Authenticator code' }}</label>
         <input id="totp-proof-{{ id_suffix }}" name="totp_proof" inputmode="{{ 'text' if fake_only_ui else 'numeric' }}" autocomplete="{{ 'off' if fake_only_ui else 'one-time-code' }}" maxlength="128" required>
         <div class="button-row">
-          <button class="button button-primary" name="action" value="approve" type="submit">Approve</button>
+          {% if approval_available %}
+          <button class="button button-primary" name="action" value="approve" type="submit">{{ 'Approve policy change' if item.gateway_internal else 'Approve' }}</button>
+          {% endif %}
           <button class="button button-danger" name="action" value="deny" type="submit">Deny</button>
           <button class="button button-quiet" name="action" value="cancel" type="submit">Cancel</button>
         </div>
@@ -232,7 +313,7 @@
     </details>
   </section>
 
-  {% if item.editable_arguments_json %}
+  {% if item.editable_arguments_json and not item.gateway_internal %}
   <section class="edit-band" aria-labelledby="edit-{{ id_suffix }}">
     <h3 id="edit-{{ id_suffix }}">Edit frozen arguments</h3>
     <form class="totp-action" action="/requests/{{ item.request_id }}/actions/totp" method="post">
@@ -266,7 +347,7 @@
   {% endif %}
 
   <section class="timeline" aria-labelledby="timeline-{{ id_suffix }}">
-    <h3 id="timeline-{{ id_suffix }}">Event timeline</h3>
+    <h3 id="timeline-{{ id_suffix }}">{{ 'Event timeline through selected event' if item.historical_event_id is not none else 'Event timeline' }}</h3>
     {% if item.events %}
     <ol>
       {% for event in item.events %}
@@ -279,8 +360,16 @@
         </div>
         {% if event.decision_confirmation %}
         <p class="confirmation-provenance">
-          Confirmation: {{ 'Passkey' if event.confirmation_kind == 'webauthn' else ('TOTP' if event.confirmation_kind == 'totp' else 'method unavailable') }}
-          via {{ event.confirmation_path or 'path unavailable' }}
+          {% if event.confirmation_attribution_ambiguous %}
+          {{ event.confirmation_match_count }} same-second matching proofs (per-event attribution unavailable):
+          {% else %}
+          Confirmation:
+          {% endif %}
+          {% if event.confirmation_proofs %}
+          {% for proof in event.confirmation_proofs %}{{ 'Passkey' if proof.kind == 'webauthn' else 'TOTP' }} via {{ proof.path }}{% if not loop.last %}; {% endif %}{% endfor %}
+          {% else %}
+          {{ 'Passkey' if event.confirmation_kind == 'webauthn' else ('TOTP' if event.confirmation_kind == 'totp' else 'method unavailable') }} via {{ event.confirmation_path or 'path unavailable' }}
+          {% endif %}
         </p>
         {% endif %}
         <dl class="event-integrity">
@@ -304,7 +393,7 @@
   </section>
 
   {% if show_detail_link %}
-  <p class="dedicated-link"><a href="/requests/{{ item.request_id }}">Open dedicated request view</a></p>
+  <p class="dedicated-link"><a href="/requests/{{ item.request_id }}">{{ 'Open current request view' if item.historical_event_id is not none else 'Open dedicated request view' }}</a></p>
   {% endif %}
 </div>
 {% endmacro %}

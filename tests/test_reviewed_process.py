@@ -4,6 +4,7 @@ import hashlib
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -122,6 +123,79 @@ def test_verified_snapshot_rejects_group_writable_source(tmp_path: Path) -> None
         )
 
 
+def test_verified_snapshot_closes_source_when_initial_fstat_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "provider-mcp"
+    digest = _write_script(executable, "reviewed")
+    opened: list[int] = []
+    real_open = os.open
+    real_fstat = os.fstat
+
+    def track_open(*args: Any, **kwargs: Any) -> int:
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_source_fstat(descriptor: int) -> os.stat_result:
+        if opened and descriptor == opened[0]:
+            raise OSError("injected source fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr("signet.reviewed_process.os.open", track_open)
+    monkeypatch.setattr("signet.reviewed_process.os.fstat", fail_source_fstat)
+
+    with pytest.raises(ReviewedProcessError, match="executable_unavailable"):
+        open_verified_executable(
+            executable,
+            expected_sha256=digest,
+            snapshot_root=tmp_path / "snapshots",
+            _test_capability=_TEST_ONLY_SCRIPT_CAPABILITY,
+        )
+
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        real_fstat(opened[0])
+
+
+def test_verified_snapshot_closes_root_and_source_when_root_fstat_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "provider-mcp"
+    digest = _write_script(executable, "reviewed")
+    opened: list[int] = []
+    real_open = os.open
+    real_fstat = os.fstat
+
+    def track_open(*args: Any, **kwargs: Any) -> int:
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_root_fstat(descriptor: int) -> os.stat_result:
+        if len(opened) >= 2 and descriptor == opened[1]:
+            raise OSError("injected root fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr("signet.reviewed_process.os.open", track_open)
+    monkeypatch.setattr("signet.reviewed_process.os.fstat", fail_root_fstat)
+
+    with pytest.raises(ReviewedProcessError, match="snapshot_root_unavailable"):
+        open_verified_executable(
+            executable,
+            expected_sha256=digest,
+            snapshot_root=tmp_path / "snapshots",
+            _test_capability=_TEST_ONLY_SCRIPT_CAPABILITY,
+        )
+
+    assert len(opened) == 2
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
 @pytest.mark.parametrize("mode", [0o750, 0o770, 0o707])
 def test_private_working_directory_rejects_non_private_modes(tmp_path: Path, mode: int) -> None:
     working_directory = tmp_path / "working"
@@ -181,3 +255,26 @@ def test_private_working_directory_detects_path_swap_and_keeps_bound_inode(
 
     assert (original / "bound-inode").is_file()
     assert not (working_directory / "bound-inode").exists()
+
+
+def test_private_working_directory_closes_descriptor_when_initial_recheck_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working_directory = tmp_path / "working"
+    working_directory.mkdir(mode=0o700)
+    opened_descriptor = -1
+
+    def fail_recheck(directory: VerifiedPrivateDirectory) -> str:
+        nonlocal opened_descriptor
+        opened_descriptor = directory.descriptor
+        raise ReviewedProcessError("working_directory_changed")
+
+    monkeypatch.setattr(VerifiedPrivateDirectory, "reverify", fail_recheck)
+
+    with pytest.raises(ReviewedProcessError, match="working_directory_changed"):
+        VerifiedPrivateDirectory.open(working_directory)
+
+    assert opened_descriptor >= 0
+    with pytest.raises(OSError):
+        os.fstat(opened_descriptor)
