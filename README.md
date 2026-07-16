@@ -96,7 +96,9 @@ host until either a Linux artifact is reviewed or a secure native macOS descript
 boundary is implemented and characterized.
 On Linux, Signet also uses the kernel-owned `/proc/self/fd` view to change the mode
 of an already-held mode-`000` directory without reopening an attacker-controlled
-path. It fails closed if procfs is unavailable; macOS uses `O_EVTONLY` instead.
+path. It fails closed if procfs is unavailable. macOS instead uses a verified
+parent descriptor and a one-component, no-follow `fchmodat` operation, then opens
+and revalidates the expected directory. It never retries an unanchored path.
 
 The generic package entry point serves only an explicitly supplied application
 factory. After creating the disabled state below, run its two shipped factories in

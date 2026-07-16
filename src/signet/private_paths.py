@@ -125,10 +125,14 @@ def capture_owned_directory_identity(path: Path) -> DirectoryIdentity:
 
 
 def harden_private_directory_identity(identity: DirectoryIdentity) -> DirectoryIdentity:
-    """Set mode 0700 on exactly one captured directory, without following replacements."""
+    """Set mode 0700 on one captured directory without following symlinks."""
 
     try:
         descriptor = _open_directory_identity_descriptor(identity.path)
+    except PermissionError as exc:
+        if not _DARWIN:
+            raise PrivatePathError("captured directory could not be opened safely") from exc
+        return _harden_darwin_directory_identity_from_parent(identity)
     except OSError as exc:
         raise PrivatePathError("captured directory could not be opened safely") from exc
     operation_error: BaseException | None = None
@@ -153,6 +157,51 @@ def harden_private_directory_identity(identity: DirectoryIdentity) -> DirectoryI
             if operation_error is None:
                 raise PrivatePathError(
                     "directory hardening descriptor could not be closed safely"
+                ) from exc
+
+
+def _harden_darwin_directory_identity_from_parent(
+    identity: DirectoryIdentity,
+) -> DirectoryIdentity:
+    try:
+        selected = Path(os.path.abspath(identity.path))
+        encoded = os.fsencode(selected)
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        raise PrivatePathError("captured directory path is unavailable or unsafe") from exc
+    if b"\x00" in encoded or selected.name in {"", ".", ".."}:
+        raise PrivatePathError("captured directory path is unavailable or unsafe")
+    try:
+        parent_descriptor = _open_with_stable_ancestry(selected.parent, create=False)
+    except PrivatePathError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise PrivatePathError("captured directory parent could not be opened safely") from exc
+    operation_error: BaseException | None = None
+    try:
+        hardened = _harden_directory_entry(
+            parent_descriptor,
+            selected.name,
+            expected=identity,
+        )
+        current = selected.lstat()
+        if not _same_directory(hardened, current):
+            raise PrivatePathError("directory identity changed during hardening")
+        return DirectoryIdentity(
+            path=identity.path,
+            device=hardened.st_dev,
+            inode=hardened.st_ino,
+            owner_uid=hardened.st_uid,
+        )
+    except BaseException as exc:
+        operation_error = exc
+        raise
+    finally:
+        try:
+            os.close(parent_descriptor)
+        except OSError as exc:
+            if operation_error is None:
+                raise PrivatePathError(
+                    "directory hardening parent descriptor could not be closed safely"
                 ) from exc
 
 
@@ -420,12 +469,7 @@ def _normal_directory_open_flags() -> int:
 
 
 def _identity_directory_open_flags() -> int:
-    if _LINUX and hasattr(os, "O_PATH"):
-        access = os.O_PATH
-    elif _DARWIN and hasattr(os, "O_EVTONLY"):
-        access = cast(int, os.O_EVTONLY)
-    else:
-        access = os.O_RDONLY
+    access = os.O_PATH if _LINUX and hasattr(os, "O_PATH") else os.O_RDONLY
     return (
         access
         | getattr(os, "O_CLOEXEC", 0)
@@ -464,6 +508,22 @@ def _harden_directory_entry(
             component,
             dir_fd=parent_descriptor,
         )
+    except PermissionError as exc:
+        if not _DARWIN:
+            raise PrivatePathError("directory entry could not be opened safely") from exc
+        _harden_darwin_directory_entry_from_parent(
+            parent_descriptor,
+            component,
+            expected=expected,
+        )
+        try:
+            descriptor = os.open(
+                component,
+                _normal_directory_open_flags(),
+                dir_fd=parent_descriptor,
+            )
+        except OSError as retry_error:
+            raise PrivatePathError("directory entry could not be opened safely") from retry_error
     except OSError as exc:
         raise PrivatePathError("directory entry could not be opened safely") from exc
     try:
@@ -474,6 +534,49 @@ def _harden_directory_entry(
         return hardened
     finally:
         os.close(descriptor)
+
+
+def _harden_darwin_directory_entry_from_parent(
+    parent_descriptor: int,
+    component: str,
+    *,
+    expected: DirectoryIdentity,
+) -> None:
+    if component in {"", ".", ".."} or Path(component).name != component:
+        raise PrivatePathError("directory entry is unavailable or unsafe")
+    try:
+        parent = os.fstat(parent_descriptor)
+        require_no_acl_grants(parent_descriptor)
+        before = os.stat(component, dir_fd=parent_descriptor, follow_symlinks=False)
+    except (OSError, ValueError) as exc:
+        raise PrivatePathError("directory entry could not be inspected safely") from exc
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or not _parent_accepts_current_owned_child(parent, current_uid)
+        or not _metadata_matches_identity(before, expected)
+        or before.st_uid != current_uid
+        or not stat.S_ISDIR(before.st_mode)
+    ):
+        raise PrivatePathError("captured directory identity changed")
+    try:
+        # Darwin has no public O_PATH equivalent; this is the documented
+        # cooperative-same-user fallback and never follows the selected edge.
+        os.chmod(
+            component,
+            stat.S_IRWXU,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        after = os.stat(component, dir_fd=parent_descriptor, follow_symlinks=False)
+    except (NotImplementedError, OSError, ValueError) as exc:
+        raise PrivatePathError("descriptor-relative directory hardening is unavailable") from exc
+    if (
+        not _same_directory(before, after)
+        or not _metadata_matches_identity(after, expected)
+        or stat.S_IMODE(after.st_mode) != 0o700
+    ):
+        raise PrivatePathError("descriptor-relative directory hardening could not be confirmed")
 
 
 def _harden_directory_descriptor(

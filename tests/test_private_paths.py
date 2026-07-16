@@ -39,7 +39,7 @@ def test_private_directory_is_created_with_exact_private_mode(tmp_path: Path) ->
     assert mode(selected) == 0o700
 
 
-def test_captured_mode_zero_directory_is_hardened_through_its_descriptor(
+def test_captured_mode_zero_directory_is_hardened_safely(
     tmp_path: Path,
 ) -> None:
     selected = tmp_path / "captured-mode-zero"
@@ -51,6 +51,251 @@ def test_captured_mode_zero_directory_is_hardened_through_its_descriptor(
 
     assert identity.same_object(hardened)
     assert mode(selected) == 0o700
+
+
+def _emulate_darwin_private_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(private_paths_module, "_DARWIN", True)
+    monkeypatch.setattr(private_paths_module, "_LINUX", False)
+    monkeypatch.setattr(
+        private_paths_module,
+        "_darwin_descriptor_acl_grants_access",
+        lambda _descriptor: False,
+    )
+
+
+def test_darwin_mode_zero_recovery_is_parent_anchored_and_nofollow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = tmp_path / "captured-darwin-mode-zero"
+    selected.mkdir(mode=0o700)
+    identity = capture_owned_directory_identity(selected)
+    selected.chmod(0o000)
+    real_chmod = private_paths_module.os.chmod
+    calls: list[tuple[Any, int, int | None, bool]] = []
+
+    def track_chmod(
+        path: Any,
+        selected_mode: int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        calls.append((path, selected_mode, dir_fd, follow_symlinks))
+        real_chmod(
+            path,
+            selected_mode,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    _emulate_darwin_private_paths(monkeypatch)
+    monkeypatch.setattr(private_paths_module.os, "chmod", track_chmod)
+
+    hardened = harden_private_directory_identity(identity)
+
+    assert identity.same_object(hardened)
+    assert mode(selected) == 0o700
+    assert len(calls) == 1
+    component, selected_mode, parent_descriptor, follow_symlinks = calls[0]
+    assert component == selected.name
+    assert selected_mode == 0o700
+    assert parent_descriptor is not None
+    assert follow_symlinks is False
+
+
+def test_darwin_mode_zero_recovery_fails_closed_without_fchmodat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = tmp_path / "captured-darwin-unsupported"
+    selected.mkdir(mode=0o700)
+    identity = capture_owned_directory_identity(selected)
+    selected.chmod(0o000)
+    real_chmod = private_paths_module.os.chmod
+    _emulate_darwin_private_paths(monkeypatch)
+    monkeypatch.setattr(
+        private_paths_module.os,
+        "chmod",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(NotImplementedError),
+    )
+
+    try:
+        with pytest.raises(PrivatePathError, match="descriptor-relative.*unavailable"):
+            harden_private_directory_identity(identity)
+        assert stat.S_IMODE(selected.lstat().st_mode) == 0o000
+    finally:
+        real_chmod(selected, 0o700)
+
+
+def test_darwin_mode_zero_recovery_never_follows_a_symlink_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = tmp_path / "captured-darwin-swap"
+    selected.mkdir(mode=0o700)
+    identity = capture_owned_directory_identity(selected)
+    selected.chmod(0o000)
+    displaced = tmp_path / "captured-darwin-displaced"
+    outside = tmp_path / "captured-darwin-outside"
+    outside.mkdir(mode=0o700)
+    outside.chmod(0o500)
+    real_chmod = private_paths_module.os.chmod
+    swapped = False
+
+    def swap_before_chmod(
+        path: Any,
+        selected_mode: int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal swapped
+        assert path == selected.name
+        assert dir_fd is not None
+        assert follow_symlinks is False
+        selected.rename(displaced)
+        selected.symlink_to(outside, target_is_directory=True)
+        swapped = True
+        real_chmod(
+            path,
+            selected_mode,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    _emulate_darwin_private_paths(monkeypatch)
+    monkeypatch.setattr(private_paths_module.os, "chmod", swap_before_chmod)
+
+    with pytest.raises(PrivatePathError):
+        harden_private_directory_identity(identity)
+
+    assert swapped
+    assert selected.is_symlink()
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o500
+    selected.unlink()
+    real_chmod(displaced, 0o700)
+    displaced.rmdir()
+    real_chmod(outside, 0o700)
+    outside.rmdir()
+
+
+def test_darwin_mode_zero_recovery_rejects_a_same_user_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = tmp_path / "captured-darwin-directory-swap"
+    selected.mkdir(mode=0o700)
+    identity = capture_owned_directory_identity(selected)
+    selected.chmod(0o000)
+    displaced = tmp_path / "captured-darwin-original"
+    real_chmod = private_paths_module.os.chmod
+    swapped = False
+
+    def swap_before_chmod(
+        path: Any,
+        selected_mode: int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal swapped
+        assert path == selected.name
+        assert dir_fd is not None
+        assert follow_symlinks is False
+        selected.rename(displaced)
+        selected.mkdir(mode=0o700)
+        (selected / "replacement-marker").write_text("preserve\n", encoding="utf-8")
+        real_chmod(selected, 0o500)
+        swapped = True
+        real_chmod(
+            path,
+            selected_mode,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    _emulate_darwin_private_paths(monkeypatch)
+    monkeypatch.setattr(private_paths_module.os, "chmod", swap_before_chmod)
+
+    with pytest.raises(PrivatePathError, match="could not be confirmed"):
+        harden_private_directory_identity(identity)
+
+    assert swapped
+    assert (selected / "replacement-marker").read_text(encoding="utf-8") == "preserve\n"
+    assert mode(selected) == 0o700
+    assert stat.S_IMODE(displaced.lstat().st_mode) == 0o000
+    real_chmod(displaced, 0o700)
+
+
+def test_darwin_mode_zero_recovery_rejects_an_unsafe_parent_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "darwin-unsafe-parent"
+    parent.mkdir(mode=0o700)
+    selected = parent / "captured"
+    selected.mkdir(mode=0o700)
+    identity = capture_owned_directory_identity(selected)
+    selected.chmod(0o000)
+    parent.chmod(0o777)
+    real_chmod = private_paths_module.os.chmod
+    _emulate_darwin_private_paths(monkeypatch)
+    monkeypatch.setattr(
+        private_paths_module.os,
+        "chmod",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe parent must be rejected before chmod")
+        ),
+    )
+
+    try:
+        with pytest.raises(PrivatePathError):
+            harden_private_directory_identity(identity)
+    finally:
+        real_chmod(selected, 0o700)
+        real_chmod(parent, 0o700)
+
+
+def test_darwin_recursive_creation_is_parent_anchored_under_restrictive_umask(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = tmp_path / "darwin-first" / "darwin-second" / "private"
+    real_chmod = private_paths_module.os.chmod
+    calls: list[tuple[Any, int | None, bool]] = []
+
+    def track_chmod(
+        path: Any,
+        selected_mode: int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        assert selected_mode == 0o700
+        calls.append((path, dir_fd, follow_symlinks))
+        real_chmod(
+            path,
+            selected_mode,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    _emulate_darwin_private_paths(monkeypatch)
+    monkeypatch.setattr(private_paths_module.os, "chmod", track_chmod)
+    previous_umask = os.umask(0o777)
+    try:
+        resolved = ensure_private_directory(selected)
+    finally:
+        os.umask(previous_umask)
+
+    assert resolved == selected.resolve(strict=True)
+    assert len(calls) == 3
+    assert all(Path(component).name == component for component, _fd, _follow in calls)
+    assert all(parent_descriptor is not None for _path, parent_descriptor, _follow in calls)
+    assert all(follow_symlinks is False for _path, _fd, follow_symlinks in calls)
+    for directory in (selected.parent.parent, selected.parent, selected):
+        assert mode(directory) == 0o700
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux O_PATH regression")
@@ -557,3 +802,53 @@ def test_real_darwin_granting_acl_on_directory_is_rejected(tmp_path: Path) -> No
             require_private_directory(selected)
     finally:
         subprocess.run(["chmod", "-N", str(selected)], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS extended ACL regression")
+def test_real_darwin_mode_zero_target_granting_acl_is_rejected_after_recovery(
+    tmp_path: Path,
+) -> None:
+    selected = tmp_path / "mode-zero-target-allow-acl"
+    selected.mkdir(mode=0o700)
+    subprocess.run(
+        ["chmod", "+a", "everyone allow delete", str(selected)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    identity = capture_owned_directory_identity(selected)
+    selected.chmod(0o000)
+
+    try:
+        with pytest.raises(PrivatePathError, match="granting ACL entries"):
+            harden_private_directory_identity(identity)
+        assert mode(selected) == 0o700
+    finally:
+        subprocess.run(["chmod", "-N", str(selected)], check=True, capture_output=True, text=True)
+        selected.chmod(0o700)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS extended ACL regression")
+def test_real_darwin_parent_granting_acl_blocks_mode_zero_recovery(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "mode-zero-parent-allow-acl"
+    parent.mkdir(mode=0o700)
+    selected = parent / "captured"
+    selected.mkdir(mode=0o700)
+    identity = capture_owned_directory_identity(selected)
+    selected.chmod(0o000)
+    subprocess.run(
+        ["chmod", "+a", "everyone allow read", str(parent)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    try:
+        with pytest.raises(PrivatePathError, match="granting ACL entries"):
+            harden_private_directory_identity(identity)
+        assert stat.S_IMODE(selected.lstat().st_mode) == 0o000
+    finally:
+        subprocess.run(["chmod", "-N", str(parent)], check=True, capture_output=True, text=True)
+        selected.chmod(0o700)
