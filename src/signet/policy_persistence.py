@@ -41,11 +41,13 @@ from signet.policy import (
     policy_document,
 )
 from signet.state_machine import ApprovalStateMachine
+from signet.web import PolicyPromotionPreview
 from signet.web_backend import (
     PolicyPromotionError,
     PreparedEdit,
     PrivatePayloadReviewer,
     WebActionDraft,
+    WebPayloadError,
 )
 
 PolicyFaultInjector = Callable[[str], None]
@@ -336,6 +338,111 @@ class SQLitePolicyPromotionBoundary:
             )
             return plan.binding_action
 
+    def preview(
+        self,
+        request_id: str,
+        action: str,
+        *,
+        expected_version: int,
+        expected_payload_hash: str,
+        now: int,
+    ) -> PolicyPromotionPreview:
+        self._require_ready()
+        with self._locked():
+            request = self.state_machine.get_request(request_id)
+            if int(request["current_version"]) != expected_version or not _same_text(
+                str(request["current_payload_hash"]), expected_payload_hash
+            ):
+                raise StaleVersion(request_id)
+            if (
+                action != "approve"
+                or not bool(request["gateway_internal"])
+                or request["downstream_alias"] != "gateway"
+                or request["tool_name"] != "request_tool_access"
+            ):
+                raise InvalidTransition("request is not a gateway policy proposal")
+            try:
+                reviewed = self.payloads.review(
+                    request_id,
+                    version=expected_version,
+                    payload_hash=expected_payload_hash,
+                )
+            except WebPayloadError as exc:
+                raise PolicyPersistenceError(
+                    "gateway policy proposal content could not be authenticated"
+                ) from exc
+            alias = reviewed.arguments.get("alias")
+            tool = reviewed.arguments.get("tool")
+            if not isinstance(alias, str) or not alias or not isinstance(tool, str) or not tool:
+                raise PolicyPersistenceError("gateway policy proposal target is invalid")
+            historical, active_version = self._reviewed_policy_snapshot(reviewed.policy_version)
+            current = historical.configured(alias, tool)
+            if current is None:
+                raise PolicyPersistenceError(
+                    "gateway policy proposal target is absent from its reviewed policy"
+                )
+            mode = _gateway_promotion_mode(current)
+            proposed_version = reviewed.policy_version + 1
+            historical_change_valid = reviewed.policy_version < _SQLITE_MAX_INTEGER
+            expected_snapshot: PolicySnapshot | None = None
+            try:
+                expected_snapshot, previous, updated = PolicyEngine(historical).preview_promotion(
+                    alias, tool, mode
+                )
+            except PolicyError:
+                historical_change_valid = False
+                previous = current
+                updated = replace(current, mode=mode)
+
+            stale = reviewed.policy_version != active_version
+            can_approve = (
+                request["state"] == "pending_approval"
+                and now < int(request["expires_at"])
+                and not stale
+                and historical_change_valid
+                and expected_snapshot is not None
+            )
+            if can_approve:
+                try:
+                    live_plan = self._build_plan(
+                        request_id,
+                        action,
+                        expected_version=expected_version,
+                        expected_payload_hash=expected_payload_hash,
+                        now=now,
+                    )
+                except (
+                    PolicyPromotionError,
+                    RequestNotFound,
+                    StaleVersion,
+                    InvalidTransition,
+                    RequestExpired,
+                ):
+                    can_approve = False
+                else:
+                    can_approve = (
+                        live_plan.alias == alias
+                        and live_plan.tool == tool
+                        and live_plan.mode is mode
+                        and live_plan.previous == previous
+                        and live_plan.updated == updated
+                        and live_plan.snapshot == expected_snapshot
+                    )
+            return PolicyPromotionPreview(
+                target_alias=alias,
+                target_tool=tool,
+                current_mode=previous.mode.value,
+                proposed_mode=updated.mode.value,
+                reviewed_read_only=previous.reviewed_read_only,
+                communication_send=previous.communication_send,
+                reviewed_classification=previous.reviewed_classification,
+                current_policy_version=reviewed.policy_version,
+                proposed_policy_version=proposed_version,
+                active_policy_version=active_version,
+                can_approve=can_approve,
+                stale=stale,
+            )
+
     def promote(
         self,
         draft: WebActionDraft,
@@ -607,25 +714,26 @@ class SQLitePolicyPromotionBoundary:
                 or request["tool_name"] != "request_tool_access"
             ):
                 raise InvalidTransition("gateway policy proposals cannot be retargeted")
-            reviewed = self.payloads.review(
-                request_id,
-                version=expected_version,
-                payload_hash=expected_payload_hash,
-            )
+            try:
+                reviewed = self.payloads.review(
+                    request_id,
+                    version=expected_version,
+                    payload_hash=expected_payload_hash,
+                )
+            except WebPayloadError as exc:
+                raise PolicyPersistenceError(
+                    "gateway policy proposal content could not be authenticated"
+                ) from exc
             alias = reviewed.arguments.get("alias")
             tool = reviewed.arguments.get("tool")
             if not isinstance(alias, str) or not isinstance(tool, str):
-                raise PolicyError("gateway policy proposal target is invalid")
+                raise PolicyPersistenceError("gateway policy proposal target is invalid")
+            if reviewed.policy_version != self.engine.snapshot.version:
+                raise StaleVersion(request_id)
             current = self.engine.snapshot.configured(alias, tool)
             if current is None:
-                raise PolicyError("only a discovered, reviewed tool can be promoted")
-            mode = (
-                PolicyMode.PASSTHROUGH
-                if current.reviewed_read_only
-                and not current.communication_send
-                and current.reviewed_classification is None
-                else PolicyMode.APPROVAL
-            )
+                raise PolicyPersistenceError("only a discovered, reviewed tool can be promoted")
+            mode = _gateway_promotion_mode(current)
             origin = "request_tool_access"
         else:
             if action not in _POLICY_ACTIONS:
@@ -635,15 +743,10 @@ class SQLitePolicyPromotionBoundary:
             mode = PolicyMode.APPROVAL if action == "promote_approval" else PolicyMode.PASSTHROUGH
             origin = "one_click_promotion"
         binding_action = f"promote_{mode.value}"
-        stored = self._stored_policy()
-        if (
-            stored is None
-            or stored.sync_state != "synced"
-            or stored.publication_pending
-            or stored.version != self.engine.snapshot.version
-            or not _same_text(stored.config_hash, policy_config_hash(self.engine.snapshot))
-        ):
+        stored = self._stored_policy(verify_history=True)
+        if stored is None:
             raise PolicyUnavailable("durable policy is not ready for promotion")
+        self._require_active_policy(stored)
         if self.engine.snapshot.version >= _SQLITE_MAX_INTEGER:
             raise PolicyUnavailable("durable policy version space is exhausted")
         try:
@@ -687,6 +790,76 @@ class SQLitePolicyPromotionBoundary:
             file_sha256=hashlib.sha256(serialized).hexdigest(),
             previous_file_sha256=stored.file_sha256,
         )
+
+    def _reviewed_policy_snapshot(self, version: int) -> tuple[PolicySnapshot, int]:
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or not 1 <= version <= _SQLITE_MAX_INTEGER
+        ):
+            raise PolicyDivergenceError("reviewed policy version is invalid")
+        try:
+            stored = self._stored_policy(verify_history=True)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PolicyDivergenceError("durable policy history metadata is invalid") from exc
+        if stored is None:
+            raise PolicyDivergenceError("durable policy history is unavailable")
+        self._require_active_policy(stored)
+
+        with self.database.read() as connection:
+            row = connection.execute(
+                """
+                SELECT snapshot.policy_version_id, snapshot.config_hash,
+                       snapshot.snapshot_yaml, snapshot.file_sha256,
+                       version.config_hash AS version_config_hash,
+                       version.applied
+                FROM durable_policy_snapshots AS snapshot
+                JOIN policy_versions AS version
+                  ON version.policy_version_id = snapshot.policy_version_id
+                WHERE snapshot.policy_version_id = ?
+                """,
+                (version,),
+            ).fetchone()
+        if row is None:
+            raise PolicyDivergenceError("reviewed durable policy snapshot is unavailable")
+        try:
+            row_version = int(row["policy_version_id"])
+            config_hash = str(row["config_hash"])
+            snapshot_yaml = bytes(row["snapshot_yaml"])
+            file_sha256 = str(row["file_sha256"])
+            version_config_hash = str(row["version_config_hash"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PolicyDivergenceError("reviewed durable policy metadata is invalid") from exc
+        snapshot = _parse_snapshot(snapshot_yaml)
+        if (
+            row_version != version
+            or not bool(row["applied"])
+            or not _same_text(config_hash, version_config_hash)
+            or not _same_digest(snapshot_yaml, file_sha256)
+            or snapshot.version != version
+            or not _same_text(policy_config_hash(snapshot), config_hash)
+        ):
+            raise PolicyDivergenceError("reviewed durable policy failed integrity review")
+        return snapshot, stored.version
+
+    def _require_active_policy(self, stored: _StoredPolicy) -> PolicySnapshot:
+        active = self._validate_stored(stored)
+        if (
+            stored.sync_state != "synced"
+            or stored.publication_pending
+            or not stored.applied
+            or stored.version > _SQLITE_MAX_INTEGER
+            or active != self.engine.snapshot
+            or not _same_text(stored.config_hash, policy_config_hash(self.engine.snapshot))
+        ):
+            raise PolicyDivergenceError("active durable policy is not safely published")
+        try:
+            current_file = _read_regular(self.policy_path)
+        except OSError as exc:
+            raise PolicyDivergenceError("active durable policy file is unavailable") from exc
+        if not _same_digest(current_file, stored.file_sha256):
+            raise PolicyDivergenceError("active durable policy file failed integrity review")
+        return active
 
     def _record_request_policy_event(
         self,
@@ -1331,6 +1504,16 @@ def _same_text(first: str, second: str) -> bool:
 
 def _same_digest(content: bytes, expected: str) -> bool:
     return _same_text(hashlib.sha256(content).hexdigest(), expected)
+
+
+def _gateway_promotion_mode(current: ToolPolicy) -> PolicyMode:
+    if (
+        current.reviewed_read_only
+        and not current.communication_send
+        and current.reviewed_classification is None
+    ):
+        return PolicyMode.PASSTHROUGH
+    return PolicyMode.APPROVAL
 
 
 def _canonical_json(value: Any) -> str:

@@ -58,7 +58,7 @@ def _stdio_config(**changes: Any) -> DownstreamConfig:
         "command": ("/opt/signet/bin/provider-mcp", "--mode", "json"),
         "working_directory": Path.home().resolve(),
         "executable_sha256": "a" * 64,
-        "execution_snapshot_root": Path("/var/empty/signet-exec"),
+        "execution_snapshot_root": Path("/var/empty/signet-exec").resolve(),
         "timeout_seconds": 2,
     }
     values.update(changes)

@@ -405,6 +405,26 @@ def test_web_totp_promotion_is_atomic_distinct_audited_and_single_use(
     assert installed.applied == [2]
     assert installed.notified == [frozenset({"fake-service"})]
     assert bundle.state_machine.get_request(request_id)["state"] == "pending_approval"
+    decision = bundle.backend.list_decisions(principal).items
+    assert len(decision) == 1
+    assert (
+        decision[0].request_id,
+        decision[0].decision,
+        decision[0].decision_label,
+        decision[0].current_state,
+        decision[0].confirmation_kind,
+        decision[0].confirmation_path,
+    ) == (
+        request_id,
+        "policy_change",
+        "Policy change approved: approval",
+        "pending_approval",
+        "totp",
+        "web",
+    )
+    detail = bundle.backend.get_detail(principal, request_id)
+    event = next(item for item in detail.events if item["action"] == "policy_promoted_to_approval")
+    assert (event["confirmation_kind"], event["confirmation_path"]) == ("totp", "web")
     assert bundle.adapter.downstream_calls == []
     with bundle.database.read() as connection:
         version = connection.execute(
@@ -441,6 +461,140 @@ def test_web_totp_promotion_is_atomic_distinct_audited_and_single_use(
         )
     assert load_policy(policy_path).version == 2
     assert not installed.boundary.pending_path.exists()
+
+
+def test_same_second_policy_proofs_are_all_visible_without_breaking_detail(
+    durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
+) -> None:
+    bundle, _, _ = durable_bundle
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    occurred_at = NOW + 50
+
+    for action, proof in (
+        ("promote_approval", "fake:501"),
+        ("promote_passthrough", "fake:502"),
+    ):
+        assert (
+            bundle.backend.complete_totp_action(
+                principal,
+                request_id,
+                cast(Any, action),
+                proof,
+                expected_version=1,
+                expected_payload_hash=payload_hash,
+                prospective_arguments_json=None,
+                now=occurred_at,
+            )
+            == "policy_updated"
+        )
+
+    options = bundle.backend.begin_passkey_action(
+        principal,
+        request_id,
+        "promote_approval",
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+        prospective_arguments_json=None,
+        http_method="POST",
+        now=occurred_at,
+    )
+    assert (
+        bundle.backend.complete_passkey_action(
+            principal,
+            request_id,
+            options.challenge_id,
+            cast(dict[str, Any], bundle.assertion(options.challenge_id)),
+            http_method="POST",
+            now=occurred_at,
+        )
+        == "policy_updated"
+    )
+
+    detail = bundle.backend.get_detail(principal, request_id)
+    approval_events = tuple(
+        event for event in detail.events if event["action"] == "policy_promoted_to_approval"
+    )
+    assert len(approval_events) == 2
+    expected_proofs = (
+        {"kind": "totp", "path": "web"},
+        {"kind": "webauthn", "path": "web"},
+    )
+    for event in approval_events:
+        assert event["confirmation_proofs"] == expected_proofs
+        assert event["confirmation_match_count"] == 2
+        assert event["confirmation_attribution_ambiguous"] is True
+        assert event["confirmation_kind"] is None
+        assert event["confirmation_path"] is None
+        assert event["decision_confirmation"] is True
+
+    passthrough_event = next(
+        event for event in detail.events if event["action"] == "policy_promoted_to_passthrough"
+    )
+    assert passthrough_event["confirmation_proofs"] == ({"kind": "totp", "path": "web"},)
+    assert passthrough_event["confirmation_match_count"] == 1
+    assert passthrough_event["confirmation_attribution_ambiguous"] is False
+    assert (
+        passthrough_event["confirmation_kind"],
+        passthrough_event["confirmation_path"],
+    ) == ("totp", "web")
+
+    decisions = bundle.backend.list_decisions(principal).items
+    assert len(decisions) == 3
+    assert [(item.confirmation_kind, item.confirmation_path) for item in decisions] == [
+        (None, None),
+        ("totp", "web"),
+        (None, None),
+    ]
+    assert [item.confirmation_attribution_ambiguous for item in decisions] == [
+        True,
+        False,
+        True,
+    ]
+    assert [item.confirmation_match_count for item in decisions] == [2, 1, 2]
+    assert len({item.event_id for item in decisions}) == 3
+
+
+def test_same_second_identical_policy_proofs_do_not_look_unambiguous(
+    durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
+) -> None:
+    bundle, _, _ = durable_bundle
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    occurred_at = NOW + 60
+
+    for action, proof in (
+        ("promote_approval", "fake:511"),
+        ("promote_passthrough", "fake:512"),
+        ("promote_approval", "fake:513"),
+    ):
+        assert (
+            bundle.backend.complete_totp_action(
+                principal,
+                request_id,
+                cast(Any, action),
+                proof,
+                expected_version=1,
+                expected_payload_hash=payload_hash,
+                prospective_arguments_json=None,
+                now=occurred_at,
+            )
+            == "policy_updated"
+        )
+
+    detail = bundle.backend.get_detail(principal, request_id)
+    approval_events = tuple(
+        event for event in detail.events if event["action"] == "policy_promoted_to_approval"
+    )
+    assert len(approval_events) == 2
+    for event in approval_events:
+        assert event["confirmation_proofs"] == ({"kind": "totp", "path": "web"},)
+        assert event["confirmation_match_count"] == 2
+        assert event["confirmation_attribution_ambiguous"] is True
+        assert event["confirmation_kind"] is None
+        assert event["confirmation_path"] is None
 
 
 def test_passkey_promotion_binds_exact_mode_and_consumes_durable_draft(
@@ -565,7 +719,7 @@ def test_gateway_access_request_chooses_guarded_mode_and_never_dispatches(
     bundle = _assemble_enrolled(Database(tmp_path / "gateway-policy.sqlite3"))
     policy_path = tmp_path / "policy.yaml"
     _write_policy(policy_path, _snapshot(reviewed_read_only=reviewed_read_only))
-    _install(bundle, policy_path)
+    installed = _install(bundle, policy_path)
     factory = FrozenAccessRequestFactory(
         RequestFreezer(
             bundle.cipher,
@@ -588,6 +742,60 @@ def test_gateway_access_request_chooses_guarded_mode_and_never_dispatches(
     request_id = request.request_id
     _, principal = bundle.session()
     payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    pending_detail = bundle.backend.get_detail(principal, request_id)
+    preview = pending_detail.policy_promotion_preview
+    assert preview is not None
+    assert (
+        preview.target_alias,
+        preview.target_tool,
+        preview.current_mode,
+        preview.proposed_mode,
+        preview.reviewed_read_only,
+        preview.communication_send,
+        preview.reviewed_classification,
+        preview.current_policy_version,
+        preview.proposed_policy_version,
+        preview.active_policy_version,
+        preview.can_approve,
+        preview.stale,
+    ) == (
+        "fake-service",
+        "create_item",
+        "deny",
+        expected_mode.value,
+        reviewed_read_only,
+        False,
+        None,
+        1,
+        2,
+        1,
+        True,
+        False,
+    )
+    assert (
+        installed.boundary.preview(
+            request_id,
+            "approve",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            now=NOW + 1,
+        )
+        == preview
+    )
+    expired_preview = installed.boundary.preview(
+        request_id,
+        "approve",
+        expected_version=1,
+        expected_payload_hash=payload_hash,
+        now=NOW + 900,
+    )
+    assert expired_preview.stale is False
+    assert expired_preview.can_approve is False
+    bundle.backend._clock = lambda: NOW + 900
+    expired_detail = bundle.backend.get_detail(principal, request_id)
+    assert expired_detail.decision_window_expired is True
+    assert expired_detail.policy_promotion_preview == expired_preview
+    bundle.backend._clock = lambda: NOW
     options = bundle.backend.begin_passkey_action(
         principal,
         request_id,
@@ -616,6 +824,65 @@ def test_gateway_access_request_chooses_guarded_mode_and_never_dispatches(
     assert result["state"] == "succeeded"
     assert json.loads(str(result["safe_outcome_json"])) == {"status": "policy_updated"}
     assert load_policy(policy_path).resolve("fake-service", "create_item") is expected_mode
+    decisions = bundle.backend.list_decisions(principal).items
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert (
+        decision.request_id,
+        decision.decision,
+        decision.decision_label,
+        decision.current_state,
+        decision.downstream_alias,
+        decision.tool_name,
+        decision.actor,
+        decision.confirmation_kind,
+        decision.confirmation_path,
+    ) == (
+        request_id,
+        "policy_change",
+        f"Policy change approved: {expected_mode.value}",
+        "succeeded",
+        "gateway",
+        "request_tool_access",
+        f"web:{USER_ID}",
+        "webauthn",
+        "web",
+    )
+    detail = bundle.backend.get_detail(principal, request_id)
+    historical_preview = detail.policy_promotion_preview
+    assert historical_preview is not None
+    assert historical_preview.current_policy_version == 1
+    assert historical_preview.proposed_policy_version == 2
+    assert historical_preview.active_policy_version == 2
+    assert historical_preview.can_approve is False
+    assert historical_preview.stale is True
+    assert detail.title == "Tool access policy proposal"
+    assert [(block.label, block.value) for block in detail.detail_blocks] == [
+        ("Requested tool", "fake-service.create_item"),
+        ("Reason", "Need this reviewed capability for a bounded workflow."),
+    ]
+    event = next(
+        item
+        for item in detail.events
+        if item["action"] == f"policy_promoted_to_{expected_mode.value}"
+    )
+    assert (event["confirmation_kind"], event["confirmation_path"]) == (
+        "webauthn",
+        "web",
+    )
+    assert event["decision_confirmation"] is True
+    assert event["decision_note"] is None
+    event_details = json.loads(str(event["details_json"]))
+    config_hash = event_details.pop("config_hash")
+    assert isinstance(config_hash, str) and len(config_hash) == 64
+    assert event_details == {
+        "alias": "fake-service",
+        "new_mode": expected_mode.value,
+        "old_mode": "deny",
+        "originating_event": "request_tool_access",
+        "policy_version": 2,
+        "tool": "create_item",
+    }
     with bundle.database.read() as connection:
         assert (
             connection.execute(
@@ -624,6 +891,217 @@ def test_gateway_access_request_chooses_guarded_mode_and_never_dispatches(
             is None
         )
     assert bundle.adapter.downstream_calls == []
+
+
+def test_gateway_preview_and_confirmation_refuse_a_changed_policy_plan(tmp_path: Path) -> None:
+    bundle = _assemble_enrolled(Database(tmp_path / "stale-gateway-policy.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path, _snapshot(reviewed_read_only=True))
+    installed = _install(bundle, policy_path)
+    factory = FrozenAccessRequestFactory(
+        RequestFreezer(
+            bundle.cipher,
+            pending_ttl_seconds=900,
+            clock=lambda: datetime.fromtimestamp(NOW, tz=UTC),
+        ),
+        policy_version=lambda: 1,
+    )
+
+    def enqueue(reason: str) -> tuple[str, str]:
+        frozen = factory.freeze(
+            AccessRequestDraft(
+                origin_namespace=f"profile:{reason}",
+                alias="fake-service",
+                tool="create_item",
+                reason=reason,
+                actor=f"mcp:profile:{reason}",
+                created_at=NOW,
+            )
+        )
+        bundle.state_machine.enqueue(frozen)
+        request_id = frozen.request_id
+        payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+        return request_id, payload_hash
+
+    first_id, first_hash = enqueue("first")
+    stale_id, stale_hash = enqueue("stale")
+    initial_preview = installed.boundary.preview(
+        stale_id,
+        "approve",
+        expected_version=1,
+        expected_payload_hash=stale_hash,
+        now=NOW + 1,
+    )
+    assert (initial_preview.current_policy_version, initial_preview.proposed_mode) == (
+        1,
+        "passthrough",
+    )
+
+    _, principal = bundle.session()
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            first_id,
+            "approve",
+            "fake:740",
+            expected_version=1,
+            expected_payload_hash=first_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+        == "policy_updated"
+    )
+    assert installed.engine.snapshot.version == 2
+
+    stale_preview = installed.boundary.preview(
+        stale_id,
+        "approve",
+        expected_version=1,
+        expected_payload_hash=stale_hash,
+        now=NOW + 2,
+    )
+    assert (
+        stale_preview.current_policy_version,
+        stale_preview.proposed_policy_version,
+        stale_preview.active_policy_version,
+        stale_preview.current_mode,
+        stale_preview.proposed_mode,
+        stale_preview.can_approve,
+        stale_preview.stale,
+    ) == (1, 2, 2, "deny", "passthrough", False, True)
+    detail = bundle.backend.get_detail(principal, stale_id)
+    assert detail.policy_promotion_preview == stale_preview
+    assert detail.policy_promotion_preview_unavailable is None
+    assert json.loads(str(detail.reviewed_arguments_json))["reason"] == "stale"
+    with pytest.raises(WebConflict, match="request changed after review"):
+        bundle.backend.complete_totp_action(
+            principal,
+            stale_id,
+            "approve",
+            "fake:741",
+            expected_version=1,
+            expected_payload_hash=stale_hash,
+            prospective_arguments_json=None,
+            now=NOW + 2,
+        )
+    assert bundle.state_machine.get_request(stale_id)["state"] == "pending_approval"
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            stale_id,
+            "deny",
+            "fake:742",
+            expected_version=1,
+            expected_payload_hash=stale_hash,
+            prospective_arguments_json=None,
+            now=NOW + 3,
+            decision_note="authenticated_denial",
+        )
+        == "denied"
+    )
+    denied_detail = bundle.backend.get_detail(principal, stale_id)
+    assert denied_detail.state == "denied"
+    assert denied_detail.policy_promotion_preview == stale_preview
+    assert denied_detail.policy_promotion_preview is not None
+    assert denied_detail.policy_promotion_preview.can_approve is False
+
+    with bundle.database.transaction() as connection:
+        connection.execute("DROP TRIGGER durable_policy_snapshots_no_delete")
+        connection.execute("DELETE FROM durable_policy_snapshots WHERE policy_version_id = 1")
+    missing_history = bundle.backend.get_detail(principal, stale_id)
+    assert missing_history.policy_promotion_preview is None
+    assert missing_history.policy_promotion_preview_unavailable is not None
+    assert json.loads(str(missing_history.reviewed_arguments_json))["reason"] == "stale"
+
+
+def test_corrupt_reviewed_policy_history_preserves_context_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    bundle = _assemble_enrolled(Database(tmp_path / "corrupt-gateway-history.sqlite3"))
+    policy_path = tmp_path / "policy.yaml"
+    _write_policy(policy_path, _snapshot(reviewed_read_only=True))
+    _install(bundle, policy_path)
+    factory = FrozenAccessRequestFactory(
+        RequestFreezer(
+            bundle.cipher,
+            pending_ttl_seconds=900,
+            clock=lambda: datetime.fromtimestamp(NOW, tz=UTC),
+        ),
+        policy_version=lambda: 1,
+    )
+    frozen = factory.freeze(
+        AccessRequestDraft(
+            origin_namespace="profile:corrupt-history",
+            alias="fake-service",
+            tool="create_item",
+            reason="The frozen reason must survive unavailable policy history.",
+            actor="mcp:profile:corrupt-history",
+            created_at=NOW,
+        )
+    )
+    bundle.state_machine.enqueue(frozen)
+    request_id = frozen.request_id
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+    _, principal = bundle.session()
+
+    with bundle.database.transaction() as connection:
+        connection.execute("DROP TRIGGER durable_policy_snapshots_no_update")
+        connection.execute(
+            """
+            UPDATE durable_policy_snapshots SET snapshot_yaml = ?
+            WHERE policy_version_id = 1
+            """,
+            (b"corrupt: [",),
+        )
+
+    detail = bundle.backend.get_detail(principal, request_id)
+    assert detail.policy_promotion_preview is None
+    assert detail.policy_promotion_preview_unavailable == (
+        "Exact frozen policy proposal history is unavailable or failed integrity validation. "
+        "Approval is disabled; the frozen request context remains available."
+    )
+    assert detail.review_available is True
+    assert json.loads(str(detail.reviewed_arguments_json)) == {
+        "alias": "fake-service",
+        "reason": "The frozen reason must survive unavailable policy history.",
+        "tool": "create_item",
+    }
+
+    with pytest.raises(WebConflict, match="policy change could not be staged safely"):
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "approve",
+            "fake:800",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 1,
+        )
+    with bundle.database.read() as connection:
+        assert connection.execute("SELECT 1 FROM auth_proof_consumptions").fetchone() is None
+
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "deny",
+            "fake:801",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            now=NOW + 2,
+            decision_note="authenticated_denial",
+        )
+        == "denied"
+    )
+    bundle.backend._clock = lambda: NOW + 1_000
+    denied = bundle.backend.get_detail(principal, request_id)
+    assert denied.state == "denied"
+    assert denied.decision_window_expired is False
+    assert denied.policy_promotion_preview is None
+    assert denied.policy_promotion_preview_unavailable is not None
+    assert "frozen reason" in str(denied.reviewed_arguments_json)
 
 
 @pytest.mark.parametrize(
