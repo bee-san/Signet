@@ -6,15 +6,17 @@ import argparse
 import asyncio
 import base64
 import copy
+import ctypes
+import errno
 import fcntl
 import hashlib
 import http.client
 import json
 import os
 import secrets
-import shutil
 import signal
 import stat
+import sys
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
@@ -47,7 +49,16 @@ from signet.auth import (
     SQLitePasswordCredentialRepository,
     SQLiteSessionRepository,
 )
-from signet.backup import BackupBundleManager, BackupError, RestoredBundle
+from signet.backup import (
+    BackupBundleManager,
+    BackupCleanupStateUnknown,
+    BackupError,
+    BackupPublicationUnknown,
+    BackupPublishedWithWarnings,
+    BackupRetentionStateUnknown,
+    RestoredBundle,
+    remove_private_tree_checked,
+)
 from signet.credential_broker import (
     CallerPrincipal,
     CredentialError,
@@ -57,7 +68,7 @@ from signet.credential_broker import (
     TokenRegistry,
 )
 from signet.crypto import PayloadCipher
-from signet.db import Database, DatabaseError
+from signet.db import Database, DatabaseError, DatabaseFinalizationStateUnknown
 from signet.delivery import DeliveryDispatcher, DeliveryError, FrozenRequestLoader
 from signet.freezer import RequestFreezer
 from signet.gateway import GatewayCallPipeline
@@ -68,7 +79,12 @@ from signet.gateway_tools import (
     GatewayToolSurface,
     SafeRequestSummary,
 )
-from signet.mcp_mirror import AliasToolSurface, SchemaMirror
+from signet.mcp_mirror import (
+    AliasToolSurface,
+    InvocationIdentity,
+    SchemaMirror,
+    derive_invocation_identity,
+)
 from signet.models import AdmissionRejected, InvalidTransition, RequestState
 from signet.notification_outbox import NotificationOutboxWorker, SQLiteNotificationOutbox
 from signet.notifications import (
@@ -79,6 +95,7 @@ from signet.notifications import (
 from signet.policy import (
     PolicyEngine,
     PolicyError,
+    PolicyMode,
     PolicySnapshot,
     dump_policy,
     parse_policy,
@@ -88,6 +105,17 @@ from signet.policy_persistence import (
     PolicyPersistenceError,
     SQLiteActionDraftRepository,
     SQLitePolicyPromotionBoundary,
+)
+from signet.private_paths import (
+    DirectoryIdentity,
+    PrivatePathError,
+    capture_owned_directory_identity,
+    harden_private_directory_identity,
+    require_no_acl_grants,
+    require_owned_directory_identity,
+    require_private_directory,
+    require_private_directory_identity,
+    revalidate_directory_identity,
 )
 from signet.reconcile import ReconciliationCoordinator
 from signet.retention import (
@@ -136,6 +164,7 @@ _STATE_FILE = "demo-state.json"
 _SECRETS_FILE = "demo-secrets.json"
 _POLICY_FILE = "policy.yaml"
 _DATABASE_FILE = "approvals.sqlite3"
+_DATABASE_MAINTENANCE_LOCK_FILE = f".{_DATABASE_FILE}.maintenance.lock"
 _SERVE_LOCK_FILE = ".serve.lock"
 _BACKUP_MAINTENANCE_LOCK_FILE = ".backup-maintenance.lock"
 _ATTACHMENTS_DIRECTORY = "attachments"
@@ -147,6 +176,10 @@ _BACKUP_KEY_SIZE = 32
 _MAX_CONFIG_BYTES = 4 * 1024 * 1024
 _DEMO_SERVER_EXIT_SECONDS = DEMO_GRACEFUL_SHUTDOWN_SECONDS + 2
 _DEMO_FORCE_CANCEL_SECONDS = 1
+_SEED_ALIAS = "fastmail"
+_SEED_TOOL = "send_email"
+_SEED_INVOCATION_PREFIX = "signet-demo-seed-request-v1"
+_MAX_SEED_REQUEST_SEQUENCE = 4_096
 
 
 class DemoError(RuntimeError):
@@ -214,6 +247,7 @@ class DemoAssembly:
     backups: DemoBackupService
     workers: DemoWorkers
     provider_clients: Mapping[str, FakeOnlyProviderClient]
+    gateway_pipeline: GatewayCallPipeline
 
 
 class DemoTotpProvider:
@@ -602,24 +636,74 @@ class DemoWorkers:
         return delivered, report.delivered
 
 
+def _absolute_demo_path(root: Path) -> Path:
+    return _absolute_artifact_path(
+        root,
+        message="demo data directory path is unavailable or unsafe",
+    )
+
+
+def _absolute_artifact_path(path: Path, *, message: str) -> Path:
+    try:
+        selected = Path(path).expanduser().absolute()
+        encoded = os.fsencode(selected)
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        raise DemoError(message) from exc
+    if b"\x00" in encoded or selected.name in {"", ".", ".."}:
+        raise DemoError(message)
+    return selected
+
+
 def initialize_demo(root: Path, *, now: int | None = None) -> Path:
     """Atomically create a new marker-guarded fake-only data directory."""
 
-    destination = Path(root).expanduser().absolute()
+    requested = _absolute_demo_path(root)
+    if requested.exists() or requested.is_symlink():
+        raise DemoError("demo data directory must not already exist")
+    try:
+        parent_identity = require_owned_directory_identity(requested.parent)
+    except PrivatePathError as exc:
+        raise DemoError("demo data directory parent is unavailable or unsafe") from exc
+    parent = parent_identity.path
+    destination = parent / requested.name
     if destination.exists() or destination.is_symlink():
         raise DemoError("demo data directory must not already exist")
-    destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.init-{secrets.token_urlsafe(8)}")
-    temporary.mkdir(mode=0o700)
     created_at = int(time.time()) if now is None else now
+    temporary_created = False
+    temporary_identity: DirectoryIdentity | None = None
+    published = False
     try:
+        try:
+            temporary.mkdir(mode=0o700)
+        except FileExistsError:
+            raise
+        except BaseException as exc:
+            raise DemoError(
+                "demo initialization did not complete, and initialization-tree creation "
+                "cleanup could not be confirmed; inspect the demo parent before retrying"
+            ) from exc
+        temporary_created = True
+        temporary_identity = capture_owned_directory_identity(temporary)
+        temporary_identity = harden_private_directory_identity(temporary_identity)
+        private_temporary = require_private_directory_identity(temporary)
+        if not temporary_identity.same_object(private_temporary):
+            raise DemoError("demo initialization directory changed or became unsafe")
+        _require_unchanged_demo_directory(parent_identity, private=False)
+        _write_new_file(temporary / _DATABASE_MAINTENANCE_LOCK_FILE, b"")
         database = Database(temporary / _DATABASE_FILE)
         database.initialize()
         generated = _new_secrets()
         _enroll_web_credentials(database, generated, now=created_at)
         policy = parse_policy(_demo_policy_document())
         _write_new_file(temporary / _POLICY_FILE, dump_policy(policy))
-        (temporary / _IMPORTS_DIRECTORY).mkdir(mode=0o700)
+        imports = temporary / _IMPORTS_DIRECTORY
+        imports.mkdir(mode=0o700)
+        imports_identity = harden_private_directory_identity(
+            capture_owned_directory_identity(imports)
+        )
+        if not imports_identity.same_object(require_private_directory_identity(imports)):
+            raise DemoError("demo imports directory changed or became unsafe")
         _write_json(
             temporary / _STATE_FILE,
             {
@@ -637,10 +721,51 @@ def initialize_demo(root: Path, *, now: int | None = None) -> Path:
         )
         _write_json(temporary / _SECRETS_FILE, _secrets_document(generated))
         _fsync_directory(temporary)
-        os.replace(temporary, destination)
-        _fsync_directory(destination.parent)
+        _require_unchanged_demo_directory(temporary_identity, private=True)
+        _require_unchanged_demo_directory(parent_identity, private=False)
+        if destination.exists() or destination.is_symlink():
+            raise DemoError("demo data directory must not already exist")
+        try:
+            _rename_directory_no_replace(temporary, destination)
+            published = True
+        except BaseException as exc:
+            try:
+                revalidate_directory_identity(temporary_identity, private=True)
+            except PrivatePathError:
+                published = True
+                raise DemoError(
+                    "demo initialization outcome is unknown because durable publication "
+                    "could not be confirmed; inspect the destination before retrying"
+                ) from exc
+            if isinstance(exc, FileExistsError):
+                raise DemoError("demo data directory must not already exist") from exc
+            raise
+        try:
+            published_identity = require_private_directory_identity(destination)
+            if not temporary_identity.same_object(published_identity):
+                raise PrivatePathError("published demo directory identity changed")
+            _require_unchanged_demo_directory(parent_identity, private=False)
+            _fsync_directory(parent)
+            _require_unchanged_demo_directory(parent_identity, private=False)
+            _require_unchanged_demo_directory(published_identity, private=True)
+        except BaseException as exc:
+            raise DemoError(
+                "demo initialization outcome is unknown because durable publication "
+                "could not be confirmed; inspect the destination before retrying"
+            ) from exc
     except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
+        if temporary_created and not published:
+            try:
+                _cleanup_demo_initialization_tree(
+                    temporary,
+                    parent_identity=parent_identity,
+                    temporary_identity=temporary_identity,
+                )
+            except BaseException as cleanup_error:
+                raise DemoError(
+                    "demo initialization did not complete, but private initialization-tree "
+                    "cleanup could not be confirmed; inspect the demo parent before retrying"
+                ) from cleanup_error
         raise
     return destination
 
@@ -956,6 +1081,7 @@ def build_demo(
         backups=backups,
         workers=workers,
         provider_clients=downstream_clients,
+        gateway_pipeline=pipeline,
     )
 
 
@@ -972,6 +1098,135 @@ def credential_value(root: Path, field: str) -> str:
         return values[field]
     except KeyError as exc:
         raise DemoError("unknown demo credential field") from exc
+
+
+def seed_demo_request(root: Path) -> dict[str, str | bool]:
+    """Admit one realistic fake request while the demo server is stopped."""
+
+    demo_root, _state, _secrets = _load_demo(root)
+    with _demo_server_lock(demo_root):
+        assembly = build_demo(demo_root)
+        policy = assembly.mirror.policy.configured(_SEED_ALIAS, _SEED_TOOL)
+        if policy is None or policy.mode is not PolicyMode.APPROVAL:
+            raise DemoError("demo seed request requires the reviewed fake approval policy")
+
+        selected_now = int(time.time())
+        identity, created = _select_seed_invocation_identity(
+            assembly,
+            policy_version=assembly.mirror.policy.version,
+            now=selected_now,
+        )
+        try:
+            result = asyncio.run(
+                assembly.gateway_pipeline.handle_call(
+                    _SEED_ALIAS,
+                    _SEED_TOOL,
+                    _seed_request_arguments(),
+                    DEMO_NAMESPACE,
+                    identity,
+                )
+            )
+        except Exception:
+            raise DemoError("fake-only seed request could not be admitted safely") from None
+
+        structured = result.get("structuredContent")
+        if not isinstance(structured, dict):
+            raise DemoError("fake-only seed request returned an invalid admission result")
+        request_id = structured.get("request_id")
+        if not isinstance(request_id, str):
+            raise DemoError("fake-only seed request returned an invalid admission result")
+        try:
+            stored = assembly.state_machine.get_request(request_id)
+        except Exception:
+            raise DemoError("fake-only seed request could not be verified safely") from None
+        if (
+            structured.get("status") != RequestState.PENDING_APPROVAL.value
+            or stored.get("state") != RequestState.PENDING_APPROVAL.value
+            or stored.get("downstream_alias") != _SEED_ALIAS
+            or stored.get("tool_name") != _SEED_TOOL
+            or stored.get("origin_namespace") != DEMO_NAMESPACE
+            or not isinstance(stored.get("expires_at"), int)
+            or cast(int, stored["expires_at"]) <= selected_now
+            or any(client.mutation_calls for client in assembly.provider_clients.values())
+        ):
+            raise DemoError("fake-only seed request could not be verified safely")
+
+    return {
+        "created": created,
+        "request_id": request_id,
+        "service": _SEED_ALIAS,
+        "state": RequestState.PENDING_APPROVAL.value,
+        "status": "ready_for_review",
+        "tool": _SEED_TOOL,
+    }
+
+
+def _select_seed_invocation_identity(
+    assembly: DemoAssembly,
+    *,
+    policy_version: int,
+    now: int,
+) -> tuple[InvocationIdentity, bool]:
+    for sequence in range(1, _MAX_SEED_REQUEST_SEQUENCE + 1):
+        identity = derive_invocation_identity(
+            namespace=DEMO_NAMESPACE,
+            alias=_SEED_ALIAS,
+            tool=_SEED_TOOL,
+            explicit_id=f"{_SEED_INVOCATION_PREFIX}:{policy_version}:{sequence}",
+            explicit_id_present=True,
+            session_scope="fake:offline-seed",
+            request_id=sequence,
+        )
+        with assembly.database.read() as connection:
+            existing = connection.execute(
+                """
+                SELECT record.request_id, request.state, request.expires_at
+                FROM idempotency_records AS record
+                LEFT JOIN approval_requests AS request
+                  ON request.request_id = record.request_id
+                WHERE record.origin_namespace = ?
+                  AND record.downstream_alias = ?
+                  AND record.tool_name = ?
+                  AND record.invocation_key = ?
+                """,
+                (
+                    DEMO_NAMESPACE,
+                    _SEED_ALIAS,
+                    _SEED_TOOL,
+                    identity.invocation_key,
+                ),
+            ).fetchone()
+        if existing is None:
+            return identity, True
+        existing_state = existing["state"]
+        existing_expires_at = existing["expires_at"]
+        if (
+            not isinstance(existing_state, str)
+            or not isinstance(existing_expires_at, int)
+            or isinstance(existing_expires_at, bool)
+        ):
+            raise DemoError("fake-only seed request history is inconsistent")
+        if existing_state == RequestState.PENDING_APPROVAL.value and existing_expires_at > now:
+            return identity, False
+    raise DemoError("fake-only seed request sequence is exhausted")
+
+
+def _seed_request_arguments() -> dict[str, Any]:
+    return {
+        "from": "fake-sender@demo.invalid",
+        "to": ["fake-customer-success@demo.invalid"],
+        "cc": [],
+        "bcc": [],
+        "subject": "Fake onboarding status follow-up",
+        "body": (
+            "Hello Fake Customer Success Team,\n\n"
+            "Please confirm the fake onboarding review is complete before this demo "
+            "follow-up is sent. Reason for sending: the fake customer requested a status "
+            "update for tomorrow's training exercise.\n\n"
+            "This message is fake-only and cannot be delivered to a real provider."
+        ),
+        "attachments": [],
+    }
 
 
 def hermes_config(*, mcp_port: int = DEFAULT_MCP_PORT) -> str:
@@ -997,21 +1252,37 @@ def hermes_config(*, mcp_port: int = DEFAULT_MCP_PORT) -> str:
 
 
 def backup_demo(root: Path, output: Path) -> Path:
-    assembly = build_demo(root)
-    destination = Path(output).expanduser().absolute()
+    destination = _absolute_artifact_path(
+        output,
+        message="demo backup destination path is unavailable or unsafe",
+    )
     _require_private_parent(destination.parent)
+    assembly = build_demo(root)
     return assembly.backups.create(destination)
 
 
 def restore_demo(source_root: Path, bundle: Path, destination: Path) -> RestoredBundle:
-    source = build_demo(source_root)
-    destination_path = Path(destination).expanduser().absolute()
+    bundle_path = _absolute_artifact_path(
+        bundle,
+        message="demo backup bundle path is unavailable or unsafe",
+    )
+    destination_path = _absolute_artifact_path(
+        destination,
+        message="demo restore destination path is unavailable or unsafe",
+    )
     _require_private_parent(destination_path.parent)
-    restored = source.backups.restore(Path(bundle).expanduser().absolute(), destination_path)
+    source = build_demo(source_root)
+    restored = source.backups.restore(bundle_path, destination_path)
     try:
         source_policy = _read_bounded_regular(source.root / _POLICY_FILE)
         _write_new_file(destination_path / _POLICY_FILE, source_policy)
-        (destination_path / _IMPORTS_DIRECTORY).mkdir(mode=0o700)
+        imports = destination_path / _IMPORTS_DIRECTORY
+        imports.mkdir(mode=0o700)
+        imports_identity = harden_private_directory_identity(
+            capture_owned_directory_identity(imports)
+        )
+        if not imports_identity.same_object(require_private_directory_identity(imports)):
+            raise DemoError("restored demo imports directory changed or became unsafe")
         source_secrets = _load_demo(source_root)[2]
         rotated = _rotated_secrets(source_secrets)
         _enroll_web_credentials(
@@ -1038,7 +1309,17 @@ def restore_demo(source_root: Path, bundle: Path, destination: Path) -> Restored
         _fsync_directory(destination_path)
         build_demo(destination_path)
     except BaseException:
-        shutil.rmtree(destination_path, ignore_errors=True)
+        try:
+            remove_private_tree_checked(
+                restored.root,
+                parent_identity=restored.parent_identity,
+                tree_identity=restored.root_identity,
+            )
+        except BaseException as cleanup_error:
+            raise BackupCleanupStateUnknown(
+                "demo restore did not complete, but its private restore tree could not be "
+                "removed; inspect the restore parent and do not start that tree"
+            ) from cleanup_error
         raise
     return restored
 
@@ -1356,6 +1637,17 @@ def add_demo_parser(subcommands: Any) -> None:
     initialize = commands.add_parser("init", help="initialize a new fake-only data directory")
     _data_dir_argument(initialize)
 
+    seed_request = commands.add_parser(
+        "seed-request",
+        help="create or return one idempotent fake approval request",
+        description=(
+            "Admit one realistic fake email through the reviewed gateway while the demo "
+            "server is stopped. Re-running while it is pending returns the same request; "
+            "after it is resolved, the next run creates a new fake request."
+        ),
+    )
+    _data_dir_argument(seed_request)
+
     credentials = commands.add_parser(
         "credentials", help="print one explicitly requested fake credential"
     )
@@ -1458,6 +1750,15 @@ def run_demo_command(args: argparse.Namespace) -> None:
     except DemoError:
         raise
     except (
+        BackupPublicationUnknown,
+        BackupPublishedWithWarnings,
+        BackupRetentionStateUnknown,
+        BackupCleanupStateUnknown,
+    ) as exc:
+        raise DemoError(exc.operator_message()) from None
+    except DatabaseFinalizationStateUnknown as exc:
+        raise DemoError(exc.operator_message()) from None
+    except (
         BackupError,
         CredentialError,
         DatabaseError,
@@ -1475,6 +1776,10 @@ def _run_demo_command(args: argparse.Namespace) -> None:
     if command == "init":
         initialized = initialize_demo(args.data_dir)
         print(f"Initialized Signet fake-only demo at {initialized}")
+        return
+    if command == "seed-request":
+        seeded = seed_demo_request(args.data_dir)
+        print(json.dumps(seeded, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         return
     if command == "credentials":
         print(credential_value(args.data_dir, args.field))
@@ -1652,9 +1957,14 @@ def _secrets_document(value: DemoSecrets) -> dict[str, Any]:
 
 
 def _load_demo(root: Path) -> tuple[Path, dict[str, Any], DemoSecrets]:
-    selected = Path(root).expanduser().absolute()
-    if selected.is_symlink() or not selected.is_dir():
+    selected = _absolute_demo_path(root)
+    try:
+        resolved = selected.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise DemoError("demo data directory is unavailable or unsafe") from None
+    if resolved != selected or selected.is_symlink() or not selected.is_dir():
         raise DemoError("demo data directory is unavailable or unsafe")
+    selected = resolved
     metadata = selected.stat()
     if (
         not stat.S_ISDIR(metadata.st_mode)
@@ -1662,6 +1972,10 @@ def _load_demo(root: Path) -> tuple[Path, dict[str, Any], DemoSecrets]:
         or metadata.st_mode & 0o077
     ):
         raise DemoError("demo data directory must be private mode 0700")
+    try:
+        selected = require_private_directory(selected)
+    except PrivatePathError as exc:
+        raise DemoError("demo data directory is unavailable or unsafe") from exc
     state = _read_json(selected / _STATE_FILE)
     required_state = {
         "format",
@@ -2075,6 +2389,7 @@ def _read_bounded_regular(path: Path, *, require_private: bool = False) -> bytes
     try:
         descriptor = os.open(path, flags)
         metadata = os.fstat(descriptor)
+        require_no_acl_grants(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
@@ -2099,7 +2414,7 @@ def _read_bounded_regular(path: Path, *, require_private: bool = False) -> bytes
         ) or total != metadata.st_size:
             raise DemoError("demo state file changed while it was read")
         return b"".join(chunks)
-    except OSError as exc:
+    except (OSError, PrivatePathError) as exc:
         raise DemoError("demo state file is unavailable or unsafe") from exc
     finally:
         if "descriptor" in locals():
@@ -2121,10 +2436,15 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
 def _write_new_file(path: Path, content: bytes) -> None:
     descriptor = os.open(
         path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
         0o600,
     )
     try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            require_no_acl_grants(descriptor)
+        except PrivatePathError as exc:
+            raise DemoError("demo state file inherited an unsafe granting ACL") from exc
         view = memoryview(content)
         while view:
             written = os.write(descriptor, view)
@@ -2160,6 +2480,67 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _rename_directory_no_replace(source: Path, destination: Path) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "linux":
+        function = cast(Any, getattr(library, "renameat2", None))
+        if function is None:
+            raise DemoError("atomic no-replace demo publication is unavailable")
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        arguments = (-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    elif sys.platform == "darwin":
+        function = cast(Any, getattr(library, "renamex_np", None))
+        if function is None:
+            raise DemoError("atomic no-replace demo publication is unavailable")
+        function.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        arguments = (os.fsencode(source), os.fsencode(destination), 0x00000004)
+    else:
+        raise DemoError("atomic no-replace demo publication is unavailable")
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if function(*arguments) != 0:
+        error = ctypes.get_errno() or errno.EIO
+        failure = OSError(error, os.strerror(error), destination)
+        if error in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination)
+        raise DemoError("atomic no-replace demo publication failed") from failure
+
+
+def _require_unchanged_demo_directory(
+    identity: DirectoryIdentity,
+    *,
+    private: bool,
+) -> Path:
+    try:
+        return revalidate_directory_identity(identity, private=private)
+    except PrivatePathError as exc:
+        raise DemoError("demo initialization directory changed or became unsafe") from exc
+
+
+def _cleanup_demo_initialization_tree(
+    temporary: Path,
+    *,
+    parent_identity: DirectoryIdentity,
+    temporary_identity: DirectoryIdentity | None,
+) -> None:
+    revalidate_directory_identity(parent_identity, private=False)
+    if temporary_identity is None:
+        raise DemoError("demo initialization tree identity is unavailable for safe cleanup")
+    if temporary_identity.path != temporary:
+        raise DemoError("demo initialization tree identity is inconsistent")
+    remove_private_tree_checked(
+        temporary,
+        parent_identity=parent_identity,
+        tree_identity=temporary_identity,
+    )
+
+
 @contextmanager
 def _demo_server_lock(root: Path) -> Iterator[None]:
     with _demo_named_lock(
@@ -2167,6 +2548,7 @@ def _demo_server_lock(root: Path) -> Iterator[None]:
         filename=_SERVE_LOCK_FILE,
         unsafe_message="demo serve lock is unavailable or unsafe",
         busy_message="this demo data directory is already being served",
+        operation_description="demo server operation",
     ):
         yield
 
@@ -2179,8 +2561,25 @@ def _demo_backup_maintenance_lock(root: Path) -> Iterator[None]:
         filename=_BACKUP_MAINTENANCE_LOCK_FILE,
         unsafe_message="demo backup maintenance lock is unavailable or unsafe",
         busy_message="demo backup maintenance is already active",
+        operation_description="demo backup or restore operation",
     ):
         yield
+
+
+def _safe_demo_operation_message(error: BaseException) -> str:
+    if isinstance(
+        error,
+        (
+            BackupPublicationUnknown,
+            BackupPublishedWithWarnings,
+            BackupRetentionStateUnknown,
+            BackupCleanupStateUnknown,
+        ),
+    ):
+        return error.operator_message()
+    if isinstance(error, DemoError):
+        return str(error)
+    return "demo operation failed safely"
 
 
 @contextmanager
@@ -2190,30 +2589,40 @@ def _demo_named_lock(
     filename: str,
     unsafe_message: str,
     busy_message: str,
+    operation_description: str,
 ) -> Iterator[None]:
     path = root / filename
     flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     descriptor: int | None = None
+    lock_acquired = False
     try:
         descriptor = os.open(path, flags, 0o600)
         metadata = os.fstat(descriptor)
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != current_uid
             or metadata.st_nlink != 1
         ):
+            raise DemoError(unsafe_message)
+        os.fchmod(descriptor, 0o600)
+        try:
+            require_no_acl_grants(descriptor)
+        except PrivatePathError as exc:
+            raise DemoError(unsafe_message) from exc
+        metadata = os.fstat(descriptor)
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
             raise DemoError(unsafe_message)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise DemoError(busy_message) from None
+        lock_acquired = True
         locked = os.fstat(descriptor)
         current = path.stat(follow_symlinks=False)
         if (
             not stat.S_ISREG(current.st_mode)
             or (current.st_dev, current.st_ino) != (locked.st_dev, locked.st_ino)
-            or locked.st_uid != os.geteuid()
             or current.st_uid != locked.st_uid
             or stat.S_IMODE(locked.st_mode) != 0o600
             or stat.S_IMODE(current.st_mode) != 0o600
@@ -2221,15 +2630,67 @@ def _demo_named_lock(
             or current.st_nlink != 1
         ):
             raise DemoError(unsafe_message)
-        yield
-    except OSError as exc:
+    except BaseException as exc:
+        finalization_error = (
+            _finalize_demo_lock_descriptor(descriptor, lock_acquired=lock_acquired)
+            if descriptor is not None
+            else None
+        )
+        if finalization_error is not None:
+            if lock_acquired:
+                raise DemoError(
+                    "demo lock setup failed, and lock release could not be confirmed; stop all "
+                    "demo processes and inspect the private lock file before retrying"
+                ) from None
+            raise DemoError(
+                "demo lock setup failed, and lock descriptor cleanup could not be confirmed; "
+                "stop all demo processes and inspect the private lock file before retrying"
+            ) from None
+        if isinstance(exc, DemoError):
+            raise
         raise DemoError(unsafe_message) from exc
-    finally:
-        if descriptor is not None:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(descriptor)
+
+    operation_error: BaseException | None = None
+    try:
+        yield
+    except BaseException as exc:
+        operation_error = exc
+
+    finalization_error = _finalize_demo_lock_descriptor(descriptor, lock_acquired=True)
+
+    if finalization_error is not None:
+        recovery = (
+            "lock release could not be confirmed; stop all demo processes and inspect the "
+            "private lock file before retrying"
+        )
+        if operation_error is not None:
+            primary = _safe_demo_operation_message(operation_error)
+            raise DemoError(f"{primary}; additionally, {recovery}") from None
+        raise DemoError(
+            f"{operation_description} completed, but {recovery}; inspect its destination result "
+            "and do not repeat the operation blindly"
+        ) from None
+    if operation_error is not None:
+        raise operation_error
+
+
+def _finalize_demo_lock_descriptor(
+    descriptor: int,
+    *,
+    lock_acquired: bool,
+) -> BaseException | None:
+    finalization_error: BaseException | None = None
+    if lock_acquired:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except BaseException as exc:
+            finalization_error = exc
+    try:
+        os.close(descriptor)
+    except BaseException as exc:
+        if finalization_error is None:
+            finalization_error = exc
+    return finalization_error
 
 
 def _require_private_parent(path: Path) -> None:
