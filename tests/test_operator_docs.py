@@ -1877,7 +1877,7 @@ def test_policy_guide_documents_shipped_durable_coordinators() -> None:
     assert "`DurableSchemaRegistry.restore()`" in deployment
 
 
-def test_linux_private_directory_hardening_documents_procfs_requirement() -> None:
+def test_private_directory_hardening_documents_platform_requirements() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     deployment = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
     security = (ROOT / "docs" / "security-model.md").read_text(encoding="utf-8")
@@ -1885,7 +1885,9 @@ def test_linux_private_directory_hardening_documents_procfs_requirement() -> Non
     assert "kernel-owned `/proc/self/fd`" in readme
     assert "mounted kernel procfs at `/proc/self/fd`" in deployment
     assert "already-held `O_PATH` descriptor" in security
-    assert "macOS uses an `O_EVTONLY` descriptor" in security
+    assert "parent-descriptor-relative `fchmodat`" in deployment
+    assert "`AT_SYMLINK_NOFOLLOW`" in security
+    assert "malicious same-user process" in security
 
 
 def test_fake_quickstart_seeds_review_without_model_or_network() -> None:

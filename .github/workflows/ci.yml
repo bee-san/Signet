@@ -400,6 +400,7 @@ jobs:
           tests/test_demo.py::test_demo_init_preserves_replacement_when_mkdir_outcome_is_unknown
           tests/test_demo.py::test_demo_init_cleans_up_restrictive_nested_directory_after_interruption
           tests/test_demo.py::test_demo_init_hardens_every_artifact_against_restrictive_umask
+          tests/test_demo.py::test_demo_backup_restore_hardens_imports_and_secrets_under_restrictive_umask
           tests/test_demo.py::test_demo_init_detects_same_path_parent_replacement_before_publish
           tests/test_demo.py::test_demo_init_reports_unknown_outcome_and_preserves_publish_on_parent_fsync_failure
           tests/test_demo.py::test_demo_init_reports_unknown_outcome_when_interrupted_immediately_after_replace

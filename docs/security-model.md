@@ -85,8 +85,16 @@ downstreams or the downstream-disabled staging assembly.
 Linux private-directory recovery also uses the kernel-owned `/proc/self/fd` view
 to harden an already-held `O_PATH` descriptor when the directory mode is `000`.
 It verifies the descriptor identity before and after the change and fails closed
-if procfs is unavailable. macOS uses an `O_EVTONLY` descriptor for the same
-exact-object operation. Neither path falls back to chmodding the selected pathname.
+if procfs is unavailable. macOS cannot use `O_EVTONLY` to open a mode-`000`
+directory because that flag still requests read access. It instead verifies the
+directory and its ancestry, applies `fchmodat` to one relative component through
+the held parent descriptor with `AT_SYMLINK_NOFOLLOW`, and then opens and verifies
+the resulting descriptor and ACL. It never retries an absolute or symlink-following
+`chmod`. A malicious same-user process can still race a different same-user inode
+into that name before the operation; post-operation identity checks fail the
+request but cannot undo a mode change to that replacement. That limitation is
+inside the shared-user threat boundary stated above. Use an isolated service
+account when arbitrary same-user code is in scope.
 
 Reconciliation receives a structurally restricted read-only client with an exact
 allowlist. It cannot call an arbitrary mutation because an adapter labels the call

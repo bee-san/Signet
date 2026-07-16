@@ -71,7 +71,8 @@ alias, tool-result, and status-polling contract without claiming a live assembly
   roots; known network filesystems are rejected;
 - on Linux, a mounted kernel procfs at `/proc/self/fd` for descriptor-bound
   hardening of mode-`000` private directories; this is not required on macOS,
-  which uses `O_EVTONLY`, and Signet fails closed rather than using path `chmod`;
+  which uses parent-descriptor-relative `fchmodat` with `AT_SYMLINK_NOFOLLOW` and
+  fails closed rather than retrying an unanchored path;
 - filesystem ownership that prevents other users from changing the code,
   virtualenv, policy, launchers, database, staging files, and deployment assembly;
 - HTTPS at the browser-facing origin and an RP ID that is a registrable/exact host
