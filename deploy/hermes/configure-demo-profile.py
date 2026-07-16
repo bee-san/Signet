@@ -11,7 +11,6 @@ import secrets
 import stat
 import sys
 from collections.abc import Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -21,6 +20,8 @@ import yaml
 from yaml.composer import ComposerError
 from yaml.events import AliasEvent, ScalarEvent
 from yaml.nodes import MappingNode, Node
+
+from signet.private_paths import PrivatePathError, require_no_acl_grants
 
 PROFILE_NAME = "signet-demo"
 TOKEN_NAME = "SIGNET_DEMO_MCP_CALLER_TOKEN"  # nosec B105
@@ -56,6 +57,15 @@ class PrivateFile:
     size: int
     modified_ns: int
     changed_ns: int
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PrivateTemporary:
+    """A temporary profile file whose directory entry can be removed by identity."""
+
+    name: str
+    device: int
+    inode: int
 
 
 class UniqueKeyLoader(yaml.SafeLoader):
@@ -184,7 +194,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _read_private_file(path: Path, *, label: str, maximum: int) -> PrivateFile:
-    selected = path.expanduser().absolute()
+    try:
+        selected = path.expanduser().absolute()
+    except (OSError, RuntimeError, ValueError):
+        raise ConfigurationError(f"{label} path is invalid") from None
     try:
         if selected.is_symlink():
             raise ConfigurationError(f"{label} must not be a symlink")
@@ -194,8 +207,11 @@ def _read_private_file(path: Path, *, label: str, maximum: int) -> PrivateFile:
         )
     except ConfigurationError:
         raise
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise ConfigurationError(f"{label} must be an existing private file") from exc
+    metadata: os.stat_result | None = None
+    value = b""
+    failure: ConfigurationError | None = None
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -208,14 +224,28 @@ def _read_private_file(path: Path, *, label: str, maximum: int) -> PrivateFile:
             raise ConfigurationError(f"{label} must have mode 0600")
         if metadata.st_size > maximum:
             raise ConfigurationError(f"{label} exceeds its size limit")
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            value = stream.read(maximum + 1)
+        require_no_acl_grants(descriptor)
+        value = _read_bounded_descriptor(descriptor, maximum, label=label)
         if len(value) > maximum:
             raise ConfigurationError(f"{label} exceeds its size limit")
-    finally:
+    except ConfigurationError as exc:
+        failure = exc
+    except (OSError, PrivatePathError):
+        failure = ConfigurationError(f"{label} could not be read safely")
+    try:
         os.close(descriptor)
+    except (OSError, RuntimeError, ValueError):
+        raise ConfigurationError(f"{label} descriptor cleanup could not be confirmed") from None
+    if failure is not None:
+        raise failure from None
+    if metadata is None:
+        raise ConfigurationError(f"{label} could not be read safely")
+    try:
+        resolved = selected.resolve(strict=True)
+    except OSError:
+        raise ConfigurationError(f"{label} changed while it was being read") from None
     return PrivateFile(
-        path=selected.resolve(strict=True),
+        path=resolved,
         value=value,
         maximum=maximum,
         device=metadata.st_dev,
@@ -232,7 +262,10 @@ def _validate_profile_paths(config: Path, env_file: Path) -> None:
     if config.name != "config.yaml" or env_file.name != ".env":
         raise ConfigurationError("Hermes profile files must be config.yaml and .env")
     parent = config.parent
-    metadata = parent.stat()
+    try:
+        metadata = parent.stat()
+    except OSError:
+        raise ConfigurationError("Hermes profile parent is unavailable") from None
     if not stat.S_ISDIR(metadata.st_mode):
         raise ConfigurationError("Hermes profile parent must be a directory")
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
@@ -321,7 +354,10 @@ def _merge_blank_profile(
 
 
 def _read_fake_token() -> str:
-    raw = sys.stdin.buffer.read(513)
+    try:
+        raw = sys.stdin.buffer.read(513)
+    except OSError:
+        raise ConfigurationError("fake token input could not be read") from None
     if len(raw) > 512:
         raise ConfigurationError("fake token input exceeds its size limit")
     if raw.endswith(b"\n"):
@@ -370,7 +406,9 @@ def _commit_profile_files(
     parent = config_file.path.parent
     directory: int | None = None
     lock: int | None = None
-    temporaries: dict[str, str] = {}
+    temporaries: dict[str, PrivateTemporary] = {}
+    stage = "before_publish"
+    failure: ConfigurationError | None = None
     try:
         directory = os.open(
             parent,
@@ -399,14 +437,17 @@ def _commit_profile_files(
         env_temporary = temporaries.get(env_file.path.name)
         if env_temporary is not None:
             _assert_snapshot(directory, env_file, label="profile environment")
+            stage = "environment_publish_attempted"
             os.replace(
-                env_temporary,
+                env_temporary.name,
                 env_file.path.name,
                 src_dir_fd=directory,
                 dst_dir_fd=directory,
             )
             temporaries.pop(env_file.path.name)
+            stage = "environment_publish_unsynced"
             os.fsync(directory)
+            stage = "environment_published"
 
         config_temporary = temporaries.get(config_file.path.name)
         if config_temporary is not None:
@@ -418,29 +459,138 @@ def _commit_profile_files(
                 label="profile environment",
             )
             _assert_snapshot(directory, config_file, label="profile config")
+            stage = "config_publish_attempted"
             os.replace(
-                config_temporary,
+                config_temporary.name,
                 config_file.path.name,
                 src_dir_fd=directory,
                 dst_dir_fd=directory,
             )
             temporaries.pop(config_file.path.name)
+            stage = "config_publish_unsynced"
             os.fsync(directory)
-    except OSError as exc:
-        raise ConfigurationError("profile files could not be replaced atomically") from exc
-    finally:
-        if directory is not None:
-            for temporary in temporaries.values():
-                with suppress(FileNotFoundError):
-                    os.unlink(temporary, dir_fd=directory)
-            if lock is not None:
-                os.close(lock)
+        stage = "complete"
+    except ConfigurationError as exc:
+        failure = exc
+    except OSError:
+        failure = _profile_commit_error(stage)
+
+    cleanup_failed = _cleanup_profile_transaction(
+        directory=directory,
+        lock=lock,
+        temporaries=tuple(temporaries.values()),
+    )
+    if cleanup_failed:
+        raise _profile_cleanup_error(stage) from None
+    if failure is not None:
+        raise failure from None
+
+
+def _profile_commit_error(stage: str) -> ConfigurationError:
+    if stage in {
+        "environment_publish_attempted",
+        "environment_publish_unsynced",
+        "environment_published",
+    }:
+        return ConfigurationError(
+            "profile environment may already contain the token, but profile config "
+            "was not published; inspect both files before retrying"
+        )
+    if stage in {"config_publish_attempted", "config_publish_unsynced"}:
+        return ConfigurationError(
+            "both profile files may already contain the requested values and publication "
+            "durability is unknown; inspect both files before retrying"
+        )
+    return ConfigurationError(
+        "profile files could not be prepared safely; no profile file was published"
+    )
+
+
+def _profile_cleanup_error(stage: str) -> ConfigurationError:
+    if stage in {
+        "environment_publish_attempted",
+        "environment_publish_unsynced",
+        "environment_published",
+    }:
+        return ConfigurationError(
+            "profile environment may already contain the token and temporary cleanup "
+            "could not be confirmed; profile config was not published; inspect both "
+            "files and the private profile directory before retrying"
+        )
+    if stage in {
+        "config_publish_attempted",
+        "config_publish_unsynced",
+    }:
+        return ConfigurationError(
+            "both profile files may already contain the requested values and publication "
+            "or temporary cleanup could not be confirmed; inspect both files and the "
+            "private profile directory before retrying"
+        )
+    if stage == "complete":
+        return ConfigurationError(
+            "requested profile values were verified present and directory sync completed, "
+            "but descriptor cleanup could not be confirmed; inspect both files and the "
+            "private profile directory before retrying"
+        )
+    return ConfigurationError(
+        "profile files were not published, but temporary cleanup could not be confirmed; "
+        "inspect the private profile directory before retrying"
+    )
+
+
+def _cleanup_profile_transaction(
+    *,
+    directory: int | None,
+    lock: int | None,
+    temporaries: tuple[PrivateTemporary, ...],
+) -> bool:
+    failed = False
+    if directory is not None and temporaries:
+        for temporary in temporaries:
+            try:
+                _unlink_private_temporary(directory, temporary)
+            except (ConfigurationError, OSError):
+                failed = True
+        try:
+            os.fsync(directory)
+        except OSError:
+            failed = True
+    if lock is not None:
+        try:
+            os.close(lock)
+        except OSError:
+            failed = True
+    if directory is not None:
+        try:
             os.close(directory)
+        except OSError:
+            failed = True
+    return failed
+
+
+def _unlink_private_temporary(directory: int, temporary: PrivateTemporary) -> None:
+    try:
+        metadata = os.stat(temporary.name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or (metadata.st_dev, metadata.st_ino) != (temporary.device, temporary.inode)
+    ):
+        raise ConfigurationError("profile temporary identity changed during cleanup")
+    os.unlink(temporary.name, dir_fd=directory)
 
 
 def _validate_open_parent(descriptor: int, path: Path) -> None:
-    metadata = os.fstat(descriptor)
-    current = path.stat()
+    try:
+        metadata = os.fstat(descriptor)
+        current = path.stat()
+        require_no_acl_grants(descriptor)
+    except (OSError, PrivatePathError):
+        raise ConfigurationError(
+            "Hermes profile parent could not be verified during configuration"
+        ) from None
     if not stat.S_ISDIR(metadata.st_mode) or (
         metadata.st_dev,
         metadata.st_ino,
@@ -453,6 +603,7 @@ def _validate_open_parent(descriptor: int, path: Path) -> None:
 
 
 def _open_profile_lock(directory: int) -> int:
+    descriptor: int | None = None
     try:
         descriptor = os.open(
             ".signet-configure.lock",
@@ -460,17 +611,27 @@ def _open_profile_lock(directory: int) -> int:
             0o600,
             dir_fd=directory,
         )
-    except OSError as exc:
-        raise ConfigurationError("profile configuration lock is unsafe") from exc
-    metadata = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
-    ):
-        os.close(descriptor)
-        raise ConfigurationError("profile configuration lock is unsafe")
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+        ):
+            raise OSError("unsafe profile lock metadata")
+        require_no_acl_grants(descriptor)
+    except (OSError, PrivatePathError):
+        close_failed = False
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                close_failed = True
+        if close_failed:
+            raise ConfigurationError(
+                "profile configuration lock cleanup could not be confirmed"
+            ) from None
+        raise ConfigurationError("profile configuration lock is unsafe") from None
     return descriptor
 
 
@@ -517,23 +678,32 @@ def _assert_expected_content(
 
 
 def _open_private_target(directory: int, name: str, *, label: str) -> int:
+    descriptor: int | None = None
     try:
         descriptor = os.open(
             name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
             dir_fd=directory,
         )
-    except OSError as exc:
-        raise ConfigurationError(f"{label} changed during configuration") from exc
-    metadata = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
-    ):
-        os.close(descriptor)
-        raise ConfigurationError(f"{label} changed during configuration")
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+        ):
+            raise OSError("unsafe profile target metadata")
+        require_no_acl_grants(descriptor)
+    except (OSError, PrivatePathError):
+        close_failed = False
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                close_failed = True
+        if close_failed:
+            raise ConfigurationError(f"{label} descriptor cleanup could not be confirmed") from None
+        raise ConfigurationError(f"{label} changed during configuration") from None
     return descriptor
 
 
@@ -553,15 +723,17 @@ def _read_bounded_descriptor(descriptor: int, maximum: int, *, label: str) -> by
     return value
 
 
-def _prepare_private_temp(directory: int, name: str, content: bytes) -> str:
+def _prepare_private_temp(directory: int, name: str, content: bytes) -> PrivateTemporary:
     descriptor: int | None = None
-    temporary = ""
+    temporary_name = ""
+    temporary: PrivateTemporary | None = None
+    failed = False
     try:
         for _ in range(8):
-            temporary = f".{name}.signet-demo-{secrets.token_hex(12)}"
+            candidate = f".{name}.signet-demo-{secrets.token_hex(12)}"
             try:
                 descriptor = os.open(
-                    temporary,
+                    candidate,
                     os.O_WRONLY
                     | os.O_CREAT
                     | os.O_EXCL
@@ -570,11 +742,29 @@ def _prepare_private_temp(directory: int, name: str, content: bytes) -> str:
                     0o600,
                     dir_fd=directory,
                 )
+                temporary_name = candidate
                 break
             except FileExistsError:
                 continue
         if descriptor is None:
             raise OSError("could not allocate a private temporary file")
+        initial = os.fstat(descriptor)
+        temporary = PrivateTemporary(
+            name=temporary_name,
+            device=initial.st_dev,
+            inode=initial.st_ino,
+        )
+        os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (metadata.st_dev, metadata.st_ino) != (temporary.device, temporary.inode)
+            or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+        ):
+            raise OSError("private temporary metadata changed")
+        require_no_acl_grants(descriptor)
         view = memoryview(content)
         while view:
             written = os.write(descriptor, view)
@@ -582,15 +772,43 @@ def _prepare_private_temp(directory: int, name: str, content: bytes) -> str:
                 raise OSError("short write")
             view = view[written:]
         os.fsync(descriptor)
-        os.close(descriptor)
-        return temporary
-    except OSError as exc:
-        if descriptor is not None:
+    except (OSError, PrivatePathError):
+        failed = True
+
+    close_failed = False
+    if descriptor is not None:
+        try:
             os.close(descriptor)
-        if temporary:
-            with suppress(FileNotFoundError):
-                os.unlink(temporary, dir_fd=directory)
-        raise ConfigurationError("profile files could not be prepared atomically") from exc
+        except OSError:
+            close_failed = True
+
+    if failed or close_failed:
+        cleanup_failed = close_failed
+        if temporary is not None:
+            try:
+                _unlink_private_temporary(directory, temporary)
+            except (ConfigurationError, OSError):
+                cleanup_failed = True
+            try:
+                os.fsync(directory)
+            except OSError:
+                cleanup_failed = True
+        elif temporary_name:
+            cleanup_failed = True
+        if cleanup_failed:
+            raise ConfigurationError(
+                "profile temporary cleanup could not be confirmed; inspect the private "
+                "profile directory before retrying"
+            ) from None
+        raise ConfigurationError(
+            "profile files could not be prepared safely; no profile file was published"
+        ) from None
+
+    if temporary is None:
+        raise ConfigurationError(
+            "profile files could not be prepared safely; no profile file was published"
+        ) from None
+    return temporary
 
 
 if __name__ == "__main__":
