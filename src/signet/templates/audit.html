@@ -4,16 +4,16 @@
   <p class="eyebrow">Review history</p>
   <h1>Audit</h1>
   <section class="decision-history" aria-labelledby="decision-history-heading">
-    <h2 id="decision-history-heading">Recent approvals and denials</h2>
+    <h2 id="decision-history-heading">Recent request decisions and policy changes</h2>
     {% if decisions %}
     <ol class="request-list">
       {% for decision in decisions %}
       {% set decision_time = decision.occurred_at|utc_time %}
-      <li id="decision-{{ decision.request_id }}">
+      <li id="decision-event-{{ decision.event_id }}" data-decision-request-id="{{ decision.request_id }}">
         <details class="request-expander decision-{{ decision.decision }}">
           <summary>
             <span class="request-summary-main">
-              <span class="service-label">{{ decision.decision }}</span>
+              <span class="service-label">{{ decision.decision_label }}</span>
               <strong>{{ decision.downstream_alias }} / {{ decision.tool_name }}</strong>
               <span class="hash-value">{{ decision.request_id }} / {{ decision.payload_hash_prefix }}</span>
             </span>
@@ -22,14 +22,18 @@
               <time datetime="{{ decision_time.iso }}">{{ decision_time.display }}</time>
               <span>
                 {{ decision.actor }}
+                {% if decision.confirmation_attribution_ambiguous %}
+                / {{ decision.confirmation_match_count }} same-second matching proofs; expand for proof details
+                {% else %}
                 / {{ 'Passkey' if decision.confirmation_kind == 'webauthn' else ('TOTP' if decision.confirmation_kind == 'totp' else 'method unavailable') }}
                 via {{ decision.confirmation_path or 'path unavailable' }}
+                {% endif %}
               </span>
             </span>
           </summary>
-          <div class="request-expansion" data-review-fragment data-review-url="/requests/{{ decision.request_id }}/review">
-            <p class="review-loading" role="status">Loading request context</p>
-            <p class="review-fallback">Full context is available in the <a href="/requests/{{ decision.request_id }}">dedicated request view</a>.</p>
+          <div class="request-expansion" data-review-fragment data-review-url="/audit/events/{{ decision.event_id }}/review">
+            <p class="review-loading" role="status">Loading exact event context</p>
+            <p class="review-fallback">Exact immutable context is available in the <a href="/audit/events/{{ decision.event_id }}">dedicated audit event view</a>.</p>
           </div>
         </details>
       </li>

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% from "_request_review.html" import request_review with context %}
+{% block content %}
+<article class="request-detail">
+  <p class="eyebrow">Review history</p>
+  <h1 class="page-heading">Exact audit event</h1>
+  {{ request_review(item, csrf_token, 'audit-event-' ~ item.historical_event_id, true) }}
+</article>
+{% endblock %}

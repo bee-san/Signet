@@ -115,6 +115,22 @@ class RequestAttachment:
     detection_source: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PolicyPromotionPreview:
+    target_alias: str
+    target_tool: str
+    current_mode: str
+    proposed_mode: str
+    reviewed_read_only: bool
+    communication_send: bool
+    reviewed_classification: str | None
+    current_policy_version: int
+    proposed_policy_version: int
+    active_policy_version: int
+    can_approve: bool
+    stale: bool
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class AttachmentDownload:
     content: bytes
@@ -148,6 +164,9 @@ class RequestDetail:
     downstream_alias: str = ""
     tool_name: str = ""
     account_context: str | None = None
+    policy_promotion_preview: PolicyPromotionPreview | None = None
+    policy_promotion_preview_unavailable: str | None = None
+    decision_window_expired: bool = False
     policy_mode: str = ""
     policy_version: str = ""
     adapter_version: str = ""
@@ -167,6 +186,10 @@ class RequestDetail:
     content_purge_reason: str | None = None
     canonical_size: int | None = None
     editor_actor: str | None = None
+    historical_event_id: int | None = None
+    historical_event_action: str | None = None
+    historical_event_actor: str | None = None
+    historical_event_occurred_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,9 +203,11 @@ class AuditEntry:
 
 @dataclass(frozen=True, slots=True)
 class DecisionEntry:
+    event_id: int
     occurred_at: int
     actor: str
-    decision: Literal["approved", "denied"]
+    decision: Literal["approved", "denied", "policy_change"]
+    decision_label: str
     confirmation_path: str | None
     confirmation_kind: str | None
     request_id: str
@@ -191,6 +216,8 @@ class DecisionEntry:
     tool_name: str
     version: int
     payload_hash_prefix: str
+    confirmation_attribution_ambiguous: bool = False
+    confirmation_match_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +308,12 @@ class WebBackend(Protocol):
     ) -> QueuePage: ...
 
     def get_detail(self, principal: SessionPrincipal, request_id: str) -> RequestDetail: ...
+
+    def get_historical_detail(
+        self,
+        principal: SessionPrincipal,
+        event_id: int,
+    ) -> RequestDetail: ...
 
     def get_attachment(
         self,
@@ -889,6 +922,42 @@ def create_web_app(
                         selected.session_id,
                         f"request:{request_id}",
                     ),
+                },
+            ),
+        )
+
+    @app.get("/audit/events/{event_id}/review", response_class=HTMLResponse)
+    async def historical_review_fragment(request: Request, event_id: int) -> Response:
+        selected = principal(request)
+        value = backend.get_historical_detail(selected, event_id)
+        return cast(
+            Response,
+            templates.TemplateResponse(
+                request,
+                "review_fragment.html",
+                {
+                    **context(request, selected),
+                    "item": value,
+                    "id_suffix": f"audit-event-{event_id}",
+                    "csrf_token": None,
+                },
+            ),
+        )
+
+    @app.get("/audit/events/{event_id}", response_class=HTMLResponse)
+    async def historical_review_page(request: Request, event_id: int) -> Response:
+        selected = principal(request)
+        value = backend.get_historical_detail(selected, event_id)
+        return cast(
+            Response,
+            templates.TemplateResponse(
+                request,
+                "audit_event.html",
+                {
+                    **context(request, selected),
+                    "item": value,
+                    "csrf_token": None,
+                    "logout_csrf": csrf.session_token(selected.session_id, "logout"),
                 },
             ),
         )
