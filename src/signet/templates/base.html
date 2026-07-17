@@ -19,6 +19,7 @@
     {% if principal %}
     <nav aria-label="Primary">
       <a class="primary-queue-link" href="/">Queue</a>
+      {% if integrations_available %}<a class="primary-integrations-link" href="/integrations">Integrations</a>{% endif %}
       <a class="primary-audit-link" href="/audit">Audit</a>
       <form action="/logout" method="post">
         <input type="hidden" name="csrf_token" value="{{ logout_csrf }}">

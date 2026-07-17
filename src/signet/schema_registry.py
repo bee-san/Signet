@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Never
 
@@ -76,6 +77,7 @@ class DurableSchemaRegistry:
         self._surfaces = dict(surfaces)
         self._max_tools_per_alias = max_tools_per_alias
         self._max_aggregate_bytes = max_aggregate_bytes
+        self._staged_locks: dict[str, asyncio.Lock] = {}
 
     def restore(self) -> None:
         """Restore only present, integrity-checked schemas before serving traffic."""
@@ -163,6 +165,59 @@ class DurableSchemaRegistry:
             except Exception:
                 await _run_sync(self._disable_changed, alias, changed)
                 raise
+            return SchemaRefresh(
+                alias=alias,
+                changed_tools=tuple(sorted(changed)),
+                list_changed=list_changed,
+                notifications_sent=sent,
+            )
+
+    async def refresh_staged(
+        self,
+        alias: str,
+        tools: Sequence[Mapping[str, Any] | types.Tool],
+        *,
+        discovered_at: int,
+    ) -> SchemaRefresh:
+        """Persist discovery while explicitly refusing every schema review.
+
+        Staged plugin onboarding must never inherit a policy-file digest or a prior
+        approval.  If the alias already has an upstream surface, disabling an exposed
+        tool is published through the same strict list-change boundary as ``refresh``.
+        An unmounted staged alias uses only an internal writer lock.
+        """
+
+        if _ALIAS_PATTERN.fullmatch(alias) is None or not _valid_timestamp(discovered_at):
+            raise ValueError("schema discovery scope is invalid")
+        surface = self._surfaces.get(alias)
+        guard = surface.schema_change_guard() if surface is not None else self._staged_guard(alias)
+        async with guard:
+            before = await _run_sync(self._listed_digest, alias)
+            try:
+                changed = await _run_sync(
+                    self._capture,
+                    alias,
+                    tools,
+                    discovered_at=discovered_at,
+                    force_unreviewed=True,
+                )
+            except asyncio.CancelledError:
+                await _run_sync(self._disable_alias, alias)
+                raise
+            after = await _run_sync(self._listed_digest, alias)
+            list_changed = before != after
+            sent = 0
+            if list_changed and surface is not None:
+                try:
+                    sent = await surface.notify_list_changed(strict=True)
+                except asyncio.CancelledError:
+                    await _run_sync(self._disable_alias, alias)
+                    raise
+                except ListChangedNotificationError:
+                    await _run_sync(self._disable_alias, alias)
+                    raise SchemaPublicationError(
+                        "staged schema discovery was stored but remains disabled"
+                    ) from None
             return SchemaRefresh(
                 alias=alias,
                 changed_tools=tuple(sorted(changed)),
@@ -304,6 +359,7 @@ class DurableSchemaRegistry:
         tools: Sequence[Mapping[str, Any] | types.Tool],
         *,
         discovered_at: int,
+        force_unreviewed: bool = False,
     ) -> set[str]:
         if _ALIAS_PATTERN.fullmatch(alias) is None or not _valid_timestamp(discovered_at):
             raise ValueError("schema discovery scope is invalid")
@@ -333,7 +389,11 @@ class DurableSchemaRegistry:
             name = str(raw["name"])
             digest = tool_schema_digest(raw)
             configured = self._mirror.policy.configured(alias, name)
-            if configured is not None and configured.schema_digest == digest:
+            if (
+                not force_unreviewed
+                and configured is not None
+                and configured.schema_digest == digest
+            ):
                 staging.approve_schema(alias, name, digest)
 
         changed: set[str] = set()
@@ -354,10 +414,15 @@ class DurableSchemaRegistry:
                 digest = tool_schema_digest(raw)
                 previous = old_rows.get(name)
                 policy = self._mirror.policy.configured(alias, name)
-                configured_review = policy is not None and policy.schema_digest == digest
-                if configured_review:
+                configured_review = (
+                    not force_unreviewed and policy is not None and policy.schema_digest == digest
+                )
+                if force_unreviewed:
+                    state = "unreviewed"
+                    reviewed_at_value: int | None = None
+                elif configured_review:
                     state = "approved"
-                    reviewed_at_value: int | None = discovered_at
+                    reviewed_at_value = discovered_at
                 elif previous is None:
                     state = "unreviewed"
                     reviewed_at_value = None
@@ -371,6 +436,7 @@ class DurableSchemaRegistry:
                     previous is None
                     or previous["schema_digest"] != digest
                     or not bool(previous["present"])
+                    or (force_unreviewed and previous["review_state"] == "approved")
                 ):
                     changed.add(name)
                 connection.execute(
@@ -424,6 +490,12 @@ class DurableSchemaRegistry:
             else:
                 self._mirror.disable_schema(alias, name)
         return changed
+
+    @asynccontextmanager
+    async def _staged_guard(self, alias: str) -> AsyncIterator[None]:
+        lock = self._staged_locks.setdefault(alias, asyncio.Lock())
+        async with lock:
+            yield
 
     def _disable_changed(self, alias: str, changed: set[str]) -> None:
         if not changed:

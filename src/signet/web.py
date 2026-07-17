@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import re
 import secrets
 import time
 from collections.abc import Callable, Mapping
@@ -17,10 +18,11 @@ from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Form, HTTPException, Query, Request, Response, status
+from fastapi import Path as ApiPath
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -34,6 +36,13 @@ from signet.decision_notes import (
     normalize_decision_note,
     reason_for_action,
 )
+from signet.effects import (
+    EffectEvidence,
+    EffectProfile,
+    MutationEffect,
+    RecommendedMode,
+    TriState,
+)
 from signet.http_security import RequestBodyLimitMiddleware
 
 type HumanAction = Literal[
@@ -44,6 +53,8 @@ type HumanAction = Literal[
     "promote_approval",
     "promote_passthrough",
 ]
+type EffectMutationInput = Literal["none", "additive", "mutating", "destructive", "unknown"]
+type EffectTriStateInput = Literal["true", "false", "unknown"]
 
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _LOGIN_CSRF_COOKIE = "__Host-signet_login_csrf"
@@ -51,6 +62,8 @@ _SESSION_COOKIE = "__Host-signet_session"
 _COOKIE_NAME_CHARACTERS = frozenset(
     "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
+_OPAQUE_INTEGRATION_ID_PATTERN = r"^[A-Za-z0-9_-]{16,128}$"
+_SHA256_PATTERN = r"^[a-f0-9]{64}$"
 
 
 class WebError(RuntimeError):
@@ -234,6 +247,267 @@ class UtcTime:
     display: str
 
 
+@dataclass(frozen=True, slots=True)
+class IntegrationToolSummary:
+    opaque_id: str
+    tool_name: str
+    display_label: str
+    schema_digest: str
+    present: bool
+    review_state: str
+    recommended_mode: RecommendedMode | None = None
+
+    def __post_init__(self) -> None:
+        _validate_opaque_integration_id(self.opaque_id)
+        _validate_bounded_text(self.tool_name, name="tool name", maximum=256)
+        _validate_bounded_text(self.display_label, name="display label", maximum=256)
+        _validate_sha256(self.schema_digest, name="tool schema digest")
+        _validate_bounded_text(self.review_state, name="review state", maximum=64)
+        if not isinstance(self.present, bool):
+            raise ValueError("tool presence must be boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrationConnectorSummary:
+    alias: str
+    connector_id: str
+    display_name: str
+    config_digest: str
+    enabled: bool
+    discovery_status: str
+    discovery_source: str | None
+    discovered_at: int | None
+    server_identity_digest: str | None
+    tools: tuple[IntegrationToolSummary, ...] = ()
+
+    def __post_init__(self) -> None:
+        _validate_bounded_text(self.alias, name="connector alias", maximum=64)
+        _validate_bounded_text(self.connector_id, name="connector ID", maximum=128)
+        _validate_bounded_text(self.display_name, name="connector display name", maximum=256)
+        _validate_sha256(self.config_digest, name="connector configuration digest")
+        _validate_bounded_text(self.discovery_status, name="discovery status", maximum=64)
+        if self.discovery_source is not None:
+            _validate_bounded_text(self.discovery_source, name="discovery source", maximum=32)
+        if self.discovered_at is not None:
+            _validate_timestamp(self.discovered_at, name="discovery time")
+        if self.server_identity_digest is not None:
+            _validate_sha256(self.server_identity_digest, name="server identity digest")
+        if not isinstance(self.enabled, bool) or len(self.tools) > 512:
+            raise ValueError("connector summary exceeds its bounds")
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrationPluginSummary:
+    plugin_id: str
+    plugin_version: str
+    manifest_sha256: str
+    display_name: str
+    enabled: bool
+    connectors: tuple[IntegrationConnectorSummary, ...] = ()
+
+    def __post_init__(self) -> None:
+        _validate_bounded_text(self.plugin_id, name="plugin ID", maximum=128)
+        _validate_bounded_text(self.plugin_version, name="plugin version", maximum=64)
+        _validate_sha256(self.manifest_sha256, name="manifest digest")
+        _validate_bounded_text(self.display_name, name="plugin display name", maximum=256)
+        if not isinstance(self.enabled, bool) or len(self.connectors) > 128:
+            raise ValueError("plugin summary exceeds its bounds")
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrationsPage:
+    plugins: tuple[IntegrationPluginSummary, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.plugins) > 256:
+            raise ValueError("integration workspace exceeds its plugin limit")
+
+
+@dataclass(frozen=True, slots=True)
+class EffectReviewView:
+    review_id: int
+    profile: EffectProfile
+    recommended_mode: RecommendedMode
+    actor: str
+    auth_kind: Literal["totp", "webauthn"]
+    reviewed_at: int
+    current: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.review_id, int)
+            or isinstance(self.review_id, bool)
+            or self.review_id < 1
+        ):
+            raise ValueError("effect review ID is invalid")
+        _validate_bounded_text(self.actor, name="effect review actor", maximum=256)
+        _validate_timestamp(self.reviewed_at, name="effect review time")
+        if self.auth_kind not in {"totp", "webauthn"} or not isinstance(self.current, bool):
+            raise ValueError("effect review provenance is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrationToolDetail:
+    opaque_id: str
+    plugin_id: str
+    plugin_version: str
+    plugin_display_name: str
+    manifest_sha256: str
+    connector_id: str
+    connector_alias: str
+    connector_display_name: str
+    connector_config_digest: str
+    discovery_status: str
+    discovery_source: str
+    discovered_at: int
+    server_identity_digest: str
+    tool_name: str
+    display_label: str
+    action_id: str
+    schema_digest: str
+    target_snapshot_digest: str
+    evidence_bundle_digest: str
+    canonical_tool_json: str
+    sensitive_json_paths: tuple[str, ...]
+    safe_result_fields: tuple[str, ...]
+    evidence: tuple[EffectEvidence, ...]
+    disagreements: tuple[str, ...]
+    reviews: tuple[EffectReviewView, ...] = ()
+    reviewable: bool = True
+    unavailable_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_opaque_integration_id(self.opaque_id)
+        for value, name, maximum in (
+            (self.plugin_id, "plugin ID", 128),
+            (self.plugin_version, "plugin version", 64),
+            (self.plugin_display_name, "plugin display name", 256),
+            (self.connector_id, "connector ID", 128),
+            (self.connector_alias, "connector alias", 64),
+            (self.connector_display_name, "connector display name", 256),
+            (self.discovery_status, "discovery status", 64),
+            (self.discovery_source, "discovery source", 32),
+            (self.tool_name, "tool name", 256),
+            (self.display_label, "display label", 256),
+            (self.action_id, "action ID", 128),
+        ):
+            _validate_bounded_text(value, name=name, maximum=maximum)
+        for value, name in (
+            (self.manifest_sha256, "manifest digest"),
+            (self.connector_config_digest, "connector configuration digest"),
+            (self.server_identity_digest, "server identity digest"),
+            (self.schema_digest, "tool schema digest"),
+            (self.target_snapshot_digest, "target snapshot digest"),
+            (self.evidence_bundle_digest, "evidence bundle digest"),
+        ):
+            _validate_sha256(value, name=name)
+        _validate_timestamp(self.discovered_at, name="discovery time")
+        if (
+            not isinstance(self.canonical_tool_json, str)
+            or not 2 <= len(self.canonical_tool_json.encode("utf-8")) <= 1_048_576
+        ):
+            raise ValueError("canonical tool JSON exceeds its bounds")
+        if (
+            len(self.sensitive_json_paths) > 128
+            or len(self.safe_result_fields) > 128
+            or len(self.evidence) > 8
+            or len(self.disagreements) > 6
+            or len(self.reviews) > 100
+        ):
+            raise ValueError("integration tool detail exceeds its collection bounds")
+        for value in (*self.sensitive_json_paths, *self.safe_result_fields):
+            _validate_bounded_text(value, name="JSON path", maximum=512)
+        effect_axes = frozenset(EffectProfile.__dataclass_fields__)
+        if any(value not in effect_axes for value in self.disagreements):
+            raise ValueError("effect disagreement names an unknown axis")
+        if not isinstance(self.reviewable, bool):
+            raise ValueError("effect review availability must be boolean")
+        if self.unavailable_reason is not None:
+            _validate_bounded_text(
+                self.unavailable_reason,
+                name="effect review unavailable reason",
+                maximum=1_000,
+            )
+        if self.reviewable == (self.unavailable_reason is not None):
+            raise ValueError("effect review availability is inconsistent")
+
+
+@dataclass(frozen=True, slots=True)
+class EffectReviewResult:
+    opaque_id: str
+    review_id: int
+    recommended_mode: RecommendedMode
+
+    def __post_init__(self) -> None:
+        _validate_opaque_integration_id(self.opaque_id)
+        if (
+            not isinstance(self.review_id, int)
+            or isinstance(self.review_id, bool)
+            or self.review_id < 1
+        ):
+            raise ValueError("effect review result ID is invalid")
+
+
+class EffectProfileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mutation: EffectMutationInput
+    external_communication: EffectTriStateInput
+    code_execution: EffectTriStateInput
+    privilege_change: EffectTriStateInput
+    open_world: EffectTriStateInput
+    idempotent: EffectTriStateInput
+
+    def effect_profile(self) -> EffectProfile:
+        return EffectProfile(
+            mutation=MutationEffect(self.mutation),
+            external_communication=TriState(self.external_communication),
+            code_execution=TriState(self.code_execution),
+            privilege_change=TriState(self.privilege_change),
+            open_world=TriState(self.open_world),
+            idempotent=TriState(self.idempotent),
+        )
+
+
+class IntegrationPasskeyReviewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    opaque_id: str = Field(min_length=16, max_length=128, pattern=_OPAQUE_INTEGRATION_ID_PATTERN)
+    expected_snapshot_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=_SHA256_PATTERN,
+    )
+    profile: EffectProfileInput
+
+
+class IntegrationPasskeyCompleteInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    opaque_id: str = Field(min_length=16, max_length=128, pattern=_OPAQUE_INTEGRATION_ID_PATTERN)
+    expected_snapshot_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=_SHA256_PATTERN,
+    )
+    challenge_id: str = Field(min_length=16, max_length=128)
+    assertion: dict[str, Any]
+
+
+class IntegrationPasskeyOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    challenge_id: str = Field(min_length=16, max_length=128)
+    public_key: dict[str, Any]
+    opaque_id: str = Field(min_length=16, max_length=128, pattern=_OPAQUE_INTEGRATION_ID_PATTERN)
+    target_snapshot_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=_SHA256_PATTERN,
+    )
+    recommended_mode: RecommendedMode
+
+
 class LoginOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -389,6 +663,59 @@ class WebBackend(Protocol):
         *,
         now: int,
     ) -> None: ...
+
+
+class IntegrationWebBackend(Protocol):
+    """Authenticated staged-integration reads and exact effect-review mutations."""
+
+    def list_integrations(
+        self,
+        principal: SessionPrincipal,
+        *,
+        now: int,
+    ) -> IntegrationsPage: ...
+
+    def get_integration_tool(
+        self,
+        principal: SessionPrincipal,
+        opaque_id: str,
+        *,
+        now: int,
+    ) -> IntegrationToolDetail: ...
+
+    def complete_totp_effect_review(
+        self,
+        principal: SessionPrincipal,
+        opaque_id: str,
+        profile: EffectProfile,
+        totp_proof: str,
+        *,
+        expected_snapshot_digest: str,
+        now: int,
+    ) -> EffectReviewResult: ...
+
+    def begin_passkey_effect_review(
+        self,
+        principal: SessionPrincipal,
+        opaque_id: str,
+        profile: EffectProfile,
+        *,
+        expected_snapshot_digest: str,
+        http_method: str,
+        now: int,
+    ) -> IntegrationPasskeyOptions: ...
+
+    def complete_passkey_effect_review(
+        self,
+        principal: SessionPrincipal,
+        opaque_id: str,
+        challenge_id: str,
+        assertion: Mapping[str, Any],
+        *,
+        expected_snapshot_digest: str,
+        http_method: str,
+        now: int,
+    ) -> EffectReviewResult: ...
 
 
 class CsrfManager:
@@ -618,6 +945,7 @@ def create_web_app(
     *,
     settings: WebSettings,
     csrf: CsrfManager,
+    integrations: IntegrationWebBackend | None = None,
     clock: Callable[[], int] | None = None,
 ) -> FastAPI:
     """Create the private human app without exposing any agent bearer authority."""
@@ -639,6 +967,9 @@ def create_web_app(
             ("POST", "/login/password"): 16 * 1024,
             ("POST", "/login/passkey/options"): 8 * 1024,
             ("POST", "/login/passkey/complete"): 128 * 1024,
+            ("POST", "/integrations/effect-reviews/totp"): 16 * 1024,
+            ("POST", "/integrations/effect-reviews/passkey/options"): 32 * 1024,
+            ("POST", "/integrations/effect-reviews/passkey/complete"): 128 * 1024,
             ("POST", "/push/subscriptions"): 16 * 1024,
             ("DELETE", "/push/subscriptions"): 8 * 1024,
         },
@@ -677,6 +1008,7 @@ def create_web_app(
             "principal": selected,
             "vapid_public_key": settings.vapid_public_key,
             "fake_only_ui": settings.fake_only_ui,
+            "integrations_available": integrations is not None,
         }
 
     @app.exception_handler(WebError)
@@ -1010,6 +1342,179 @@ def create_web_app(
             ),
         )
 
+    integration_backend = integrations
+    if integration_backend is not None:
+
+        @app.get("/integrations", response_class=HTMLResponse)
+        def integration_workspace(request: Request) -> Response:
+            selected = principal(request)
+            page = integration_backend.list_integrations(selected, now=now_fn())
+            return cast(
+                Response,
+                templates.TemplateResponse(
+                    request,
+                    "integrations.html",
+                    {
+                        **context(request, selected),
+                        "integration_page": page,
+                        "logout_csrf": csrf.session_token(selected.session_id, "logout"),
+                    },
+                ),
+            )
+
+        @app.get("/integrations/tools/{opaque_id}", response_class=HTMLResponse)
+        def integration_tool(
+            request: Request,
+            opaque_id: Annotated[
+                str,
+                ApiPath(
+                    min_length=16,
+                    max_length=128,
+                    pattern=_OPAQUE_INTEGRATION_ID_PATTERN,
+                ),
+            ],
+        ) -> Response:
+            selected = principal(request)
+            item = integration_backend.get_integration_tool(
+                selected,
+                opaque_id,
+                now=now_fn(),
+            )
+            return cast(
+                Response,
+                templates.TemplateResponse(
+                    request,
+                    "integration_detail.html",
+                    {
+                        **context(request, selected),
+                        "item": item,
+                        "review_csrf": csrf.session_token(
+                            selected.session_id,
+                            _effect_review_csrf_purpose(
+                                item.opaque_id,
+                                item.target_snapshot_digest,
+                            ),
+                        ),
+                        "logout_csrf": csrf.session_token(selected.session_id, "logout"),
+                    },
+                ),
+            )
+
+        @app.post("/integrations/effect-reviews/totp")
+        def integration_totp_review(
+            request: Request,
+            opaque_id: Annotated[
+                str,
+                Form(
+                    min_length=16,
+                    max_length=128,
+                    pattern=_OPAQUE_INTEGRATION_ID_PATTERN,
+                ),
+            ],
+            expected_snapshot_digest: Annotated[
+                str,
+                Form(min_length=64, max_length=64, pattern=_SHA256_PATTERN),
+            ],
+            mutation: Annotated[EffectMutationInput, Form()],
+            external_communication: Annotated[EffectTriStateInput, Form()],
+            code_execution: Annotated[EffectTriStateInput, Form()],
+            privilege_change: Annotated[EffectTriStateInput, Form()],
+            open_world: Annotated[EffectTriStateInput, Form()],
+            idempotent: Annotated[EffectTriStateInput, Form()],
+            totp_proof: Annotated[str, Form(min_length=1, max_length=128)],
+            csrf_token: Annotated[str, Form()],
+        ) -> Response:
+            selected = principal(request)
+            require_csrf(
+                request,
+                selected,
+                _effect_review_csrf_purpose(opaque_id, expected_snapshot_digest),
+                csrf_token,
+            )
+            profile = _effect_profile(
+                mutation=mutation,
+                external_communication=external_communication,
+                code_execution=code_execution,
+                privilege_change=privilege_change,
+                open_world=open_world,
+                idempotent=idempotent,
+            )
+            result = integration_backend.complete_totp_effect_review(
+                selected,
+                opaque_id,
+                profile,
+                totp_proof,
+                expected_snapshot_digest=expected_snapshot_digest,
+                now=now_fn(),
+            )
+            _require_effect_review_result(result, opaque_id)
+            return Response(
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={
+                    "Location": f"/integrations/tools/{result.opaque_id}#effect-review-current"
+                },
+            )
+
+        @app.post("/integrations/effect-reviews/passkey/options")
+        async def integration_passkey_review_options(request: Request) -> IntegrationPasskeyOptions:
+            selected = await async_principal(request)
+            payload = await _validated_json_model(request, IntegrationPasskeyReviewInput)
+            require_csrf(
+                request,
+                selected,
+                _effect_review_csrf_purpose(
+                    payload.opaque_id,
+                    payload.expected_snapshot_digest,
+                ),
+                None,
+            )
+            options = await run_in_threadpool(
+                integration_backend.begin_passkey_effect_review,
+                selected,
+                payload.opaque_id,
+                payload.profile.effect_profile(),
+                expected_snapshot_digest=payload.expected_snapshot_digest,
+                http_method=request.method,
+                now=now_fn(),
+            )
+            if options.opaque_id != payload.opaque_id or not hmac.compare_digest(
+                options.target_snapshot_digest,
+                payload.expected_snapshot_digest,
+            ):
+                raise WebConflict("passkey effect review binding is invalid")
+            return options
+
+        @app.post("/integrations/effect-reviews/passkey/complete")
+        async def integration_passkey_review_complete(request: Request) -> dict[str, object]:
+            selected = await async_principal(request)
+            payload = await _validated_json_model(request, IntegrationPasskeyCompleteInput)
+            require_csrf(
+                request,
+                selected,
+                _effect_review_csrf_purpose(
+                    payload.opaque_id,
+                    payload.expected_snapshot_digest,
+                ),
+                None,
+            )
+            result = await run_in_threadpool(
+                integration_backend.complete_passkey_effect_review,
+                selected,
+                payload.opaque_id,
+                payload.challenge_id,
+                payload.assertion,
+                expected_snapshot_digest=payload.expected_snapshot_digest,
+                http_method=request.method,
+                now=now_fn(),
+            )
+            _require_effect_review_result(result, payload.opaque_id)
+            return {
+                "status": "reviewed",
+                "review_id": result.review_id,
+                "recommended_mode": result.recommended_mode.value,
+                "redirect_url": (f"/integrations/tools/{result.opaque_id}#effect-review-current"),
+            }
+
     @app.post("/requests/{request_id}/actions/totp")
     def totp_action(
         request: Request,
@@ -1164,6 +1669,72 @@ _HUMAN_ACTIONS: frozenset[str] = frozenset(
         "promote_passthrough",
     }
 )
+
+
+def _effect_profile(
+    *,
+    mutation: EffectMutationInput,
+    external_communication: EffectTriStateInput,
+    code_execution: EffectTriStateInput,
+    privilege_change: EffectTriStateInput,
+    open_world: EffectTriStateInput,
+    idempotent: EffectTriStateInput,
+) -> EffectProfile:
+    return EffectProfile(
+        mutation=MutationEffect(mutation),
+        external_communication=TriState(external_communication),
+        code_execution=TriState(code_execution),
+        privilege_change=TriState(privilege_change),
+        open_world=TriState(open_world),
+        idempotent=TriState(idempotent),
+    )
+
+
+def _effect_review_csrf_purpose(opaque_id: str, snapshot_digest: str) -> str:
+    _validate_opaque_integration_id(opaque_id)
+    _validate_sha256(snapshot_digest, name="target snapshot digest")
+    return f"effect-review:{opaque_id}:{snapshot_digest}"
+
+
+def _require_effect_review_result(result: EffectReviewResult, expected_opaque_id: str) -> None:
+    if not hmac.compare_digest(result.opaque_id, expected_opaque_id):
+        raise WebConflict("effect review result does not match its exact target")
+
+
+async def _validated_json_model[ModelT: BaseModel](
+    request: Request,
+    model: type[ModelT],
+) -> ModelT:
+    value = await _json_object(request)
+    try:
+        return model.model_validate(value)
+    except ValidationError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT) from None
+
+
+def _validate_opaque_integration_id(value: str) -> None:
+    if not isinstance(value, str) or re.fullmatch(_OPAQUE_INTEGRATION_ID_PATTERN, value) is None:
+        raise ValueError("opaque integration ID is invalid")
+
+
+def _validate_sha256(value: str, *, name: str) -> None:
+    if not isinstance(value, str) or re.fullmatch(_SHA256_PATTERN, value) is None:
+        raise ValueError(f"{name} is invalid")
+
+
+def _validate_bounded_text(value: str, *, name: str, maximum: int) -> None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > maximum
+        or "\x00" in value
+    ):
+        raise ValueError(f"{name} is invalid")
+
+
+def _validate_timestamp(value: int, *, name: str) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{name} is invalid")
 
 
 def _decision_note_input(

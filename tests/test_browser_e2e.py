@@ -25,6 +25,9 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from playwright.sync_api import ConsoleMessage, Locator, Page, Request, Route, sync_playwright
 
+from signet.canonical import canonical_json
+from signet.connector_config import detached_connector_document, parse_connector_config
+from signet.connector_discovery import ConnectorDiscoveryService
 from signet.demo import (
     DEMO_GRACEFUL_SHUTDOWN_SECONDS,
     DEMO_NAMESPACE,
@@ -32,6 +35,11 @@ from signet.demo import (
     build_demo,
     credential_value,
     initialize_demo,
+)
+from signet.integration_store import SQLiteIntegrationStore
+from signet.plugin_manifest import (
+    load_reference_discovery_fixture,
+    load_reference_plugin,
 )
 
 BROWSER_ATTACHMENT_CONTENT = (
@@ -216,12 +224,15 @@ def _served_demo(
     tmp_path: Path,
     *,
     force_deny_tool: tuple[str, str, str] | None = None,
+    seed_fastmail_integration: bool = False,
 ) -> Iterator[LiveDemo]:
     private_parent = tmp_path / "browser-acceptance"
     private_parent.mkdir(mode=0o700)
     os.chmod(private_parent, 0o700)
     root = private_parent / "state"
     initialize_demo(root)
+    if seed_fastmail_integration:
+        _seed_fastmail_integration(root)
     if stat.S_IMODE(root.stat().st_mode) != 0o700:
         pytest.fail("browser demo state directory is not private", pytrace=False)
     if force_deny_tool is not None:
@@ -296,6 +307,50 @@ def _served_demo(
                 marker in server_output for marker in (b"Traceback", b"CancelledError", b"ERROR")
             ):
                 pytest.fail("fake demo server reported an internal error", pytrace=False)
+
+
+def _seed_fastmail_integration(root: Path) -> None:
+    """Install and discover one provider-free reference connector before serving."""
+
+    assembly = build_demo(root)
+    store = SQLiteIntegrationStore(assembly.database)
+    manifest = load_reference_plugin("fastmail")
+    template = manifest.manifest.connectors[0]
+    seeded_at = int(time.time()) - 2
+    identity = store.install_plugin(manifest, installed_at=seeded_at)
+    validated = parse_connector_config(
+        canonical_json(
+            {
+                "connector_config_version": 1,
+                "transport": "streamable_http",
+                "credential_ref": "keychain://Signet/reference-fastmail-fixture",
+                "credential_identity_digest": "f" * 64,
+                "url": "https://fastmail-fixture.invalid/mcp",
+            }
+        ),
+        template=template,
+    )
+    detached = detached_connector_document(validated)
+    credential_ref = detached.pop("credential_ref")
+    credential_identity_digest = detached.pop("credential_identity_digest")
+    store.configure_connector(
+        plugin_id=identity.plugin_id,
+        connector_id=template.connector_id,
+        alias="fastmail-staged",
+        config=detached,
+        credential_ref=credential_ref,
+        credential_identity_digest=credential_identity_digest,
+        canonical_config_bytes=validated.canonical_bytes,
+        canonical_config_sha256=validated.sha256,
+        configured_at=seeded_at + 1,
+    )
+    asyncio.run(
+        ConnectorDiscoveryService.staged(store).discover_fixture(
+            "fastmail-staged",
+            load_reference_discovery_fixture("fastmail"),
+            discovered_at=seeded_at + 2,
+        )
+    )
 
 
 async def _enqueue(demo: LiveDemo) -> tuple[str, str, dict[str, Any]]:
@@ -885,6 +940,234 @@ def _assert_keyboard_focus(page: Page) -> None:
     )
     if focus_style["outlineStyle"] == "none" or focus_style["outlineWidth"] == "0px":
         pytest.fail("keyboard focus is not visibly indicated", pytrace=False)
+
+
+def test_fake_demo_browser_staged_fastmail_effect_review_is_inert(
+    tmp_path: Path,
+) -> None:
+    with _served_demo(tmp_path, seed_fastmail_integration=True) as demo:
+        signals = BrowserSignals()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-background-networking",
+                    "--disable-component-update",
+                    "--disable-default-apps",
+                    "--no-first-run",
+                ],
+            )
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                timezone_id="UTC",
+                service_workers="block",
+            )
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.set_default_navigation_timeout(15_000)
+            _install_network_guards(page, demo, signals)
+
+            _login(page, demo)
+            integrations_link = page.locator("a.primary-integrations-link")
+            if not integrations_link.is_visible():
+                pytest.fail("authenticated demo did not expose Integrations", pytrace=False)
+            integrations_link.click()
+            page.wait_for_url(f"{demo.web_origin}/integrations")
+
+            workspace = _normalized_text(page.locator("main"))
+            for expected in (
+                "Live dispatch is disabled",
+                "Fastmail staged integration",
+                "fastmail-staged",
+                "fixture",
+                "search_email",
+                "unreviewed",
+            ):
+                if expected not in workspace:
+                    pytest.fail("staged integration workspace omitted exact state", pytrace=False)
+            rows = page.locator(".integration-tools-table tbody tr")
+            search_row = rows.filter(has_text="search_email")
+            if rows.count() != 5 or search_row.count() != 1:
+                pytest.fail("Fastmail fixture tools were not rendered exactly once", pytrace=False)
+            search_row.get_by_role("link", name="Inspect exact definition").click()
+            page.wait_for_url(re.compile(rf"{re.escape(demo.web_origin)}/integrations/tools/.+"))
+
+            detail = page.locator("[data-integration-tool-id]")
+            detail_text = _normalized_text(detail)
+            for expected in (
+                "Search email",
+                "Search the fake mailbox without changing provider state.",
+                "MCP annotations — untrusted server hints",
+                "Name and schema classifier signals",
+                "Plugin proposal — untrusted mapping evidence",
+                "Effect evidence, not authorization",
+            ):
+                if expected not in detail_text:
+                    pytest.fail(
+                        f"exact Fastmail evidence omitted {expected!r}",
+                        pytrace=False,
+                    )
+            if _definition_value(detail.locator(".context-band"), "Exact tool name") != (
+                "search_email"
+            ):
+                pytest.fail("exact Fastmail tool name was not reviewable", pytrace=False)
+            if detail.locator(".effect-evidence-card").count() != 3:
+                pytest.fail("effect evidence sources were not retained separately", pytrace=False)
+            try:
+                discovered_tool = json.loads(
+                    detail.locator(".integration-json").text_content() or ""
+                )
+            except json.JSONDecodeError:
+                pytest.fail(
+                    "exact discovered tool definition was not canonical JSON",
+                    pytrace=False,
+                )
+            expected_tool = next(
+                tool
+                for tool in load_reference_discovery_fixture("fastmail")["tools"]
+                if tool["name"] == "search_email"
+            )
+            if discovered_tool != expected_tool:
+                pytest.fail(
+                    "browser detail was not bound to the exact fixture schema",
+                    pytrace=False,
+                )
+
+            form = detail.locator("#effect-review-form")
+            form.locator("select[name='mutation']").select_option("none")
+            for field in (
+                "external_communication",
+                "code_execution",
+                "privilege_change",
+                "open_world",
+            ):
+                form.locator(f"select[name='{field}']").select_option("false")
+            form.locator("select[name='idempotent']").select_option("true")
+            recommendation = _normalized_text(form.locator("[data-effect-recommendation]"))
+            if recommendation != (
+                "passthrough — staged recommendation only; live dispatch stays disabled."
+            ):
+                pytest.fail(
+                    "browser recommendation did not match the complete profile",
+                    pytrace=False,
+                )
+            form.locator("input[name='totp_proof']").fill(
+                credential_value(demo.root, "web-action-proof")
+            )
+            with page.expect_navigation(wait_until="domcontentloaded"):
+                form.get_by_role("button", name="Record review with fake proof").click()
+            page.wait_for_url(
+                re.compile(
+                    rf"{re.escape(demo.web_origin)}/integrations/tools/.+#effect-review-current$"
+                )
+            )
+
+            current = page.locator("#effect-review-current")
+            current_text = _normalized_text(current)
+            for expected in (
+                "passthrough recommendation",
+                "Current",
+                f"Reviewed by web:{DEMO_USER_ID}",
+                "TOTP via the authenticated web app",
+            ):
+                if expected not in current_text:
+                    pytest.fail(
+                        f"current effect review omitted {expected!r}",
+                        pytrace=False,
+                    )
+            expected_effects = {
+                "Mutation": "none",
+                "External communication": "false",
+                "Code execution": "false",
+                "Privilege change": "false",
+                "Open world": "false",
+                "Idempotent": "true",
+            }
+            for label, expected in expected_effects.items():
+                if _definition_value(current, label) != expected:
+                    pytest.fail(
+                        f"current effect review misstated {label!r}",
+                        pytrace=False,
+                    )
+            if page.locator(".effect-review-history li").count() != 1:
+                pytest.fail("effect review history was not append-only and singular", pytrace=False)
+            if "Live dispatch is disabled" not in _normalized_text(page.locator("main")):
+                pytest.fail("review result obscured the staged-only boundary", pytrace=False)
+            _assert_layout(page)
+
+            context.close()
+            browser.close()
+
+        if (
+            signals.console_errors != 0
+            or signals.page_errors != 0
+            or signals.failed_requests != 0
+            or signals.error_responses != 0
+            or signals.external_requests != 0
+        ):
+            pytest.fail(
+                "staged integration browser workflow emitted an application or network error: "
+                f"console={signals.console_errors}, page={signals.page_errors}, "
+                f"failed_requests={signals.failed_requests}, "
+                f"error_responses={signals.error_responses}, "
+                f"external_requests={signals.external_requests}, "
+                f"request_failures={signals.failed_request_details!r}",
+                pytrace=False,
+            )
+        if signals.post_requests != 2 or not signals.exact_post_origins:
+            pytest.fail(
+                "integration login and review POSTs did not carry the exact same-origin Origin",
+                pytrace=False,
+            )
+
+    persisted = build_demo(demo.root)
+    with persisted.database.read() as connection:
+        review = connection.execute(
+            """
+            SELECT alias, tool_name, mutation, external_communication,
+                   code_execution, privilege_change, open_world, idempotent,
+                   recommended_mode, auth_kind
+            FROM connector_effect_reviews
+            """
+        ).fetchall()
+        dispatch_counts = {
+            "approval_requests": int(
+                connection.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+            ),
+            "execution_attempts": int(
+                connection.execute("SELECT COUNT(*) FROM execution_attempts").fetchone()[0]
+            ),
+            "request_events": int(
+                connection.execute("SELECT COUNT(*) FROM request_events").fetchone()[0]
+            ),
+        }
+        enabled_schema_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM schema_cache WHERE review_state != 'unreviewed'"
+            ).fetchone()[0]
+        )
+    assert [tuple(row) for row in review] == [
+        (
+            "fastmail-staged",
+            "search_email",
+            "none",
+            "false",
+            "false",
+            "false",
+            "false",
+            "true",
+            "passthrough",
+            "totp",
+        )
+    ]
+    assert dispatch_counts == {
+        "approval_requests": 0,
+        "execution_attempts": 0,
+        "request_events": 0,
+    }
+    assert enabled_schema_count == 0
+    assert all(client.mutation_calls == 0 for client in persisted.provider_clients.values())
 
 
 def test_fake_demo_browser_approval_and_denial_workflow(tmp_path: Path) -> None:

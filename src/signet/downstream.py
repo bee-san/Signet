@@ -531,6 +531,7 @@ class DownstreamClient:
         self._session_factory = session_factory
         self._state = _Lifecycle.NEW
         self._session: DownstreamSession | None = None
+        self._initialize_result: dict[str, Any] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._ready: asyncio.Future[None] | None = None
         self._stop_event: asyncio.Event | None = None
@@ -561,6 +562,17 @@ class DownstreamClient:
     @property
     def is_running(self) -> bool:
         return self._state is _Lifecycle.RUNNING
+
+    @property
+    def initialization_identity(self) -> dict[str, Any] | None:
+        """Return the detached initialize result captured before discovery.
+
+        Normal dispatch code does not use this value.  The staged discovery
+        wrapper requires it so server identity drift is bound independently
+        from tool schemas.
+        """
+
+        return copy.deepcopy(self._initialize_result)
 
     async def __aenter__(self) -> DownstreamClient:
         return await self.start()
@@ -758,7 +770,13 @@ class DownstreamClient:
                         timedelta(seconds=self._config.timeout_seconds),
                     )
                     session = await stack.enter_async_context(session_context)
-                    await session.initialize()
+                    initialized = await session.initialize()
+                    try:
+                        raw_initialized = raw_model(initialized)
+                    except Exception:
+                        raw_initialized = None
+                    if isinstance(raw_initialized, dict):
+                        self._initialize_result = copy.deepcopy(raw_initialized)
             except asyncio.CancelledError:
                 cancelled = True
             except BaseException:

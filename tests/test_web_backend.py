@@ -400,8 +400,20 @@ def downgrade_schema_13(connection: Any) -> None:
         BEGIN SELECT RAISE(ABORT, 'staged object immutable context changed'); END
         """
     )
+    connection.execute("DROP TABLE connector_effect_review_drafts")
+    connection.execute("DROP TABLE connector_effect_review_challenges")
+    connection.execute("DROP TABLE connector_effect_reviews")
+    connection.execute("DROP TABLE connector_effect_evidence")
+    connection.execute("DROP TABLE connector_tool_state")
+    connection.execute("DROP TABLE connector_discovered_tools")
+    connection.execute("DROP TABLE connector_discovery_runs")
+    connection.execute("DROP TABLE connector_active")
+    connection.execute("DROP TABLE connector_configurations")
+    connection.execute("DROP TABLE plugin_tool_mappings")
+    connection.execute("DROP TABLE plugin_active")
+    connection.execute("DROP TABLE plugin_manifests")
     connection.execute("DROP TABLE privacy_maintenance")
-    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14)")
+    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15)")
     connection.execute("PRAGMA user_version = 12")
 
 
@@ -2162,12 +2174,12 @@ def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
         )
     assert backups == [12]
     with bundle.database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
         assert (
             connection.execute(
-                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14)"
+                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14, 15)"
             ).fetchone()[0]
-            == 2
+            == 3
         )
 
     # Both privacy migrations are committed, so recovery must not repeat a backup.

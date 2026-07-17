@@ -1,0 +1,52 @@
+{
+  "plugin_manifest_version": 1,
+  "plugin_id": "signet.whatsapp",
+  "plugin_version": "1.0.0",
+  "display_name": "WhatsApp CLI shim staged integration",
+  "description": "Fake-only MCP shim contract around an inert WhatsApp CLI boundary.",
+  "connectors": [
+    {
+      "connector_id": "whatsapp_cli_shim",
+      "display_name": "WhatsApp CLI MCP shim",
+      "protocol": "mcp",
+      "transports": ["stdio"],
+      "requires_mcp_shim": true
+    }
+  ],
+  "tool_mappings": [
+    {
+      "connector_id": "whatsapp_cli_shim",
+      "tool_name": "send_text",
+      "action_id": "whatsapp.send_text",
+      "display_label": "Send WhatsApp text",
+      "sensitive_json_paths": ["/recipient", "/text"],
+      "safe_result_fields": ["/message_id", "/accepted_at"],
+      "proposed_effects": {
+        "mutation": "additive",
+        "external_communication": true,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": true,
+        "idempotent": "unknown"
+      },
+      "adapter_requirement": "provider_specific"
+    },
+    {
+      "connector_id": "whatsapp_cli_shim",
+      "tool_name": "send_media",
+      "action_id": "whatsapp.send_media",
+      "display_label": "Send WhatsApp media",
+      "sensitive_json_paths": ["/recipient", "/media_ref", "/caption"],
+      "safe_result_fields": ["/message_id", "/accepted_at"],
+      "proposed_effects": {
+        "mutation": "additive",
+        "external_communication": true,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": true,
+        "idempotent": "unknown"
+      },
+      "adapter_requirement": "provider_specific"
+    }
+  ]
+}

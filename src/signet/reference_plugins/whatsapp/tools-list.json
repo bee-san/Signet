@@ -1,0 +1,61 @@
+{
+  "tools": [
+    {
+      "name": "send_text",
+      "description": "Describe a fake WhatsApp text send through an inert MCP shim.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["recipient", "text"],
+        "properties": {
+          "recipient": {"type": "string", "minLength": 1},
+          "text": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["message_id", "accepted_at"],
+        "properties": {
+          "message_id": {"type": "string"},
+          "accepted_at": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "send_media",
+      "description": "Describe a fake WhatsApp media send through an inert MCP shim.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["recipient", "media_ref"],
+        "properties": {
+          "recipient": {"type": "string", "minLength": 1},
+          "media_ref": {"type": "string", "minLength": 1},
+          "caption": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["message_id", "accepted_at"],
+        "properties": {
+          "message_id": {"type": "string"},
+          "accepted_at": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    }
+  ]
+}

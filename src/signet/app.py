@@ -13,6 +13,11 @@ from signet.credential_broker import CredentialError
 from signet.db import DatabaseError
 from signet.demo import DemoError, add_demo_parser, run_demo_command
 from signet.deployment import DeploymentError, add_deployment_parser, run_deployment_command
+from signet.integration_cli import (
+    IntegrationCLIError,
+    add_integration_parsers,
+    run_integration_command,
+)
 from signet.runtime import RuntimeAssemblyError, _loopback_address
 
 _FACTORY_PATTERN = re.compile(
@@ -50,6 +55,12 @@ def main(
         ) as exc:
             parser.error(str(exc))
         return
+    if args.command in {"plugin", "connector"}:
+        try:
+            run_integration_command(args)
+        except IntegrationCLIError as exc:
+            parser.error(str(exc))
+        return
     if _FACTORY_PATTERN.fullmatch(args.factory) is None:
         parser.error("--factory must be an explicit module.path:callable reference")
     if args.command == "serve-mcp":
@@ -84,6 +95,7 @@ def _parser() -> argparse.ArgumentParser:
     _factory_arguments(web, default_host="127.0.0.1", default_port=8790)
     add_demo_parser(subcommands)
     add_deployment_parser(subcommands)
+    add_integration_parsers(subcommands)
     return parser
 
 

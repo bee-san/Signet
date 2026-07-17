@@ -32,13 +32,15 @@ _PROOF_DOMAINS = frozenset({PASSWORD_PROOF_DOMAIN, TOTP_PROOF_DOMAIN, WEBAUTHN_P
 
 @dataclass(frozen=True, slots=True)
 class ActionBinding:
-    """The exact browser action and immutable request revision being confirmed."""
+    """The exact browser action and immutable subject snapshot being confirmed."""
 
     action: str
     request_id: str | None = None
     version: int | None = None
     payload_hash: str | None = None
     prospective_payload_hash: str | None = None
+    effect_mapping_key: str | None = None
+    effect_review_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.action not in {
@@ -49,20 +51,37 @@ class ActionBinding:
             "human_cancel",
             "promote_approval",
             "promote_passthrough",
+            "review_effect_mapping",
         }:
             raise ValueError("a supported bounded action is required")
         request_fields = (self.request_id, self.version, self.payload_hash)
-        if self.action == "login" and any(
-            field is not None for field in (*request_fields, self.prospective_payload_hash)
-        ):
-            raise ValueError("login cannot carry a request binding")
-        if self.action != "login" and not all(field is not None for field in request_fields):
-            raise ValueError("request ID, version, and payload hash must be bound together")
+        effect_fields = (self.effect_mapping_key, self.effect_review_digest)
+        if self.action == "login":
+            if any(
+                field is not None
+                for field in (*request_fields, self.prospective_payload_hash, *effect_fields)
+            ):
+                raise ValueError("login cannot carry an action binding")
+        elif self.action == "review_effect_mapping":
+            if any(field is not None for field in (*request_fields, self.prospective_payload_hash)):
+                raise ValueError("effect review cannot carry an approval-request binding")
+            if not all(field is not None for field in effect_fields):
+                raise ValueError("effect mapping key and review digest must be bound together")
+        else:
+            if not all(field is not None for field in request_fields):
+                raise ValueError("request ID, version, and payload hash must be bound together")
+            if any(field is not None for field in effect_fields):
+                raise ValueError("approval requests cannot carry an effect-review binding")
         if self.request_id is not None and (not self.request_id or len(self.request_id) > 256):
             raise ValueError("invalid request ID")
         if self.version is not None and self.version < 1:
             raise ValueError("request version must be positive")
-        for value in (self.payload_hash, self.prospective_payload_hash):
+        for value in (
+            self.payload_hash,
+            self.prospective_payload_hash,
+            self.effect_mapping_key,
+            self.effect_review_digest,
+        ):
             if value is not None and not _is_sha256(value):
                 raise ValueError("payload hashes must be lowercase SHA-256 values")
         if (self.prospective_payload_hash is not None) != (self.action == "edit"):
@@ -1569,6 +1588,8 @@ def _consume_webauthn_credential(
 def _binding_claims(binding: ActionBinding) -> dict[str, object]:
     return {
         "action": binding.action,
+        "effect_mapping_key": binding.effect_mapping_key,
+        "effect_review_digest": binding.effect_review_digest,
         "payload_hash": binding.payload_hash,
         "prospective_payload_hash": binding.prospective_payload_hash,
         "request_id": binding.request_id,

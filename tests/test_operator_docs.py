@@ -284,12 +284,14 @@ def test_hermes_runtime_is_fully_locked_and_overrides_vulnerable_upstream_pins()
     assert project["project"]["dependencies"] == ["hermes-agent[mcp]==0.18.2"]
     assert set(project["tool"]["uv"]["override-dependencies"]) == {
         "cryptography==48.0.1",
+        "mcp==1.28.1",
         "pillow==12.3.0",
         "starlette==1.3.1",
     }
     for package, version in (
         ("cryptography", "48.0.1"),
         ("hermes-agent", "0.18.2"),
+        ("mcp", "1.28.1"),
         ("pillow", "12.3.0"),
         ("starlette", "1.3.1"),
     ):

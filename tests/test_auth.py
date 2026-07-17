@@ -250,6 +250,33 @@ def test_action_binding_requires_complete_canonical_request_hashes() -> None:
     with pytest.raises(ValueError, match="only for edits"):
         ActionBinding("approve", "request-a", 1, "a" * 64, "b" * 64)
 
+    effect = ActionBinding(
+        "review_effect_mapping",
+        effect_mapping_key="c" * 64,
+        effect_review_digest="d" * 64,
+    )
+    assert effect.request_id is None
+    with pytest.raises(ValueError, match="bound together"):
+        ActionBinding("review_effect_mapping", effect_mapping_key="c" * 64)
+    with pytest.raises(ValueError, match="approval-request"):
+        ActionBinding(
+            "review_effect_mapping",
+            "request-a",
+            1,
+            "a" * 64,
+            effect_mapping_key="c" * 64,
+            effect_review_digest="d" * 64,
+        )
+    with pytest.raises(ValueError, match="effect-review"):
+        ActionBinding(
+            "approve",
+            "request-a",
+            1,
+            "a" * 64,
+            effect_mapping_key="c" * 64,
+            effect_review_digest="d" * 64,
+        )
+
 
 def test_authentication_identifiers_are_bounded_and_canonical() -> None:
     manager = session_manager()

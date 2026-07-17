@@ -1,0 +1,103 @@
+{
+  "plugin_manifest_version": 1,
+  "plugin_id": "signet.fastmail",
+  "plugin_version": "1.0.0",
+  "display_name": "Fastmail staged integration",
+  "description": "Fake-only Fastmail MCP mappings for effect review and staged contract testing.",
+  "connectors": [
+    {
+      "connector_id": "fastmail",
+      "display_name": "Fastmail MCP",
+      "protocol": "mcp",
+      "transports": ["streamable_http"],
+      "requires_mcp_shim": false
+    }
+  ],
+  "tool_mappings": [
+    {
+      "connector_id": "fastmail",
+      "tool_name": "search_email",
+      "action_id": "fastmail.search_email",
+      "display_label": "Search email",
+      "sensitive_json_paths": ["/query"],
+      "safe_result_fields": ["/message_ids", "/total"],
+      "proposed_effects": {
+        "mutation": "none",
+        "external_communication": false,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": false,
+        "idempotent": true
+      },
+      "adapter_requirement": "generic_json_staged"
+    },
+    {
+      "connector_id": "fastmail",
+      "tool_name": "read_email",
+      "action_id": "fastmail.read_email",
+      "display_label": "Read email",
+      "sensitive_json_paths": ["/message_id"],
+      "safe_result_fields": ["/message_id", "/received_at"],
+      "proposed_effects": {
+        "mutation": "none",
+        "external_communication": false,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": false,
+        "idempotent": true
+      },
+      "adapter_requirement": "generic_json_staged"
+    },
+    {
+      "connector_id": "fastmail",
+      "tool_name": "send_email",
+      "action_id": "fastmail.send_email",
+      "display_label": "Send email",
+      "sensitive_json_paths": ["/to", "/cc", "/bcc", "/subject", "/body"],
+      "safe_result_fields": ["/message_id", "/submission_id"],
+      "proposed_effects": {
+        "mutation": "additive",
+        "external_communication": true,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": true,
+        "idempotent": "unknown"
+      },
+      "adapter_requirement": "provider_specific"
+    },
+    {
+      "connector_id": "fastmail",
+      "tool_name": "move_email",
+      "action_id": "fastmail.move_email",
+      "display_label": "Move email",
+      "sensitive_json_paths": ["/message_ids", "/destination_mailbox_id"],
+      "safe_result_fields": ["/moved_count"],
+      "proposed_effects": {
+        "mutation": "mutating",
+        "external_communication": false,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": false,
+        "idempotent": true
+      },
+      "adapter_requirement": "generic_json_staged"
+    },
+    {
+      "connector_id": "fastmail",
+      "tool_name": "delete_email",
+      "action_id": "fastmail.delete_email",
+      "display_label": "Delete email",
+      "sensitive_json_paths": ["/message_ids"],
+      "safe_result_fields": ["/deleted_count"],
+      "proposed_effects": {
+        "mutation": "destructive",
+        "external_communication": false,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": false,
+        "idempotent": true
+      },
+      "adapter_requirement": "provider_specific"
+    }
+  ]
+}

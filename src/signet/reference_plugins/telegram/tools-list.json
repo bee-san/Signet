@@ -1,0 +1,168 @@
+{
+  "tools": [
+    {
+      "name": "send_message",
+      "description": "Describe a fake Telegram message send without contacting Telegram.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["chat_id", "text"],
+        "properties": {
+          "chat_id": {"type": "string", "minLength": 1},
+          "text": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["message_id", "sent_at"],
+        "properties": {
+          "message_id": {"type": "string"},
+          "sent_at": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "edit_message",
+      "description": "Describe editing a fake Telegram message.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["chat_id", "message_id", "text"],
+        "properties": {
+          "chat_id": {"type": "string"},
+          "message_id": {"type": "string"},
+          "text": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["message_id", "edited_at"],
+        "properties": {
+          "message_id": {"type": "string"},
+          "edited_at": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "delete_message",
+      "description": "Describe deleting a fake Telegram message.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["chat_id", "message_id"],
+        "properties": {
+          "chat_id": {"type": "string"},
+          "message_id": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["deleted"],
+        "properties": {"deleted": {"type": "boolean"}},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "invite_member",
+      "description": "Describe inviting a fake member to a fake Telegram chat.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["chat_id", "user_id"],
+        "properties": {
+          "chat_id": {"type": "string"},
+          "user_id": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["membership_status"],
+        "properties": {"membership_status": {"type": "string"}},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "remove_member",
+      "description": "Describe removing a fake member from a fake Telegram chat.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["chat_id", "user_id"],
+        "properties": {
+          "chat_id": {"type": "string"},
+          "user_id": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["membership_status"],
+        "properties": {"membership_status": {"type": "string"}},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "promote_member",
+      "description": "Describe assigning fake Telegram administrator permissions.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["chat_id", "user_id", "permissions"],
+        "properties": {
+          "chat_id": {"type": "string"},
+          "user_id": {"type": "string"},
+          "permissions": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 16,
+            "uniqueItems": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["role"],
+        "properties": {"role": {"type": "string"}},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    }
+  ]
+}
