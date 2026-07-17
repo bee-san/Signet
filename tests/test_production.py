@@ -207,9 +207,7 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == expected
 
     durable_bytes = b"".join(
-        path.read_bytes()
-        for path in config.storage.data_dir.iterdir()
-        if path.is_file()
+        path.read_bytes() for path in config.storage.data_dir.iterdir() if path.is_file()
     )
     for secret in (
         b"capability-secret-",

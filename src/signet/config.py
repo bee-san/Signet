@@ -299,11 +299,7 @@ class ProductionConfig(BaseModel):
             or len(value) > 32
             or len(set(value)) != len(value)
             or any(
-                not host
-                or len(host) > 253
-                or "\x00" in host
-                or "*" in host
-                or "/" in host
+                not host or len(host) > 253 or "\x00" in host or "*" in host or "/" in host
                 for host in value
             )
         ):
@@ -383,9 +379,7 @@ class ProductionConfig(BaseModel):
         if origin_host not in self.allowed_hosts:
             raise ValueError("allowed_hosts must include the public origin host")
         references = [
-            reference
-            for reference in self.secrets.model_dump().values()
-            if reference is not None
+            reference for reference in self.secrets.model_dump().values() if reference is not None
         ]
         if len(references) != len(set(references)):
             raise ValueError("production secret purposes must use distinct references")

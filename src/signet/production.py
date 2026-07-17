@@ -319,9 +319,7 @@ def build_production_runtime(
     database = Database(config.storage.data_dir / "signet.db")
     database.initialize(pre_migration_backup=pre_migration_backup)
 
-    capabilities = ProofCapability(
-        secret_values["capability_key_ref"].reveal().encode("utf-8")
-    )
+    capabilities = ProofCapability(secret_values["capability_key_ref"].reveal().encode("utf-8"))
     payload_cipher = PayloadCipher(
         secret_values["payload_key_ref"],
         secret_references["payload_key_ref"],
@@ -538,9 +536,7 @@ def _service_inventory(
         ProductionServiceRecord(
             "web", "web", cast(Any, staged("web_ready")), config.web_host, config.web_port
         ),
-        ProductionServiceRecord(
-            "maintenance", "maintenance", cast(Any, staged("workers_ready"))
-        ),
+        ProductionServiceRecord("maintenance", "maintenance", cast(Any, staged("workers_ready"))),
         ProductionServiceRecord("delivery", "worker", "blocked"),
         ProductionServiceRecord("reconciliation", "worker", "blocked"),
         ProductionServiceRecord("retention", "worker", "blocked"),
@@ -639,9 +635,7 @@ def _read_private_config(path: Path) -> str:
 def _production_config_path_from_environment() -> Path:
     raw_path = os.environ.get("SIGNET_PRODUCTION_CONFIG")
     if raw_path is None or not raw_path.strip() or "\x00" in raw_path:
-        raise ProductionAssemblyError(
-            "SIGNET_PRODUCTION_CONFIG must name the private config file"
-        )
+        raise ProductionAssemblyError("SIGNET_PRODUCTION_CONFIG must name the private config file")
     return Path(raw_path).expanduser().absolute()
 
 
@@ -708,6 +702,4 @@ def _read_private_document(path: Path, *, label: str) -> str:
             os.close(descriptor)
         except OSError as exc:
             if operation_error is None:
-                raise ProductionAssemblyError(
-                    f"{label} descriptor could not be closed"
-                ) from exc
+                raise ProductionAssemblyError(f"{label} descriptor could not be closed") from exc
