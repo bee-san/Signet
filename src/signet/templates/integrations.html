@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="integrations-view" aria-labelledby="integrations-heading">
+  <p class="eyebrow">Staged connector review</p>
+  <h1 id="integrations-heading">Integrations</h1>
+  <section class="staged-only-band" aria-labelledby="staged-only-heading">
+    <h2 id="staged-only-heading">Live dispatch is disabled</h2>
+    <p>Discovery and human effect reviews are staged evidence only. Recording a review does not call a provider, enable a tool, or authorize retries.</p>
+  </section>
+
+  {% if integration_page.plugins %}
+  <div class="integration-plugin-list">
+    {% for plugin in integration_page.plugins %}
+    {% set plugin_index = loop.index %}
+    <article class="integration-plugin" aria-labelledby="plugin-{{ loop.index }}">
+      <header class="integration-heading">
+        <div>
+          <p class="eyebrow">{{ 'Enabled' if plugin.enabled else 'Disabled' }} plugin</p>
+          <h2 id="plugin-{{ loop.index }}">{{ plugin.display_name }}</h2>
+        </div>
+        <span class="state state-{{ 'approved' if plugin.enabled else 'disabled' }}">{{ 'enabled' if plugin.enabled else 'disabled' }}</span>
+      </header>
+      <dl class="context-grid integration-identity">
+        <div><dt>Plugin ID</dt><dd class="hash-value">{{ plugin.plugin_id }}</dd></div>
+        <div><dt>Version</dt><dd>{{ plugin.plugin_version }}</dd></div>
+        <div class="context-wide"><dt>Manifest SHA-256</dt><dd class="hash-value">{{ plugin.manifest_sha256 }}</dd></div>
+      </dl>
+
+      {% if plugin.connectors %}
+      {% for connector in plugin.connectors %}
+      <section class="integration-connector" aria-labelledby="connector-{{ plugin_index }}-{{ loop.index }}">
+        <div class="integration-heading">
+          <div>
+            <p class="eyebrow">Connector {{ connector.alias }}</p>
+            <h3 id="connector-{{ plugin_index }}-{{ loop.index }}">{{ connector.display_name }}</h3>
+          </div>
+          <span class="state state-{{ 'approved' if connector.enabled else 'disabled' }}">{{ connector.discovery_status|replace('_', ' ') }}</span>
+        </div>
+        <dl class="context-grid integration-identity">
+          <div><dt>Alias</dt><dd class="hash-value">{{ connector.alias }}</dd></div>
+          <div><dt>Connector ID</dt><dd class="hash-value">{{ connector.connector_id }}</dd></div>
+          <div><dt>Discovery source</dt><dd>{{ connector.discovery_source or 'Not discovered' }}</dd></div>
+          {% if connector.discovered_at is not none %}{% set discovery_time = connector.discovered_at|utc_time %}<div><dt>Discovered</dt><dd><time datetime="{{ discovery_time.iso }}">{{ discovery_time.display }}</time></dd></div>{% endif %}
+          <div class="context-wide"><dt>Connector generation digest</dt><dd class="hash-value">{{ connector.config_digest }}</dd></div>
+          {% if connector.server_identity_digest %}<div class="context-wide"><dt>Server identity digest</dt><dd class="hash-value">{{ connector.server_identity_digest }}</dd></div>{% endif %}
+        </dl>
+
+        {% if connector.tools %}
+        <div class="table-scroll" role="region" aria-label="Discovered tools for {{ connector.alias }}" tabindex="0">
+          <table class="integration-tools-table">
+            <thead><tr><th>Tool</th><th>Presence</th><th>Review</th><th>Recommendation</th><th>Exact review</th></tr></thead>
+            <tbody>
+              {% for tool in connector.tools %}
+              <tr>
+                <td><strong>{{ tool.display_label }}</strong><br><span class="hash-value">{{ tool.tool_name }}</span><br><span class="hash-value">{{ tool.schema_digest }}</span></td>
+                <td>{{ 'Present' if tool.present else 'Removed' }}</td>
+                <td>{{ tool.review_state|replace('_', ' ') }}</td>
+                <td>{{ tool.recommended_mode.value if tool.recommended_mode else 'None' }}</td>
+                <td><a href="/integrations/tools/{{ tool.opaque_id }}">Inspect exact definition</a></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="muted-value">No discovered tools are retained for this connector.</p>
+        {% endif %}
+      </section>
+      {% endfor %}
+      {% else %}
+      <p class="muted-value">No configured connector is retained for this plugin.</p>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <section class="empty-state">
+    <h2>No installed plugins</h2>
+    <p>Install and configure a local SHA-256-pinned plugin from the CLI before reviewing discovery here.</p>
+  </section>
+  {% endif %}
+</section>
+{% endblock %}

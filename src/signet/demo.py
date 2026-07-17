@@ -81,6 +81,8 @@ from signet.gateway_tools import (
     GatewayToolSurface,
     SafeRequestSummary,
 )
+from signet.integration_store import SQLiteIntegrationStore
+from signet.integration_web_backend import SQLiteIntegrationWebBackend
 from signet.mcp_mirror import (
     AliasToolSurface,
     InvocationIdentity,
@@ -991,6 +993,18 @@ def build_demo(
         verifier=password_verifier,
     )
     webauthn = SQLiteWebAuthnRepository(database)
+    webauthn_issuer = WebAuthnChallengeIssuer(webauthn, rp_id="localhost")
+    webauthn_verifier = WebAuthnAssertionVerifier(
+        webauthn,
+        rp_id="localhost",
+        origin="https://localhost",
+        capabilities=capabilities,
+    )
+    authentication_transactions = SQLiteAuthenticationTransactions(
+        database,
+        signing_key=demo_secrets.session_key,
+        capabilities=capabilities,
+    )
     web_backend = PersistentWebBackend(
         database,
         authorized_user_id=DEMO_USER_ID,
@@ -998,26 +1012,30 @@ def build_demo(
         passwords=passwords,
         totp=totp,
         webauthn_repository=webauthn,
-        webauthn_issuer=WebAuthnChallengeIssuer(webauthn, rp_id="localhost"),
-        webauthn_verifier=WebAuthnAssertionVerifier(
-            webauthn,
-            rp_id="localhost",
-            origin="https://localhost",
-            capabilities=capabilities,
-        ),
-        authentication_transactions=SQLiteAuthenticationTransactions(
-            database,
-            signing_key=demo_secrets.session_key,
-            capabilities=capabilities,
-        ),
+        webauthn_issuer=webauthn_issuer,
+        webauthn_verifier=webauthn_verifier,
+        authentication_transactions=authentication_transactions,
         state_machine=state_machine,
         payloads=reviewer,
         action_drafts=SQLiteActionDraftRepository(database),
         policy_promotions=cast(PolicyPromotionBoundary, policy_promotions),
         pushes=SQLitePushRepository(database),
     )
+    integration_backend = SQLiteIntegrationWebBackend(
+        database,
+        authorized_user_id=DEMO_USER_ID,
+        sessions=sessions,
+        store=SQLiteIntegrationStore(database),
+        totp=totp,
+        capabilities=capabilities,
+        webauthn_repository=webauthn,
+        webauthn_issuer=webauthn_issuer,
+        webauthn_verifier=webauthn_verifier,
+        opaque_id_key=demo_secrets.csrf_key,
+    )
     web = create_web_app(
         web_backend,
+        integrations=integration_backend,
         settings=WebSettings(
             public_origin=f"http://127.0.0.1:{web_port}",
             allowed_hosts=("127.0.0.1",),

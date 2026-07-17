@@ -1,0 +1,120 @@
+{
+  "plugin_manifest_version": 1,
+  "plugin_id": "signet.telegram",
+  "plugin_version": "1.0.0",
+  "display_name": "Telegram staged integration",
+  "description": "Fake-only Telegram MCP mappings for messages, membership, and administrator review.",
+  "connectors": [
+    {
+      "connector_id": "telegram",
+      "display_name": "Telegram MCP",
+      "protocol": "mcp",
+      "transports": ["streamable_http", "stdio"],
+      "requires_mcp_shim": false
+    }
+  ],
+  "tool_mappings": [
+    {
+      "connector_id": "telegram",
+      "tool_name": "send_message",
+      "action_id": "telegram.send_message",
+      "display_label": "Send Telegram message",
+      "sensitive_json_paths": ["/chat_id", "/text"],
+      "safe_result_fields": ["/message_id", "/sent_at"],
+      "proposed_effects": {
+        "mutation": "additive",
+        "external_communication": true,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": true,
+        "idempotent": "unknown"
+      },
+      "adapter_requirement": "generic_json_staged"
+    },
+    {
+      "connector_id": "telegram",
+      "tool_name": "edit_message",
+      "action_id": "telegram.edit_message",
+      "display_label": "Edit Telegram message",
+      "sensitive_json_paths": ["/chat_id", "/message_id", "/text"],
+      "safe_result_fields": ["/message_id", "/edited_at"],
+      "proposed_effects": {
+        "mutation": "mutating",
+        "external_communication": true,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": true,
+        "idempotent": true
+      },
+      "adapter_requirement": "provider_specific"
+    },
+    {
+      "connector_id": "telegram",
+      "tool_name": "delete_message",
+      "action_id": "telegram.delete_message",
+      "display_label": "Delete Telegram message",
+      "sensitive_json_paths": ["/chat_id", "/message_id"],
+      "safe_result_fields": ["/deleted"],
+      "proposed_effects": {
+        "mutation": "destructive",
+        "external_communication": true,
+        "code_execution": false,
+        "privilege_change": false,
+        "open_world": true,
+        "idempotent": true
+      },
+      "adapter_requirement": "provider_specific"
+    },
+    {
+      "connector_id": "telegram",
+      "tool_name": "invite_member",
+      "action_id": "telegram.invite_member",
+      "display_label": "Invite Telegram member",
+      "sensitive_json_paths": ["/chat_id", "/user_id"],
+      "safe_result_fields": ["/membership_status"],
+      "proposed_effects": {
+        "mutation": "additive",
+        "external_communication": true,
+        "code_execution": false,
+        "privilege_change": true,
+        "open_world": true,
+        "idempotent": "unknown"
+      },
+      "adapter_requirement": "provider_specific"
+    },
+    {
+      "connector_id": "telegram",
+      "tool_name": "remove_member",
+      "action_id": "telegram.remove_member",
+      "display_label": "Remove Telegram member",
+      "sensitive_json_paths": ["/chat_id", "/user_id"],
+      "safe_result_fields": ["/membership_status"],
+      "proposed_effects": {
+        "mutation": "destructive",
+        "external_communication": true,
+        "code_execution": false,
+        "privilege_change": true,
+        "open_world": true,
+        "idempotent": true
+      },
+      "adapter_requirement": "provider_specific"
+    },
+    {
+      "connector_id": "telegram",
+      "tool_name": "promote_member",
+      "action_id": "telegram.promote_member",
+      "display_label": "Promote Telegram administrator",
+      "sensitive_json_paths": ["/chat_id", "/user_id", "/permissions"],
+      "safe_result_fields": ["/role"],
+      "proposed_effects": {
+        "mutation": "mutating",
+        "external_communication": true,
+        "code_execution": false,
+        "privilege_change": true,
+        "open_world": true,
+        "idempotent": "unknown"
+      },
+      "adapter_requirement": "provider_specific"
+    }
+  ]
+}

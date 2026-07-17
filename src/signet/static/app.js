@@ -66,6 +66,61 @@ function decisionReasonRequired(root, action) {
   return action === "approve" && root.dataset.gatewayInternal !== "true";
 }
 
+const effectProfileFields = [
+  "mutation",
+  "external_communication",
+  "code_execution",
+  "privilege_change",
+  "open_world",
+  "idempotent"
+];
+
+function selectedEffectProfile(form) {
+  const profile = {};
+  for (const field of effectProfileFields) {
+    const value = form.elements[field]?.value;
+    if (!value) return null;
+    profile[field] = value;
+  }
+  return profile;
+}
+
+function recommendedEffectMode(profile) {
+  if (!profile || Object.values(profile).includes("unknown")) return "deny";
+  if (
+    profile.mutation === "destructive"
+    || profile.code_execution === "true"
+    || profile.privilege_change === "true"
+    || profile.open_world === "true"
+  ) return "deny";
+  if (
+    profile.mutation === "none"
+    && profile.external_communication === "false"
+    && profile.code_execution === "false"
+    && profile.privilege_change === "false"
+    && profile.open_world === "false"
+  ) return "passthrough";
+  if (
+    ["none", "additive", "mutating"].includes(profile.mutation)
+    && profile.code_execution === "false"
+    && profile.privilege_change === "false"
+    && profile.open_world === "false"
+  ) return "approval";
+  return "deny";
+}
+
+function updateEffectRecommendation(form) {
+  const output = form.querySelector("[data-effect-recommendation]");
+  if (!output) return;
+  const profile = selectedEffectProfile(form);
+  if (!profile) {
+    output.textContent = "Complete all six axes; incomplete or unknown profiles are denied.";
+    return;
+  }
+  const recommendation = recommendedEffectMode(profile);
+  output.textContent = `${recommendation} — staged recommendation only; live dispatch stays disabled.`;
+}
+
 async function postJson(url, body, csrf) {
   const response = await fetch(url, {
     method: "POST",
@@ -132,6 +187,50 @@ document.addEventListener("click", async (event) => {
   } catch (error) {
     showMessage(error.message);
   }
+});
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest?.("[data-effect-review-passkey]");
+  if (!button) return;
+  const form = button.closest("[data-effect-review-form]");
+  try {
+    if (!form) throw new Error("Effect review context is unavailable");
+    const profile = selectedEffectProfile(form);
+    if (!profile) {
+      form.querySelector("select:invalid")?.focus();
+      throw new Error("Choose a conclusion for all six effect axes");
+    }
+    const opaqueId = form.elements.opaque_id?.value;
+    const snapshotDigest = form.elements.expected_snapshot_digest?.value;
+    const csrf = form.dataset.csrf;
+    if (!opaqueId || !snapshotDigest || !csrf) {
+      throw new Error("Exact effect review binding is unavailable");
+    }
+    const options = await postJson("/integrations/effect-reviews/passkey/options", {
+      opaque_id: opaqueId,
+      expected_snapshot_digest: snapshotDigest,
+      profile
+    }, csrf);
+    const credential = await navigator.credentials.get({
+      publicKey: preparePublicKey(options.public_key)
+    });
+    const completed = await postJson("/integrations/effect-reviews/passkey/complete", {
+      opaque_id: opaqueId,
+      expected_snapshot_digest: snapshotDigest,
+      challenge_id: options.challenge_id,
+      assertion: assertionJson(credential)
+    }, csrf);
+    window.location.assign(
+      completed.redirect_url || `/integrations/tools/${encodeURIComponent(opaqueId)}`
+    );
+  } catch (error) {
+    showMessage(error.message);
+  }
+});
+
+document.querySelectorAll("[data-effect-review-form]").forEach((form) => {
+  form.addEventListener("change", () => updateEffectRecommendation(form));
+  updateEffectRecommendation(form);
 });
 
 document.addEventListener("submit", (event) => {

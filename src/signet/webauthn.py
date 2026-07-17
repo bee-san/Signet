@@ -323,36 +323,83 @@ class SQLiteWebAuthnRepository:
                     (challenge.user_id, now),
                 ).fetchone()[0]
             )
+            active += int(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM connector_effect_review_challenges
+                    WHERE user_id = ? AND consumed_at IS NULL
+                      AND invalidated_at IS NULL AND expires_at > ?
+                    """,
+                    (challenge.user_id, now),
+                ).fetchone()[0]
+            )
             if active >= max_active:
                 return False
             try:
-                connection.execute(
+                collision = connection.execute(
                     """
-                    INSERT INTO auth_challenges(
-                        challenge_id, challenge, user_id, action, request_id,
-                        version, current_payload_hash, prospective_payload_hash,
-                        session_id, http_method, offered_credential_ids_json,
-                        created_at, expires_at, consumed_at, invalidated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    SELECT 1 FROM auth_challenges WHERE challenge_id = ?
+                    UNION ALL
+                    SELECT 1 FROM connector_effect_review_challenges
+                    WHERE challenge_id = ?
                     """,
-                    (
-                        challenge.challenge_id,
-                        challenge.challenge,
-                        challenge.user_id,
-                        challenge.binding.action,
-                        challenge.binding.request_id,
-                        challenge.binding.version,
-                        challenge.binding.payload_hash,
-                        challenge.binding.prospective_payload_hash,
-                        challenge.session_id,
-                        challenge.http_method,
-                        offered_json,
-                        challenge.created_at,
-                        challenge.expires_at,
-                        challenge.consumed_at,
-                        challenge.invalidated_at,
-                    ),
-                )
+                    (challenge.challenge_id, challenge.challenge_id),
+                ).fetchone()
+                if collision is not None:
+                    return False
+                if challenge.binding.action == "review_effect_mapping":
+                    connection.execute(
+                        """
+                        INSERT INTO connector_effect_review_challenges(
+                            challenge_id, challenge, user_id, effect_mapping_key,
+                            effect_review_digest, session_id, http_method,
+                            offered_credential_ids_json, created_at, expires_at,
+                            consumed_at, invalidated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            challenge.challenge_id,
+                            challenge.challenge,
+                            challenge.user_id,
+                            challenge.binding.effect_mapping_key,
+                            challenge.binding.effect_review_digest,
+                            challenge.session_id,
+                            challenge.http_method,
+                            offered_json,
+                            challenge.created_at,
+                            challenge.expires_at,
+                            challenge.consumed_at,
+                            challenge.invalidated_at,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO auth_challenges(
+                            challenge_id, challenge, user_id, action, request_id,
+                            version, current_payload_hash, prospective_payload_hash,
+                            session_id, http_method, offered_credential_ids_json,
+                            created_at, expires_at, consumed_at, invalidated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            challenge.challenge_id,
+                            challenge.challenge,
+                            challenge.user_id,
+                            challenge.binding.action,
+                            challenge.binding.request_id,
+                            challenge.binding.version,
+                            challenge.binding.payload_hash,
+                            challenge.binding.prospective_payload_hash,
+                            challenge.session_id,
+                            challenge.http_method,
+                            offered_json,
+                            challenge.created_at,
+                            challenge.expires_at,
+                            challenge.consumed_at,
+                            challenge.invalidated_at,
+                        ),
+                    )
             except IntegrityError:
                 return False
         return True
@@ -363,16 +410,29 @@ class SQLiteWebAuthnRepository:
                 "SELECT * FROM auth_challenges WHERE challenge_id = ?",
                 (challenge_id,),
             ).fetchone()
+            effect = False
+            if row is None:
+                row = connection.execute(
+                    """
+                    SELECT * FROM connector_effect_review_challenges
+                    WHERE challenge_id = ?
+                    """,
+                    (challenge_id,),
+                ).fetchone()
+                effect = row is not None
         if row is None:
             return None
         offered = json.loads(str(row["offered_credential_ids_json"]))
         if not isinstance(offered, list) or not all(isinstance(item, str) for item in offered):
             raise WebAuthnError("stored WebAuthn challenge is invalid")
-        return WebAuthnChallenge(
-            challenge_id=str(row["challenge_id"]),
-            challenge=bytes(row["challenge"]),
-            user_id=str(row["user_id"]),
-            binding=ActionBinding(
+        binding = (
+            ActionBinding(
+                action="review_effect_mapping",
+                effect_mapping_key=str(row["effect_mapping_key"]),
+                effect_review_digest=str(row["effect_review_digest"]),
+            )
+            if effect
+            else ActionBinding(
                 action=str(row["action"]),
                 request_id=(str(row["request_id"]) if row["request_id"] is not None else None),
                 version=(int(row["version"]) if row["version"] is not None else None),
@@ -386,7 +446,13 @@ class SQLiteWebAuthnRepository:
                     if row["prospective_payload_hash"] is not None
                     else None
                 ),
-            ),
+            )
+        )
+        return WebAuthnChallenge(
+            challenge_id=str(row["challenge_id"]),
+            challenge=bytes(row["challenge"]),
+            user_id=str(row["user_id"]),
+            binding=binding,
             session_id=str(row["session_id"]),
             http_method=str(row["http_method"]),
             offered_credential_ids=tuple(offered),
@@ -408,6 +474,15 @@ class SQLiteWebAuthnRepository:
                 """,
                 (now, challenge_id),
             ).rowcount
+            if int(updated) == 0:
+                updated = connection.execute(
+                    """
+                    UPDATE connector_effect_review_challenges SET invalidated_at = ?
+                    WHERE challenge_id = ? AND consumed_at IS NULL
+                      AND invalidated_at IS NULL
+                    """,
+                    (now, challenge_id),
+                ).rowcount
         return int(updated) == 1
 
     def find_credential(self, credential_id: str) -> WebAuthnCredential | None:

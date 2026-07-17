@@ -203,8 +203,20 @@ def _downgrade_catalog_to_schema_12(database: Database) -> None:
             END
             """
         )
+        connection.execute("DROP TABLE connector_effect_review_drafts")
+        connection.execute("DROP TABLE connector_effect_review_challenges")
+        connection.execute("DROP TABLE connector_effect_reviews")
+        connection.execute("DROP TABLE connector_effect_evidence")
+        connection.execute("DROP TABLE connector_tool_state")
+        connection.execute("DROP TABLE connector_discovered_tools")
+        connection.execute("DROP TABLE connector_discovery_runs")
+        connection.execute("DROP TABLE connector_active")
+        connection.execute("DROP TABLE connector_configurations")
+        connection.execute("DROP TABLE plugin_tool_mappings")
+        connection.execute("DROP TABLE plugin_active")
+        connection.execute("DROP TABLE plugin_manifests")
         connection.execute("DROP TABLE privacy_maintenance")
-        connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14)")
+        connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15)")
         connection.execute("PRAGMA user_version = 12")
 
 

@@ -32,6 +32,13 @@ credential resolver, dispatch worker, or downstream MCP alias. Its authenticated
 or a substitute for deferred human setup and cutover. `signet.operations` consumes
 local, bounded fixtures only; it has no discovery network client or host scanner.
 
+The generic plugin surface is staged-only as well. Local, hash-pinned manifests
+can describe MCP connectors and propose effects, but installation, discovery, and
+authenticated effect review never enable `tools/call` or provider dispatch. Read
+the [plugin integration guide](docs/plugin-integrations.md) and the explicit
+[plugin readiness boundary](docs/plugin-readiness.md) before handling a manifest
+or connector configuration.
+
 ## Guarantees
 
 - Unknown tools resolve to `deny`. A tool is exposed only after exact schema
@@ -80,6 +87,11 @@ with `pipx install 'uv==0.11.28'` or the official versioned
 downloaded installer before executing it and do not substitute the unversioned
 installer. The repository pins `uv`-managed Python 3.12.13 because its bundled
 SQLite satisfies Signet's 3.51.3 safety floor.
+
+Developers extending the provider-neutral onboarding path should start with the
+[manifest, connector, discovery, review, and worker contracts](docs/plugin-integrations.md).
+The companion [readiness report](docs/plugin-readiness.md) lists the capabilities
+that remain intentionally absent and the prerequisites for any future live work.
 
 ```console
 (
@@ -256,6 +268,8 @@ The readiness report is advisory: it always keeps `ready` and
 - [Provider-neutral MCP agent integration](docs/mcp-client-integration.md)
 - [Security model](docs/security-model.md)
 - [Policy and adapter onboarding](docs/policy-guide.md)
+- [Staged plugin integrations](docs/plugin-integrations.md)
+- [Plugin readiness boundary](docs/plugin-readiness.md)
 - [Deployment, backup, restore, and rollback](docs/deployment.md)
 - [No-live operator and Hermes runbook](docs/operator-runbook.md)
 

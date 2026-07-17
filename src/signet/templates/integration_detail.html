@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% block content %}
+<article class="integration-detail" data-integration-tool-id="{{ item.opaque_id }}">
+  <p class="eyebrow">Staged effect mapping</p>
+  <h1>{{ item.display_label }}</h1>
+  <section class="staged-only-band" aria-labelledby="staged-only-heading">
+    <h2 id="staged-only-heading">Live dispatch is disabled</h2>
+    <p>This review records a provider-neutral effect conclusion. It does not call the provider, enable this tool, change policy, or authorize a retry.</p>
+  </section>
+
+  <section class="context-band" aria-labelledby="integration-target-heading">
+    <h2 id="integration-target-heading">Exact review target</h2>
+    <dl class="context-grid">
+      <div><dt>Plugin</dt><dd>{{ item.plugin_display_name }}</dd></div>
+      <div><dt>Plugin ID</dt><dd class="hash-value">{{ item.plugin_id }}</dd></div>
+      <div><dt>Plugin version</dt><dd>{{ item.plugin_version }}</dd></div>
+      <div class="context-wide"><dt>Manifest SHA-256</dt><dd class="hash-value">{{ item.manifest_sha256 }}</dd></div>
+      <div><dt>Connector</dt><dd>{{ item.connector_display_name }}</dd></div>
+      <div><dt>Connector alias</dt><dd class="hash-value">{{ item.connector_alias }}</dd></div>
+      <div><dt>Connector ID</dt><dd class="hash-value">{{ item.connector_id }}</dd></div>
+      <div class="context-wide"><dt>Connector generation digest</dt><dd class="hash-value">{{ item.connector_config_digest }}</dd></div>
+      <div><dt>Discovery status</dt><dd>{{ item.discovery_status|replace('_', ' ') }}</dd></div>
+      <div><dt>Discovery source</dt><dd>{{ item.discovery_source }}</dd></div>
+      {% set discovery_time = item.discovered_at|utc_time %}
+      <div><dt>Discovered</dt><dd><time datetime="{{ discovery_time.iso }}">{{ discovery_time.display }}</time></dd></div>
+      <div class="context-wide"><dt>Server identity digest</dt><dd class="hash-value">{{ item.server_identity_digest }}</dd></div>
+      <div><dt>Exact tool name</dt><dd class="hash-value">{{ item.tool_name }}</dd></div>
+      <div><dt>Plugin action ID</dt><dd class="hash-value">{{ item.action_id }}</dd></div>
+      <div class="context-wide"><dt>Tool definition digest</dt><dd class="hash-value">{{ item.schema_digest }}</dd></div>
+      <div class="context-wide"><dt>Target snapshot digest</dt><dd class="hash-value">{{ item.target_snapshot_digest }}</dd></div>
+      <div class="context-wide"><dt>Evidence bundle digest</dt><dd class="hash-value">{{ item.evidence_bundle_digest }}</dd></div>
+    </dl>
+  </section>
+
+  <section class="arguments-band" aria-labelledby="exact-tool-heading">
+    <h2 id="exact-tool-heading">Exact discovered MCP tool definition</h2>
+    <p>Descriptions and annotations below came from the server and are untrusted hints.</p>
+    <pre class="integration-json">{{ item.canonical_tool_json }}</pre>
+  </section>
+
+  <section class="integration-paths" aria-labelledby="plugin-mapping-heading">
+    <h2 id="plugin-mapping-heading">Plugin mapping proposal</h2>
+    <div class="integration-path-grid">
+      <div>
+        <h3>Sensitive JSON paths</h3>
+        {% if item.sensitive_json_paths %}<ul class="hash-list">{% for path in item.sensitive_json_paths %}<li class="hash-value">{{ path }}</li>{% endfor %}</ul>{% else %}<p class="muted-value">None proposed</p>{% endif %}
+      </div>
+      <div>
+        <h3>Safe result fields</h3>
+        {% if item.safe_result_fields %}<ul class="hash-list">{% for path in item.safe_result_fields %}<li class="hash-value">{{ path }}</li>{% endfor %}</ul>{% else %}<p class="muted-value">None proposed</p>{% endif %}
+      </div>
+    </div>
+  </section>
+
+  <section class="effect-evidence" aria-labelledby="effect-evidence-heading">
+    <h2 id="effect-evidence-heading">Effect evidence, not authorization</h2>
+    <p>Each source is retained separately. No annotation, heuristic, or plugin proposal enables a tool.</p>
+    <div class="effect-evidence-list">
+      {% for evidence in item.evidence %}
+      <article class="effect-evidence-card">
+        <h3>
+          {% if evidence.source.value == 'mcp_annotations' %}MCP annotations — untrusted server hints
+          {% elif evidence.source.value == 'name_schema_heuristic' %}Name and schema classifier signals
+          {% else %}Plugin proposal — untrusted mapping evidence{% endif %}
+        </h3>
+        {% if evidence.action_id %}<p>Action ID: <span class="hash-value">{{ evidence.action_id }}</span></p>{% endif %}
+        <dl class="effect-profile-grid">
+          <div><dt>Mutation</dt><dd>{{ evidence.proposed_profile.mutation.value }}</dd></div>
+          <div><dt>External communication</dt><dd>{{ evidence.proposed_profile.external_communication.value }}</dd></div>
+          <div><dt>Code execution</dt><dd>{{ evidence.proposed_profile.code_execution.value }}</dd></div>
+          <div><dt>Privilege change</dt><dd>{{ evidence.proposed_profile.privilege_change.value }}</dd></div>
+          <div><dt>Open world</dt><dd>{{ evidence.proposed_profile.open_world.value }}</dd></div>
+          <div><dt>Idempotent</dt><dd>{{ evidence.proposed_profile.idempotent.value }}</dd></div>
+        </dl>
+        <h4>Signals</h4>
+        {% if evidence.signals %}<ul>{% for signal in evidence.signals %}<li>{{ signal }}</li>{% endfor %}</ul>{% else %}<p class="muted-value">No signal</p>{% endif %}
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+
+  {% if item.disagreements %}
+  <section class="warning-band" aria-labelledby="effect-disagreements-heading">
+    <h2 id="effect-disagreements-heading">Evidence disagreements</h2>
+    <p>The retained sources disagree on these axes. Resolve each axis explicitly in the human conclusion.</p>
+    <ul>{% for axis in item.disagreements %}<li>{{ axis|replace('_', ' ') }}</li>{% endfor %}</ul>
+  </section>
+  {% endif %}
+
+  <section class="effect-review-history" aria-labelledby="effect-review-history-heading">
+    <h2 id="effect-review-history-heading">Append-only human reviews</h2>
+    {% if item.reviews %}
+    <ol>
+      {% for review in item.reviews %}
+      {% set review_time = review.reviewed_at|utc_time %}
+      <li{% if review.current %} id="effect-review-current"{% endif %}>
+        <div class="integration-heading">
+          <strong>{{ review.recommended_mode.value }} recommendation</strong>
+          <span>{{ 'Current' if review.current else 'Superseded' }}</span>
+        </div>
+        <dl class="effect-profile-grid">
+          <div><dt>Mutation</dt><dd>{{ review.profile.mutation.value }}</dd></div>
+          <div><dt>External communication</dt><dd>{{ review.profile.external_communication.value }}</dd></div>
+          <div><dt>Code execution</dt><dd>{{ review.profile.code_execution.value }}</dd></div>
+          <div><dt>Privilege change</dt><dd>{{ review.profile.privilege_change.value }}</dd></div>
+          <div><dt>Open world</dt><dd>{{ review.profile.open_world.value }}</dd></div>
+          <div><dt>Idempotent</dt><dd>{{ review.profile.idempotent.value }}</dd></div>
+        </dl>
+        <p class="confirmation-provenance">Reviewed by {{ review.actor }} at <time datetime="{{ review_time.iso }}">{{ review_time.display }}</time> with {{ 'Passkey' if review.auth_kind == 'webauthn' else 'TOTP' }} via the authenticated web app.</p>
+      </li>
+      {% endfor %}
+    </ol>
+    {% else %}
+    <p class="muted-value">No human effect review is retained for this exact target.</p>
+    {% endif %}
+  </section>
+
+  {% if item.reviewable %}
+  <section class="effect-review-band" aria-labelledby="record-effect-review-heading">
+    <h2 id="record-effect-review-heading">Record a fresh human conclusion</h2>
+    <p>Every axis is required. Choosing <strong>unknown</strong> is explicit and produces a deny recommendation. Idempotence is recorded but never authorizes retries.</p>
+    <form id="effect-review-form" class="effect-review-form" data-effect-review-form data-csrf="{{ review_csrf }}" action="/integrations/effect-reviews/totp" method="post">
+      <input type="hidden" name="csrf_token" value="{{ review_csrf }}">
+      <input type="hidden" name="opaque_id" value="{{ item.opaque_id }}">
+      <input type="hidden" name="expected_snapshot_digest" value="{{ item.target_snapshot_digest }}">
+      <div class="effect-review-inputs">
+        <div>
+          <label for="effect-mutation">Mutation</label>
+          <select id="effect-mutation" name="mutation" required>
+            <option value="" selected disabled>Choose one</option>
+            <option value="none">None</option><option value="additive">Additive</option><option value="mutating">Mutating</option><option value="destructive">Destructive</option><option value="unknown">Unknown</option>
+          </select>
+        </div>
+        {% for field, label in [
+          ('external_communication', 'External communication'),
+          ('code_execution', 'Code execution'),
+          ('privilege_change', 'Privilege change'),
+          ('open_world', 'Open world'),
+          ('idempotent', 'Idempotent')
+        ] %}
+        <div>
+          <label for="effect-{{ field|replace('_', '-') }}">{{ label }}</label>
+          <select id="effect-{{ field|replace('_', '-') }}" name="{{ field }}" required>
+            <option value="" selected disabled>Choose one</option>
+            <option value="true">True</option><option value="false">False</option><option value="unknown">Unknown</option>
+          </select>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="effect-recommendation" aria-live="polite">
+        <span>Derived policy recommendation</span>
+        <output data-effect-recommendation>Complete all six axes; incomplete or unknown profiles are denied.</output>
+      </div>
+      <label for="effect-review-totp">{{ 'Fake action proof' if fake_only_ui else 'Authenticator code' }}</label>
+      <input id="effect-review-totp" name="totp_proof" inputmode="{{ 'text' if fake_only_ui else 'numeric' }}" autocomplete="{{ 'off' if fake_only_ui else 'one-time-code' }}" maxlength="128" required>
+      <div class="button-row">
+        <button class="button button-primary" type="submit">Record review with {{ 'fake proof' if fake_only_ui else 'authenticator code' }}</button>
+        {% if not fake_only_ui %}<button class="button button-quiet" type="button" data-effect-review-passkey>Use passkey</button>{% endif %}
+      </div>
+    </form>
+  </section>
+  {% else %}
+  <section class="warning-band" aria-labelledby="effect-review-unavailable-heading">
+    <h2 id="effect-review-unavailable-heading">Fresh review unavailable</h2>
+    <p>{{ item.unavailable_reason }}</p>
+  </section>
+  {% endif %}
+
+  <p class="dedicated-link"><a href="/integrations">Return to integrations</a></p>
+</article>
+{% endblock %}

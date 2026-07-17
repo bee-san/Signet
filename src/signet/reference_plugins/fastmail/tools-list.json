@@ -1,0 +1,136 @@
+{
+  "tools": [
+    {
+      "name": "search_email",
+      "description": "Search the fake mailbox without changing provider state.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {"query": {"type": "string", "maxLength": 4096}},
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["message_ids", "total"],
+        "properties": {
+          "message_ids": {"type": "array", "items": {"type": "string"}},
+          "total": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "read_email",
+      "description": "Read one fake email without changing provider state.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["message_id"],
+        "properties": {"message_id": {"type": "string", "minLength": 1}},
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["message_id", "received_at", "subject", "body"],
+        "properties": {
+          "message_id": {"type": "string"},
+          "received_at": {"type": "string"},
+          "subject": {"type": "string"},
+          "body": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "send_email",
+      "description": "Describe a fake outbound email action; this fixture never dispatches it.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["to", "subject", "body"],
+        "properties": {
+          "to": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+          "cc": {"type": "array", "items": {"type": "string"}},
+          "bcc": {"type": "array", "items": {"type": "string"}},
+          "subject": {"type": "string"},
+          "body": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["message_id", "submission_id"],
+        "properties": {
+          "message_id": {"type": "string"},
+          "submission_id": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "move_email",
+      "description": "Describe moving fake messages between fake mailboxes.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["message_ids", "destination_mailbox_id"],
+        "properties": {
+          "message_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+          "destination_mailbox_id": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["moved_count"],
+        "properties": {"moved_count": {"type": "integer", "minimum": 0}},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "delete_email",
+      "description": "Describe deleting fake messages; this fixture never dispatches it.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["message_ids"],
+        "properties": {
+          "message_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["deleted_count"],
+        "properties": {"deleted_count": {"type": "integer", "minimum": 0}},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}

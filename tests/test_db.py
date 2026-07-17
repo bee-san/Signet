@@ -57,6 +57,18 @@ CORE_TABLES = {
     "purge_jobs",
     "schema_meta",
     "notification_outbox_deliveries",
+    "plugin_manifests",
+    "plugin_active",
+    "plugin_tool_mappings",
+    "connector_configurations",
+    "connector_active",
+    "connector_discovery_runs",
+    "connector_discovered_tools",
+    "connector_tool_state",
+    "connector_effect_evidence",
+    "connector_effect_review_challenges",
+    "connector_effect_review_drafts",
+    "connector_effect_reviews",
 }
 
 
