@@ -271,7 +271,11 @@ The readiness report is advisory: it always keeps `ready` and
 - [Staged plugin integrations](docs/plugin-integrations.md)
 - [Plugin readiness boundary](docs/plugin-readiness.md)
 - [Deployment, backup, restore, and rollback](docs/deployment.md)
+- [Production runtime and lifecycle architecture](docs/production-runtime.md)
+- [Productionisation plan and acceptance matrix](docs/plans/2026-07-17-signet-productionization-plan.md)
 - [No-live operator and Hermes runbook](docs/operator-runbook.md)
 
-The implementation contract and deferred human-only ceremony are recorded in
+The current productionisation plan and acceptance matrix are recorded in
+[`docs/plans/2026-07-17-signet-productionization-plan.md`](docs/plans/2026-07-17-signet-productionization-plan.md).
+The earlier generic approval-gateway plan remains in
 [`2026-07-14-signet-approval-gateway-plan.md`](2026-07-14-signet-approval-gateway-plan.md).
