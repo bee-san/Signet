@@ -47,6 +47,7 @@ from signet.db import (
     MigrationBackupReceipt,
     PreMigrationBackup,
     PreMigrationBackupRequired,
+    _file_sha256,
 )
 from signet.execution_scope import PolicyExecutionScopeResolver
 from signet.freezer import RequestFreezer
@@ -614,7 +615,8 @@ def build_production_runtime(
     def production_health_probe() -> bool:
         status = state.status()
         return (
-            workers.running and workers.healthy and status.services["maintenance"].state == "ready"
+            status.services["maintenance"].state == "ready"
+            and "workers_ready" not in status.missing_prerequisites
         )
 
     if web is not None:
@@ -715,7 +717,7 @@ def _snapshot_pre_migration_backup(backup_dir: Path) -> PreMigrationBackup:
             database_path=database.path,
             source_schema_version=current_version,
             artifact_path=snapshot.absolute(),
-            artifact_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            artifact_sha256=_file_sha256(snapshot),
             verified_restore_schema_version=current_version,
         )
 

@@ -248,6 +248,28 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     assert isinstance(assembly.provider_clients["mail"], ProductionDisabledProviderClient)
 
 
+def test_web_health_uses_durable_maintenance_state_from_a_separate_worker(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        clock=lambda: 123,
+    )
+    client = TestClient(assembly.web, base_url="https://signet.example.test")
+
+    assert assembly.workers.running is False
+    assert client.get("/healthz").status_code == 503
+
+    assembly.state.record_worker_state("ready", ready=True, now=124)
+    assert assembly.workers.running is False
+    assert client.get("/healthz").status_code == 200
+
+    assembly.state.record_worker_state("blocked", ready=False, now=125)
+    assert client.get("/healthz").status_code == 503
+
+
 def test_production_http_surfaces_reject_non_loopback_transport_peers(tmp_path: Path) -> None:
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
     assembly = build_production_runtime(config, secret_store=_secret_store())
@@ -552,6 +574,14 @@ def test_standard_factory_creates_and_verifies_required_upgrade_backup(
     monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 16)
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     config_path.chmod(0o600)
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path: Path) -> bytes:
+        if path.parent == config.storage.backup_dir:
+            raise AssertionError("production backup digest loaded the complete snapshot")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
 
     runtime = create_production_mcp_runtime(config_path, secret_store=_secret_store())
 

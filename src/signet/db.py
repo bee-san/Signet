@@ -602,7 +602,23 @@ class Database:
             or not receipt.artifact_path.is_absolute()
         ):
             raise MigrationIntegrityError("pre-migration backup receipt is inconsistent")
+        artifact_path = receipt.artifact_path.resolve()
+        live_paths = tuple(
+            candidate.resolve()
+            for candidate in (
+                self.path,
+                Path(f"{self.path}-wal"),
+                Path(f"{self.path}-shm"),
+            )
+        )
+        if artifact_path in live_paths:
+            raise MigrationIntegrityError("pre-migration backup receipt is inconsistent")
         _require_private_file(receipt.artifact_path, label="pre-migration backup artifact")
+        if any(
+            candidate.exists() and receipt.artifact_path.samefile(candidate)
+            for candidate in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm"))
+        ):
+            raise MigrationIntegrityError("pre-migration backup receipt is inconsistent")
         if receipt.artifact_path.stat().st_size <= 0:
             raise MigrationIntegrityError("pre-migration backup artifact is empty")
         actual_digest = _file_sha256(receipt.artifact_path)

@@ -684,6 +684,21 @@ def test_migration_backup_receipt_digest_is_verified_without_read_bytes(
     database._verify_migration_backup_receipt(receipt, LATEST_SCHEMA_VERSION)
 
 
+def test_migration_backup_receipt_rejects_the_live_database_artifact(tmp_path: Path) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+    receipt = MigrationBackupReceipt(
+        database_path=database.path,
+        source_schema_version=LATEST_SCHEMA_VERSION,
+        artifact_path=database.path.absolute(),
+        artifact_sha256=hashlib.sha256(database.path.read_bytes()).hexdigest(),
+        verified_restore_schema_version=LATEST_SCHEMA_VERSION,
+    )
+
+    with pytest.raises(MigrationIntegrityError, match="inconsistent"):
+        database._verify_migration_backup_receipt(receipt, LATEST_SCHEMA_VERSION)
+
+
 def test_preflight_schema_version_reads_committed_wal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
