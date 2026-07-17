@@ -241,9 +241,9 @@ def test_discovery_transaction_rejects_stale_expected_connector_generation(
 
     assert store.current_tools("mail") == ()
     with store.database.read() as connection:
-        run_count = connection.execute(
-            "SELECT count(*) FROM connector_discovery_runs"
-        ).fetchone()[0]
+        run_count = connection.execute("SELECT count(*) FROM connector_discovery_runs").fetchone()[
+            0
+        ]
     assert run_count == 0
 
 

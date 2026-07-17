@@ -165,9 +165,9 @@ async def test_live_discovery_rejects_connector_generation_changed_during_networ
 
     assert store.current_tools("mail") == ()
     with store.database.read() as connection:
-        run_count = connection.execute(
-            "SELECT count(*) FROM connector_discovery_runs"
-        ).fetchone()[0]
+        run_count = connection.execute("SELECT count(*) FROM connector_discovery_runs").fetchone()[
+            0
+        ]
     assert run_count == 0
 
 
