@@ -412,8 +412,16 @@ def downgrade_schema_13(connection: Any) -> None:
     connection.execute("DROP TABLE plugin_tool_mappings")
     connection.execute("DROP TABLE plugin_active")
     connection.execute("DROP TABLE plugin_manifests")
+    connection.execute("DROP TABLE production_secret_generations")
+    connection.execute("DROP TABLE production_secret_references")
+    connection.execute("DROP TABLE production_user_factors")
+    connection.execute("DROP TABLE production_services")
+    connection.execute("DROP TABLE production_policies")
+    connection.execute("DROP TABLE production_connectors")
+    connection.execute("DROP TABLE production_users")
+    connection.execute("DROP TABLE production_setup_state")
     connection.execute("DROP TABLE privacy_maintenance")
-    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15)")
+    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15, 16)")
     connection.execute("PRAGMA user_version = 12")
 
 
@@ -2174,12 +2182,12 @@ def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
         )
     assert backups == [12]
     with bundle.database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert (
             connection.execute(
-                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14, 15)"
+                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14, 15, 16)"
             ).fetchone()[0]
-            == 3
+            == 4
         )
 
     # Both privacy migrations are committed, so recovery must not repeat a backup.

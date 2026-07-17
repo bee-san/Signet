@@ -215,8 +215,16 @@ def _downgrade_catalog_to_schema_12(database: Database) -> None:
         connection.execute("DROP TABLE plugin_tool_mappings")
         connection.execute("DROP TABLE plugin_active")
         connection.execute("DROP TABLE plugin_manifests")
+        connection.execute("DROP TABLE production_secret_generations")
+        connection.execute("DROP TABLE production_secret_references")
+        connection.execute("DROP TABLE production_user_factors")
+        connection.execute("DROP TABLE production_services")
+        connection.execute("DROP TABLE production_policies")
+        connection.execute("DROP TABLE production_connectors")
+        connection.execute("DROP TABLE production_users")
+        connection.execute("DROP TABLE production_setup_state")
         connection.execute("DROP TABLE privacy_maintenance")
-        connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15)")
+        connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15, 16)")
         connection.execute("PRAGMA user_version = 12")
 
 
