@@ -515,6 +515,40 @@ def test_standard_factory_creates_and_verifies_required_upgrade_backup(
     legacy_database.initialize()
     with legacy_database.transaction() as connection:
         connection.execute("DROP INDEX auth_credentials_one_active_totp")
+        connection.executemany(
+            """
+            INSERT INTO auth_credentials(
+                credential_id, user_id, kind, public_material,
+                secret_reference, enrolled_at, disabled_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                (
+                    "x" * 47 + " " + "tail",
+                    config.owner_user_id,
+                    "totp",
+                    None,
+                    "keychain://signet/totp",
+                    2,
+                ),
+                (
+                    "shared-passkey-prefix-" * 3 + "one",
+                    config.owner_user_id,
+                    "webauthn",
+                    b"first-public-key",
+                    None,
+                    None,
+                ),
+                (
+                    "shared-passkey-prefix-" * 3 + "two",
+                    config.owner_user_id,
+                    "webauthn",
+                    b"second-public-key",
+                    None,
+                    None,
+                ),
+            ),
+        )
     monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 16)
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     config_path.chmod(0o600)
@@ -524,6 +558,14 @@ def test_standard_factory_creates_and_verifies_required_upgrade_backup(
     assert runtime.app is not None
     with Database(config.storage.database_path).read() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        labels = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT factor_label FROM auth_credentials ORDER BY credential_id"
+            )
+        )
+    assert len(labels) == len(set(labels)) == 3
+    assert all(label == label.strip() for label in labels)
     backups = tuple(config.storage.backup_dir.glob("signet-pre-migration-v15-*.sqlite3"))
     assert len(backups) == 1
     Database.verify_snapshot(backups[0])

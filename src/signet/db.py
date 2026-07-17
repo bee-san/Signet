@@ -605,7 +605,7 @@ class Database:
         _require_private_file(receipt.artifact_path, label="pre-migration backup artifact")
         if receipt.artifact_path.stat().st_size <= 0:
             raise MigrationIntegrityError("pre-migration backup artifact is empty")
-        actual_digest = hashlib.sha256(receipt.artifact_path.read_bytes()).hexdigest()
+        actual_digest = _file_sha256(receipt.artifact_path)
         if actual_digest != receipt.artifact_sha256:
             raise MigrationIntegrityError("pre-migration backup artifact digest is inconsistent")
 
@@ -777,6 +777,14 @@ def _private_file_metadata(metadata: os.stat_result) -> bool:
         and metadata.st_uid == current_uid
         and stat.S_IMODE(metadata.st_mode) == 0o600
     )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _sql_statements(script: str) -> Iterator[str]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,7 @@ from signet.db import (
     DatabaseError,
     DatabaseFinalizationStateUnknown,
     IncompatibleSchemaError,
+    MigrationBackupReceipt,
     MigrationIntegrityError,
 )
 from signet.models import (
@@ -652,6 +654,34 @@ def test_generic_operation_failure_combined_with_lock_failure_is_bounded(
     assert "stop Signet processes and inspect the private maintenance lock" in message
     assert "injected raw" not in message
     assert unlock_calls == 1
+
+
+def test_migration_backup_receipt_digest_is_verified_without_read_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+    artifact = tmp_path / "large-backup.signet"
+    content = b"x" * (2 * 1024 * 1024 + 1)
+    artifact.write_bytes(content)
+    artifact.chmod(0o600)
+    receipt = MigrationBackupReceipt(
+        database_path=database.path,
+        source_schema_version=LATEST_SCHEMA_VERSION,
+        artifact_path=artifact,
+        artifact_sha256=hashlib.sha256(content).hexdigest(),
+        verified_restore_schema_version=LATEST_SCHEMA_VERSION,
+    )
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path: Path) -> bytes:
+        if path == artifact:
+            raise AssertionError("migration receipt loaded the complete artifact")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    database._verify_migration_backup_receipt(receipt, LATEST_SCHEMA_VERSION)
 
 
 def test_preflight_schema_version_reads_committed_wal(

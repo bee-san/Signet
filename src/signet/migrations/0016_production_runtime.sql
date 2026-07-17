@@ -5,7 +5,7 @@ ALTER TABLE auth_credentials ADD COLUMN factor_label TEXT NOT NULL
     CHECK (length(factor_label) BETWEEN 1 AND 64 AND factor_label = trim(factor_label));
 
 UPDATE auth_credentials
-SET factor_label = kind || ' ' || substr(credential_id, 1, 48);
+SET factor_label = kind || ' ' || printf('%016x', rowid);
 
 CREATE UNIQUE INDEX auth_credentials_active_factor_label
     ON auth_credentials(user_id, kind, factor_label)
