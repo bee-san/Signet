@@ -139,6 +139,9 @@ and remain disabled.
 
 ## Human authentication
 
+The production factor contract, data model, and abuse-case matrix live in
+[docs/reviews/02-security-contract.md](reviews/02-security-contract.md).
+
 ### WebAuthn
 
 WebAuthn/passkeys are primary because a user-verifying authenticator signs a
