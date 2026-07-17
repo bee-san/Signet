@@ -130,8 +130,11 @@ A stdio configuration replaces `url` with both `command_ref` and
 Transport-specific fields cannot be mixed. Cleartext HTTP is allowed only for a
 loopback host; URLs cannot carry user information, query parameters, or fragments.
 The configured transport must be allowed by the exact plugin connector template.
-Signet computes, persists, and prints the canonical connector-configuration digest
-when it configures an alias. There is no connector `--sha256` flag.
+Signet validates the canonical connector-configuration SHA-256 internally, then
+persists and prints a domain-separated connector-generation digest bound to that
+hash, the alias, the exact plugin ID/version/manifest, and the connector ID. This
+lets an unchanged connector document become a distinct immutable generation after
+a plugin upgrade. There is no connector `--sha256` flag.
 
 For live stdio discovery, the opaque command reference must resolve through a
 separately reviewed, SHA-256-pinned command document. Its version 1 shape
@@ -217,6 +220,12 @@ Live discovery is limited to MCP initialization followed by bounded, paginated
 8 MiB aggregate data; repeated, empty, or oversized cursors fail closed. The
 discovery client has no `tools/call`, sampling, elicitation, resources, or prompts
 operation. A live flag does not broaden that interface.
+
+Both fixture and live onboarding discovery persist only in the dedicated integration
+tables. They never read, write, disable, publish, or restore the runtime
+`schema_cache`, even when a staged alias matches an existing managed downstream.
+The returned schema-change summary is inert metadata and sends no runtime
+notifications.
 
 Durable workspace cardinality is also bounded: at most 128 plugin IDs, 128
 connector aliases, and 512 retained exact tool names per alias. A new identity

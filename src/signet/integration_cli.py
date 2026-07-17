@@ -55,6 +55,7 @@ from signet.integration_store import (
     PluginIdentity,
     PluginRecord,
     SQLiteIntegrationStore,
+    connector_generation_digest,
 )
 from signet.plugin_manifest import (
     ConnectorTemplate,
@@ -432,8 +433,14 @@ def _validated_stored_config(
         raise IntegrationStoreError("connector plugin generation is no longer current")
     document = store.connector_configuration(connector.alias)
     validated = parse_connector_config(canonical_json(document), template=template)
-    if not hmac.compare_digest(validated.sha256, connector.config_digest):
-        raise IntegrationStoreError("connector configuration digest no longer matches")
+    expected_digest = connector_generation_digest(
+        alias=connector.alias,
+        plugin=connector.plugin,
+        connector_id=connector.connector_id,
+        canonical_config_sha256=validated.sha256,
+    )
+    if not hmac.compare_digest(expected_digest, connector.config_digest):
+        raise IntegrationStoreError("connector generation digest no longer matches")
     return validated
 
 

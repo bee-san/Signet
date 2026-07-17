@@ -18,7 +18,7 @@
       <div><dt>Connector</dt><dd>{{ item.connector_display_name }}</dd></div>
       <div><dt>Connector alias</dt><dd class="hash-value">{{ item.connector_alias }}</dd></div>
       <div><dt>Connector ID</dt><dd class="hash-value">{{ item.connector_id }}</dd></div>
-      <div class="context-wide"><dt>Configuration digest</dt><dd class="hash-value">{{ item.connector_config_digest }}</dd></div>
+      <div class="context-wide"><dt>Connector generation digest</dt><dd class="hash-value">{{ item.connector_config_digest }}</dd></div>
       <div><dt>Discovery status</dt><dd>{{ item.discovery_status|replace('_', ' ') }}</dd></div>
       <div><dt>Discovery source</dt><dd>{{ item.discovery_source }}</dd></div>
       {% set discovery_time = item.discovered_at|utc_time %}

@@ -419,7 +419,7 @@ class SQLiteIntegrationStore:
                 "credential_ref": credential_ref,
             }
             canonical = canonical_json(envelope)
-            digest = sha256_hex(canonical)
+            canonical_config_digest = sha256_hex(canonical)
         else:
             canonical = bytes(canonical_config_bytes)
             _validate_digest(cast(str, canonical_config_sha256), "connector configuration digest")
@@ -443,8 +443,8 @@ class SQLiteIntegrationStore:
                     "canonical connector configuration does not match its detached fields"
                 )
             _reject_credentials(noncredential_config)
-            digest = cast(str, canonical_config_sha256)
-            if not hmac.compare_digest(sha256_hex(canonical), digest):
+            canonical_config_digest = cast(str, canonical_config_sha256)
+            if not hmac.compare_digest(sha256_hex(canonical), canonical_config_digest):
                 raise IntegrationStoreError(
                     "canonical connector configuration digest does not match"
                 )
@@ -485,6 +485,12 @@ class SQLiteIntegrationStore:
                 ).fetchone()
                 if exists is None:
                     raise IntegrationStoreError("connector is not declared by the active plugin")
+                digest = connector_generation_digest(
+                    alias=alias,
+                    plugin=identity,
+                    connector_id=connector_id,
+                    canonical_config_sha256=canonical_config_digest,
+                )
                 connection.execute(
                     """
                     INSERT INTO connector_configurations(
@@ -569,7 +575,16 @@ class SQLiteIntegrationStore:
             ).fetchone()
         if row is None:
             raise IntegrationStoreError("connector configuration is unavailable")
-        value = _strict_json(bytes(row["canonical_config"]))
+        canonical = bytes(row["canonical_config"])
+        expected_digest = connector_generation_digest(
+            alias=connector.alias,
+            plugin=connector.plugin,
+            connector_id=connector.connector_id,
+            canonical_config_sha256=sha256_hex(canonical),
+        )
+        if not hmac.compare_digest(expected_digest, connector.config_digest):
+            raise IntegrationStoreError("connector generation digest no longer matches")
+        value = _strict_json(canonical)
         if not isinstance(value, dict):
             raise IntegrationStoreError("connector configuration is invalid")
         return value
@@ -1448,6 +1463,34 @@ def _review_from_row(row: Any) -> EffectReviewRecord:
         auth_kind=cast(Literal["totp", "webauthn"], str(row["auth_kind"])),
         auth_use_id=str(row["auth_use_id"]),
         reviewed_at=int(row["reviewed_at"]),
+    )
+
+
+def connector_generation_digest(
+    *,
+    alias: str,
+    plugin: PluginIdentity,
+    connector_id: str,
+    canonical_config_sha256: str,
+) -> str:
+    """Bind one canonical connector document to its exact durable generation."""
+
+    _validate_alias(alias)
+    if not connector_id:
+        raise ValueError("connector identifier is invalid")
+    _validate_digest(canonical_config_sha256, "canonical connector configuration digest")
+    return sha256_hex(
+        canonical_json(
+            {
+                "alias": alias,
+                "canonical_config_sha256": canonical_config_sha256,
+                "connector_generation_digest_version": 1,
+                "connector_id": connector_id,
+                "manifest_sha256": plugin.manifest_sha256,
+                "plugin_id": plugin.plugin_id,
+                "plugin_version": plugin.plugin_version,
+            }
+        )
     )
 
 

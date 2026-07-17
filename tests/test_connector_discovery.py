@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from signet.canonical import canonical_json
 from signet.connector_discovery import (
     ConnectorDiscoveryError,
     ConnectorDiscoveryService,
@@ -14,6 +15,7 @@ from signet.connector_discovery import (
 )
 from signet.db import Database
 from signet.integration_store import SQLiteIntegrationStore
+from signet.mcp_mirror import tool_schema_digest
 from signet.plugin_manifest import load_reference_discovery_fixture, load_reference_plugin
 
 NOW = 2_100_000_000
@@ -104,23 +106,64 @@ async def test_fixture_discovery_is_staged_unreviewed_and_removal_is_durable(
     assert not outcome.schema_refresh.list_changed
     assert store.current_valid_review("mail", "search_email") is None
     with store.database.read() as connection:
-        rows = connection.execute(
-            """
-            SELECT review_state, reviewed_at, present FROM schema_cache
-            WHERE downstream_alias = 'mail'
-            """
-        ).fetchall()
-    assert len(rows) == 5
-    assert {tuple(row) for row in rows} == {("unreviewed", None, 1)}
+        assert connection.execute("SELECT count(*) FROM schema_cache").fetchone()[0] == 0
 
     removed = await service.discover_fixture("mail", {"tools": []}, discovered_at=NOW + 3)
     assert removed.discovery.tool_count == 0
     assert all(not item.present for item in store.current_tools("mail", include_removed=True))
     with store.database.read() as connection:
-        states = connection.execute(
-            "SELECT review_state, reviewed_at, present FROM schema_cache"
-        ).fetchall()
-    assert {tuple(row) for row in states} == {("disabled_drift", None, 0)}
+        assert connection.execute("SELECT count(*) FROM schema_cache").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_staged_discovery_never_mutates_live_schema_cache(
+    store: SQLiteIntegrationStore,
+) -> None:
+    service = ConnectorDiscoveryService.staged(store)
+    live_tool = tool("live_read")
+    live_digest = tool_schema_digest(live_tool)
+    with store.database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO schema_cache(
+                downstream_alias, tool_name, schema_digest, tool_schema_json,
+                discovered_at, review_state, reviewed_at, present
+            ) VALUES (?, ?, ?, ?, ?, 'approved', ?, 1)
+            """,
+            (
+                "mail",
+                "live_read",
+                live_digest,
+                canonical_json(live_tool),
+                NOW,
+                NOW,
+            ),
+        )
+    with store.database.read() as connection:
+        before = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM schema_cache ORDER BY downstream_alias, tool_name"
+            )
+        )
+
+    outcome = await service.discover_fixture(
+        "mail",
+        load_reference_discovery_fixture("fastmail"),
+        discovered_at=NOW + 2,
+    )
+
+    with store.database.read() as connection:
+        after = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM schema_cache ORDER BY downstream_alias, tool_name"
+            )
+        )
+    assert after == before
+    assert outcome.schema_refresh.changed_tools
+    assert not outcome.schema_refresh.list_changed
+    assert outcome.schema_refresh.notifications_sent == 0
 
 
 @pytest.mark.asyncio

@@ -19,9 +19,15 @@ from signet.integration_store import (
     IntegrationStoreError,
     SQLiteIntegrationStore,
 )
-from signet.mcp_mirror import MirrorError, SchemaMirror, raw_model, validate_lossless_tool
+from signet.mcp_mirror import (
+    MirrorError,
+    SchemaMirror,
+    raw_model,
+    tool_schema_digest,
+    validate_lossless_tool,
+)
 from signet.policy import parse_policy
-from signet.schema_registry import DurableSchemaRegistry, SchemaRefresh
+from signet.schema_registry import SchemaRefresh
 
 
 class ConnectorDiscoveryError(RuntimeError):
@@ -78,22 +84,10 @@ class ConnectorDiscoveryService:
         max_aggregate_bytes: int = 8 * 1024 * 1024,
         timeout_seconds: float = 30.0,
     ) -> ConnectorDiscoveryService:
-        """Construct an inert registry with no configured or mounted tool surface."""
+        """Construct discovery state isolated from every live runtime schema surface."""
 
-        mirror = SchemaMirror(
-            parse_policy({"version": 1, "default_mode": "deny", "downstreams": {}})
-        )
-        registry = DurableSchemaRegistry(
-            database=store.database,
-            mirror=mirror,
-            surfaces={},
-            max_tools_per_alias=max_tools,
-            max_aggregate_bytes=max_aggregate_bytes,
-        )
-        registry.restore()
         return cls(
             store,
-            registry,
             max_pages=max_pages,
             max_tools=max_tools,
             max_aggregate_bytes=max_aggregate_bytes,
@@ -103,7 +97,6 @@ class ConnectorDiscoveryService:
     def __init__(
         self,
         store: SQLiteIntegrationStore,
-        schema_registry: DurableSchemaRegistry,
         *,
         max_pages: int = 32,
         max_tools: int = 512,
@@ -122,7 +115,6 @@ class ConnectorDiscoveryService:
         ):
             raise ValueError("connector discovery bounds are invalid")
         self._store = store
-        self._schema_registry = schema_registry
         self._max_pages = max_pages
         self._max_tools = max_tools
         self._max_aggregate_bytes = max_aggregate_bytes
@@ -311,6 +303,10 @@ class ConnectorDiscoveryService:
             if mapping is not None:
                 packet.append(plugin_evidence(mapping.action_id, mapping.proposed_effect))
             evidence[name] = tuple(packet)
+        previous_state = {
+            item.tool_name: (item.schema_digest, item.present)
+            for item in self._store.current_tools(alias, include_removed=True)
+        }
         try:
             discovery = self._store.record_discovery(
                 alias=alias,
@@ -323,10 +319,21 @@ class ConnectorDiscoveryService:
             )
         except ConnectorGenerationChangedError as exc:
             raise ConnectorDiscoveryError("connector changed during discovery") from exc
-        refresh = await self._schema_registry.refresh_staged(
-            alias,
-            raw_tools,
-            discovered_at=discovered_at,
+        next_state = {str(tool["name"]): (tool_schema_digest(tool), True) for tool in raw_tools}
+        for name, (digest, _present) in previous_state.items():
+            next_state.setdefault(name, (digest, False))
+        changed = tuple(
+            sorted(
+                name
+                for name in previous_state.keys() | next_state.keys()
+                if previous_state.get(name) != next_state.get(name)
+            )
+        )
+        refresh = SchemaRefresh(
+            alias=alias,
+            changed_tools=changed,
+            list_changed=False,
+            notifications_sent=0,
         )
         return DiscoveryOutcome(discovery=discovery, schema_refresh=refresh)
 

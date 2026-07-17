@@ -25,6 +25,7 @@ from signet.integration_store import (
     EffectReviewRecord,
     IntegrationStoreError,
     SQLiteIntegrationStore,
+    connector_generation_digest,
 )
 from signet.plugin_manifest import (
     ValidatedPluginManifest,
@@ -247,6 +248,33 @@ def test_discovery_transaction_rejects_stale_expected_connector_generation(
     assert run_count == 0
 
 
+def test_plugin_upgrade_accepts_unchanged_connector_configuration(
+    store: SQLiteIntegrationStore,
+) -> None:
+    plugin = install_fastmail(store)
+    configure_fastmail(store)
+    first = store.active_connector("mail")
+    upgraded_data = copy.deepcopy(plugin.manifest.model_dump(mode="json", exclude_none=True))
+    upgraded_data["plugin_version"] = "1.0.1"
+    upgraded = parse_plugin_manifest(canonical_json(upgraded_data))
+    store.install_plugin(upgraded, installed_at=NOW + 2)
+
+    second = store.configure_connector(
+        plugin_id="signet.fastmail",
+        connector_id="fastmail",
+        alias="mail",
+        config={"transport": "streamable_http", "url": "https://mcp.test/fastmail"},
+        credential_ref="keychain://signet/fastmail/test",
+        credential_identity_digest="a" * 64,
+        configured_at=NOW + 3,
+    )
+
+    assert second.plugin.plugin_version == "1.0.1"
+    assert second.config_digest != first.config_digest
+    assert store.active_connector("mail") == second
+    assert store.connector_configuration("mail")["config"]["url"] == ("https://mcp.test/fastmail")
+
+
 def test_durable_workspace_bounds_reject_new_identities_without_hiding_state(
     store: SQLiteIntegrationStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -331,7 +359,14 @@ def test_connector_can_persist_the_exact_validated_configuration_digest(
         configured_at=NOW + 1,
     )
 
-    assert configured.config_digest == validated.sha256
+    expected_generation_digest = connector_generation_digest(
+        alias=configured.alias,
+        plugin=configured.plugin,
+        connector_id=configured.connector_id,
+        canonical_config_sha256=validated.sha256,
+    )
+    assert configured.config_digest == expected_generation_digest
+    assert configured.config_digest != validated.sha256
     assert store.connector_configuration("mail") == validated.config.model_dump(
         mode="json", exclude_none=True
     )

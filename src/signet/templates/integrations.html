@@ -41,7 +41,7 @@
           <div><dt>Connector ID</dt><dd class="hash-value">{{ connector.connector_id }}</dd></div>
           <div><dt>Discovery source</dt><dd>{{ connector.discovery_source or 'Not discovered' }}</dd></div>
           {% if connector.discovered_at is not none %}{% set discovery_time = connector.discovered_at|utc_time %}<div><dt>Discovered</dt><dd><time datetime="{{ discovery_time.iso }}">{{ discovery_time.display }}</time></dd></div>{% endif %}
-          <div class="context-wide"><dt>Configuration digest</dt><dd class="hash-value">{{ connector.config_digest }}</dd></div>
+          <div class="context-wide"><dt>Connector generation digest</dt><dd class="hash-value">{{ connector.config_digest }}</dd></div>
           {% if connector.server_identity_digest %}<div class="context-wide"><dt>Server identity digest</dt><dd class="hash-value">{{ connector.server_identity_digest }}</dd></div>{% endif %}
         </dl>
 
