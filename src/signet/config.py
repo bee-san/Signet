@@ -267,6 +267,10 @@ class ProductionConfig(BaseModel):
     @classmethod
     def origin_requires_https(cls, value: str) -> str:
         parsed = urlsplit(value)
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("public_origin must use canonical HTTPS serialization") from None
         if (
             parsed.scheme != "https"
             or not parsed.hostname
@@ -278,6 +282,18 @@ class ProductionConfig(BaseModel):
             or value.endswith("/")
         ):
             raise ValueError("public_origin must be an HTTPS origin without a trailing slash")
+        try:
+            hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            raise ValueError("public_origin hostname is invalid") from None
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("public_origin port is invalid")
+        authority = f"[{hostname}]" if ":" in hostname else hostname
+        canonical = f"https://{authority}"
+        if port is not None and port != 443:
+            canonical = f"{canonical}:{port}"
+        if value != canonical:
+            raise ValueError("public_origin must use canonical HTTPS serialization")
         return value
 
     @field_validator("mcp_host", "web_host")

@@ -666,7 +666,12 @@ async def test_registry_verifier_does_not_block_the_event_loop() -> None:
     assert verified.subject == "profile:blocked"
 
 
-def test_cli_requires_explicit_factory_and_mcp_loopback() -> None:
+def test_cli_requires_explicit_factory_and_loopback_listeners() -> None:
+    calls: list[None] = []
+
+    def runner(*_args: object, **_kwargs: object) -> None:
+        calls.append(None)
+
     with pytest.raises(SystemExit):
         main([])
     with pytest.raises(SystemExit):
@@ -679,10 +684,23 @@ def test_cli_requires_explicit_factory_and_mcp_loopback() -> None:
                 "tests.factories:create_mcp",
                 "--host",
                 "0.0.0.0",
-            ]
+            ],
+            runner=runner,
+        )
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "serve-web",
+                "--factory",
+                "tests.factories:create_web",
+                "--host",
+                "0.0.0.0",
+            ],
+            runner=runner,
         )
     with pytest.raises(SystemExit):
         main(["serve-web", "--factory", "not a factory"])
+    assert calls == []
 
 
 def test_cli_platform_support_is_explicitly_posix_only() -> None:

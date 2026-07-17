@@ -169,6 +169,30 @@ def test_production_config_rejects_unsafe_or_ambiguous_values(
         ProductionConfig.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    "origin",
+    (
+        "https://signet.example.test:bad",
+        "https://signet.example.test:99999",
+        "https://Signet.example.test",
+    ),
+)
+def test_noncanonical_public_origin_is_rejected_before_database_initialization(
+    tmp_path: Path,
+    origin: str,
+) -> None:
+    config_path = tmp_path / "production.json"
+    payload = _production_payload(tmp_path)
+    payload["public_origin"] = origin
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    config_path.chmod(0o600)
+
+    with pytest.raises(ProductionAssemblyError, match="configuration is invalid"):
+        create_production_assembly(config_path, secret_store=_secret_store())
+
+    assert not (Path(payload["storage"]["data_dir"]) / "signet.db").exists()
+
+
 def test_production_config_rejects_mixed_connector_transport_fields(tmp_path: Path) -> None:
     payload = _production_payload(tmp_path)
     payload["connectors"]["mail"]["command"] = ["/usr/bin/false"]

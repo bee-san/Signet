@@ -63,7 +63,7 @@ def main(
         return
     if _FACTORY_PATTERN.fullmatch(args.factory) is None:
         parser.error("--factory must be an explicit module.path:callable reference")
-    if args.command == "serve-mcp":
+    if args.command in {"serve-mcp", "serve-web"}:
         try:
             _loopback_address(args.host)
         except RuntimeAssemblyError as exc:
