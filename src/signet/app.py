@@ -6,6 +6,7 @@ import argparse
 import re
 import sys
 from collections.abc import Callable, Sequence
+from typing import Literal
 
 import uvicorn
 
@@ -23,6 +24,16 @@ from signet.runtime import RuntimeAssemblyError, _loopback_address
 _FACTORY_PATTERN = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$"
 )
+_PRODUCTION_FACTORIES: dict[tuple[str, str], Literal["mcp", "web"]] = {
+    (
+        "serve-mcp",
+        "signet.production:create_production_mcp_app_from_environment",
+    ): "mcp",
+    (
+        "serve-web",
+        "signet.production:create_production_web_app_from_environment",
+    ): "web",
+}
 Runner = Callable[..., None]
 
 
@@ -68,6 +79,19 @@ def main(
             _loopback_address(args.host)
         except RuntimeAssemblyError as exc:
             parser.error(str(exc))
+    production_service = _PRODUCTION_FACTORIES.get((args.command, args.factory))
+    if production_service is not None:
+        from signet.production import (
+            ProductionAssemblyError,
+            production_listener_from_environment,
+        )
+
+        try:
+            expected_host, expected_port = production_listener_from_environment(production_service)
+        except (ProductionAssemblyError, ValueError) as exc:
+            parser.error(str(exc))
+        if (args.host, args.port) != (expected_host, expected_port):
+            parser.error("listener host and port must match the production configuration")
 
     selected_runner = runner or uvicorn.run
     selected_runner(

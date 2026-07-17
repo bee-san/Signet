@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from fastapi import FastAPI
 from starlette.applications import Starlette
@@ -344,6 +344,19 @@ def create_production_web_app_from_environment(
         _production_config_path_from_environment(),
         secret_store=secret_store or KeychainSecretStore(),
     )
+
+
+def production_listener_from_environment(
+    service: Literal["mcp", "web"],
+) -> tuple[str, int]:
+    """Return the configured endpoint for a production environment factory."""
+
+    config = load_production_config(_production_config_path_from_environment())
+    if service == "mcp":
+        return config.mcp_host, config.mcp_port
+    if service == "web":
+        return config.web_host, config.web_port
+    raise ValueError("production listener service is invalid")
 
 
 def build_production_runtime(

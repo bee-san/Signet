@@ -572,7 +572,21 @@ class Database:
             return 0
         if len(header) != 100 or header[:16] != b"SQLite format 3\x00":
             raise MigrationIntegrityError("database header is missing or invalid")
-        return int.from_bytes(header[60:64], byteorder="big")
+        header_version = int.from_bytes(header[60:64], byteorder="big")
+        if not Path(f"{self.path}-wal").exists():
+            return header_version
+        try:
+            connection = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=ro",
+                uri=True,
+                timeout=self.timeout,
+            )
+            try:
+                return int(connection.execute("PRAGMA user_version").fetchone()[0])
+            finally:
+                connection.close()
+        except sqlite3.DatabaseError as exc:
+            raise MigrationIntegrityError("database schema version could not be read") from exc
 
     def _verify_migration_backup_receipt(
         self,

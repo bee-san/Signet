@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+import signet.db as db_module
 from signet.auth import (
     TOTP_PROOF_DOMAIN,
     ActionBinding,
@@ -651,6 +652,36 @@ def test_generic_operation_failure_combined_with_lock_failure_is_bounded(
     assert "stop Signet processes and inspect the private maintenance lock" in message
     assert "injected raw" not in message
     assert unlock_calls == 1
+
+
+def test_preflight_schema_version_reads_committed_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", LATEST_SCHEMA_VERSION - 1)
+    database.initialize()
+    reader = database.connect()
+    try:
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+        monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", LATEST_SCHEMA_VERSION)
+        database.initialize(
+            pre_migration_backup=verified_backup_callback(tmp_path / "upgrade-backups", [])
+        )
+
+        with database.path.open("rb") as stream:
+            stream.seek(60)
+            main_file_version = int.from_bytes(stream.read(4), byteorder="big")
+        assert main_file_version == LATEST_SCHEMA_VERSION - 1
+
+        restarted = Database(database.path)
+        restarted.initialize()
+        with restarted.read() as connection:
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
+    finally:
+        reader.rollback()
+        reader.close()
 
 
 def test_newer_schema_is_refused_before_application_work(tmp_path: Path) -> None:

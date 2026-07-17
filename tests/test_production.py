@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 import signet.db as db_module
 import signet.production as production_module
+from signet.app import main as run_cli
 from signet.config import ProductionConfig
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
 from signet.db import Database
@@ -416,6 +417,63 @@ def test_environment_asgi_factories_use_only_the_private_config_path(
 
     assert mcp_app is not None
     assert web_app is not None
+
+
+@pytest.mark.parametrize(
+    ("command", "factory", "host", "port"),
+    (
+        (
+            "serve-mcp",
+            "signet.production:create_production_mcp_app_from_environment",
+            "127.0.0.2",
+            9000,
+        ),
+        (
+            "serve-web",
+            "signet.production:create_production_web_app_from_environment",
+            "127.0.0.3",
+            9001,
+        ),
+    ),
+)
+def test_environment_factories_require_the_configured_listener_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    factory: str,
+    host: str,
+    port: int,
+) -> None:
+    payload = _production_payload(tmp_path)
+    service = command.removeprefix("serve-")
+    payload[f"{service}_host"] = host
+    payload[f"{service}_port"] = port
+    config_path = tmp_path / "production.json"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    config_path.chmod(0o600)
+    monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", str(config_path))
+    calls: list[dict[str, Any]] = []
+
+    def runner(_app: str, **kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    with pytest.raises(SystemExit):
+        run_cli([command, "--factory", factory], runner=runner)
+    assert calls == []
+
+    run_cli(
+        [command, "--factory", factory, "--host", host, "--port", str(port)],
+        runner=runner,
+    )
+    assert calls == [
+        {
+            "factory": True,
+            "host": host,
+            "port": port,
+            "server_header": False,
+            "limit_concurrency": 64,
+        }
+    ]
 
 
 def test_service_specific_factories_do_not_construct_unused_sibling_apps(
