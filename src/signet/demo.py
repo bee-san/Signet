@@ -69,7 +69,12 @@ from signet.credential_broker import (
     TokenRegistry,
 )
 from signet.crypto import PayloadCipher
-from signet.db import Database, DatabaseError, DatabaseFinalizationStateUnknown
+from signet.db import (
+    Database,
+    DatabaseError,
+    DatabaseFinalizationStateUnknown,
+    MigrationBackupReceipt,
+)
 from signet.delivery import DeliveryDispatcher, DeliveryError, FrozenRequestLoader
 from signet.execution_scope import PolicyExecutionScopeResolver
 from signet.freezer import RequestFreezer
@@ -228,12 +233,12 @@ class DemoBackupService:
     def create_pre_migration_callback(
         self,
         backup_directory: Path,
-    ) -> Callable[[Database, int], None]:
+    ) -> Callable[[Database, int], MigrationBackupReceipt]:
         callback = self._manager.create_pre_migration_callback(backup_directory)
 
-        def locked_backup(database: Database, current_version: int) -> None:
+        def locked_backup(database: Database, current_version: int) -> MigrationBackupReceipt:
             with _demo_backup_maintenance_lock(self.root):
-                callback(database, current_version)
+                return callback(database, current_version)
 
         return locked_backup
 

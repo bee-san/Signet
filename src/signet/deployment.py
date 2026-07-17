@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import ipaddress
 import json
 import os
@@ -31,7 +32,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from signet.auth import InvalidCredentials, canonical_user_id
 from signet.credential_broker import SQLiteTokenRegistry, StoredTokenMetadata
-from signet.db import Database, DatabaseError
+from signet.db import Database, DatabaseError, MigrationBackupReceipt
 from signet.gateway_tools import GATEWAY_TOOL_DEFINITIONS, GatewayPrincipal, GatewayToolSurface
 from signet.mcp_mirror import domain_error_result
 from signet.private_paths import PrivatePathError, ensure_private_directory
@@ -572,9 +573,16 @@ def _migrate_command(config: DisabledDeploymentConfig, destination: Path) -> Non
         raise DeploymentError("the backup snapshot path must not use symbolic links")
     database = Database(config.database_path)
 
-    def backup(selected: Database, prior_version: int) -> None:
-        del prior_version
-        selected.create_snapshot(destination)
+    def backup(selected: Database, prior_version: int) -> MigrationBackupReceipt:
+        snapshot = selected.create_snapshot(destination)
+        Database.verify_snapshot(snapshot)
+        return MigrationBackupReceipt(
+            database_path=selected.path,
+            source_schema_version=prior_version,
+            artifact_path=snapshot.absolute(),
+            artifact_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            verified_restore_schema_version=prior_version,
+        )
 
     try:
         database.initialize(pre_migration_backup=backup)

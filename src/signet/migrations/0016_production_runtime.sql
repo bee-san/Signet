@@ -1,29 +1,22 @@
+DROP INDEX IF EXISTS auth_credentials_one_active_totp;
+
+ALTER TABLE auth_credentials ADD COLUMN factor_label TEXT NOT NULL
+    DEFAULT 'Primary factor'
+    CHECK (length(factor_label) BETWEEN 1 AND 64 AND factor_label = trim(factor_label));
+
+UPDATE auth_credentials
+SET factor_label = kind || ' ' || substr(credential_id, 1, 48);
+
+CREATE UNIQUE INDEX auth_credentials_active_factor_label
+    ON auth_credentials(user_id, kind, factor_label)
+    WHERE disabled_at IS NULL;
+
 CREATE TABLE production_users (
     user_id TEXT PRIMARY KEY NOT NULL CHECK (length(user_id) BETWEEN 1 AND 256),
     state TEXT NOT NULL CHECK (state IN ('staged', 'active', 'disabled')),
     created_at INTEGER NOT NULL CHECK (created_at >= 0),
     updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
 ) STRICT;
-
-CREATE TABLE production_user_factors (
-    factor_id TEXT PRIMARY KEY NOT NULL CHECK (length(factor_id) BETWEEN 1 AND 128),
-    user_id TEXT NOT NULL REFERENCES production_users(user_id) ON DELETE RESTRICT,
-    factor_kind TEXT NOT NULL CHECK (factor_kind IN ('password', 'totp', 'webauthn')),
-    label TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 128),
-    state TEXT NOT NULL CHECK (state IN ('staged', 'active', 'revoked')),
-    credential_ref TEXT CHECK (
-        credential_ref IS NULL OR (
-            length(credential_ref) BETWEEN 12 AND 512 AND
-            substr(credential_ref, 1, 11) = 'keychain://'
-        )
-    ),
-    created_at INTEGER NOT NULL CHECK (created_at >= 0),
-    updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
-    UNIQUE(user_id, factor_kind, label)
-) STRICT;
-
-CREATE INDEX idx_production_user_factors_user_id
-    ON production_user_factors(user_id);
 
 CREATE TABLE production_connectors (
     connector_alias TEXT PRIMARY KEY NOT NULL CHECK (
@@ -48,17 +41,6 @@ CREATE TABLE production_connectors (
     updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
 ) STRICT;
 
-CREATE TABLE production_policies (
-    policy_name TEXT PRIMARY KEY NOT NULL CHECK (length(policy_name) BETWEEN 1 AND 128),
-    policy_version INTEGER NOT NULL CHECK (policy_version > 0),
-    policy_digest TEXT NOT NULL CHECK (
-        length(policy_digest) = 64 AND policy_digest NOT GLOB '*[^0-9a-f]*'
-    ),
-    state TEXT NOT NULL CHECK (state IN ('staged', 'published', 'active', 'retired')),
-    created_at INTEGER NOT NULL CHECK (created_at >= 0),
-    updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
-) STRICT;
-
 CREATE TABLE production_secret_references (
     secret_ref TEXT PRIMARY KEY NOT NULL CHECK (
         length(secret_ref) BETWEEN 12 AND 512 AND
@@ -67,25 +49,21 @@ CREATE TABLE production_secret_references (
     purpose TEXT NOT NULL UNIQUE CHECK (
         length(purpose) BETWEEN 1 AND 64 AND purpose NOT GLOB '*[^a-z0-9_]*'
     ),
-    state TEXT NOT NULL CHECK (state IN ('required', 'present', 'missing', 'disabled')),
-    current_generation INTEGER NOT NULL CHECK (current_generation >= 1),
-    created_at INTEGER NOT NULL CHECK (created_at >= 0),
-    updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
-) STRICT;
-
-CREATE TABLE production_secret_generations (
-    secret_ref TEXT NOT NULL REFERENCES production_secret_references(secret_ref) ON DELETE RESTRICT,
-    generation INTEGER NOT NULL CHECK (generation >= 1),
-    identity_digest TEXT NOT NULL CHECK (
-        length(identity_digest) = 64 AND identity_digest NOT GLOB '*[^0-9a-f]*'
+    current_generation INTEGER CHECK (current_generation >= 1),
+    material_identity_digest TEXT CHECK (
+        length(material_identity_digest) = 64 AND
+        material_identity_digest NOT GLOB '*[^0-9a-f]*'
     ),
-    state TEXT NOT NULL CHECK (state IN ('current', 'rotated', 'revoked', 'missing')),
-    observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
-    PRIMARY KEY (secret_ref, generation)
+    state TEXT NOT NULL CHECK (state IN ('required', 'present', 'missing', 'disabled')),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+    CHECK (
+        (state = 'present' AND current_generation IS NOT NULL
+            AND material_identity_digest IS NOT NULL) OR
+        (state <> 'present' AND current_generation IS NULL
+            AND material_identity_digest IS NULL)
+    )
 ) STRICT;
-
-CREATE INDEX idx_production_secret_generations_secret_ref
-    ON production_secret_generations(secret_ref);
 
 CREATE TABLE production_services (
     service_name TEXT PRIMARY KEY NOT NULL CHECK (length(service_name) BETWEEN 1 AND 128),

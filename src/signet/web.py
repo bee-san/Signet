@@ -1031,7 +1031,11 @@ def create_web_app(
     @app.get("/healthz")
     async def healthz() -> Response:
         probe = getattr(app.state, "signet_health_probe", None)
-        if probe is not None and (not callable(probe) or probe() is not True):
+        try:
+            healthy = probe is None or (callable(probe) and probe() is True)
+        except Exception:
+            healthy = False
+        if not healthy:
             return JSONResponse(
                 {"status": "unavailable", "service": "signet-web"},
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

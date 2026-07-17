@@ -12,7 +12,6 @@ from typing import Any, Literal
 from signet.canonical import canonical_json
 from signet.config import ProductionConfig
 from signet.db import Database
-from signet.policy import PolicySnapshot, policy_config_hash
 
 _CAPABILITY_ORDER = (
     "storage_ready",
@@ -47,12 +46,23 @@ class ProductionServiceStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class ProductionFactorStatus:
+    user_id: str
+    kind: str
+    label: str
+    state: Literal["active", "disabled"]
+    enrolled_at: int
+    last_used_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class ProductionStatus:
     schema_version: int
     setup_status: str
     ready: bool
     missing_prerequisites: tuple[str, ...]
     services: Mapping[str, ProductionServiceStatus]
+    factors: Mapping[str, ProductionFactorStatus]
 
 
 class ProductionStateStore:
@@ -64,10 +74,10 @@ class ProductionStateStore:
     def stage(
         self,
         config: ProductionConfig,
-        policy: PolicySnapshot,
         *,
         capabilities: Mapping[str, bool],
         secret_references: Mapping[str, str],
+        secret_identities: Mapping[str, str],
         services: tuple[ProductionServiceRecord, ...],
         now: int,
     ) -> None:
@@ -101,9 +111,12 @@ class ProductionStateStore:
                 """,
                 (config.owner_user_id, now, now),
             )
-            self._stage_factors(connection, config, now=now)
-            self._stage_policy(connection, policy, now=now)
-            self._stage_secrets(connection, secret_references, now=now)
+            self._stage_secrets(
+                connection,
+                secret_references,
+                identities=secret_identities,
+                now=now,
+            )
             self._stage_connectors(connection, config, now=now)
             self._stage_services(
                 connection,
@@ -122,7 +135,7 @@ class ProductionStateStore:
             )
             stored = connection.execute(
                 """
-                SELECT config_version, config_digest, capability_status_json
+                SELECT config_version, config_digest
                 FROM production_setup_state WHERE state_id = 1
                 """
             ).fetchone()
@@ -130,9 +143,110 @@ class ProductionStateStore:
                 stored is None
                 or stored["config_version"] != config.version
                 or stored["config_digest"] != config_digest
-                or stored["capability_status_json"] != capability_json
             ):
                 raise ProductionStateError("durable production setup state has diverged")
+
+    def record_worker_state(
+        self,
+        state: Literal["ready", "blocked", "stopped"],
+        *,
+        ready: bool,
+        now: int,
+    ) -> None:
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("production worker state time is invalid")
+        with self.database.transaction() as connection:
+            setup = connection.execute(
+                "SELECT capability_status_json FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()
+            if setup is None:
+                raise ProductionStateError("production setup state is unavailable")
+            capabilities = self._parse_capabilities(setup["capability_status_json"])
+            capabilities["workers_ready"] = ready
+            changed = connection.execute(
+                """
+                UPDATE production_services SET state = ?, updated_at = ?
+                WHERE service_name = 'maintenance' AND service_kind = 'maintenance'
+                """,
+                (state, now),
+            ).rowcount
+            if changed != 1:
+                raise ProductionStateError("production maintenance service is unavailable")
+            connection.execute(
+                """
+                UPDATE production_setup_state
+                SET capability_status_json = ?, updated_at = ?
+                WHERE state_id = 1
+                """,
+                (
+                    json.dumps(capabilities, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
+
+    def record_service_state(
+        self,
+        service_name: str,
+        state: Literal["ready", "blocked", "stopped"],
+        *,
+        capability: Literal["mcp_ready", "web_ready"],
+        ready: bool,
+        now: int,
+    ) -> None:
+        if (state == "ready") != ready:
+            raise ValueError("service readiness does not match lifecycle state")
+        with self.database.transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE production_services SET state = ?, updated_at = ?
+                WHERE service_name = ?
+                """,
+                (state, now, service_name),
+            ).rowcount
+            setup = connection.execute(
+                "SELECT capability_status_json FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()
+            if updated != 1 or setup is None:
+                raise ProductionStateError("production service state is not staged")
+            capabilities = self._parse_capabilities(setup["capability_status_json"])
+            capabilities[capability] = ready
+            connection.execute(
+                """
+                UPDATE production_setup_state
+                SET capability_status_json = ?, updated_at = ? WHERE state_id = 1
+                """,
+                (json.dumps(capabilities, sort_keys=True, separators=(",", ":")), now),
+            )
+
+    def rotate_secret(
+        self,
+        purpose: str,
+        *,
+        reference: str,
+        current_identity: str,
+        new_identity: str,
+        now: int,
+    ) -> None:
+        if any(
+            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+            for value in (current_identity, new_identity)
+        ):
+            raise ValueError("secret identity digest is invalid")
+        if current_identity == new_identity:
+            raise ValueError("secret rotation requires new material identity")
+        with self.database.transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE production_secret_references
+                SET current_generation = current_generation + 1,
+                    material_identity_digest = ?, updated_at = ?
+                WHERE purpose = ? AND secret_ref = ? AND state = 'present'
+                  AND material_identity_digest = ?
+                """,
+                (new_identity, now, purpose, reference, current_identity),
+            ).rowcount
+            if updated != 1:
+                raise ProductionStateError("secret rotation precondition failed")
 
     def status(self) -> ProductionStatus:
         with self.database.read() as connection:
@@ -149,16 +263,16 @@ class ProductionStateStore:
                 FROM production_services ORDER BY service_name
                 """
             ).fetchall()
+            factor_rows = connection.execute(
+                """
+                SELECT credential_id, user_id, kind, factor_label, enrolled_at,
+                       disabled_at, last_used_at
+                FROM auth_credentials ORDER BY credential_id
+                """
+            ).fetchall()
         if setup is None:
             raise ProductionStateError("production setup state is unavailable")
-        try:
-            capabilities = json.loads(str(setup["capability_status_json"]))
-        except (TypeError, ValueError) as exc:
-            raise ProductionStateError("production capability state is invalid") from exc
-        if not isinstance(capabilities, dict) or tuple(sorted(capabilities)) != tuple(
-            sorted(_CAPABILITY_ORDER)
-        ):
-            raise ProductionStateError("production capability state is invalid")
+        capabilities = self._parse_capabilities(setup["capability_status_json"])
         missing = tuple(name for name in _CAPABILITY_ORDER if capabilities.get(name) is not True)
         setup_status = str(setup["setup_status"])
         services = MappingProxyType(
@@ -172,138 +286,111 @@ class ProductionStateStore:
                 for row in rows
             }
         )
+        factors = MappingProxyType(
+            {
+                str(row["credential_id"]): ProductionFactorStatus(
+                    user_id=str(row["user_id"]),
+                    kind=str(row["kind"]),
+                    label=str(row["factor_label"]),
+                    state="disabled" if row["disabled_at"] is not None else "active",
+                    enrolled_at=int(row["enrolled_at"]),
+                    last_used_at=(
+                        int(row["last_used_at"]) if row["last_used_at"] is not None else None
+                    ),
+                )
+                for row in factor_rows
+            }
+        )
         return ProductionStatus(
             schema_version=schema_version,
             setup_status=setup_status,
             ready=setup_status == "ready" and not missing,
             missing_prerequisites=missing,
             services=services,
+            factors=factors,
         )
 
     @staticmethod
-    def _stage_factors(connection: Any, config: ProductionConfig, *, now: int) -> None:
-        factors: list[tuple[str, str | None]] = [("password", None)]
-        if config.secrets.totp_secret_ref is not None:
-            factors.append(("totp", config.secrets.totp_secret_ref))
-        for kind, reference in factors:
-            factor_id = hashlib.sha256(
-                canonical_json(
-                    {
-                        "factor_kind": kind,
-                        "label": "primary",
-                        "user_id": config.owner_user_id,
-                    }
-                )
-            ).hexdigest()
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO production_user_factors(
-                    factor_id, user_id, factor_kind, label, state,
-                    credential_ref, created_at, updated_at
-                ) VALUES (?, ?, ?, 'primary', 'staged', ?, ?, ?)
-                """,
-                (factor_id, config.owner_user_id, kind, reference, now, now),
-            )
-            stored = connection.execute(
-                """
-                SELECT user_id, factor_kind, label, state, credential_ref
-                FROM production_user_factors WHERE factor_id = ?
-                """,
-                (factor_id,),
-            ).fetchone()
-            if stored is None or tuple(stored) != (
-                config.owner_user_id,
-                kind,
-                "primary",
-                "staged",
-                reference,
-            ):
-                raise ProductionStateError("durable production factor inventory has diverged")
-
-    @staticmethod
-    def _stage_policy(connection: Any, policy: PolicySnapshot, *, now: int) -> None:
-        digest = policy_config_hash(policy)
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO production_policies(
-                policy_name, policy_version, policy_digest, state, created_at, updated_at
-            ) VALUES ('primary', ?, ?, 'staged', ?, ?)
-            """,
-            (policy.version, digest, now, now),
-        )
-        stored = connection.execute(
-            """
-            SELECT policy_version, policy_digest FROM production_policies
-            WHERE policy_name = 'primary'
-            """
-        ).fetchone()
+    def _parse_capabilities(payload: Any) -> dict[str, bool]:
+        try:
+            capabilities = json.loads(str(payload))
+        except (TypeError, ValueError) as exc:
+            raise ProductionStateError("production capability state is invalid") from exc
         if (
-            stored is None
-            or stored["policy_version"] != policy.version
-            or stored["policy_digest"] != digest
+            not isinstance(capabilities, dict)
+            or tuple(sorted(capabilities)) != tuple(sorted(_CAPABILITY_ORDER))
+            or any(not isinstance(value, bool) for value in capabilities.values())
         ):
-            raise ProductionStateError("durable production policy differs from configured policy")
+            raise ProductionStateError("production capability state is invalid")
+        return capabilities
 
     @staticmethod
     def _stage_secrets(
         connection: Any,
         references: Mapping[str, str],
         *,
+        identities: Mapping[str, str],
         now: int,
     ) -> None:
+        if set(identities) - set(references) or any(
+            len(identity) != 64
+            or any(character not in "0123456789abcdef" for character in identity)
+            for identity in identities.values()
+        ):
+            raise ValueError("production secret identity inventory is invalid")
         for purpose, reference in references.items():
-            identity_digest = hashlib.sha256(
-                canonical_json(
-                    {
-                        "generation": 1,
-                        "purpose": purpose,
-                        "secret_ref": reference,
-                    }
-                )
-            ).hexdigest()
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO production_secret_references(
-                    secret_ref, purpose, state, current_generation, created_at, updated_at
-                ) VALUES (?, ?, 'present', 1, ?, ?)
-                """,
-                (reference, purpose, now, now),
-            )
+            identity = identities.get(purpose)
             stored = connection.execute(
                 """
-                SELECT purpose, state, current_generation
-                FROM production_secret_references WHERE secret_ref = ?
+                SELECT secret_ref, state, current_generation, material_identity_digest
+                FROM production_secret_references WHERE purpose = ?
                 """,
-                (reference,),
+                (purpose,),
             ).fetchone()
-            if (
-                stored is None
-                or stored["purpose"] != purpose
-                or stored["state"] != "present"
-                or stored["current_generation"] != 1
-            ):
+            if stored is None:
+                connection.execute(
+                    """
+                    INSERT INTO production_secret_references(
+                        secret_ref, purpose, current_generation,
+                        material_identity_digest, state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        reference,
+                        purpose,
+                        1 if identity is not None else None,
+                        identity,
+                        "present" if identity is not None else "required",
+                        now,
+                        now,
+                    ),
+                )
+                continue
+            if stored["secret_ref"] != reference:
                 raise ProductionStateError("durable production secret inventory has diverged")
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO production_secret_generations(
-                    secret_ref, generation, identity_digest, state, observed_at
-                ) VALUES (?, 1, ?, 'current', ?)
-                """,
-                (reference, identity_digest, now),
-            )
-            generation = connection.execute(
-                """
-                SELECT identity_digest, state FROM production_secret_generations
-                WHERE secret_ref = ? AND generation = 1
-                """,
-                (reference,),
-            ).fetchone()
+            if identity is None:
+                if stored["state"] != "required":
+                    raise ProductionStateError("required secret identity is no longer observable")
+                continue
+            if stored["state"] == "required":
+                connection.execute(
+                    """
+                    UPDATE production_secret_references
+                    SET current_generation = 1, material_identity_digest = ?,
+                        state = 'present', updated_at = ?
+                    WHERE purpose = ? AND state = 'required'
+                    """,
+                    (identity, now, purpose),
+                )
+                continue
             if (
-                generation is None
-                or generation["identity_digest"] != identity_digest
-                or generation["state"] != "current"
+                stored["state"] != "present"
+                or stored["current_generation"] is None
+                or stored["material_identity_digest"] != identity
             ):
-                raise ProductionStateError("durable production secret generation has diverged")
+                raise ProductionStateError(
+                    "secret material changed without an explicit generation rotation"
+                )
 
     @staticmethod
     def _stage_connectors(connection: Any, config: ProductionConfig, *, now: int) -> None:
@@ -384,7 +471,7 @@ class ProductionStateStore:
             )
             stored = connection.execute(
                 """
-                SELECT service_kind, host, port, state, config_digest
+                SELECT service_kind, host, port, config_digest
                 FROM production_services WHERE service_name = ?
                 """,
                 (service.name,),
@@ -393,7 +480,6 @@ class ProductionStateStore:
                 service.kind,
                 service.host,
                 service.port,
-                service.state,
                 config_digest,
             ):
                 raise ProductionStateError("durable production service differs from config")

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import stat
@@ -40,7 +42,12 @@ from signet.credential_broker import (
     SQLiteTokenRegistry,
 )
 from signet.crypto import PayloadCipher
-from signet.db import Database, PreMigrationBackup
+from signet.db import (
+    Database,
+    MigrationBackupReceipt,
+    PreMigrationBackup,
+    PreMigrationBackupRequired,
+)
 from signet.execution_scope import PolicyExecutionScopeResolver
 from signet.freezer import RequestFreezer
 from signet.gateway import GatewayCallPipeline, RawDownstreamClient
@@ -63,13 +70,24 @@ from signet.production_state import (
     ProductionStateStore,
     ProductionStatus,
 )
-from signet.runtime import MCPRuntime, assemble_mcp_runtime, gateway_principal_provider
+from signet.runtime import (
+    LoopbackPeerMiddleware,
+    MCPRuntime,
+    assemble_mcp_runtime,
+    gateway_principal_provider,
+)
 from signet.schema_registry import DurableSchemaRegistry, SchemaRegistryError
+from signet.staging import StagingError, open_confined_readonly, read_verified_descriptor
 from signet.state_machine import ApprovalStateMachine
 from signet.totp import SQLiteTotpCredentialRepository, TotpVerifier
 from signet.web import CsrfManager, WebSettings, create_web_app
-from signet.web_backend import EncryptedPayloadReviewer, PolicyPromotionBoundary
-from signet.web_backend import WebBackend as PersistentWebBackend
+from signet.web_backend import (
+    EncryptedPayloadReviewer,
+    PolicyPromotionBoundary,
+)
+from signet.web_backend import (
+    WebBackend as PersistentWebBackend,
+)
 from signet.webauthn import (
     SQLiteWebAuthnRepository,
     WebAuthnAssertionVerifier,
@@ -81,15 +99,6 @@ _REQUIRED_SECRET_PURPOSES = (
     "csrf_secret_ref",
     "capability_key_ref",
     "payload_key_ref",
-)
-_CAPABILITY_ORDER = (
-    "storage_ready",
-    "secret_broker_ready",
-    "mcp_ready",
-    "web_ready",
-    "workers_ready",
-    "policy_ready",
-    "live_providers_ready",
 )
 _MAX_PRIVATE_DOCUMENT_BYTES = 1_048_576
 
@@ -155,15 +164,19 @@ class ProductionWorkers:
         *,
         approvals: ApprovalStateMachine,
         policy_promotions: SQLitePolicyPromotionBoundary,
+        state: ProductionStateStore,
+        clock: Callable[[], int],
         interval_seconds: float = 5.0,
     ) -> None:
         if interval_seconds < 0.1 or interval_seconds > 300:
             raise ValueError("production worker interval must be 0.1 to 300 seconds")
         self._approvals = approvals
         self._policy_promotions = policy_promotions
+        self._state = state
+        self._clock = clock
         self._interval_seconds = interval_seconds
         self._running = False
-        self._healthy = True
+        self._healthy = False
 
     @property
     def running(self) -> bool:
@@ -174,7 +187,7 @@ class ProductionWorkers:
         return self._healthy
 
     async def run_once(self, *, now: int | None = None) -> None:
-        selected_now = int(time.time()) if now is None else now
+        selected_now = self._clock() if now is None else now
         if not isinstance(selected_now, int) or isinstance(selected_now, bool) or selected_now < 0:
             raise ValueError("production maintenance time is invalid")
         try:
@@ -182,8 +195,12 @@ class ProductionWorkers:
             await _run_sync(self._approvals.sweep_expired, now=selected_now, limit=100)
         except BaseException:
             self._healthy = False
+            if self._running:
+                self._state.record_worker_state("blocked", ready=False, now=selected_now)
             raise
-        self._healthy = True
+        if self._running:
+            self._healthy = True
+            self._state.record_worker_state("ready", ready=True, now=selected_now)
 
     async def serve(self, stop: asyncio.Event) -> None:
         """Recover execution fences, then maintain state until the stop event is set."""
@@ -193,30 +210,48 @@ class ProductionWorkers:
         if self._running:
             raise RuntimeError("production workers are already running")
         self._running = True
+        self._healthy = False
+        failed = False
         try:
-            await _run_sync(self._approvals.recover_startup, now=int(time.time()))
+            selected_now = self._clock()
+            self._state.record_worker_state("blocked", ready=False, now=selected_now)
+            await _run_sync(self._approvals.recover_startup, now=selected_now)
+            self._healthy = True
+            self._state.record_worker_state("ready", ready=True, now=selected_now)
             while not stop.is_set():
                 await self.run_once()
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=self._interval_seconds)
                 except TimeoutError:
                     continue
+        except BaseException:
+            failed = True
+            self._healthy = False
+            self._state.record_worker_state("blocked", ready=False, now=self._clock())
+            raise
         finally:
             self._running = False
+            if not failed:
+                self._healthy = False
+                self._state.record_worker_state("stopped", ready=False, now=self._clock())
 
 
 @dataclass(frozen=True, slots=True)
 class ProductionAssembly:
     config: ProductionConfig
     database: Database
-    policy: PolicySnapshot
-    mcp: MCPRuntime
-    web: FastAPI
+    policy_engine: PolicyEngine
+    mcp: MCPRuntime | None
+    web: FastAPI | None
     workers: ProductionWorkers
     state: ProductionStateStore
     schema_registry: DurableSchemaRegistry
     token_registry: SQLiteTokenRegistry
     provider_clients: Mapping[str, MCPClient]
+
+    @property
+    def policy(self) -> PolicySnapshot:
+        return self.policy_engine.snapshot
 
     def status(self) -> ProductionStatus:
         return self.state.status()
@@ -229,8 +264,8 @@ def load_production_config(path: str | os.PathLike[str]) -> ProductionConfig:
     payload = _read_private_config(config_path)
     try:
         return ProductionConfig.model_validate_json(payload)
-    except Exception as exc:
-        raise ProductionAssemblyError("production configuration is invalid") from exc
+    except Exception:
+        raise ProductionAssemblyError("production configuration is invalid") from None
 
 
 def create_production_assembly(
@@ -238,11 +273,18 @@ def create_production_assembly(
     *,
     secret_store: SecretStore,
     pre_migration_backup: PreMigrationBackup | None = None,
+    components: frozenset[str] = frozenset({"mcp", "web"}),
 ) -> ProductionAssembly:
+    config = load_production_config(config_path)
     return build_production_runtime(
-        load_production_config(config_path),
+        config,
         secret_store=secret_store,
-        pre_migration_backup=pre_migration_backup,
+        components=components,
+        pre_migration_backup=(
+            pre_migration_backup
+            if pre_migration_backup is not None
+            else _snapshot_pre_migration_backup(config.storage.backup_dir)
+        ),
     )
 
 
@@ -252,11 +294,15 @@ def create_production_mcp_runtime(
     secret_store: SecretStore,
     pre_migration_backup: PreMigrationBackup | None = None,
 ) -> MCPRuntime:
-    return create_production_assembly(
+    runtime = create_production_assembly(
         config_path,
         secret_store=secret_store,
         pre_migration_backup=pre_migration_backup,
+        components=frozenset({"mcp"}),
     ).mcp
+    if runtime is None:
+        raise AssertionError("MCP assembly did not produce its requested component")
+    return runtime
 
 
 def create_production_web_app(
@@ -265,11 +311,15 @@ def create_production_web_app(
     secret_store: SecretStore,
     pre_migration_backup: PreMigrationBackup | None = None,
 ) -> FastAPI:
-    return create_production_assembly(
+    app = create_production_assembly(
         config_path,
         secret_store=secret_store,
         pre_migration_backup=pre_migration_backup,
+        components=frozenset({"web"}),
     ).web
+    if app is None:
+        raise AssertionError("web assembly did not produce its requested component")
+    return app
 
 
 def create_production_mcp_app_from_environment(
@@ -302,9 +352,12 @@ def build_production_runtime(
     secret_store: SecretStore,
     pre_migration_backup: PreMigrationBackup | None = None,
     clock: Callable[[], int] | None = None,
+    components: frozenset[str] = frozenset({"mcp", "web"}),
 ) -> ProductionAssembly:
     """Assemble MCP, web, and provider-free workers without any provider calls."""
 
+    if not components <= {"mcp", "web"}:
+        raise ProductionAssemblyError("production component selection is invalid")
     now = clock or (lambda: int(time.time()))
     selected_now = now()
     if not isinstance(selected_now, int) or isinstance(selected_now, bool) or selected_now < 0:
@@ -313,11 +366,36 @@ def build_production_runtime(
     config.prepare_directories()
     policy = _load_policy(config.policy_path)
     _validate_policy_connector_bindings(config, policy)
-    secret_references, secret_values = _resolve_secret_inventory(config, secret_store)
-    _resolve_connector_credentials(config, secret_store)
+    secret_references, secret_values, secret_identities = _resolve_secret_inventory(
+        config,
+        secret_store,
+    )
 
     database = Database(config.storage.data_dir / "signet.db")
-    database.initialize(pre_migration_backup=pre_migration_backup)
+    verified_backup_version: int | None = None
+
+    def track_verified_backup(
+        database: Database,
+        current_version: int,
+    ) -> MigrationBackupReceipt:
+        nonlocal verified_backup_version
+        if pre_migration_backup is None:
+            raise AssertionError("pre-migration backup wrapper was installed without a callback")
+        receipt = pre_migration_backup(database, current_version)
+        verified_backup_version = current_version
+        return receipt
+
+    try:
+        database.initialize(
+            pre_migration_backup=(
+                track_verified_backup if pre_migration_backup is not None else None
+            )
+        )
+    except PreMigrationBackupRequired:
+        raise ProductionAssemblyError(
+            "production schema upgrade requires a verified pre-migration backup; "
+            "migration was not started"
+        ) from None
 
     capabilities = ProofCapability(secret_values["capability_key_ref"].reveal().encode("utf-8"))
     payload_cipher = PayloadCipher(
@@ -372,16 +450,21 @@ def build_production_runtime(
     def apply_policy(snapshot: PolicySnapshot) -> None:
         mirror.apply_policy(snapshot)
 
-    policy_promotions = SQLitePolicyPromotionBoundary(
-        database,
-        approvals,
-        reviewer,
-        engine,
-        config.policy_path,
-        apply_policy=apply_policy,
-        publication_gate=mirror,
-        notify_list_changed=notify_list_changed,
-    )
+    try:
+        policy_promotions = SQLitePolicyPromotionBoundary(
+            database,
+            approvals,
+            reviewer,
+            engine,
+            config.policy_path,
+            apply_policy=apply_policy,
+            publication_gate=mirror,
+            notify_list_changed=notify_list_changed,
+        )
+    except Exception:
+        if verified_backup_version is not None:
+            raise _post_migration_startup_failure(verified_backup_version) from None
+        raise
     pipeline = GatewayCallPipeline(
         mirror=mirror,
         downstream_clients=cast(Mapping[str, RawDownstreamClient], clients),
@@ -405,6 +488,8 @@ def build_production_runtime(
     try:
         schema_registry.restore()
     except SchemaRegistryError:
+        if verified_backup_version is not None:
+            raise _post_migration_startup_failure(verified_backup_version) from None
         raise ProductionAssemblyError(
             "the durable production tool schema cache failed closed"
         ) from None
@@ -431,14 +516,130 @@ def build_production_runtime(
         principal_provider=gateway_principal_provider(config.owner_user_id),
     )
     token_registry = SQLiteTokenRegistry(database, allowed_principals={})
-    mcp = assemble_mcp_runtime(
-        aliases=surfaces,
-        approvals=gateway_surface,
-        tokens=token_registry,
-        bind_host=config.mcp_host,
-        bind_port=config.mcp_port,
+    runtime_states: list[ProductionStateStore] = []
+
+    def mcp_readiness() -> bool:
+        return bool(runtime_states and runtime_states[0].status().services["mcp"].state == "ready")
+
+    def observe_mcp_lifecycle(state_name: str) -> None:
+        if state_name not in {"ready", "blocked", "stopped"}:
+            raise ProductionAssemblyError("MCP lifecycle emitted an invalid state")
+        runtime_states[0].record_service_state(
+            "mcp",
+            cast(Any, state_name),
+            capability="mcp_ready",
+            ready=state_name == "ready",
+            now=now(),
+        )
+
+    mcp = (
+        assemble_mcp_runtime(
+            aliases=surfaces,
+            approvals=gateway_surface,
+            tokens=token_registry,
+            bind_host=config.mcp_host,
+            bind_port=config.mcp_port,
+            health_probe=mcp_readiness,
+            readiness_probe=mcp_readiness,
+            lifecycle_observer=observe_mcp_lifecycle,
+        )
+        if "mcp" in components
+        else None
     )
 
+    web = (
+        _assemble_production_web(
+            database=database,
+            config=config,
+            secret_values=secret_values,
+            capabilities=capabilities,
+            limiter=limiter,
+            totp=totp,
+            approvals=approvals,
+            reviewer=reviewer,
+            policy_promotions=policy_promotions,
+        )
+        if "web" in components
+        else None
+    )
+    capability_status = MappingProxyType(
+        {
+            "storage_ready": True,
+            "secret_broker_ready": all(
+                purpose in secret_identities for purpose in _REQUIRED_SECRET_PURPOSES
+            ),
+            "mcp_ready": False,
+            "web_ready": False,
+            "workers_ready": False,
+            "policy_ready": policy_promotions.ready,
+            "live_providers_ready": False,
+        }
+    )
+    services = _service_inventory(config, components)
+    state = ProductionStateStore(database)
+    try:
+        state.stage(
+            config,
+            capabilities=capability_status,
+            secret_references=secret_references,
+            secret_identities=secret_identities,
+            services=services,
+            now=selected_now,
+        )
+    except Exception as exc:
+        if verified_backup_version is not None:
+            raise _post_migration_startup_failure(verified_backup_version) from None
+        raise ProductionAssemblyError(str(exc)) from None
+    runtime_states.append(state)
+    workers = ProductionWorkers(
+        approvals=approvals,
+        policy_promotions=policy_promotions,
+        state=state,
+        clock=now,
+    )
+
+    def production_health_probe() -> bool:
+        status = state.status()
+        return (
+            workers.running and workers.healthy and status.services["maintenance"].state == "ready"
+        )
+
+    if web is not None:
+        web.state.signet_health_probe = production_health_probe
+    return ProductionAssembly(
+        config=config,
+        database=database,
+        policy_engine=engine,
+        mcp=mcp,
+        web=web,
+        workers=workers,
+        state=state,
+        schema_registry=schema_registry,
+        token_registry=token_registry,
+        provider_clients=clients,
+    )
+
+
+def _post_migration_startup_failure(previous_version: int) -> ProductionAssemblyError:
+    return ProductionAssemblyError(
+        "production startup failed after upgrading the database from schema "
+        f"{previous_version}; services remain blocked. Stop Signet processes and restore the "
+        "verified pre-migration backup before retrying"
+    )
+
+
+def _assemble_production_web(
+    *,
+    database: Database,
+    config: ProductionConfig,
+    secret_values: Mapping[str, Secret],
+    capabilities: ProofCapability,
+    limiter: SQLiteAttemptLimiter,
+    totp: TotpVerifier,
+    approvals: ApprovalStateMachine,
+    reviewer: EncryptedPayloadReviewer,
+    policy_promotions: SQLitePolicyPromotionBoundary,
+) -> FastAPI:
     sessions = SessionManager(
         SQLiteSessionRepository(database),
         signing_key=secret_values["session_secret_ref"].reveal().encode("utf-8"),
@@ -486,57 +687,48 @@ def build_production_runtime(
         ),
         csrf=CsrfManager(secret_values["csrf_secret_ref"].reveal().encode("utf-8")),
     )
-    workers = ProductionWorkers(
-        approvals=approvals,
-        policy_promotions=policy_promotions,
-    )
+    web.add_middleware(LoopbackPeerMiddleware)
+    return web
 
-    capability_status = MappingProxyType(
-        {name: bool(getattr(config.capabilities, name)) for name in _CAPABILITY_ORDER}
-    )
-    state = ProductionStateStore(database)
-    state.stage(
-        config,
-        policy,
-        capabilities=capability_status,
-        secret_references=secret_references,
-        services=_service_inventory(config, capability_status),
-        now=selected_now,
-    )
 
-    def production_health_probe() -> bool:
-        return workers.healthy and state.status().ready
+def _snapshot_pre_migration_backup(backup_dir: Path) -> PreMigrationBackup:
+    def backup(database: Database, current_version: int) -> MigrationBackupReceipt:
+        destination = backup_dir / (
+            f"signet-pre-migration-v{current_version}-{time.time_ns()}.sqlite3"
+        )
+        snapshot = database.create_snapshot(destination)
+        Database.verify_snapshot(snapshot)
+        return MigrationBackupReceipt(
+            database_path=database.path,
+            source_schema_version=current_version,
+            artifact_path=snapshot.absolute(),
+            artifact_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            verified_restore_schema_version=current_version,
+        )
 
-    web.state.signet_health_probe = production_health_probe
-    return ProductionAssembly(
-        config=config,
-        database=database,
-        policy=policy,
-        mcp=mcp,
-        web=web,
-        workers=workers,
-        state=state,
-        schema_registry=schema_registry,
-        token_registry=token_registry,
-        provider_clients=clients,
-    )
+    return backup
 
 
 def _service_inventory(
     config: ProductionConfig,
-    capabilities: Mapping[str, bool],
+    components: frozenset[str],
 ) -> tuple[ProductionServiceRecord, ...]:
-    def staged(capability: str) -> str:
-        return "staged" if capabilities[capability] else "blocked"
-
     return (
         ProductionServiceRecord(
-            "mcp", "mcp", cast(Any, staged("mcp_ready")), config.mcp_host, config.mcp_port
+            "mcp",
+            "mcp",
+            "staged" if "mcp" in components else "blocked",
+            config.mcp_host,
+            config.mcp_port,
         ),
         ProductionServiceRecord(
-            "web", "web", cast(Any, staged("web_ready")), config.web_host, config.web_port
+            "web",
+            "web",
+            "staged" if "web" in components else "blocked",
+            config.web_host,
+            config.web_port,
         ),
-        ProductionServiceRecord("maintenance", "maintenance", cast(Any, staged("workers_ready"))),
+        ProductionServiceRecord("maintenance", "maintenance", "blocked"),
         ProductionServiceRecord("delivery", "worker", "blocked"),
         ProductionServiceRecord("reconciliation", "worker", "blocked"),
         ProductionServiceRecord("retention", "worker", "blocked"),
@@ -547,7 +739,7 @@ def _service_inventory(
 def _resolve_secret_inventory(
     config: ProductionConfig,
     secret_store: SecretStore,
-) -> tuple[Mapping[str, str], Mapping[str, Secret]]:
+) -> tuple[Mapping[str, str], Mapping[str, Secret], Mapping[str, str]]:
     references = {
         purpose: reference
         for purpose, reference in config.secrets.model_dump().items()
@@ -558,38 +750,40 @@ def _resolve_secret_inventory(
         raise ProductionAssemblyError(
             "required production secret references are missing: " + ", ".join(missing)
         )
+    parsed_references: dict[str, SecretReference] = {}
     values: dict[str, Secret] = {}
     try:
         for purpose, raw_reference in references.items():
-            reference = SecretReference.parse(raw_reference)
+            parsed_references[purpose] = SecretReference.parse(raw_reference)
+        for purpose in _REQUIRED_SECRET_PURPOSES:
+            reference = parsed_references[purpose]
             value = secret_store.get(reference)
-            if purpose in _REQUIRED_SECRET_PURPOSES:
-                encoded = value.reveal().encode("utf-8")
-                if not 32 <= len(encoded) <= 4_096:
-                    raise ProductionAssemblyError(
-                        "production cryptographic secrets must be 32 to 4096 UTF-8 bytes"
-                    )
+            encoded = value.reveal().encode("utf-8")
+            if not 32 <= len(encoded) <= 4_096:
+                raise ProductionAssemblyError(
+                    "production cryptographic secrets must be 32 to 4096 UTF-8 bytes"
+                )
             values[purpose] = value
     except ProductionAssemblyError:
         raise
-    except Exception as exc:
+    except Exception:
         raise ProductionAssemblyError(
             "a configured production secret could not be resolved"
-        ) from exc
-    return MappingProxyType(references), MappingProxyType(values)
-
-
-def _resolve_connector_credentials(
-    config: ProductionConfig,
-    secret_store: SecretStore,
-) -> None:
-    try:
-        for connector in config.connectors.values():
-            secret_store.get(SecretReference.parse(connector.credential_ref))
-    except Exception as exc:
-        raise ProductionAssemblyError(
-            "a configured production connector credential could not be resolved"
-        ) from exc
+        ) from None
+    identity_key = values["capability_key_ref"].reveal().encode("utf-8")
+    identities = {
+        purpose: hmac.new(
+            identity_key,
+            purpose.encode("utf-8") + b"\x00" + value.reveal().encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        for purpose, value in values.items()
+    }
+    return (
+        MappingProxyType(references),
+        MappingProxyType(values),
+        MappingProxyType(identities),
+    )
 
 
 def _validate_policy_connector_bindings(
@@ -640,58 +834,28 @@ def _production_config_path_from_environment() -> Path:
 
 
 def _read_private_document(path: Path, *, label: str) -> str:
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
+        descriptor = open_confined_readonly(Path(path.anchor), path)
+    except (OSError, StagingError) as exc:
         raise ProductionAssemblyError(f"{label} could not be opened safely") from exc
 
     operation_error: BaseException | None = None
     try:
-        before = os.fstat(descriptor)
+        metadata = os.fstat(descriptor)
         require_no_acl_grants(descriptor)
         if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != os.geteuid()
-            or stat.S_IMODE(before.st_mode) != 0o600
-            or before.st_size > _MAX_PRIVATE_DOCUMENT_BYTES
+            metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > _MAX_PRIVATE_DOCUMENT_BYTES
         ):
             raise ProductionAssemblyError(
                 f"{label} must be an owned mode-0600 regular file within the size limit"
             )
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            chunk = os.read(descriptor, min(65_536, _MAX_PRIVATE_DOCUMENT_BYTES + 1 - size))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > _MAX_PRIVATE_DOCUMENT_BYTES:
-                raise ProductionAssemblyError(f"{label} exceeds the size limit")
-        after = os.fstat(descriptor)
-        before_identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_uid,
-            before.st_mode,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        after_identity = (
-            after.st_dev,
-            after.st_ino,
-            after.st_uid,
-            after.st_mode,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        if before_identity != after_identity or size != after.st_size:
-            raise ProductionAssemblyError(f"{label} changed while it was read")
-        return b"".join(chunks).decode("utf-8")
-    except (OSError, PrivatePathError, UnicodeDecodeError) as exc:
+        return read_verified_descriptor(
+            descriptor,
+            maximum_bytes=_MAX_PRIVATE_DOCUMENT_BYTES,
+        ).decode("utf-8")
+    except (OSError, PrivatePathError, StagingError, UnicodeDecodeError) as exc:
         operation_error = exc
         raise ProductionAssemblyError(f"{label} could not be read safely") from exc
     except BaseException as exc:

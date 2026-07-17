@@ -35,6 +35,7 @@ from signet.models import (
 )
 from signet.state_machine import ApprovalStateMachine
 from tests.attachment_fixtures import register_catalog_attachment
+from tests.migration_helpers import verified_backup_callback
 
 TEST_CAPABILITIES = ProofCapability(b"test-only-proof-capability-key-0001")
 
@@ -330,13 +331,9 @@ def test_retention_trigger_migration_is_atomic_and_restartable(tmp_path: Path) -
     with pytest.raises(RuntimeError, match="retention migration"):
         database.initialize(fault_injector=fail_after_trigger_replacement)
     with database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
 
-    backed_up_versions: list[int] = []
-    database.initialize(
-        pre_migration_backup=lambda _database, version: backed_up_versions.append(version)
-    )
-    assert backed_up_versions == [3]
+    database.initialize()
     with database.read() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
         trigger = connection.execute(
@@ -378,16 +375,14 @@ def test_upgrade_requires_and_runs_a_verified_pre_migration_backup(
     with pytest.raises(MigrationIntegrityError, match="backup callback"):
         upgrading.initialize()
 
-    snapshots: list[Path] = []
-
-    def backup(database: Database, current_version: int) -> None:
-        assert current_version == 1
-        snapshot = database.create_snapshot(tmp_path / "pre-migration.sqlite3")
-        Database.verify_snapshot(snapshot)
-        snapshots.append(snapshot)
-
-    upgrading.initialize(pre_migration_backup=backup)
-    assert snapshots
+    backed_up_versions: list[int] = []
+    upgrading.initialize(
+        pre_migration_backup=verified_backup_callback(
+            tmp_path / "pre-migration-backups",
+            backed_up_versions,
+        )
+    )
+    assert backed_up_versions == [1]
     with upgrading.read() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert (
@@ -405,6 +400,9 @@ def test_pre_migration_publication_warning_survives_connection_close_failure(
     database.initialize()
     with database.transaction() as connection:
         connection.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION - 1}")
+        connection.execute(
+            "DELETE FROM schema_meta WHERE migration_id = ?", (LATEST_SCHEMA_VERSION,)
+        )
 
     original_connect = database._connect
     close_calls: list[None] = []
@@ -446,6 +444,9 @@ def test_generic_pre_migration_failure_combined_with_connection_close_is_bounded
     database.initialize()
     with database.transaction() as connection:
         connection.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION - 1}")
+        connection.execute(
+            "DELETE FROM schema_meta WHERE migration_id = ?", (LATEST_SCHEMA_VERSION,)
+        )
 
     original_connect = database._connect
     close_calls: list[None] = []
@@ -503,6 +504,9 @@ def test_pre_migration_publication_warning_survives_all_database_finalizer_failu
     database.initialize()
     with database.transaction() as connection:
         connection.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION - 1}")
+        connection.execute(
+            "DELETE FROM schema_meta WHERE migration_id = ?", (LATEST_SCHEMA_VERSION,)
+        )
 
     original_connect = database._connect
     real_flock = db_module.fcntl.flock
@@ -657,11 +661,17 @@ def test_newer_schema_is_refused_before_application_work(tmp_path: Path) -> None
         connection.execute("PRAGMA user_version=99")
     finally:
         connection.close()
+    wal_path = Path(f"{database.path}-wal")
+    shm_path = Path(f"{database.path}-shm")
+    wal_path.unlink(missing_ok=True)
+    shm_path.unlink(missing_ok=True)
 
     downstream_calls = 0
     with pytest.raises(IncompatibleSchemaError, match="newer"):
         database.initialize()
     assert downstream_calls == 0
+    assert not wal_path.exists()
+    assert not shm_path.exists()
 
 
 def test_applied_migration_checksum_tampering_is_refused(tmp_path: Path) -> None:
@@ -675,6 +685,69 @@ def test_applied_migration_checksum_tampering_is_refused(tmp_path: Path) -> None
 
     with pytest.raises(MigrationIntegrityError, match="checksum"):
         database.initialize()
+
+
+def test_upgrade_validates_existing_migration_history_before_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    monkeypatch.setattr("signet.db.LATEST_SCHEMA_VERSION", 15)
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE schema_meta SET checksum = ? WHERE migration_id = 1",
+            ("0" * 64,),
+        )
+    monkeypatch.setattr("signet.db.LATEST_SCHEMA_VERSION", 16)
+    backups: list[int] = []
+
+    with pytest.raises(MigrationIntegrityError, match="checksum"):
+        database.initialize(
+            pre_migration_backup=verified_backup_callback(tmp_path / "backups", backups)
+        )
+
+    assert backups == []
+    with database.read() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+
+
+def test_upgrade_rejects_noop_backup_receipt_and_rolls_back_failed_postcheck(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    monkeypatch.setattr("signet.db.LATEST_SCHEMA_VERSION", 15)
+    database.initialize()
+    monkeypatch.setattr("signet.db.LATEST_SCHEMA_VERSION", 16)
+
+    with pytest.raises(MigrationIntegrityError, match="receipt"):
+        database.initialize(
+            pre_migration_backup=lambda _database, _version: None  # type: ignore[arg-type,return-value]
+        )
+
+    backups: list[int] = []
+
+    def fail_postcheck(event: str) -> None:
+        if event == "migration:transaction:postcheck":
+            raise RuntimeError("injected postcheck failure")
+
+    with pytest.raises(RuntimeError, match="injected postcheck failure"):
+        database.initialize(
+            pre_migration_backup=verified_backup_callback(tmp_path / "backups", backups),
+            fault_injector=fail_postcheck,
+        )
+
+    assert backups == [15]
+    with database.read() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'production_setup_state'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None:

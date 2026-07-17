@@ -29,10 +29,15 @@ TEST_CAPABILITIES = ProofCapability(b"test-only-proof-capability-key-0001")
 
 @dataclass
 class TotpRepository:
-    credentials: dict[str, TotpCredential]
+    credentials: dict[str, TotpCredential | tuple[TotpCredential, ...]]
 
-    def find_totp(self, user_id: str) -> TotpCredential | None:
-        return self.credentials.get(user_id)
+    def active_totps(self, user_id: str) -> tuple[TotpCredential, ...]:
+        credentials = self.credentials.get(user_id)
+        if credentials is None:
+            return ()
+        if isinstance(credentials, TotpCredential):
+            return (credentials,)
+        return credentials
 
 
 def repository() -> TotpRepository:
@@ -171,6 +176,39 @@ def test_totp_unenrolled_and_unavailable_are_distinct_from_invalid() -> None:
     )
     with pytest.raises(TotpNotEnrolled):
         wrong_owner.verify("human", "fake:any", binding=binding, now=1_000)
+
+
+def test_totp_verifier_accepts_any_active_factor_and_skips_unavailable_factors() -> None:
+    class PerSecretProvider:
+        test_only = True
+
+        def verify_step(self, secret: Secret, proof: str, *, now: int) -> int | None:
+            del now
+            if secret.reveal() == "second-secret" and proof == "fake:second":
+                return 81
+            return None
+
+    credentials = (
+        TotpCredential("totp-first", "human", "keychain://Signet/missing-totp"),
+        TotpCredential("totp-second", "human", "keychain://Signet/second-totp"),
+    )
+    selected = TotpVerifier(
+        TotpRepository({"human": credentials}),
+        MemorySecretStore({("Signet", "second-totp"): "second-secret"}),
+        InMemoryAttemptLimiter(),
+        capabilities=TEST_CAPABILITIES,
+        provider=PerSecretProvider(),
+        allow_test_provider=True,
+    )
+
+    proof = selected.verify(
+        "human",
+        "fake:second",
+        binding=ActionBinding("approve", "request-a", 1, HASH_A),
+        now=1_000,
+    )
+
+    assert proof.credential_id == "totp-second"
 
 
 def test_production_provider_rejects_non_authenticator_shaped_proof() -> None:

@@ -42,6 +42,7 @@ from tests.attachment_fixtures import (
     FAKE_ATTACHMENT_KEY_REF,
     attachment_cipher,
 )
+from tests.migration_helpers import downgrade_auth_credentials_before_schema_16
 
 PAYLOAD_KEY_REF = "keychain://Signet/payload-backupfixture"
 
@@ -165,6 +166,7 @@ def _rewrite_encrypted_archive(
 
 def _downgrade_catalog_to_schema_12(database: Database) -> None:
     with database.transaction() as connection:
+        downgrade_auth_credentials_before_schema_16(connection)
         connection.execute("DROP TABLE attachment_metadata_privacy_maintenance")
         connection.execute("DROP TRIGGER IF EXISTS request_events_structured_reason_insert")
         connection.execute("DROP TRIGGER IF EXISTS web_action_drafts_structured_reason_insert")
@@ -215,11 +217,8 @@ def _downgrade_catalog_to_schema_12(database: Database) -> None:
         connection.execute("DROP TABLE plugin_tool_mappings")
         connection.execute("DROP TABLE plugin_active")
         connection.execute("DROP TABLE plugin_manifests")
-        connection.execute("DROP TABLE production_secret_generations")
         connection.execute("DROP TABLE production_secret_references")
-        connection.execute("DROP TABLE production_user_factors")
         connection.execute("DROP TABLE production_services")
-        connection.execute("DROP TABLE production_policies")
         connection.execute("DROP TABLE production_connectors")
         connection.execute("DROP TABLE production_users")
         connection.execute("DROP TABLE production_setup_state")

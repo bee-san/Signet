@@ -517,8 +517,8 @@ class SQLiteWebAuthnRepository:
                 """
                 INSERT INTO auth_credentials(
                     credential_id, user_id, kind, public_material, enrolled_at,
-                    sign_count, backup_eligible, backup_state, user_handle
-                ) VALUES (?, ?, 'webauthn', ?, ?, ?, ?, ?, ?)
+                    sign_count, backup_eligible, backup_state, user_handle, factor_label
+                ) VALUES (?, ?, 'webauthn', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     credential.credential_id,
@@ -529,6 +529,8 @@ class SQLiteWebAuthnRepository:
                     int(credential.device_type == "multi_device"),
                     int(credential.backed_up),
                     credential.user_handle,
+                    "Passkey "
+                    + hashlib.sha256(credential.credential_id.encode("utf-8")).hexdigest()[:12],
                 ),
             )
             _revoke_user_sessions(connection, user_id, revoked_at=now)

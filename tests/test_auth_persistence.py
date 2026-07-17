@@ -252,6 +252,11 @@ def test_password_and_sessions_survive_restart_and_password_change_revokes(
         ).credential_id
         == "password-two"
     )
+    with after_restart.read() as connection:
+        factor_label = connection.execute(
+            "SELECT factor_label FROM auth_credentials WHERE credential_id = 'password-two'"
+        ).fetchone()[0]
+    assert factor_label.startswith("Password ")
 
 
 def test_persistent_session_clock_rollback_fails_closed(database: Database) -> None:
@@ -293,6 +298,22 @@ def test_totp_and_webauthn_credential_changes_revoke_user_sessions(
     assert SQLiteWebAuthnRepository(restarted(database)).credentials_for_user(USER_ID) == (
         web_credential(),
     )
+
+
+def test_multiple_active_totp_factors_persist_and_can_be_disabled_independently(
+    database: Database,
+) -> None:
+    repository = SQLiteTotpCredentialRepository(database)
+    first = TotpCredential("totp-first", USER_ID, "keychain://Signet/totp-first")
+    second = TotpCredential("totp-second", USER_ID, "keychain://Signet/totp-second")
+
+    repository.add_totp(first, now=10)
+    repository.add_totp(second, now=11)
+
+    restarted_repository = SQLiteTotpCredentialRepository(restarted(database))
+    assert restarted_repository.active_totps(USER_ID) == (first, second)
+    assert restarted_repository.disable_totp("totp-first", USER_ID, now=12)
+    assert restarted_repository.active_totps(USER_ID) == (second,)
 
 
 def test_sqlite_rate_limit_reservations_are_atomic_and_durable(database: Database) -> None:

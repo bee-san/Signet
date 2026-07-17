@@ -551,6 +551,21 @@ def test_agent_listener_has_only_privacy_safe_health() -> None:
     assert "request" not in health.text and "target" not in health.text
 
 
+def test_web_health_probe_fails_closed_without_leaking_details(backend: FakeBackend) -> None:
+    app = _blocking_app(backend)
+
+    def failed_probe() -> bool:
+        raise RuntimeError("private worker detail")
+
+    app.state.signet_health_probe = failed_probe
+    with TestClient(app, base_url=ORIGIN) as client:
+        response = client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable", "service": "signet-web"}
+    assert "private worker detail" not in response.text
+
+
 def _blocking_app(backend: FakeBackend) -> Any:
     return create_web_app(
         backend,
