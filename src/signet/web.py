@@ -28,6 +28,13 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from signet.auth import InvalidSession, SessionPrincipal
+from signet.authenticator_management import AuthenticatorManagementError
+from signet.browser_auth import (
+    BootstrapAlreadyComplete,
+    BootstrapError,
+    BrowserAuthController,
+    ManagementIntent,
+)
 from signet.config import is_valid_allowed_host
 from signet.decision_notes import (
     APPROVAL_REASON_LABELS,
@@ -45,6 +52,10 @@ from signet.effects import (
     TriState,
 )
 from signet.http_security import RequestBodyLimitMiddleware
+from signet.totp import TotpError
+from signet.totp_enrollment import TotpEnrollmentError
+from signet.webauthn import WebAuthnError
+from signet.webauthn_registration import PasskeyRegistrationError
 
 type HumanAction = Literal[
     "approve",
@@ -647,6 +658,7 @@ class WebBackend(Protocol):
         prospective_arguments_json: str | None,
         now: int,
         decision_note: str | None = None,
+        credential_id: str | None = None,
     ) -> str: ...
 
     def subscribe_push(
@@ -693,6 +705,7 @@ class IntegrationWebBackend(Protocol):
         *,
         expected_snapshot_digest: str,
         now: int,
+        credential_id: str | None = None,
     ) -> EffectReviewResult: ...
 
     def begin_passkey_effect_review(
@@ -928,6 +941,7 @@ def create_web_app(
     settings: WebSettings,
     csrf: CsrfManager,
     integrations: IntegrationWebBackend | None = None,
+    browser_auth: BrowserAuthController | None = None,
     clock: Callable[[], int] | None = None,
 ) -> FastAPI:
     """Create the private human app without exposing any agent bearer authority."""
@@ -949,6 +963,19 @@ def create_web_app(
             ("POST", "/login/password"): 16 * 1024,
             ("POST", "/login/passkey/options"): 8 * 1024,
             ("POST", "/login/passkey/complete"): 128 * 1024,
+            ("POST", "/setup/password"): 16 * 1024,
+            ("POST", "/setup/passkeys/options"): 8 * 1024,
+            ("POST", "/setup/passkeys/complete"): 128 * 1024,
+            ("POST", "/setup/totp/start"): 8 * 1024,
+            ("POST", "/setup/totp/verify"): 8 * 1024,
+            ("POST", "/setup/complete"): 8 * 1024,
+            ("POST", "/authenticators/passkeys/options"): 8 * 1024,
+            ("POST", "/authenticators/passkeys/complete"): 128 * 1024,
+            ("POST", "/authenticators/totp/start"): 8 * 1024,
+            ("POST", "/authenticators/totp/verify"): 8 * 1024,
+            ("POST", "/authenticators/confirm/passkey/options"): 16 * 1024,
+            ("POST", "/authenticators/confirm/passkey/complete"): 128 * 1024,
+            ("POST", "/authenticators/confirm/totp"): 16 * 1024,
             ("POST", "/integrations/effect-reviews/totp"): 16 * 1024,
             ("POST", "/integrations/effect-reviews/passkey/options"): 32 * 1024,
             ("POST", "/integrations/effect-reviews/passkey/complete"): 128 * 1024,
@@ -991,7 +1018,17 @@ def create_web_app(
             "vapid_public_key": settings.vapid_public_key,
             "fake_only_ui": settings.fake_only_ui,
             "integrations_available": integrations is not None,
+            "authenticator_management_available": browser_auth is not None,
         }
+
+    def active_totp_factors(selected: SessionPrincipal) -> tuple[Any, ...]:
+        if browser_auth is None:
+            return ()
+        return tuple(
+            factor
+            for factor in browser_auth.list_factors(selected.user_id)
+            if factor.kind == "totp"
+        )
 
     @app.exception_handler(WebError)
     async def web_error_handler(request: Request, exc: WebError) -> Response:
@@ -1009,6 +1046,42 @@ def create_web_app(
                 status_code=exc.status_code,
             ),
         )
+
+    async def browser_auth_error_handler(request: Request, exc: Exception) -> Response:
+        status_code = (
+            status.HTTP_409_CONFLICT
+            if isinstance(exc, BootstrapAlreadyComplete)
+            else status.HTTP_400_BAD_REQUEST
+        )
+        message = (
+            "Setup was already completed. Reload before continuing."
+            if isinstance(exc, BootstrapAlreadyComplete)
+            else "The authenticator request was invalid, stale, or already used."
+        )
+        if request.headers.get("accept", "").startswith("application/json"):
+            return JSONResponse(
+                {"error": {"code": "authenticator_request_failed", "message": message}},
+                status_code=status_code,
+            )
+        return cast(
+            Response,
+            templates.TemplateResponse(
+                request,
+                "error.html",
+                {**context(request), "status_code": status_code, "message": message},
+                status_code=status_code,
+            ),
+        )
+
+    for browser_error in (
+        BootstrapError,
+        PasskeyRegistrationError,
+        TotpEnrollmentError,
+        AuthenticatorManagementError,
+        TotpError,
+        WebAuthnError,
+    ):
+        app.add_exception_handler(browser_error, browser_auth_error_handler)
 
     @app.get("/healthz")
     async def healthz() -> Response:
@@ -1038,8 +1111,227 @@ def create_web_app(
             headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"},
         )
 
+    def required_browser_auth() -> BrowserAuthController:
+        if browser_auth is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        return browser_auth
+
+    def require_bootstrap_complete() -> None:
+        if browser_auth is not None and not browser_auth.bootstrap.status(now=now_fn()).complete:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="setup incomplete")
+
+    def require_setup_csrf(request: Request, supplied: str | None) -> None:
+        if not csrf.verify_login(
+            request.cookies.get(settings.login_csrf_cookie),
+            request.headers.get("x-csrf-token") or supplied,
+        ):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    def management_intent(body: Mapping[str, Any]) -> ManagementIntent:
+        action = body.get("action")
+        operation_id = body.get("operation_id")
+        if action not in {"add_passkey", "add_totp", "rename", "revoke"} or not isinstance(
+            operation_id, str
+        ):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        factor_id = body.get("factor_id")
+        label = body.get("label")
+        registration_id = body.get("registration_id")
+        compromised = body.get("compromised", False)
+        if (
+            (factor_id is not None and not isinstance(factor_id, str))
+            or (label is not None and not isinstance(label, str))
+            or (registration_id is not None and not isinstance(registration_id, str))
+            or not isinstance(compromised, bool)
+        ):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        return ManagementIntent(
+            action=action,
+            operation_id=operation_id,
+            factor_id=factor_id,
+            label=label,
+            registration_id=registration_id,
+            compromised=compromised,
+        )
+
+    @app.get("/setup", response_class=HTMLResponse)
+    def setup_page(request: Request) -> Response:
+        selected_auth = required_browser_auth()
+        setup_status = selected_auth.bootstrap.status(now=now_fn())
+        if setup_status.complete:
+            return Response(
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={"Location": "/login"},
+            )
+        token = csrf.login_token()
+        response = cast(
+            Response,
+            templates.TemplateResponse(
+                request,
+                "setup.html",
+                {
+                    **context(request),
+                    "setup": setup_status,
+                    "login_csrf": token,
+                },
+            ),
+        )
+        response.set_cookie(
+            settings.login_csrf_cookie,
+            token,
+            secure=settings.secure_cookies,
+            httponly=True,
+            samesite="strict",
+            path="/",
+            max_age=600,
+        )
+        return response
+
+    @app.post("/setup/password")
+    async def setup_password(
+        request: Request,
+        password: Annotated[str, Form(min_length=12, max_length=1024)],
+        password_confirmation: Annotated[str, Form(min_length=12, max_length=1024)],
+        csrf_token: Annotated[str, Form()],
+    ) -> Response:
+        require_setup_csrf(request, csrf_token)
+        if not hmac.compare_digest(password, password_confirmation):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="password confirmation does not match",
+            )
+        selected_auth = required_browser_auth()
+        await run_in_threadpool(selected_auth.bootstrap.enroll_password, password, now=now_fn())
+        return Response(
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers={"Location": "/setup#passkey"},
+        )
+
+    @app.post("/setup/passkeys/options")
+    async def setup_passkey_options(request: Request) -> dict[str, Any]:
+        require_setup_csrf(request, None)
+        body = await _json_object(request)
+        label = body.get("label")
+        if not isinstance(label, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        issued = await run_in_threadpool(
+            selected_auth.begin_registration,
+            selected_auth.bootstrap.owner_user_id,
+            label,
+            flow="bootstrap",
+            session_id=None,
+            now=now_fn(),
+        )
+        return {
+            "challenge_id": issued.challenge_id,
+            "publicKey": json.loads(issued.options_json),
+        }
+
+    @app.post("/setup/passkeys/complete")
+    async def setup_passkey_complete(request: Request) -> dict[str, Any]:
+        require_setup_csrf(request, None)
+        body = await _json_object(request)
+        challenge_id = body.get("challenge_id")
+        credential = body.get("credential")
+        if not isinstance(challenge_id, str) or not isinstance(credential, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        await run_in_threadpool(
+            selected_auth.complete_registration,
+            challenge_id,
+            credential,
+            user_id=selected_auth.bootstrap.owner_user_id,
+            session_id=None,
+            now=now_fn(),
+        )
+        setup_status = await run_in_threadpool(
+            selected_auth.commit_bootstrap_passkey,
+            challenge_id,
+            now=now_fn(),
+        )
+        return {
+            "status": "registered",
+            "authenticator_count": len(setup_status.factor_labels),
+        }
+
+    @app.post("/setup/totp/start")
+    async def setup_totp_start(request: Request) -> dict[str, str]:
+        require_setup_csrf(request, None)
+        body = await _json_object(request)
+        label = body.get("label")
+        if not isinstance(label, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        issued = await run_in_threadpool(
+            selected_auth.begin_totp_enrollment,
+            selected_auth.bootstrap.owner_user_id,
+            label,
+            flow="bootstrap",
+            session_id=None,
+            now=now_fn(),
+        )
+        return {
+            "enrollment_id": issued.enrollment.enrollment_id,
+            "provisioning_uri": issued.provisioning_uri,
+            "qr_code_data_uri": issued.qr_code_data_uri,
+            "manual_key": issued.manual_key,
+        }
+
+    @app.post("/setup/totp/verify")
+    async def setup_totp_verify(request: Request) -> dict[str, Any]:
+        require_setup_csrf(request, None)
+        body = await _json_object(request)
+        enrollment_id = body.get("enrollment_id")
+        proof = body.get("proof")
+        if not isinstance(enrollment_id, str) or not isinstance(proof, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        await run_in_threadpool(
+            selected_auth.verify_totp_enrollment,
+            enrollment_id,
+            proof,
+            user_id=selected_auth.bootstrap.owner_user_id,
+            session_id=None,
+            now=now_fn(),
+        )
+        setup_status = await run_in_threadpool(
+            selected_auth.commit_bootstrap_totp,
+            enrollment_id,
+            now=now_fn(),
+        )
+        return {
+            "status": "registered",
+            "authenticator_count": len(setup_status.factor_labels),
+        }
+
+    @app.post("/setup/complete")
+    async def setup_complete(
+        request: Request,
+        csrf_token: Annotated[str, Form()],
+    ) -> Response:
+        require_setup_csrf(request, csrf_token)
+        selected_auth = required_browser_auth()
+        await run_in_threadpool(selected_auth.bootstrap.complete, now=now_fn())
+        response = Response(
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers={"Location": "/login?setup=complete"},
+        )
+        response.delete_cookie(
+            settings.login_csrf_cookie,
+            path="/",
+            secure=settings.secure_cookies,
+            httponly=True,
+        )
+        return response
+
     @app.get("/login", response_class=HTMLResponse)
     def login_page(request: Request) -> Response:
+        if browser_auth is not None and not browser_auth.bootstrap.status(now=now_fn()).complete:
+            return Response(
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={"Location": "/setup"},
+            )
         token = csrf.login_token()
         response = cast(
             Response,
@@ -1068,6 +1360,7 @@ def create_web_app(
         totp_proof: Annotated[str, Form(min_length=1, max_length=128)],
         csrf_token: Annotated[str, Form()],
     ) -> Response:
+        require_bootstrap_complete()
         if not csrf.verify_login(request.cookies.get(settings.login_csrf_cookie), csrf_token):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
         token = backend.password_totp_login(
@@ -1095,6 +1388,7 @@ def create_web_app(
 
     @app.post("/login/passkey/options")
     async def passkey_login_options(request: Request) -> LoginOptions:
+        require_bootstrap_complete()
         if not csrf.verify_login(
             request.cookies.get(settings.login_csrf_cookie),
             request.headers.get("x-csrf-token"),
@@ -1114,6 +1408,7 @@ def create_web_app(
 
     @app.post("/login/passkey/complete")
     async def passkey_login_complete(request: Request) -> Response:
+        require_bootstrap_complete()
         if not csrf.verify_login(
             request.cookies.get(settings.login_csrf_cookie),
             request.headers.get("x-csrf-token"),
@@ -1162,6 +1457,213 @@ def create_web_app(
         )
         return response
 
+    def authenticator_mutation_response() -> Response:
+        response = Response(
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers={"Location": "/login?authenticators=updated"},
+        )
+        response.delete_cookie(
+            settings.session_cookie,
+            path="/",
+            secure=settings.secure_cookies,
+            httponly=True,
+        )
+        return response
+
+    @app.get("/authenticators", response_class=HTMLResponse)
+    async def authenticators_page(request: Request) -> Response:
+        selected = await async_principal(request)
+        selected_auth = required_browser_auth()
+        factors = await run_in_threadpool(selected_auth.list_factors, selected.user_id)
+        return cast(
+            Response,
+            templates.TemplateResponse(
+                request,
+                "authenticators.html",
+                {
+                    **context(request, selected),
+                    "factors": factors,
+                    "totp_factors": tuple(factor for factor in factors if factor.kind == "totp"),
+                    "csrf_token": csrf.session_token(selected.session_id, "authenticators"),
+                    "logout_csrf": csrf.session_token(selected.session_id, "logout"),
+                    "operation_ids": {
+                        factor.factor_id: {
+                            "rename": secrets.token_urlsafe(24),
+                            "revoke": secrets.token_urlsafe(24),
+                        }
+                        for factor in factors
+                    },
+                },
+            ),
+        )
+
+    @app.post("/authenticators/passkeys/options")
+    async def authenticator_passkey_options(request: Request) -> dict[str, Any]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        body = await _json_object(request)
+        label = body.get("label")
+        if not isinstance(label, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        issued = await run_in_threadpool(
+            selected_auth.begin_registration,
+            selected.user_id,
+            label,
+            flow="management",
+            session_id=selected.session_id,
+            now=now_fn(),
+        )
+        return {
+            "challenge_id": issued.challenge_id,
+            "publicKey": json.loads(issued.options_json),
+        }
+
+    @app.post("/authenticators/passkeys/complete")
+    async def authenticator_passkey_complete(request: Request) -> dict[str, str]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        body = await _json_object(request)
+        challenge_id = body.get("challenge_id")
+        credential = body.get("credential")
+        if not isinstance(challenge_id, str) or not isinstance(credential, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        await run_in_threadpool(
+            selected_auth.complete_registration,
+            challenge_id,
+            credential,
+            user_id=selected.user_id,
+            session_id=selected.session_id,
+            now=now_fn(),
+        )
+        return {
+            "status": "confirmation_required",
+            "registration_id": challenge_id,
+            "operation_id": secrets.token_urlsafe(24),
+        }
+
+    @app.post("/authenticators/totp/start")
+    async def authenticator_totp_start(request: Request) -> dict[str, str]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        body = await _json_object(request)
+        label = body.get("label")
+        if not isinstance(label, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        issued = await run_in_threadpool(
+            required_browser_auth().begin_totp_enrollment,
+            selected.user_id,
+            label,
+            flow="management",
+            session_id=selected.session_id,
+            now=now_fn(),
+        )
+        return {
+            "enrollment_id": issued.enrollment.enrollment_id,
+            "provisioning_uri": issued.provisioning_uri,
+            "qr_code_data_uri": issued.qr_code_data_uri,
+            "manual_key": issued.manual_key,
+        }
+
+    @app.post("/authenticators/totp/verify")
+    async def authenticator_totp_verify(request: Request) -> dict[str, str]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        body = await _json_object(request)
+        enrollment_id = body.get("enrollment_id")
+        proof = body.get("proof")
+        if not isinstance(enrollment_id, str) or not isinstance(proof, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        await run_in_threadpool(
+            required_browser_auth().verify_totp_enrollment,
+            enrollment_id,
+            proof,
+            user_id=selected.user_id,
+            session_id=selected.session_id,
+            now=now_fn(),
+        )
+        return {
+            "registration_id": enrollment_id,
+            "operation_id": secrets.token_urlsafe(24),
+        }
+
+    @app.post("/authenticators/confirm/passkey/options")
+    async def authenticator_confirmation_options(request: Request) -> dict[str, Any]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        intent = management_intent(await _json_object(request))
+        selected_auth = required_browser_auth()
+        issued = await run_in_threadpool(
+            selected_auth.begin_webauthn_confirmation,
+            selected.user_id,
+            selected.session_id,
+            intent,
+            now=now_fn(),
+        )
+        return {
+            "challenge_id": issued.challenge_id,
+            "publicKey": json.loads(issued.options_json),
+        }
+
+    @app.post("/authenticators/confirm/passkey/complete")
+    async def authenticator_confirmation_complete(request: Request) -> dict[str, str]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        body = await _json_object(request)
+        challenge_id = body.get("challenge_id")
+        assertion = body.get("assertion")
+        if not isinstance(challenge_id, str) or not isinstance(assertion, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        intent = management_intent(body)
+        selected_auth = required_browser_auth()
+        await run_in_threadpool(
+            selected_auth.apply_with_webauthn,
+            selected.user_id,
+            selected.session_id,
+            intent,
+            challenge_id=challenge_id,
+            assertion=assertion,
+            now=now_fn(),
+        )
+        return {"status": "updated", "redirect_url": "/login?authenticators=updated"}
+
+    @app.post("/authenticators/confirm/totp")
+    async def authenticator_confirmation_totp(
+        request: Request,
+        action: Annotated[Literal["add_passkey", "add_totp", "rename", "revoke"], Form()],
+        operation_id: Annotated[str, Form(min_length=16, max_length=128)],
+        totp_proof: Annotated[str, Form(min_length=1, max_length=128)],
+        csrf_token: Annotated[str, Form()],
+        factor_id: Annotated[str | None, Form(max_length=128)] = None,
+        label: Annotated[str | None, Form(max_length=64)] = None,
+        registration_id: Annotated[str | None, Form(max_length=128)] = None,
+        totp_credential_id: Annotated[str | None, Form(max_length=256)] = None,
+        compromised: Annotated[bool, Form()] = False,
+    ) -> Response:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", csrf_token)
+        intent = ManagementIntent(
+            action=action,
+            operation_id=operation_id,
+            factor_id=factor_id,
+            label=label,
+            registration_id=registration_id,
+            compromised=compromised,
+        )
+        selected_auth = required_browser_auth()
+        await run_in_threadpool(
+            selected_auth.apply_with_totp,
+            selected.user_id,
+            selected.session_id,
+            intent,
+            totp_proof,
+            source_id=source(request),
+            credential_id=totp_credential_id,
+            now=now_fn(),
+        )
+        return authenticator_mutation_response()
+
     @app.get("/", response_class=HTMLResponse)
     def queue(request: Request, after: str | None = None) -> Response:
         selected = principal(request)
@@ -1196,6 +1698,7 @@ def create_web_app(
                 {
                     **context(request, selected),
                     "item": value,
+                    "totp_factors": active_totp_factors(selected),
                     "csrf_token": csrf.session_token(selected.session_id, purpose),
                     "logout_csrf": csrf.session_token(selected.session_id, "logout"),
                 },
@@ -1241,6 +1744,7 @@ def create_web_app(
                 {
                     **context(request, selected),
                     "item": value,
+                    "totp_factors": active_totp_factors(selected),
                     "id_suffix": hashlib.sha256(request_id.encode()).hexdigest()[:12],
                     "csrf_token": csrf.session_token(
                         selected.session_id,
@@ -1374,6 +1878,7 @@ def create_web_app(
                     {
                         **context(request, selected),
                         "item": item,
+                        "totp_factors": active_totp_factors(selected),
                         "review_csrf": csrf.session_token(
                             selected.session_id,
                             _effect_review_csrf_purpose(
@@ -1409,6 +1914,7 @@ def create_web_app(
             idempotent: Annotated[EffectTriStateInput, Form()],
             totp_proof: Annotated[str, Form(min_length=1, max_length=128)],
             csrf_token: Annotated[str, Form()],
+            totp_credential_id: Annotated[str | None, Form(max_length=256)] = None,
         ) -> Response:
             selected = principal(request)
             require_csrf(
@@ -1432,6 +1938,7 @@ def create_web_app(
                 totp_proof,
                 expected_snapshot_digest=expected_snapshot_digest,
                 now=now_fn(),
+                credential_id=totp_credential_id,
             )
             _require_effect_review_result(result, opaque_id)
             return Response(
@@ -1526,6 +2033,7 @@ def create_web_app(
             str | None,
             Form(max_length=MAX_DECISION_NOTE_CHARS),
         ] = None,
+        totp_credential_id: Annotated[str | None, Form(max_length=256)] = None,
     ) -> Response:
         selected = principal(request)
         require_csrf(request, selected, f"request:{request_id}", csrf_token)
@@ -1553,6 +2061,7 @@ def create_web_app(
             prospective_arguments_json=prospective_arguments_json,
             now=now_fn(),
             decision_note=normalized_note,
+            credential_id=totp_credential_id,
         )
         return Response(
             status_code=status.HTTP_303_SEE_OTHER,

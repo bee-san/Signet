@@ -321,6 +321,7 @@ class SQLiteIntegrationWebBackend:
         *,
         expected_snapshot_digest: str,
         now: int,
+        credential_id: str | None = None,
     ) -> EffectReviewResult:
         self._require_principal(principal)
         self._validate_now(now)
@@ -338,6 +339,7 @@ class SQLiteIntegrationWebBackend:
                 session_id=principal.session_id,
                 http_method="POST",
                 now=now,
+                credential_id=credential_id,
             )
         except AuthenticationRateLimited as exc:
             raise WebRateLimited(str(exc)) from None

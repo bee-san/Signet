@@ -310,6 +310,36 @@ def test_totp_review_appends_once_and_rejects_replay(bundle: BackendBundle) -> N
         )
 
 
+def test_totp_review_uses_the_selected_credential(bundle: BackendBundle) -> None:
+    SQLiteTotpCredentialRepository(bundle.database).add_totp(
+        TotpCredential("totp-travel", USER_ID, TOTP_REFERENCE),
+        now=NOW,
+    )
+    token = bundle.sessions.create_session(USER_ID, auth_method="webauthn", now=NOW + 1)
+    principal = bundle.sessions.authenticate(token, now=NOW + 2)
+    opaque_id, snapshot = bundle.tool("read_email", now=NOW + 2)
+
+    bundle.backend.complete_totp_effect_review(
+        principal,
+        opaque_id,
+        read_profile(),
+        TOTP_PROOF,
+        expected_snapshot_digest=snapshot,
+        credential_id="totp-travel",
+        now=NOW + 3,
+    )
+
+    with bundle.database.read() as connection:
+        rows = connection.execute(
+            "SELECT credential_id, last_used_at FROM auth_credentials "
+            "WHERE credential_id IN ('totp-main', 'totp-travel') ORDER BY credential_id"
+        ).fetchall()
+    assert [(row["credential_id"], row["last_used_at"]) for row in rows] == [
+        ("totp-main", None),
+        ("totp-travel", NOW + 3),
+    ]
+
+
 @pytest.mark.parametrize("drift", ["schema", "evidence"])
 def test_stale_schema_or_evidence_snapshot_is_rejected_before_totp(
     bundle: BackendBundle,

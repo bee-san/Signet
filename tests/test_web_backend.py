@@ -393,6 +393,9 @@ def password_verifier() -> Argon2PasswordVerifier:
 def downgrade_schema_13(connection: Any) -> None:
     """Restore the schema-12 shape after test-only schema-13 data injection."""
 
+    connection.execute("DROP TABLE browser_totp_enrollments")
+    connection.execute("DROP TABLE auth_registration_challenges")
+    connection.execute("DROP TABLE browser_bootstrap_state")
     connection.execute("DROP TABLE auth_factor_challenges")
     connection.execute("DROP TABLE auth_factor_events")
     connection.execute("DROP TABLE auth_factors")
@@ -428,7 +431,7 @@ def downgrade_schema_13(connection: Any) -> None:
     connection.execute("DROP TABLE production_users")
     connection.execute("DROP TABLE production_setup_state")
     connection.execute("DROP TABLE privacy_maintenance")
-    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15, 16, 17)")
+    connection.execute("DELETE FROM schema_meta WHERE migration_id BETWEEN 13 AND 18")
     connection.execute("PRAGMA user_version = 12")
 
 
@@ -596,6 +599,41 @@ def test_password_totp_login_rotates_old_and_intermediate_sessions(
             "SELECT auth_method FROM web_sessions WHERE revoked_at IS NULL"
         ).fetchall()
     assert [row["auth_method"] for row in active] == ["password+totp"]
+
+
+def test_totp_action_uses_the_selected_credential(bundle: BackendBundle) -> None:
+    SQLiteTotpCredentialRepository(bundle.database).add_totp(
+        TotpCredential("totp-travel", USER_ID, TOTP_REFERENCE),
+        now=NOW - 100,
+    )
+    request_id = bundle.enqueue()
+    _, principal = bundle.session()
+    payload_hash = str(bundle.state_machine.get_request(request_id)["current_payload_hash"])
+
+    assert (
+        bundle.backend.complete_totp_action(
+            principal,
+            request_id,
+            "approve",
+            "fake:101",
+            expected_version=1,
+            expected_payload_hash=payload_hash,
+            prospective_arguments_json=None,
+            decision_note="exact_request_approved",
+            credential_id="totp-travel",
+            now=NOW,
+        )
+        == "approved"
+    )
+    with bundle.database.read() as connection:
+        rows = connection.execute(
+            "SELECT credential_id, last_used_at FROM auth_credentials "
+            "WHERE credential_id IN ('totp-main', 'totp-travel') ORDER BY credential_id"
+        ).fetchall()
+    assert [(row["credential_id"], row["last_used_at"]) for row in rows] == [
+        ("totp-main", None),
+        ("totp-travel", NOW),
+    ]
 
 
 def test_passkey_login_options_are_exact_and_completion_rotates_previous_session(
@@ -2195,12 +2233,12 @@ def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
         )
     assert backups == [12]
     with bundle.database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
         assert (
             connection.execute(
-                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14, 15, 16, 17)"
+                "SELECT count(*) FROM schema_meta WHERE migration_id BETWEEN 13 AND 18"
             ).fetchone()[0]
-            == 5
+            == 6
         )
 
     # Both privacy migrations are committed, so recovery must not repeat a backup.

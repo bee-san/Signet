@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 import struct
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 from signet.auth import InvalidSession, SessionPrincipal
+from signet.browser_auth import BootstrapService, BrowserAuthController
+from signet.db import Database
 from signet.web import (
     ActionOptions,
     AttachmentDownload,
@@ -34,6 +37,8 @@ from signet.web import (
     create_agent_health_app,
     create_web_app,
 )
+from signet.webauthn import SQLiteWebAuthnRepository
+from signet.webauthn_registration import PasskeyRegistrationService, RegistrationResult
 
 NOW = 1_800_000_000
 ORIGIN = "https://signet.test"
@@ -44,6 +49,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @dataclass
 class FakeBackend:
     actions: list[tuple[str, str, str]] = field(default_factory=list)
+    totp_credential_ids: list[str | None] = field(default_factory=list)
     push_endpoints: list[str] = field(default_factory=list)
     conflict: bool = False
     detail_state: str = "pending_approval"
@@ -439,6 +445,7 @@ class FakeBackend:
         prospective_arguments_json: str | None,
         now: int,
         decision_note: str | None = None,
+        credential_id: str | None = None,
     ) -> str:
         assert principal.user_id == "autumn" and now == NOW
         if self.conflict:
@@ -446,6 +453,7 @@ class FakeBackend:
         assert expected_version == 1 and expected_payload_hash == HASH
         assert prospective_arguments_json is None
         self.actions.append((action, request_id, totp_proof))
+        self.totp_credential_ids.append(credential_id)
         self.decision_notes.append(decision_note)
         return {"approve": "approved", "deny": "denied"}.get(action, action)
 
@@ -1095,6 +1103,7 @@ def test_valid_totp_action_and_stale_conflict_are_explicit(
         "expected_version": "1",
         "expected_payload_hash": HASH,
         "totp_proof": "fake:proof",
+        "totp_credential_id": "totp-travel",
         "decision_note": "exact_request_approved",
         "csrf_token": csrf.session_token("session-id", "request:req_test"),
     }
@@ -1107,6 +1116,7 @@ def test_valid_totp_action_and_stale_conflict_are_explicit(
     assert response.status_code == 303
     assert response.headers["location"] == "/audit#decision-req_test"
     assert backend.actions == [("approve", "req_test", "fake:proof")]
+    assert backend.totp_credential_ids == ["totp-travel"]
     assert backend.decision_notes == ["exact_request_approved"]
 
     backend.conflict = True
@@ -1694,3 +1704,148 @@ def test_csrf_repr_redacts_key() -> None:
     assert manager.verify_session("session", "action", token)
     assert not manager.verify_session("session", "other", token)
     assert re.fullmatch(r"c1\.[a-f0-9]{64}", token)
+
+
+class _SetupRegistrationProvider:
+    test_only = True
+
+    def verify(
+        self,
+        credential: Mapping[str, Any],
+        *,
+        expected_challenge: bytes,
+        expected_rp_id: str,
+        expected_origin: str,
+    ) -> RegistrationResult:
+        assert credential["challenge"] == expected_challenge.hex()
+        assert expected_rp_id == "signet.test"
+        assert expected_origin == ORIGIN
+        return RegistrationResult(
+            credential_id=base64.urlsafe_b64encode(b"setup-passkey").rstrip(b"=").decode(),
+            public_key=b"public-key",
+            sign_count=0,
+            device_type="multi_device",
+            backed_up=True,
+            transports=("internal",),
+            discoverable=True,
+        )
+
+
+def test_initial_owner_setup_is_browser_only_resumable_and_one_time(
+    tmp_path: Path,
+    backend: FakeBackend,
+    csrf: CsrfManager,
+) -> None:
+    database = Database(tmp_path / "setup-web.db")
+    database.initialize()
+    bootstrap = BootstrapService(database, owner_user_id="user:owner")
+    registrations = PasskeyRegistrationService(
+        database,
+        provider=_SetupRegistrationProvider(),
+        rp_id="signet.test",
+        origin=ORIGIN,
+        allow_test_provider=True,
+    )
+    unused = cast(Any, object())
+    webauthn_repository = SQLiteWebAuthnRepository(database)
+    browser_auth = BrowserAuthController(
+        bootstrap=bootstrap,
+        registrations=registrations,
+        manager=unused,
+        totp_verifier=unused,
+        webauthn_issuer=unused,
+        webauthn_verifier=unused,
+        webauthn_repository=webauthn_repository,
+    )
+    app = create_web_app(
+        backend,
+        settings=WebSettings(public_origin=ORIGIN, allowed_hosts=("signet.test",)),
+        csrf=csrf,
+        browser_auth=browser_auth,
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app, base_url=ORIGIN) as setup_client:
+        login = setup_client.get("/login", follow_redirects=False)
+        assert login.status_code == 303
+        assert login.headers["location"] == "/setup"
+
+        page = setup_client.get("/setup")
+        token = setup_client.cookies.get("__Host-signet_login_csrf")
+        assert page.status_code == 200 and token
+        assert "Set up Signet" in page.text
+        assert "Create your password" in page.text
+        assert "Add an authenticator" in page.text
+
+        wrong_origin = setup_client.post(
+            "/setup/password",
+            data={
+                "password": "correct horse battery staple",
+                "password_confirmation": "correct horse battery staple",
+                "csrf_token": token,
+            },
+            headers={"Origin": "https://attacker.test"},
+        )
+        assert wrong_origin.status_code == 403
+
+        password = setup_client.post(
+            "/setup/password",
+            data={
+                "password": "correct horse battery staple",
+                "password_confirmation": "correct horse battery staple",
+                "csrf_token": token,
+            },
+            headers={"Origin": ORIGIN},
+            follow_redirects=False,
+        )
+        assert password.status_code == 303
+
+        too_early = setup_client.post(
+            "/setup/complete",
+            data={"csrf_token": token},
+            headers={"Origin": ORIGIN},
+        )
+        assert too_early.status_code == 400
+
+        options = setup_client.post(
+            "/setup/passkeys/options",
+            json={"label": "Mac passkey"},
+            headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+        )
+        assert options.status_code == 200
+        body = options.json()
+        assert body["publicKey"]["rp"]["id"] == "signet.test"
+        encoded_challenge = str(body["publicKey"]["challenge"])
+        challenge = base64.urlsafe_b64decode(
+            encoded_challenge + "=" * (-len(encoded_challenge) % 4)
+        )
+
+        completed = setup_client.post(
+            "/setup/passkeys/complete",
+            json={
+                "challenge_id": body["challenge_id"],
+                "credential": {"id": "test", "challenge": challenge.hex()},
+            },
+            headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+        )
+        assert completed.status_code == 200
+
+        finished = setup_client.post(
+            "/setup/complete",
+            data={"csrf_token": token},
+            headers={"Origin": ORIGIN},
+            follow_redirects=False,
+        )
+        assert finished.status_code == 303
+        assert finished.headers["location"] == "/login?setup=complete"
+
+        login_after_setup = setup_client.get("/login")
+        replay_token = setup_client.cookies.get("__Host-signet_login_csrf")
+        assert login_after_setup.status_code == 200 and replay_token
+        replay = setup_client.post(
+            "/setup/complete",
+            data={"csrf_token": replay_token},
+            headers={"Origin": ORIGIN},
+        )
+        assert replay.status_code == 409
+        assert "correct horse" not in replay.text

@@ -39,6 +39,7 @@ from signet.authenticator_management import (
     KeychainTotpSecretProvisioner,
     TotpSecretProvisioner,
 )
+from signet.browser_auth import BootstrapService, BrowserAuthController
 from signet.config import ProductionConfig
 from signet.credential_broker import (
     KeychainSecretStore,
@@ -87,6 +88,7 @@ from signet.schema_registry import DurableSchemaRegistry, SchemaRegistryError
 from signet.staging import StagingError, open_confined_readonly, read_verified_descriptor
 from signet.state_machine import ApprovalStateMachine
 from signet.totp import SQLiteTotpCredentialRepository, TotpVerifier
+from signet.totp_enrollment import TotpEnrollmentService
 from signet.web import CsrfManager, WebSettings, create_web_app
 from signet.web_backend import (
     EncryptedPayloadReviewer,
@@ -99,6 +101,10 @@ from signet.webauthn import (
     SQLiteWebAuthnRepository,
     WebAuthnAssertionVerifier,
     WebAuthnChallengeIssuer,
+)
+from signet.webauthn_registration import (
+    OfficialRegistrationProvider,
+    PasskeyRegistrationService,
 )
 
 _REQUIRED_SECRET_PURPOSES = (
@@ -432,10 +438,11 @@ def build_production_runtime(
         ) from None
 
     capabilities = ProofCapability(secret_values["capability_key_ref"].reveal().encode("utf-8"))
+    selected_totp_provisioner = totp_provisioner or KeychainTotpSecretProvisioner()
     authenticators = AuthenticatorManager(
         database,
         capabilities=capabilities,
-        provisioner=totp_provisioner or KeychainTotpSecretProvisioner(),
+        provisioner=selected_totp_provisioner,
     )
     payload_cipher = PayloadCipher(
         secret_values["payload_key_ref"],
@@ -592,6 +599,9 @@ def build_production_runtime(
             config=config,
             secret_values=secret_values,
             capabilities=capabilities,
+            authenticators=authenticators,
+            totp_provisioner=selected_totp_provisioner,
+            secret_store=secret_store,
             limiter=limiter,
             totp=totp,
             approvals=approvals,
@@ -678,6 +688,9 @@ def _assemble_production_web(
     config: ProductionConfig,
     secret_values: Mapping[str, Secret],
     capabilities: ProofCapability,
+    authenticators: AuthenticatorManager,
+    totp_provisioner: TotpSecretProvisioner,
+    secret_store: SecretStore,
     limiter: SQLiteAttemptLimiter,
     totp: TotpVerifier,
     approvals: ApprovalStateMachine,
@@ -705,6 +718,26 @@ def _assemble_production_web(
         rp_id=config.rp_id,
         origin=config.public_origin,
         capabilities=capabilities,
+    )
+    registrations = PasskeyRegistrationService(
+        database,
+        provider=OfficialRegistrationProvider(),
+        rp_id=config.rp_id,
+        origin=config.public_origin,
+    )
+    browser_auth = BrowserAuthController(
+        bootstrap=BootstrapService(database, owner_user_id=config.owner_user_id),
+        registrations=registrations,
+        manager=authenticators,
+        totp_verifier=totp,
+        webauthn_issuer=webauthn_issuer,
+        webauthn_verifier=webauthn_verifier,
+        webauthn_repository=webauthn_repository,
+        totp_enrollments=TotpEnrollmentService(
+            database,
+            provisioner=totp_provisioner,
+            secret_store=secret_store,
+        ),
     )
     authentication_transactions = SQLiteAuthenticationTransactions(
         database,
@@ -734,6 +767,7 @@ def _assemble_production_web(
             allowed_hosts=config.allowed_hosts,
         ),
         csrf=CsrfManager(secret_values["csrf_secret_ref"].reveal().encode("utf-8")),
+        browser_auth=browser_auth,
     )
     web.add_middleware(LoopbackPeerMiddleware)
     return web

@@ -1836,6 +1836,7 @@ class WebBackend:
         prospective_arguments_json: str | None,
         now: int,
         decision_note: str | None = None,
+        credential_id: str | None = None,
     ) -> str:
         self._require_ui_principal(principal)
         request = self._require_pending_revision(
@@ -1900,6 +1901,7 @@ class WebBackend:
                 session_id=principal.session_id,
                 http_method="POST",
                 now=now,
+                credential_id=credential_id,
             )
             confirmation = _totp_confirmation(proof)
             if policy_change:

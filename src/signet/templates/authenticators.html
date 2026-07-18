@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Authenticators · Signet{% endblock %}
+{% block head %}<meta name="csrf-token" content="{{ csrf_token }}">{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='authenticators.js') }}" defer></script>{% endblock %}
+{% block content %}
+<section class="panel" aria-labelledby="authenticators-title">
+  <p class="eyebrow">Account security</p>
+  <h1 id="authenticators-title">Authenticators</h1>
+  <p>Add, name, or remove authenticators for this account. Every change requires a fresh confirmation from one selected existing TOTP or passkey.</p>
+  <p>For safety, a successful change signs out existing browser sessions.</p>
+
+  <p data-auth-status role="status" aria-live="polite"></p>
+
+  <section aria-labelledby="add-passkey-title">
+    <h2 id="add-passkey-title">Add a passkey</h2>
+    <form data-add-passkey class="stack-form">
+      <label for="new-passkey-label">Passkey name</label>
+      <input id="new-passkey-label" name="label" maxlength="64" placeholder="Laptop passkey" required>
+      <button class="button" type="submit">Create new passkey</button>
+    </form>
+    <div data-pending-passkey class="confirmation-panel" hidden>
+      <h3>Confirm this passkey addition</h3>
+      <p>Use an existing authenticator—not the passkey you just created.</p>
+      <button type="button" class="button" data-confirm-new-passkey data-intent="{}">Confirm with existing passkey</button>
+      {% if totp_factors %}
+      <form action="/authenticators/confirm/totp" method="post" class="stack-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input data-intent-field type="hidden" name="action">
+        <input data-intent-field type="hidden" name="operation_id">
+        <input data-intent-field type="hidden" name="registration_id">
+        <label for="add-passkey-totp-factor">Existing TOTP authenticator</label>
+        <select id="add-passkey-totp-factor" name="totp_credential_id" required>
+          {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}
+        </select>
+        <label for="add-passkey-totp">Current code</label>
+        <input id="add-passkey-totp" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" required>
+        <button class="button" type="submit">Confirm addition with TOTP</button>
+      </form>
+      {% endif %}
+    </div>
+  </section>
+
+  <section aria-labelledby="add-totp-title">
+    <h2 id="add-totp-title">Add a TOTP authenticator</h2>
+    <form data-totp-start data-flow="management" class="stack-form">
+      <label for="new-totp-label">Authenticator name</label>
+      <input id="new-totp-label" name="label" maxlength="64" placeholder="Phone authenticator" required>
+      <button class="button" type="submit">Set up TOTP</button>
+    </form>
+    <div data-totp-enrollment hidden>
+      <p>Scan this QR code with your authenticator app:</p>
+      <img data-totp-qr class="totp-qr" alt="TOTP enrollment QR code" hidden>
+      <p>Or add an account with this one-time manual key:</p>
+      <output data-totp-key class="manual-key" aria-label="TOTP manual setup key"></output>
+      <form data-totp-verify data-flow="management" class="stack-form">
+        <label for="new-totp-proof">Code from the new authenticator</label>
+        <input id="new-totp-proof" name="proof" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
+        <button class="button" type="submit">Verify new TOTP</button>
+      </form>
+    </div>
+    <div data-pending-totp class="confirmation-panel" hidden>
+      <h3>Confirm this TOTP addition</h3>
+      <p>Now use a different, existing authenticator to authorize the exact addition.</p>
+      <button type="button" class="button" data-confirm-new-totp data-intent="{}">Confirm with existing passkey</button>
+      {% if totp_factors %}
+      <form action="/authenticators/confirm/totp" method="post" class="stack-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input data-intent-field type="hidden" name="action">
+        <input data-intent-field type="hidden" name="operation_id">
+        <input data-intent-field type="hidden" name="registration_id">
+        <label for="add-totp-existing-factor">Existing TOTP authenticator</label>
+        <select id="add-totp-existing-factor" name="totp_credential_id" required>
+          {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}
+        </select>
+        <label for="add-totp-existing-proof">Current code from the existing authenticator</label>
+        <input id="add-totp-existing-proof" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" required>
+        <button class="button" type="submit">Confirm addition with existing TOTP</button>
+      </form>
+      {% endif %}
+    </div>
+  </section>
+
+  <section aria-labelledby="existing-authenticators-title">
+    <h2 id="existing-authenticators-title">Existing authenticators</h2>
+    {% if factors %}
+    <ul class="authenticator-list">
+      {% for factor in factors %}
+      <li class="authenticator-card">
+        <h3>{{ factor.label }}</h3>
+        <p>{{ "Passkey" if factor.kind == "webauthn" else "TOTP app" }} · added {{ factor.created_at|utc_time }}</p>
+        {% if factor.last_used_at %}<p>Last used {{ factor.last_used_at|utc_time }}</p>{% endif %}
+
+        <details>
+          <summary>Rename</summary>
+          <label for="rename-{{ loop.index }}">New name</label>
+          <input id="rename-{{ loop.index }}" data-factor-label maxlength="64" value="{{ factor.label }}">
+          <button
+            type="button"
+            class="button button-quiet"
+            data-passkey-intent
+            data-intent='{{ {"action": "rename", "operation_id": operation_ids[factor.factor_id]["rename"], "factor_id": factor.factor_id, "label": factor.label}|tojson }}'>
+            Confirm rename with passkey
+          </button>
+          {% if totp_factors %}
+          <form action="/authenticators/confirm/totp" method="post" class="stack-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="action" value="rename">
+            <input type="hidden" name="operation_id" value="{{ operation_ids[factor.factor_id]["rename"] }}">
+            <input type="hidden" name="factor_id" value="{{ factor.factor_id }}">
+            <label for="rename-label-{{ loop.index }}">New name</label>
+            <input id="rename-label-{{ loop.index }}" name="label" maxlength="64" value="{{ factor.label }}" required>
+            <label for="rename-totp-factor-{{ loop.index }}">TOTP authenticator</label>
+            <select id="rename-totp-factor-{{ loop.index }}" name="totp_credential_id" required>
+              {% for totp in totp_factors %}<option value="{{ totp.credential_id }}">{{ totp.label }}</option>{% endfor %}
+            </select>
+            <label for="rename-code-{{ loop.index }}">Current code</label>
+            <input id="rename-code-{{ loop.index }}" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" required>
+            <button class="button button-quiet" type="submit">Confirm rename with TOTP</button>
+          </form>
+          {% endif %}
+        </details>
+
+        <details>
+          <summary>Remove</summary>
+          <p>Signet blocks removal of the final active authenticator. Password does not bypass that safeguard.</p>
+          <button
+            type="button"
+            class="button button-danger"
+            data-passkey-intent
+            data-intent='{{ {"action": "revoke", "operation_id": operation_ids[factor.factor_id]["revoke"], "factor_id": factor.factor_id}|tojson }}'>
+            Confirm removal with passkey
+          </button>
+          {% if totp_factors %}
+          <form action="/authenticators/confirm/totp" method="post" class="stack-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="action" value="revoke">
+            <input type="hidden" name="operation_id" value="{{ operation_ids[factor.factor_id]["revoke"] }}">
+            <input type="hidden" name="factor_id" value="{{ factor.factor_id }}">
+            <label for="remove-totp-factor-{{ loop.index }}">TOTP authenticator</label>
+            <select id="remove-totp-factor-{{ loop.index }}" name="totp_credential_id" required>
+              {% for totp in totp_factors %}<option value="{{ totp.credential_id }}">{{ totp.label }}</option>{% endfor %}
+            </select>
+            <label for="remove-code-{{ loop.index }}">Current code</label>
+            <input id="remove-code-{{ loop.index }}" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" required>
+            <button class="button button-danger" type="submit">Confirm removal with TOTP</button>
+          </form>
+          {% endif %}
+        </details>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+      <p>No active authenticators are available.</p>
+    {% endif %}
+  </section>
+</section>
+{% endblock %}

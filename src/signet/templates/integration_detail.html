@@ -151,6 +151,12 @@
         <span>Derived policy recommendation</span>
         <output data-effect-recommendation>Complete all six axes; incomplete or unknown profiles are denied.</output>
       </div>
+      {% if totp_factors %}
+      <label for="effect-review-totp-factor">TOTP authenticator</label>
+      <select id="effect-review-totp-factor" name="totp_credential_id" required>
+        {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}
+      </select>
+      {% endif %}
       <label for="effect-review-totp">{{ 'Fake action proof' if fake_only_ui else 'Authenticator code' }}</label>
       <input id="effect-review-totp" name="totp_proof" inputmode="{{ 'text' if fake_only_ui else 'numeric' }}" autocomplete="{{ 'off' if fake_only_ui else 'one-time-code' }}" maxlength="128" required>
       <div class="button-row">

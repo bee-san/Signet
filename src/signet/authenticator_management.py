@@ -276,6 +276,38 @@ class AuthenticatorManager:
             },
         )
 
+    def binding_for_add_preprovisioned_totp(
+        self,
+        user_id: str,
+        label: str,
+        factor_id: str,
+        credential_id: str,
+        secret_reference: str,
+        operation_id: str,
+    ) -> ActionBinding:
+        selected_credential = _bounded_identifier(
+            credential_id,
+            name="TOTP credential ID",
+            maximum=64,
+        )
+        if len(selected_credential) < 20 or not selected_credential.startswith("totp_"):
+            raise ValueError("TOTP credential ID is invalid")
+        SecretReference.parse(secret_reference)
+        return self._binding(
+            "add_authenticator",
+            user_id,
+            operation_id,
+            {
+                "credential_id": selected_credential,
+                "factor_id": _factor_id(factor_id),
+                "kind": "totp",
+                "label": _label(label),
+                "secret_reference_hash": hashlib.sha256(
+                    secret_reference.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+
     def binding_for_rename(
         self,
         user_id: str,
@@ -373,6 +405,72 @@ class AuthenticatorManager:
                 self._totp_provisioner.delete(secret_reference)
             raise
         factor = self.get_factor(selected_user, factor_id)
+        if factor is None:  # pragma: no cover - committed invariant
+            raise AuthenticatorManagementError("new TOTP factor was not persisted")
+        return factor
+
+    def add_preprovisioned_totp(
+        self,
+        user_id: str,
+        label: str,
+        factor_id: str,
+        credential_id: str,
+        secret_reference: str,
+        operation_id: str,
+        confirmation: VerifiedTotp | VerifiedWebAuthn,
+        *,
+        now: int,
+    ) -> FactorMetadata:
+        selected_user = canonical_user_id(user_id)
+        selected_label = _label(label)
+        selected_factor = _factor_id(factor_id)
+        SecretReference.parse(secret_reference)
+        binding = self.binding_for_add_preprovisioned_totp(
+            selected_user,
+            selected_label,
+            selected_factor,
+            credential_id,
+            secret_reference,
+            operation_id,
+        )
+        self._validate_proof_envelope(
+            confirmation,
+            user_id=selected_user,
+            binding=binding,
+            now=now,
+        )
+        with self.database.transaction() as connection:
+            actor_factor_id = self._consume_proof(
+                connection,
+                confirmation,
+                user_id=selected_user,
+                binding=binding,
+                now=now,
+            )
+            _ensure_auth_user(connection, selected_user, created_at=now)
+            connection.execute(
+                """
+                INSERT INTO auth_credentials(
+                    credential_id, user_id, kind, secret_reference, enrolled_at, factor_label
+                ) VALUES (?, ?, 'totp', ?, ?, ?)
+                """,
+                (credential_id, selected_user, secret_reference, now, selected_label),
+            )
+            self._insert_factor(
+                connection,
+                factor_id=selected_factor,
+                credential_id=credential_id,
+                user_id=selected_user,
+                kind="totp",
+                label=selected_label,
+                action="added",
+                actor_factor_id=actor_factor_id,
+                operation_id=operation_id,
+                payload_hash=binding.payload_hash or "",
+                now=now,
+            )
+            _revoke_user_sessions(connection, selected_user, revoked_at=now)
+        factor = self.get_factor(selected_user, selected_factor)
         if factor is None:  # pragma: no cover - committed invariant
             raise AuthenticatorManagementError("new TOTP factor was not persisted")
         return factor

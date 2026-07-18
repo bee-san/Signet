@@ -212,6 +212,9 @@ def _downgrade_catalog_to_schema_12(database: Database) -> None:
             END
             """
         )
+        connection.execute("DROP TABLE browser_totp_enrollments")
+        connection.execute("DROP TABLE auth_registration_challenges")
+        connection.execute("DROP TABLE browser_bootstrap_state")
         connection.execute("DROP TABLE connector_effect_review_drafts")
         connection.execute("DROP TABLE connector_effect_review_challenges")
         connection.execute("DROP TABLE connector_effect_reviews")
@@ -230,7 +233,7 @@ def _downgrade_catalog_to_schema_12(database: Database) -> None:
         connection.execute("DROP TABLE production_users")
         connection.execute("DROP TABLE production_setup_state")
         connection.execute("DROP TABLE privacy_maintenance")
-        connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15, 16, 17)")
+        connection.execute("DELETE FROM schema_meta WHERE migration_id BETWEEN 13 AND 18")
         connection.execute("PRAGMA user_version = 12")
 
 

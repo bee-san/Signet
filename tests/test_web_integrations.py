@@ -164,6 +164,7 @@ def integration_detail() -> IntegrationToolDetail:
 class FakeIntegrationBackend:
     conflict: bool = False
     totp_calls: list[tuple[str, EffectProfile, str, str]] = field(default_factory=list)
+    totp_credential_ids: list[str | None] = field(default_factory=list)
     option_calls: list[tuple[str, EffectProfile, str, str]] = field(default_factory=list)
     complete_calls: list[tuple[str, str, dict[str, Any], str, str]] = field(default_factory=list)
 
@@ -195,11 +196,13 @@ class FakeIntegrationBackend:
         *,
         expected_snapshot_digest: str,
         now: int,
+        credential_id: str | None = None,
     ) -> EffectReviewResult:
         assert principal.user_id == "autumn" and now == NOW
         if self.conflict:
             raise WebConflict("effect review target changed after review")
         self.totp_calls.append((opaque_id, profile, totp_proof, expected_snapshot_digest))
+        self.totp_credential_ids.append(credential_id)
         return EffectReviewResult(opaque_id, 8, recommend_policy(profile))
 
     def begin_passkey_effect_review(
@@ -381,7 +384,11 @@ def test_totp_review_requires_origin_exact_csrf_and_current_snapshot(
     web: IntegrationWebFixture,
 ) -> None:
     web.authenticate()
-    form = {**effect_form(), "csrf_token": web.review_csrf}
+    form = {
+        **effect_form(),
+        "csrf_token": web.review_csrf,
+        "totp_credential_id": "totp-travel",
+    }
 
     assert web.client.post("/integrations/effect-reviews/totp", data=form).status_code == 403
     assert (
@@ -407,6 +414,7 @@ def test_totp_review_requires_origin_exact_csrf_and_current_snapshot(
     assert web.integrations.totp_calls == [
         (OPAQUE_ID, reviewed_profile(), "fake:fresh-review", SNAPSHOT_DIGEST)
     ]
+    assert web.integrations.totp_credential_ids == ["totp-travel"]
 
     calls = list(web.integrations.totp_calls)
     wrong_binding = web.client.post(

@@ -300,6 +300,12 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="expected_version" value="{{ item.version }}">
         <input type="hidden" name="expected_payload_hash" value="{{ item.payload_hash }}">
+        {% if totp_factors %}
+        <label for="totp-factor-{{ id_suffix }}">TOTP authenticator</label>
+        <select id="totp-factor-{{ id_suffix }}" name="totp_credential_id" required>
+          {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}
+        </select>
+        {% endif %}
         <label for="totp-proof-{{ id_suffix }}">{{ 'Fake action proof' if fake_only_ui else 'Authenticator code' }}</label>
         <input id="totp-proof-{{ id_suffix }}" name="totp_proof" inputmode="{{ 'text' if fake_only_ui else 'numeric' }}" autocomplete="{{ 'off' if fake_only_ui else 'one-time-code' }}" maxlength="128" required>
         <div class="button-row">
@@ -323,6 +329,12 @@
       <input type="hidden" name="action" value="edit">
       <label for="edit-json-{{ id_suffix }}">Arguments</label>
       <textarea id="edit-json-{{ id_suffix }}" data-edit-json name="prospective_arguments_json" rows="14" maxlength="4000000" required>{{ item.editable_arguments_json }}</textarea>
+      {% if totp_factors %}
+      <label for="edit-totp-factor-{{ id_suffix }}">TOTP authenticator</label>
+      <select id="edit-totp-factor-{{ id_suffix }}" name="totp_credential_id" required>
+        {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}
+      </select>
+      {% endif %}
       <label for="edit-totp-{{ id_suffix }}">{{ 'Fake action proof' if fake_only_ui else 'Authenticator code' }}</label>
       <input id="edit-totp-{{ id_suffix }}" name="totp_proof" inputmode="{{ 'text' if fake_only_ui else 'numeric' }}" autocomplete="{{ 'off' if fake_only_ui else 'one-time-code' }}" maxlength="128" required>
       <div class="button-row">
