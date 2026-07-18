@@ -34,6 +34,11 @@ from signet.auth import (
     SQLitePasswordCredentialRepository,
     SQLiteSessionRepository,
 )
+from signet.authenticator_management import (
+    AuthenticatorManager,
+    KeychainTotpSecretProvisioner,
+    TotpSecretProvisioner,
+)
 from signet.config import ProductionConfig
 from signet.credential_broker import (
     KeychainSecretStore,
@@ -262,6 +267,7 @@ class ProductionAssembly:
     schema_registry: DurableSchemaRegistry
     token_registry: SQLiteTokenRegistry
     provider_clients: Mapping[str, MCPClient]
+    authenticators: AuthenticatorManager
 
     @property
     def policy(self) -> PolicySnapshot:
@@ -378,6 +384,7 @@ def build_production_runtime(
     *,
     secret_store: SecretStore,
     pre_migration_backup: PreMigrationBackup | None = None,
+    totp_provisioner: TotpSecretProvisioner | None = None,
     clock: Callable[[], int] | None = None,
     components: frozenset[str] = frozenset({"mcp", "web"}),
 ) -> ProductionAssembly:
@@ -425,6 +432,11 @@ def build_production_runtime(
         ) from None
 
     capabilities = ProofCapability(secret_values["capability_key_ref"].reveal().encode("utf-8"))
+    authenticators = AuthenticatorManager(
+        database,
+        capabilities=capabilities,
+        provisioner=totp_provisioner or KeychainTotpSecretProvisioner(),
+    )
     payload_cipher = PayloadCipher(
         secret_values["payload_key_ref"],
         secret_references["payload_key_ref"],
@@ -648,6 +660,7 @@ def build_production_runtime(
         schema_registry=schema_registry,
         token_registry=token_registry,
         provider_clients=clients,
+        authenticators=authenticators,
     )
 
 
@@ -682,7 +695,11 @@ def _assemble_production_web(
         verifier=Argon2PasswordVerifier(),
     )
     webauthn_repository = SQLiteWebAuthnRepository(database)
-    webauthn_issuer = WebAuthnChallengeIssuer(webauthn_repository, rp_id=config.rp_id)
+    webauthn_issuer = WebAuthnChallengeIssuer(
+        webauthn_repository,
+        rp_id=config.rp_id,
+        origin=config.public_origin,
+    )
     webauthn_verifier = WebAuthnAssertionVerifier(
         webauthn_repository,
         rp_id=config.rp_id,
