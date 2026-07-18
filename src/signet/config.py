@@ -16,6 +16,30 @@ from signet.credential_broker import CredentialError, SecretReference
 from signet.private_paths import PrivatePathError, ensure_private_directory
 
 
+def is_valid_allowed_host(host: str) -> bool:
+    if (
+        not host
+        or len(host) > 253
+        or host.endswith(".")
+        or any(character in host for character in ("\x00", "*", "/", "%"))
+    ):
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        labels = host.split(".")
+        return all(
+            label
+            and len(label) <= 63
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and all(character.isalnum() or character == "-" for character in label)
+            and label.isascii()
+            for label in labels
+        )
+    return True
+
+
 class DownstreamConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -313,13 +337,10 @@ class ProductionConfig(BaseModel):
         if (
             not value
             or len(value) > 32
-            or len(set(value)) != len(value)
-            or any(
-                not host or len(host) > 253 or "\x00" in host or "*" in host or "/" in host
-                for host in value
-            )
+            or len({host.lower() for host in value}) != len(value)
+            or any(not is_valid_allowed_host(host) for host in value)
         ):
-            raise ValueError("allowed_hosts must contain non-empty host labels")
+            raise ValueError("allowed_hosts must contain valid unique host labels")
         return value
 
     @field_validator("policy_path", mode="before")

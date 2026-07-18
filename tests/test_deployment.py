@@ -755,7 +755,7 @@ def test_schema_12_rejects_rotation_context_divergence(
         )
 
 
-def test_schema_11_upgrade_requires_and_creates_private_snapshot(
+def test_schema_11_upgrade_requires_and_streams_private_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     data_dir = tmp_path / "data"
@@ -786,6 +786,14 @@ def test_schema_11_upgrade_requires_and_creates_private_snapshot(
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir(mode=0o700)
     snapshot = backup_dir / "pre-schema-12.sqlite3"
+    original_read_bytes = Path.read_bytes
+
+    def reject_snapshot_whole_file_read(path: Path) -> bytes:
+        if path == snapshot:
+            raise AssertionError("deployment migration must stream the snapshot digest")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_snapshot_whole_file_read)
     main(
         [
             "deployment",

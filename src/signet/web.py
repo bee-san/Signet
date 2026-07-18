@@ -28,6 +28,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from signet.auth import InvalidSession, SessionPrincipal
+from signet.config import is_valid_allowed_host
 from signet.decision_notes import (
     APPROVAL_REASON_LABELS,
     DENIAL_REASON_LABELS,
@@ -898,7 +899,7 @@ class WebSettings:
             or hostname not in self.allowed_hosts
             or len({host.lower() for host in self.allowed_hosts}) != len(self.allowed_hosts)
             or len(set(cookie_names)) != len(cookie_names)
-            or any(not _valid_allowed_host(host) for host in self.allowed_hosts)
+            or any(not is_valid_allowed_host(host) for host in self.allowed_hosts)
             or any(
                 not name
                 or len(name) > 128
@@ -907,25 +908,6 @@ class WebSettings:
             )
         ):
             raise ValueError("web host or cookie configuration is invalid")
-
-
-def _valid_allowed_host(host: str) -> bool:
-    if not host or len(host) > 253 or host.endswith("."):
-        return False
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        labels = host.split(".")
-        return all(
-            label
-            and len(label) <= 63
-            and label[0].isalnum()
-            and label[-1].isalnum()
-            and all(character.isalnum() or character == "-" for character in label)
-            and label.isascii()
-            for label in labels
-        )
-    return True
 
 
 def create_agent_health_app() -> FastAPI:

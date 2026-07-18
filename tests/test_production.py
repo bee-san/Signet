@@ -194,6 +194,31 @@ def test_noncanonical_public_origin_is_rejected_before_database_initialization(
     assert not (Path(payload["storage"]["data_dir"]) / "signet.db").exists()
 
 
+@pytest.mark.parametrize(
+    "allowed_hosts",
+    (
+        ["signet.example.test", "bad host"],
+        ["signet.example.test", "host:8790"],
+        ["signet.example.test", "fe80::1%*"],
+        ["signet.example.test", "localhost", "LOCALHOST"],
+    ),
+)
+def test_invalid_allowed_hosts_are_rejected_before_database_initialization(
+    tmp_path: Path,
+    allowed_hosts: list[str],
+) -> None:
+    config_path = tmp_path / "production.json"
+    payload = _production_payload(tmp_path)
+    payload["allowed_hosts"] = allowed_hosts
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    config_path.chmod(0o600)
+
+    with pytest.raises(ProductionAssemblyError, match="configuration is invalid"):
+        create_production_assembly(config_path, secret_store=_secret_store())
+
+    assert not (Path(payload["storage"]["data_dir"]) / "signet.db").exists()
+
+
 def test_production_config_rejects_mixed_connector_transport_fields(tmp_path: Path) -> None:
     payload = _production_payload(tmp_path)
     payload["connectors"]["mail"]["command"] = ["/usr/bin/false"]
@@ -251,22 +276,44 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
 def test_web_health_uses_durable_maintenance_state_from_a_separate_worker(
     tmp_path: Path,
 ) -> None:
+    current_time = 123
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
     assembly = build_production_runtime(
         config,
         secret_store=_secret_store(),
-        clock=lambda: 123,
+        clock=lambda: current_time,
     )
     client = TestClient(assembly.web, base_url="https://signet.example.test")
 
     assert assembly.workers.running is False
     assert client.get("/healthz").status_code == 503
 
-    assembly.state.record_worker_state("ready", ready=True, now=124)
+    assembly.state.record_worker_state("ready", ready=True, now=current_time)
     assert assembly.workers.running is False
     assert client.get("/healthz").status_code == 200
 
-    assembly.state.record_worker_state("blocked", ready=False, now=125)
+    current_time += 1
+    assembly.state.record_worker_state("blocked", ready=False, now=current_time)
+    assert client.get("/healthz").status_code == 503
+
+
+def test_web_health_expires_stale_durable_worker_readiness(tmp_path: Path) -> None:
+    current_time = 123
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        clock=lambda: current_time,
+    )
+    client = TestClient(assembly.web, base_url="https://signet.example.test")
+
+    assembly.state.record_worker_state("ready", ready=True, now=current_time)
+    assert client.get("/healthz").status_code == 200
+
+    current_time += assembly.workers.heartbeat_lease_seconds
+    assert client.get("/healthz").status_code == 200
+
+    current_time += 1
     assert client.get("/healthz").status_code == 503
 
 
@@ -337,6 +384,51 @@ async def test_production_maintenance_worker_has_explicit_lifecycle(tmp_path: Pa
 
     assert assembly.workers.running is False
     assert assembly.workers.healthy is False
+
+
+@pytest.mark.asyncio
+async def test_worker_heartbeat_uses_maintenance_completion_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_time = 123
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        clock=lambda: current_time,
+    )
+    stop = asyncio.Event()
+    recorded_states: list[tuple[str, int]] = []
+    expected_ready_timestamps: list[int] = []
+    record_worker_state = assembly.state.record_worker_state
+
+    def record_state(state: Any, *, ready: bool, now: int) -> None:
+        recorded_states.append((state, now))
+        record_worker_state(state, ready=ready, now=now)
+
+    def delayed_recovery(*, now: int) -> None:
+        nonlocal current_time
+        assert now == current_time
+        current_time += assembly.workers.heartbeat_lease_seconds + 1
+        expected_ready_timestamps.append(current_time)
+
+    async def delayed_publish(*, now: int | None = None) -> bool:
+        nonlocal current_time
+        assert now == current_time
+        current_time += assembly.workers.heartbeat_lease_seconds + 1
+        expected_ready_timestamps.append(current_time)
+        stop.set()
+        return False
+
+    monkeypatch.setattr(assembly.state, "record_worker_state", record_state)
+    monkeypatch.setattr(assembly.workers._approvals, "recover_startup", delayed_recovery)
+    monkeypatch.setattr(assembly.workers._policy_promotions, "publish_pending", delayed_publish)
+
+    await assembly.workers.serve(stop)
+
+    ready_timestamps = [now for state, now in recorded_states if state == "ready"]
+    assert ready_timestamps == expected_ready_timestamps
 
 
 def test_build_fails_closed_before_database_creation_when_secret_is_missing(

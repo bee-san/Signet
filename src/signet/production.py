@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import stat
 import time
@@ -176,6 +177,7 @@ class ProductionWorkers:
         self._state = state
         self._clock = clock
         self._interval_seconds = interval_seconds
+        self._heartbeat_lease_seconds = max(1, math.ceil(interval_seconds * 3))
         self._running = False
         self._healthy = False
 
@@ -187,13 +189,22 @@ class ProductionWorkers:
     def healthy(self) -> bool:
         return self._healthy
 
-    async def run_once(self, *, now: int | None = None) -> None:
+    @property
+    def heartbeat_lease_seconds(self) -> int:
+        return self._heartbeat_lease_seconds
+
+    def _maintenance_time(self, now: int | None = None) -> int:
         selected_now = self._clock() if now is None else now
         if not isinstance(selected_now, int) or isinstance(selected_now, bool) or selected_now < 0:
             raise ValueError("production maintenance time is invalid")
+        return selected_now
+
+    async def run_once(self, *, now: int | None = None) -> None:
+        selected_now = self._maintenance_time(now)
         try:
             await self._policy_promotions.publish_pending(now=selected_now)
             await _run_sync(self._approvals.sweep_expired, now=selected_now, limit=100)
+            completed_now = self._maintenance_time(now)
         except BaseException:
             self._healthy = False
             if self._running:
@@ -201,7 +212,7 @@ class ProductionWorkers:
             raise
         if self._running:
             self._healthy = True
-            self._state.record_worker_state("ready", ready=True, now=selected_now)
+            self._state.record_worker_state("ready", ready=True, now=completed_now)
 
     async def serve(self, stop: asyncio.Event) -> None:
         """Recover execution fences, then maintain state until the stop event is set."""
@@ -214,11 +225,11 @@ class ProductionWorkers:
         self._healthy = False
         failed = False
         try:
-            selected_now = self._clock()
+            selected_now = self._maintenance_time()
             self._state.record_worker_state("blocked", ready=False, now=selected_now)
             await _run_sync(self._approvals.recover_startup, now=selected_now)
             self._healthy = True
-            self._state.record_worker_state("ready", ready=True, now=selected_now)
+            self._state.record_worker_state("ready", ready=True, now=self._maintenance_time())
             while not stop.is_set():
                 await self.run_once()
                 try:
@@ -228,13 +239,15 @@ class ProductionWorkers:
         except BaseException:
             failed = True
             self._healthy = False
-            self._state.record_worker_state("blocked", ready=False, now=self._clock())
+            self._state.record_worker_state("blocked", ready=False, now=self._maintenance_time())
             raise
         finally:
             self._running = False
             if not failed:
                 self._healthy = False
-                self._state.record_worker_state("stopped", ready=False, now=self._clock())
+                self._state.record_worker_state(
+                    "stopped", ready=False, now=self._maintenance_time()
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,9 +627,12 @@ def build_production_runtime(
 
     def production_health_probe() -> bool:
         status = state.status()
+        maintenance = status.services["maintenance"]
+        heartbeat_age = now() - maintenance.updated_at
         return (
-            status.services["maintenance"].state == "ready"
+            maintenance.state == "ready"
             and "workers_ready" not in status.missing_prerequisites
+            and 0 <= heartbeat_age <= workers.heartbeat_lease_seconds
         )
 
     if web is not None:

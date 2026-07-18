@@ -43,6 +43,7 @@ class ProductionServiceStatus:
     state: str
     host: str | None
     port: int | None
+    updated_at: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,7 +260,7 @@ class ProductionStateStore:
             ).fetchone()
             rows = connection.execute(
                 """
-                SELECT service_name, service_kind, state, host, port
+                SELECT service_name, service_kind, state, host, port, updated_at
                 FROM production_services ORDER BY service_name
                 """
             ).fetchall()
@@ -282,6 +283,7 @@ class ProductionStateStore:
                     state=str(row["state"]),
                     host=str(row["host"]) if row["host"] is not None else None,
                     port=int(row["port"]) if row["port"] is not None else None,
+                    updated_at=int(row["updated_at"]),
                 )
                 for row in rows
             }
