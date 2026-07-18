@@ -154,6 +154,8 @@ class ProductionStateStore:
         ready: bool,
         now: int,
     ) -> None:
+        if (state == "ready") != ready:
+            raise ValueError("worker readiness does not match lifecycle state")
         if not isinstance(now, int) or isinstance(now, bool) or now < 0:
             raise ValueError("production worker state time is invalid")
         with self.database.transaction() as connection:
