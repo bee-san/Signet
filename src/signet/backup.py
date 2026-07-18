@@ -26,7 +26,12 @@ from typing import Any, BinaryIO, cast
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from signet.db import DATABASE_OPERATOR_RECOVERY_NOTES, Database, DatabaseRecoveryNoteCarrier
+from signet.db import (
+    DATABASE_OPERATOR_RECOVERY_NOTES,
+    Database,
+    DatabaseRecoveryNoteCarrier,
+    MigrationBackupReceipt,
+)
 from signet.private_paths import (
     DirectoryIdentity,
     PrivatePathError,
@@ -512,10 +517,10 @@ class BackupBundleManager:
 
     def create_pre_migration_callback(
         self, backup_directory: Path
-    ) -> Callable[[Database, int], None]:
+    ) -> Callable[[Database, int], MigrationBackupReceipt]:
         backup_directory = Path(backup_directory)
 
-        def backup(database: Database, current_version: int) -> None:
+        def backup(database: Database, current_version: int) -> MigrationBackupReceipt:
             if database.path.resolve() != self.database.path.resolve():
                 raise BackupError("pre-migration callback received an unexpected database")
             timestamp = int(time.time())
@@ -566,6 +571,13 @@ class BackupBundleManager:
                     "complete; do not migrate or recreate the backup; inspect the published "
                     "bundle before continuing"
                 ) from verification_error
+            return MigrationBackupReceipt(
+                database_path=database.path,
+                source_schema_version=current_version,
+                artifact_path=destination.absolute(),
+                artifact_sha256=_file_hash(destination),
+                verified_restore_schema_version=current_version,
+            )
 
         return backup
 

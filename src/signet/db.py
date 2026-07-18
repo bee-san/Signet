@@ -16,6 +16,7 @@ import stat
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ except ImportError:  # pragma: no cover - CPython's bundled driver is normal
 
 
 IntegrityError = sqlite3.IntegrityError
-LATEST_SCHEMA_VERSION = 15
+LATEST_SCHEMA_VERSION = 16
 MIN_SUPPORTED_SCHEMA_VERSION = 1
 MINIMUM_SQLITE_VERSION = (3, 51, 3)
 _MIGRATION_PATTERN = re.compile(r"^(\d{4})_[a-z0-9_]+\.sql$")
@@ -90,8 +91,21 @@ class MigrationIntegrityError(DatabaseError):
     pass
 
 
+class PreMigrationBackupRequired(MigrationIntegrityError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationBackupReceipt:
+    database_path: Path
+    source_schema_version: int
+    artifact_path: Path
+    artifact_sha256: str
+    verified_restore_schema_version: int
+
+
 MigrationFaultInjector = Callable[[str], None]
-PreMigrationBackup = Callable[["Database", int], None]
+PreMigrationBackup = Callable[["Database", int], MigrationBackupReceipt]
 _NETWORK_FILESYSTEMS = {
     "9p",
     "afs",
@@ -189,6 +203,12 @@ class Database:
         fault_injector: MigrationFaultInjector | None,
         pre_migration_backup: PreMigrationBackup | None,
     ) -> None:
+        preflight_version = self._read_schema_version_read_only()
+        if preflight_version > LATEST_SCHEMA_VERSION:
+            raise IncompatibleSchemaError(
+                f"database schema {preflight_version} is newer than supported "
+                f"schema {LATEST_SCHEMA_VERSION}"
+            )
         connection = self._connect()
         operation_error: BaseException | None = None
         try:
@@ -198,11 +218,8 @@ class Database:
             connection.execute("PRAGMA synchronous=FULL")
 
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if current > LATEST_SCHEMA_VERSION:
-                raise IncompatibleSchemaError(
-                    f"database schema {current} is newer than supported "
-                    f"schema {LATEST_SCHEMA_VERSION}"
-                )
+            if current != preflight_version:
+                raise MigrationIntegrityError("database schema changed during migration preflight")
 
             migrations = self._migration_files()
             if current and current not in migrations:
@@ -210,33 +227,32 @@ class Database:
                     f"no migration definition is available for schema {current}"
                 )
 
+            if current:
+                self._verify_applied_migrations(connection, migrations)
+                self._verify_database_integrity(connection)
+
             if 0 < current < LATEST_SCHEMA_VERSION:
                 if pre_migration_backup is None:
-                    raise MigrationIntegrityError(
+                    raise PreMigrationBackupRequired(
                         "a verified pre-migration backup callback is required"
                     )
-                pre_migration_backup(self, current)
+                receipt = pre_migration_backup(self, current)
+                self._verify_migration_backup_receipt(receipt, current)
 
-            for version in range(current + 1, LATEST_SCHEMA_VERSION + 1):
-                migration = migrations.get(version)
-                if migration is None:
-                    raise MigrationIntegrityError(f"ordered migration {version:04d} is missing")
-                self._apply_migration(
+            if current < LATEST_SCHEMA_VERSION:
+                self._apply_migrations(
                     connection,
-                    version,
-                    migration,
+                    current,
+                    migrations,
                     fault_injector=fault_injector,
                 )
 
             self._complete_privacy_maintenance(connection, fault_injector=fault_injector)
 
             self._verify_applied_migrations(connection, migrations)
-            integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
-            foreign_keys = tuple(connection.execute("PRAGMA foreign_key_check"))
+            self._verify_database_integrity(connection)
             if fault_injector is not None:
                 fault_injector("migration:postcheck")
-            if integrity != "ok" or foreign_keys:
-                raise MigrationIntegrityError("post-migration database integrity check failed")
         except BaseException as exc:
             operation_error = exc
 
@@ -545,6 +561,77 @@ class Database:
         if integrity != "ok" or foreign_keys:
             raise DatabaseError("backup snapshot failed integrity verification")
 
+    def _read_schema_version_read_only(self) -> int:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        descriptor = os.open(self.path, flags)
+        try:
+            header = os.read(descriptor, 100)
+        finally:
+            os.close(descriptor)
+        if not header:
+            return 0
+        if len(header) != 100 or header[:16] != b"SQLite format 3\x00":
+            raise MigrationIntegrityError("database header is missing or invalid")
+        header_version = int.from_bytes(header[60:64], byteorder="big")
+        if not Path(f"{self.path}-wal").exists():
+            return header_version
+        try:
+            connection = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=ro",
+                uri=True,
+                timeout=self.timeout,
+            )
+            try:
+                return int(connection.execute("PRAGMA user_version").fetchone()[0])
+            finally:
+                connection.close()
+        except sqlite3.DatabaseError as exc:
+            raise MigrationIntegrityError("database schema version could not be read") from exc
+
+    def _verify_migration_backup_receipt(
+        self,
+        receipt: MigrationBackupReceipt,
+        current_version: int,
+    ) -> None:
+        if not isinstance(receipt, MigrationBackupReceipt):
+            raise MigrationIntegrityError("pre-migration backup did not return a verified receipt")
+        if (
+            receipt.database_path.resolve() != self.path.resolve()
+            or receipt.source_schema_version != current_version
+            or receipt.verified_restore_schema_version != current_version
+            or not receipt.artifact_path.is_absolute()
+        ):
+            raise MigrationIntegrityError("pre-migration backup receipt is inconsistent")
+        artifact_path = receipt.artifact_path.resolve()
+        live_paths = tuple(
+            candidate.resolve()
+            for candidate in (
+                self.path,
+                Path(f"{self.path}-wal"),
+                Path(f"{self.path}-shm"),
+            )
+        )
+        if artifact_path in live_paths:
+            raise MigrationIntegrityError("pre-migration backup receipt is inconsistent")
+        _require_private_file(receipt.artifact_path, label="pre-migration backup artifact")
+        if any(
+            candidate.exists() and receipt.artifact_path.samefile(candidate)
+            for candidate in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm"))
+        ):
+            raise MigrationIntegrityError("pre-migration backup receipt is inconsistent")
+        if receipt.artifact_path.stat().st_size <= 0:
+            raise MigrationIntegrityError("pre-migration backup artifact is empty")
+        actual_digest = _file_sha256(receipt.artifact_path)
+        if actual_digest != receipt.artifact_sha256:
+            raise MigrationIntegrityError("pre-migration backup artifact digest is inconsistent")
+
+    @staticmethod
+    def _verify_database_integrity(connection: Any) -> None:
+        integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+        foreign_keys = tuple(connection.execute("PRAGMA foreign_key_check"))
+        if integrity != "ok" or foreign_keys:
+            raise MigrationIntegrityError("database integrity verification failed")
+
     def _connect(self) -> Any:
         current_version = tuple(int(part) for part in sqlite3.sqlite_version.split(".")[:3])
         if current_version < MINIMUM_SQLITE_VERSION:
@@ -599,41 +686,49 @@ class Database:
             migrations[version] = path
         return migrations
 
-    def _apply_migration(
+    def _apply_migrations(
         self,
         connection: Any,
-        version: int,
-        path: Path,
+        current_version: int,
+        migrations: dict[int, Path],
         *,
         fault_injector: MigrationFaultInjector | None,
     ) -> None:
-        script = path.read_text(encoding="utf-8")
-        checksum = hashlib.sha256(script.encode("utf-8")).hexdigest()
         connection.execute("BEGIN EXCLUSIVE")
         try:
-            if fault_injector is not None:
-                fault_injector(f"migration:{version}:started")
-            for index, statement in enumerate(_sql_statements(script), start=1):
-                connection.execute(statement)
+            for version in range(current_version + 1, LATEST_SCHEMA_VERSION + 1):
+                path = migrations.get(version)
+                if path is None:
+                    raise MigrationIntegrityError(f"ordered migration {version:04d} is missing")
+                script = path.read_text(encoding="utf-8")
+                checksum = hashlib.sha256(script.encode("utf-8")).hexdigest()
                 if fault_injector is not None:
-                    fault_injector(f"migration:{version}:statement:{index}")
-            connection.execute(
-                """
-                INSERT INTO schema_meta(
-                    migration_id, checksum, applied_at,
-                    min_reader_version, max_reader_version
-                ) VALUES (?, ?, unixepoch(), ?, ?)
-                """,
-                (
-                    version,
-                    checksum,
-                    MIN_SUPPORTED_SCHEMA_VERSION,
-                    LATEST_SCHEMA_VERSION,
-                ),
-            )
-            connection.execute(_USER_VERSION_STATEMENTS[version])
+                    fault_injector(f"migration:{version}:started")
+                for index, statement in enumerate(_sql_statements(script), start=1):
+                    connection.execute(statement)
+                    if fault_injector is not None:
+                        fault_injector(f"migration:{version}:statement:{index}")
+                connection.execute(
+                    """
+                    INSERT INTO schema_meta(
+                        migration_id, checksum, applied_at,
+                        min_reader_version, max_reader_version
+                    ) VALUES (?, ?, unixepoch(), ?, ?)
+                    """,
+                    (
+                        version,
+                        checksum,
+                        MIN_SUPPORTED_SCHEMA_VERSION,
+                        LATEST_SCHEMA_VERSION,
+                    ),
+                )
+                connection.execute(_USER_VERSION_STATEMENTS[version])
+                if fault_injector is not None:
+                    fault_injector(f"migration:{version}:before_commit")
+            self._verify_applied_migrations(connection, migrations)
+            self._verify_database_integrity(connection)
             if fault_injector is not None:
-                fault_injector(f"migration:{version}:before_commit")
+                fault_injector("migration:transaction:postcheck")
             connection.commit()
         except BaseException:
             if connection.in_transaction:
@@ -698,6 +793,14 @@ def _private_file_metadata(metadata: os.stat_result) -> bool:
         and metadata.st_uid == current_uid
         and stat.S_IMODE(metadata.st_mode) == 0o600
     )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _sql_statements(script: str) -> Iterator[str]:

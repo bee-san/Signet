@@ -676,10 +676,17 @@ class SQLitePasswordCredentialRepository:
             connection.execute(
                 """
                 INSERT INTO auth_credentials(
-                    credential_id, user_id, kind, public_material, enrolled_at
-                ) VALUES (?, ?, 'password', ?, ?)
+                    credential_id, user_id, kind, public_material, enrolled_at, factor_label
+                ) VALUES (?, ?, 'password', ?, ?, ?)
                 """,
-                (credential.credential_id, user_id, credential.verifier.encode(), now),
+                (
+                    credential.credential_id,
+                    user_id,
+                    credential.verifier.encode(),
+                    now,
+                    "Password "
+                    + hashlib.sha256(credential.credential_id.encode("utf-8")).hexdigest()[:12],
+                ),
             )
             _revoke_user_sessions(connection, user_id, revoked_at=now)
 

@@ -168,6 +168,7 @@ def make_runtime(
     handler: Callable[[str, str, dict[str, Any], str], Any] | None = None,
     json_response: bool = False,
     session_limit: int = 1_024,
+    health_probe: Callable[[], bool] | None = None,
 ) -> RuntimeHarness:
     calls: list[tuple[str, str, dict[str, Any], str]] = []
 
@@ -197,6 +198,7 @@ def make_runtime(
         approvals=approvals,
         tokens=auth.registry,
         json_response=json_response,
+        health_probe=health_probe,
     )
     return RuntimeHarness(runtime, calls, gateway_tools, surface)
 
@@ -272,6 +274,25 @@ def test_health_is_privacy_safe_host_guarded_and_has_no_ui_routes(auth: AuthFixt
         rejected = client.get("/healthz", headers={"Host": "attacker.example"})
         assert rejected.status_code == 421
         assert "fastmail" not in rejected.text
+
+
+def test_health_probe_fails_closed_without_leaking_service_details(auth: AuthFixture) -> None:
+    healthy = True
+
+    def probe() -> bool:
+        if healthy:
+            return True
+        raise RuntimeError("private downstream detail")
+
+    harness = make_runtime(auth, health_probe=probe)
+    with TestClient(harness.runtime.app, base_url="http://localhost:8789") as client:
+        assert client.get("/healthz").json() == {"status": "ok"}
+        healthy = False
+        response = client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+    assert "private downstream detail" not in response.text
 
 
 def test_mcp_listener_rejects_declared_oversized_body_before_auth(auth: AuthFixture) -> None:
@@ -645,7 +666,12 @@ async def test_registry_verifier_does_not_block_the_event_loop() -> None:
     assert verified.subject == "profile:blocked"
 
 
-def test_cli_requires_explicit_factory_and_mcp_loopback() -> None:
+def test_cli_requires_explicit_factory_and_loopback_listeners() -> None:
+    calls: list[None] = []
+
+    def runner(*_args: object, **_kwargs: object) -> None:
+        calls.append(None)
+
     with pytest.raises(SystemExit):
         main([])
     with pytest.raises(SystemExit):
@@ -658,10 +684,23 @@ def test_cli_requires_explicit_factory_and_mcp_loopback() -> None:
                 "tests.factories:create_mcp",
                 "--host",
                 "0.0.0.0",
-            ]
+            ],
+            runner=runner,
+        )
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "serve-web",
+                "--factory",
+                "tests.factories:create_web",
+                "--host",
+                "0.0.0.0",
+            ],
+            runner=runner,
         )
     with pytest.raises(SystemExit):
         main(["serve-web", "--factory", "not a factory"])
+    assert calls == []
 
 
 def test_cli_platform_support_is_explicitly_posix_only() -> None:

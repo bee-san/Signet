@@ -66,39 +66,63 @@ class TotpCredential:
 
 
 class TotpCredentialRepository(Protocol):
-    def find_totp(self, user_id: str) -> TotpCredential | None: ...
+    def active_totps(self, user_id: str) -> tuple[TotpCredential, ...]: ...
 
 
 class SQLiteTotpCredentialRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def find_totp(self, user_id: str) -> TotpCredential | None:
+    def active_totps(self, user_id: str) -> tuple[TotpCredential, ...]:
         user_id = canonical_user_id(user_id)
         with self.database.read() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
                 SELECT credential_id, user_id, secret_reference, disabled_at
                 FROM auth_credentials
                 WHERE user_id = ? AND kind = 'totp' AND disabled_at IS NULL
+                ORDER BY credential_id
                 """,
                 (user_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return TotpCredential(
-            credential_id=str(row["credential_id"]),
-            user_id=str(row["user_id"]),
-            secret_reference=str(row["secret_reference"]),
-            disabled=row["disabled_at"] is not None,
+            ).fetchall()
+        return tuple(
+            TotpCredential(
+                credential_id=str(row["credential_id"]),
+                user_id=str(row["user_id"]),
+                secret_reference=str(row["secret_reference"]),
+                disabled=row["disabled_at"] is not None,
+            )
+            for row in rows
         )
 
+    def find_totp(self, user_id: str) -> TotpCredential | None:
+        """Return the first active factor for compatibility with legacy callers."""
+
+        credentials = self.active_totps(user_id)
+        return credentials[0] if credentials else None
+
+    def add_totp(self, credential: TotpCredential, *, now: int) -> None:
+        user_id = _validate_active_credential(credential)
+        with self.database.transaction() as connection:
+            _ensure_auth_user(connection, user_id, created_at=now)
+            connection.execute(
+                """
+                INSERT INTO auth_credentials(
+                    credential_id, user_id, kind, secret_reference, enrolled_at, factor_label
+                ) VALUES (?, ?, 'totp', ?, ?, ?)
+                """,
+                (
+                    credential.credential_id,
+                    user_id,
+                    credential.secret_reference,
+                    now,
+                    _totp_factor_label(credential.credential_id),
+                ),
+            )
+            _revoke_user_sessions(connection, user_id, revoked_at=now)
+
     def replace_totp(self, credential: TotpCredential, *, now: int) -> None:
-        user_id = canonical_user_id(credential.user_id)
-        if credential.disabled:
-            raise ValueError("an active TOTP credential is required")
-        _bounded_identifier(credential.credential_id, name="credential ID", maximum=256)
-        SecretReference.parse(credential.secret_reference)
+        user_id = _validate_active_credential(credential)
         with self.database.transaction() as connection:
             _ensure_auth_user(connection, user_id, created_at=now)
             connection.execute(
@@ -111,12 +135,50 @@ class SQLiteTotpCredentialRepository:
             connection.execute(
                 """
                 INSERT INTO auth_credentials(
-                    credential_id, user_id, kind, secret_reference, enrolled_at
-                ) VALUES (?, ?, 'totp', ?, ?)
+                    credential_id, user_id, kind, secret_reference, enrolled_at, factor_label
+                ) VALUES (?, ?, 'totp', ?, ?, ?)
                 """,
-                (credential.credential_id, user_id, credential.secret_reference, now),
+                (
+                    credential.credential_id,
+                    user_id,
+                    credential.secret_reference,
+                    now,
+                    _totp_factor_label(credential.credential_id),
+                ),
             )
             _revoke_user_sessions(connection, user_id, revoked_at=now)
+
+    def disable_totp(self, credential_id: str, user_id: str, *, now: int) -> bool:
+        user_id = canonical_user_id(user_id)
+        _bounded_identifier(credential_id, name="credential ID", maximum=256)
+        with self.database.transaction() as connection:
+            updated = int(
+                connection.execute(
+                    """
+                    UPDATE auth_credentials SET disabled_at = ?
+                    WHERE credential_id = ? AND user_id = ? AND kind = 'totp'
+                      AND disabled_at IS NULL
+                    """,
+                    (now, credential_id, user_id),
+                ).rowcount
+            )
+            if updated:
+                _revoke_user_sessions(connection, user_id, revoked_at=now)
+        return updated == 1
+
+
+def _validate_active_credential(credential: TotpCredential) -> str:
+    user_id = canonical_user_id(credential.user_id)
+    if credential.disabled:
+        raise ValueError("an active TOTP credential is required")
+    _bounded_identifier(credential.credential_id, name="credential ID", maximum=256)
+    SecretReference.parse(credential.secret_reference)
+    return user_id
+
+
+def _totp_factor_label(credential_id: str) -> str:
+    digest = hashlib.sha256(credential_id.encode("utf-8")).hexdigest()[:12]
+    return f"TOTP {digest}"
 
 
 class TotpCodeProvider(Protocol):
@@ -259,20 +321,40 @@ class TotpVerifier:
             source_key=source_rate_limit_key(source_id),
             now=now,
         )
-        credential = self._credentials.find_totp(user_id)
-        if credential is None or credential.user_id != user_id or credential.disabled:
+        credentials = tuple(
+            credential
+            for credential in self._credentials.active_totps(user_id)
+            if credential.user_id == user_id and not credential.disabled
+        )
+        if not credentials:
             raise TotpNotEnrolled("TOTP is not enrolled; use the authenticated web app")
         if not proof or len(proof) > 128:
             self._limiter.record_failure(reservation, now=now)
             raise InvalidTotp("invalid or consumed TOTP proof")
-        try:
-            reference = SecretReference.parse(credential.secret_reference)
-            secret = self._secret_store.get(reference)
-        except CredentialError as exc:
-            raise TotpUnavailable("TOTP credential material is unavailable") from exc
 
-        step = self._provider.verify_step(secret, proof, now=now)
-        if step is None:
+        credential: TotpCredential | None = None
+        step: int | None = None
+        usable_factor_found = False
+        unavailable_cause: Exception | None = None
+        for candidate in credentials:
+            try:
+                reference = SecretReference.parse(candidate.secret_reference)
+                secret = self._secret_store.get(reference)
+                candidate_step = self._provider.verify_step(secret, proof, now=now)
+                usable_factor_found = True
+            except (CredentialError, TotpUnavailable) as exc:
+                unavailable_cause = exc
+                continue
+            if candidate_step is not None:
+                credential = candidate
+                step = candidate_step
+                break
+
+        if credential is None or step is None:
+            if not usable_factor_found and unavailable_cause is not None:
+                raise TotpUnavailable(
+                    "TOTP credential material is unavailable"
+                ) from unavailable_cause
             self._limiter.record_failure(reservation, now=now)
             raise InvalidTotp("invalid or consumed TOTP proof")
         use_id = _use_id(credential.credential_id, step)

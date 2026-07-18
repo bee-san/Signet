@@ -121,6 +121,36 @@ class LoopbackHostMiddleware:
         await self._app(scope, receive, send)
 
 
+class LoopbackPeerMiddleware:
+    """Reject non-loopback transport peers independently of Host headers."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] in {"http", "websocket"}:
+            client = scope.get("client")
+            host = client[0] if isinstance(client, tuple) and client else None
+            try:
+                allowed = host == "testclient" or (
+                    isinstance(host, str) and ipaddress.ip_address(host).is_loopback
+                )
+            except ValueError:
+                allowed = False
+            if not allowed:
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    response = Response(
+                        "Forbidden",
+                        status_code=403,
+                        headers={"Cache-Control": "no-store"},
+                    )
+                    await response(scope, receive, send)
+                return
+        await self._app(scope, receive, send)
+
+
 class CallerContextMiddleware:
     """Expose the authenticated profile to gateway-owned tool providers."""
 
@@ -298,6 +328,9 @@ def assemble_mcp_runtime(
     json_response: bool = False,
     request_concurrency_limit: int = 32,
     per_token_concurrency_limit: int = 8,
+    health_probe: Callable[[], bool] | None = None,
+    readiness_probe: Callable[[], bool] | None = None,
+    lifecycle_observer: Callable[[str], None] | None = None,
 ) -> MCPRuntime:
     """Assemble a local MCP ASGI app without contacting downstream providers."""
 
@@ -376,12 +409,47 @@ def assemble_mcp_runtime(
                 include_in_schema=False,
             )
         )
+
+    async def health(request: Any) -> JSONResponse:
+        del request
+        try:
+            healthy = health_probe is None or health_probe()
+        except Exception:
+            healthy = False
+        return JSONResponse(
+            {"status": "ok" if healthy else "unavailable"},
+            status_code=200 if healthy else 503,
+            headers={"Cache-Control": "no-store"},
+        )
+
     routes.append(
         Route(
             "/healthz",
-            endpoint=_healthz,
+            endpoint=health,
             methods=["GET"],
             name="healthz",
+            include_in_schema=False,
+        )
+    )
+
+    async def readiness(request: Any) -> JSONResponse:
+        del request
+        try:
+            ready = readiness_probe is not None and readiness_probe()
+        except Exception:
+            ready = False
+        return JSONResponse(
+            {"status": "ready" if ready else "unavailable"},
+            status_code=200 if ready else 503,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    routes.append(
+        Route(
+            "/readyz",
+            endpoint=readiness,
+            methods=["GET"],
+            name="readyz",
             include_in_schema=False,
         )
     )
@@ -389,10 +457,24 @@ def assemble_mcp_runtime(
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         del app
-        async with AsyncExitStack() as stack:
-            for manager in managers.values():
-                await stack.enter_async_context(manager.run())
-            yield
+        started = False
+        failed = False
+        try:
+            async with AsyncExitStack() as stack:
+                for manager in managers.values():
+                    await stack.enter_async_context(manager.run())
+                if lifecycle_observer is not None:
+                    lifecycle_observer("ready")
+                started = True
+                yield
+        except BaseException:
+            failed = True
+            if lifecycle_observer is not None:
+                lifecycle_observer("blocked")
+            raise
+        finally:
+            if started and not failed and lifecycle_observer is not None:
+                lifecycle_observer("stopped")
 
     app = Starlette(
         debug=False,
@@ -401,9 +483,10 @@ def assemble_mcp_runtime(
             Middleware(
                 RequestConcurrencyLimitMiddleware,
                 maximum=request_concurrency_limit,
-                exempt_paths=frozenset({"/healthz"}),
+                exempt_paths=frozenset({"/healthz", "/readyz"}),
             ),
             Middleware(RequestBodyLimitMiddleware, default_limit=16 * 1024 * 1024),
+            Middleware(LoopbackPeerMiddleware),
             Middleware(LoopbackHostMiddleware, allowed_hosts=allowed_hosts),
         ],
         lifespan=lifespan,
@@ -413,14 +496,6 @@ def assemble_mcp_runtime(
         app=app,
         managers=MappingProxyType(managers),
         allowed_hosts=allowed_hosts,
-    )
-
-
-async def _healthz(request: Any) -> JSONResponse:
-    del request
-    return JSONResponse(
-        {"status": "ok"},
-        headers={"Cache-Control": "no-store"},
     )
 
 

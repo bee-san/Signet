@@ -79,6 +79,10 @@ from signet.webauthn import (
     WebAuthnCredential,
 )
 from tests.attachment_fixtures import attachment_cipher
+from tests.migration_helpers import (
+    downgrade_auth_credentials_before_schema_16,
+    verified_backup_callback,
+)
 
 NOW = 1_800_000_000
 USER_ID = "autumn"
@@ -388,6 +392,7 @@ def password_verifier() -> Argon2PasswordVerifier:
 def downgrade_schema_13(connection: Any) -> None:
     """Restore the schema-12 shape after test-only schema-13 data injection."""
 
+    downgrade_auth_credentials_before_schema_16(connection)
     connection.execute("DROP TABLE attachment_metadata_privacy_maintenance")
     connection.execute("DROP TRIGGER IF EXISTS request_events_structured_reason_insert")
     connection.execute("DROP TRIGGER IF EXISTS web_action_drafts_structured_reason_insert")
@@ -412,8 +417,13 @@ def downgrade_schema_13(connection: Any) -> None:
     connection.execute("DROP TABLE plugin_tool_mappings")
     connection.execute("DROP TABLE plugin_active")
     connection.execute("DROP TABLE plugin_manifests")
+    connection.execute("DROP TABLE production_secret_references")
+    connection.execute("DROP TABLE production_services")
+    connection.execute("DROP TABLE production_connectors")
+    connection.execute("DROP TABLE production_users")
+    connection.execute("DROP TABLE production_setup_state")
     connection.execute("DROP TABLE privacy_maintenance")
-    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15)")
+    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15, 16)")
     connection.execute("PRAGMA user_version = 12")
 
 
@@ -1978,7 +1988,10 @@ def test_schema_13_sanitizes_legacy_reasons_invalidates_drafts_and_vacuums(
 
     backed_up_versions: list[int] = []
     Database(bundle.database.path).initialize(
-        pre_migration_backup=lambda _database, version: backed_up_versions.append(version)
+        pre_migration_backup=verified_backup_callback(
+            tmp_path / "schema-13-pre-migration-backups",
+            backed_up_versions,
+        )
     )
 
     assert backed_up_versions == [12]
@@ -2169,17 +2182,20 @@ def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
 
     with pytest.raises(RuntimeError, match="injected privacy-maintenance fault"):
         Database(bundle.database.path).initialize(
-            pre_migration_backup=lambda _database, version: backups.append(version),
+            pre_migration_backup=verified_backup_callback(
+                bundle.database.path.parent / f"{fault_stage}-pre-migration-backups",
+                backups,
+            ),
             fault_injector=fail_at,
         )
     assert backups == [12]
     with bundle.database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
         assert (
             connection.execute(
-                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14, 15)"
+                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14, 15, 16)"
             ).fetchone()[0]
-            == 3
+            == 4
         )
 
     # Both privacy migrations are committed, so recovery must not repeat a backup.
