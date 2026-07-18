@@ -34,11 +34,14 @@ from webauthn.helpers.structs import (
 )
 
 from signet.auth import (
+    FACTOR_MANAGEMENT_ACTIONS,
     WEBAUTHN_PROOF_DOMAIN,
     ActionBinding,
     ProofCapability,
     _bounded_identifier,
+    _disable_auth_factors,
     _ensure_auth_user,
+    _register_auth_factor,
     _revoke_user_sessions,
     canonical_user_id,
     webauthn_proof_claims,
@@ -67,6 +70,7 @@ class WebAuthnChallengeRateLimited(WebAuthnError):
 
 
 type DeviceType = Literal["single_device", "multi_device"]
+_AUTHENTICATOR_TRANSPORTS = frozenset({"ble", "hybrid", "internal", "nfc", "smart-card", "usb"})
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -105,6 +109,8 @@ class WebAuthnCredential:
     device_type: DeviceType
     backed_up: bool
     disabled: bool = False
+    transports: tuple[str, ...] = ()
+    discoverable: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -118,6 +124,12 @@ class WebAuthnCredential:
             raise ValueError("credential counter cannot be negative")
         if self.device_type == "single_device" and self.backed_up:
             raise ValueError("a single-device credential cannot be backed up")
+        if (
+            len(self.transports) > 8
+            or tuple(dict.fromkeys(self.transports)) != self.transports
+            or any(transport not in _AUTHENTICATOR_TRANSPORTS for transport in self.transports)
+        ):
+            raise ValueError("credential transports are invalid")
         try:
             raw_id = _base64url_decode(self.credential_id)
         except ValueError:
@@ -135,7 +147,8 @@ class WebAuthnCredential:
             f"credential_id=<redacted>, user_id={self.user_id!r}, "
             "user_handle=<redacted>, public_key=<redacted>, "
             f"sign_count={self.sign_count!r}, device_type={self.device_type!r}, "
-            f"backed_up={self.backed_up!r}, disabled={self.disabled!r})"
+            f"backed_up={self.backed_up!r}, disabled={self.disabled!r}, "
+            f"transports={self.transports!r}, discoverable={self.discoverable!r})"
         )
 
 
@@ -150,6 +163,8 @@ class WebAuthnChallenge:
     offered_credential_ids: tuple[str, ...]
     created_at: int
     expires_at: int
+    expected_rp_id: str | None = None
+    expected_origin: str | None = None
     consumed_at: int | None = None
     invalidated_at: int | None = None
 
@@ -333,6 +348,16 @@ class SQLiteWebAuthnRepository:
                     (challenge.user_id, now),
                 ).fetchone()[0]
             )
+            active += int(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM auth_factor_challenges
+                    WHERE user_id = ? AND consumed_at IS NULL
+                      AND invalidated_at IS NULL AND expires_at > ?
+                    """,
+                    (challenge.user_id, now),
+                ).fetchone()[0]
+            )
             if active >= max_active:
                 return False
             try:
@@ -342,12 +367,44 @@ class SQLiteWebAuthnRepository:
                     UNION ALL
                     SELECT 1 FROM connector_effect_review_challenges
                     WHERE challenge_id = ?
+                    UNION ALL
+                    SELECT 1 FROM auth_factor_challenges WHERE challenge_id = ?
                     """,
-                    (challenge.challenge_id, challenge.challenge_id),
+                    (challenge.challenge_id, challenge.challenge_id, challenge.challenge_id),
                 ).fetchone()
                 if collision is not None:
                     return False
-                if challenge.binding.action == "review_effect_mapping":
+                if challenge.binding.action in FACTOR_MANAGEMENT_ACTIONS:
+                    connection.execute(
+                        """
+                        INSERT INTO auth_factor_challenges(
+                            challenge_id, challenge, user_id, action, operation_id,
+                            version, payload_hash, session_id, http_method,
+                            expected_rp_id, expected_origin,
+                            offered_credential_ids_json, created_at, expires_at,
+                            consumed_at, invalidated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            challenge.challenge_id,
+                            challenge.challenge,
+                            challenge.user_id,
+                            challenge.binding.action,
+                            challenge.binding.request_id,
+                            challenge.binding.version,
+                            challenge.binding.payload_hash,
+                            challenge.session_id,
+                            challenge.http_method,
+                            challenge.expected_rp_id,
+                            challenge.expected_origin,
+                            offered_json,
+                            challenge.created_at,
+                            challenge.expires_at,
+                            challenge.consumed_at,
+                            challenge.invalidated_at,
+                        ),
+                    )
+                elif challenge.binding.action == "review_effect_mapping":
                     connection.execute(
                         """
                         INSERT INTO connector_effect_review_challenges(
@@ -411,6 +468,16 @@ class SQLiteWebAuthnRepository:
                 (challenge_id,),
             ).fetchone()
             effect = False
+            management = False
+            if row is None:
+                row = connection.execute(
+                    """
+                    SELECT * FROM auth_factor_challenges
+                    WHERE challenge_id = ?
+                    """,
+                    (challenge_id,),
+                ).fetchone()
+                management = row is not None
             if row is None:
                 row = connection.execute(
                     """
@@ -432,6 +499,13 @@ class SQLiteWebAuthnRepository:
                 effect_review_digest=str(row["effect_review_digest"]),
             )
             if effect
+            else ActionBinding(
+                action=str(row["action"]),
+                request_id=str(row["operation_id"]),
+                version=int(row["version"]),
+                payload_hash=str(row["payload_hash"]),
+            )
+            if management
             else ActionBinding(
                 action=str(row["action"]),
                 request_id=(str(row["request_id"]) if row["request_id"] is not None else None),
@@ -458,6 +532,8 @@ class SQLiteWebAuthnRepository:
             offered_credential_ids=tuple(offered),
             created_at=int(row["created_at"]),
             expires_at=int(row["expires_at"]),
+            expected_rp_id=(str(row["expected_rp_id"]) if management else None),
+            expected_origin=(str(row["expected_origin"]) if management else None),
             consumed_at=(int(row["consumed_at"]) if row["consumed_at"] is not None else None),
             invalidated_at=(
                 int(row["invalidated_at"]) if row["invalidated_at"] is not None else None
@@ -474,6 +550,15 @@ class SQLiteWebAuthnRepository:
                 """,
                 (now, challenge_id),
             ).rowcount
+            if int(updated) == 0:
+                updated = connection.execute(
+                    """
+                    UPDATE auth_factor_challenges SET invalidated_at = ?
+                    WHERE challenge_id = ? AND consumed_at IS NULL
+                      AND invalidated_at IS NULL
+                    """,
+                    (now, challenge_id),
+                ).rowcount
             if int(updated) == 0:
                 updated = connection.execute(
                     """
@@ -511,14 +596,18 @@ class SQLiteWebAuthnRepository:
 
     def add_credential(self, credential: WebAuthnCredential, *, now: int) -> None:
         user_id = canonical_user_id(credential.user_id)
+        factor_label = (
+            "Passkey " + hashlib.sha256(credential.credential_id.encode("utf-8")).hexdigest()[:12]
+        )
         with self.database.transaction() as connection:
             _ensure_auth_user(connection, user_id, created_at=now)
             connection.execute(
                 """
                 INSERT INTO auth_credentials(
                     credential_id, user_id, kind, public_material, enrolled_at,
-                    sign_count, backup_eligible, backup_state, user_handle, factor_label
-                ) VALUES (?, ?, 'webauthn', ?, ?, ?, ?, ?, ?, ?)
+                    sign_count, backup_eligible, backup_state, user_handle, factor_label,
+                    transports_json, discoverable
+                ) VALUES (?, ?, 'webauthn', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     credential.credential_id,
@@ -529,9 +618,18 @@ class SQLiteWebAuthnRepository:
                     int(credential.device_type == "multi_device"),
                     int(credential.backed_up),
                     credential.user_handle,
-                    "Passkey "
-                    + hashlib.sha256(credential.credential_id.encode("utf-8")).hexdigest()[:12],
+                    factor_label,
+                    json.dumps(list(credential.transports), separators=(",", ":")),
+                    int(credential.discoverable),
                 ),
+            )
+            _register_auth_factor(
+                connection,
+                credential_id=credential.credential_id,
+                user_id=user_id,
+                kind="webauthn",
+                label=factor_label,
+                now=now,
             )
             _revoke_user_sessions(connection, user_id, revoked_at=now)
 
@@ -549,6 +647,13 @@ class SQLiteWebAuthnRepository:
                 ).rowcount
             )
             if updated:
+                _disable_auth_factors(
+                    connection,
+                    user_id=user_id,
+                    kind="webauthn",
+                    now=now,
+                    credential_id=credential_id,
+                )
                 _revoke_user_sessions(connection, user_id, revoked_at=now)
         return updated == 1
 
@@ -576,14 +681,18 @@ class WebAuthnChallengeIssuer:
         repository: WebAuthnRepository,
         *,
         rp_id: str,
+        origin: str | None = None,
         lifetime: int = 2 * 60,
         max_active_per_user: int = 5,
     ) -> None:
         normalized_rp = _normalize_rp_id(rp_id)
+        if origin is not None:
+            _validate_origin_and_rp(origin, normalized_rp)
         if lifetime <= 0 or lifetime > 10 * 60 or max_active_per_user <= 0:
             raise ValueError("invalid WebAuthn challenge limits")
         self._repository = repository
         self.rp_id = normalized_rp
+        self.origin = origin
         self.lifetime = lifetime
         self.max_active_per_user = max_active_per_user
 
@@ -600,6 +709,9 @@ class WebAuthnChallengeIssuer:
         _bounded_identifier(session_id, name="session ID", maximum=128)
         if len(session_id) < 16 or http_method != "POST":
             raise ValueError("WebAuthn challenges require a bound session and POST method")
+        management = binding.action in FACTOR_MANAGEMENT_ACTIONS
+        if management and self.origin is None:
+            raise ValueError("factor-management challenges require a bound origin")
         credentials = self._repository.credentials_for_user(user_id)
         if not credentials:
             raise WebAuthnCredentialUnavailable("no active WebAuthn credential")
@@ -615,6 +727,8 @@ class WebAuthnChallengeIssuer:
             offered_credential_ids=tuple(credential.credential_id for credential in credentials),
             created_at=now,
             expires_at=now + self.lifetime,
+            expected_rp_id=(self.rp_id if management else None),
+            expected_origin=(self.origin if management else None),
         )
         created = self._repository.create_challenge(
             challenge,
@@ -828,6 +942,8 @@ class VerifiedWebAuthn:
     previous_backed_up: bool
     new_backed_up: bool
     capability: str
+    verified_at: int | None = None
+    expires_at: int | None = None
 
     def __repr__(self) -> str:
         return (
@@ -878,6 +994,13 @@ class WebAuthnAssertionVerifier:
             or challenge.binding != binding
             or challenge.session_id != session_id
             or challenge.http_method != http_method
+            or (
+                challenge.binding.action in FACTOR_MANAGEMENT_ACTIONS
+                and (
+                    challenge.expected_rp_id != self.rp_id
+                    or challenge.expected_origin != self.origin
+                )
+            )
             or challenge.consumed_at is not None
             or challenge.invalidated_at is not None
             or now >= challenge.expires_at
@@ -954,6 +1077,8 @@ class WebAuthnAssertionVerifier:
                 new_backup_eligible=new_backup_eligible,
                 previous_backed_up=credential.backed_up,
                 new_backed_up=verified.backed_up,
+                verified_at=now,
+                expires_at=challenge.expires_at,
             ),
         )
         return VerifiedWebAuthn(
@@ -972,6 +1097,8 @@ class WebAuthnAssertionVerifier:
             previous_backed_up=credential.backed_up,
             new_backed_up=verified.backed_up,
             capability=capability,
+            verified_at=now,
+            expires_at=challenge.expires_at,
         )
 
 
@@ -1094,6 +1221,14 @@ _HOST_LABEL = re.compile(r"[a-z0-9-]+")
 def _credential_from_row(row: Any) -> WebAuthnCredential:
     if row["user_handle"] is None or row["backup_eligible"] is None:
         raise WebAuthnError("stored WebAuthn credential is incomplete")
+    try:
+        transports_value = json.loads(str(row["transports_json"]))
+    except (TypeError, ValueError):
+        raise WebAuthnError("stored WebAuthn credential transports are invalid") from None
+    if not isinstance(transports_value, list) or not all(
+        isinstance(transport, str) for transport in transports_value
+    ):
+        raise WebAuthnError("stored WebAuthn credential transports are invalid")
     return WebAuthnCredential(
         credential_id=str(row["credential_id"]),
         user_id=str(row["user_id"]),
@@ -1103,4 +1238,6 @@ def _credential_from_row(row: Any) -> WebAuthnCredential:
         device_type=("multi_device" if bool(row["backup_eligible"]) else "single_device"),
         backed_up=bool(row["backup_state"]),
         disabled=row["disabled_at"] is not None,
+        transports=tuple(transports_value),
+        discoverable=bool(row["discoverable"]),
     )

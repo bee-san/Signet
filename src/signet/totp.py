@@ -22,10 +22,13 @@ from signet.auth import (
     AttemptReservation,
     ProofCapability,
     _bounded_identifier,
+    _disable_auth_factors,
     _ensure_auth_user,
+    _register_auth_factor,
     _revoke_user_sessions,
     canonical_user_id,
     source_rate_limit_key,
+    totp_factor_rate_limit_key,
     totp_proof_claims,
     totp_rate_limit_key,
 )
@@ -103,6 +106,7 @@ class SQLiteTotpCredentialRepository:
 
     def add_totp(self, credential: TotpCredential, *, now: int) -> None:
         user_id = _validate_active_credential(credential)
+        factor_label = _totp_factor_label(credential.credential_id)
         with self.database.transaction() as connection:
             _ensure_auth_user(connection, user_id, created_at=now)
             connection.execute(
@@ -116,13 +120,22 @@ class SQLiteTotpCredentialRepository:
                     user_id,
                     credential.secret_reference,
                     now,
-                    _totp_factor_label(credential.credential_id),
+                    factor_label,
                 ),
+            )
+            _register_auth_factor(
+                connection,
+                credential_id=credential.credential_id,
+                user_id=user_id,
+                kind="totp",
+                label=factor_label,
+                now=now,
             )
             _revoke_user_sessions(connection, user_id, revoked_at=now)
 
     def replace_totp(self, credential: TotpCredential, *, now: int) -> None:
         user_id = _validate_active_credential(credential)
+        factor_label = _totp_factor_label(credential.credential_id)
         with self.database.transaction() as connection:
             _ensure_auth_user(connection, user_id, created_at=now)
             connection.execute(
@@ -132,6 +145,7 @@ class SQLiteTotpCredentialRepository:
                 """,
                 (now, user_id),
             )
+            _disable_auth_factors(connection, user_id=user_id, kind="totp", now=now)
             connection.execute(
                 """
                 INSERT INTO auth_credentials(
@@ -143,8 +157,16 @@ class SQLiteTotpCredentialRepository:
                     user_id,
                     credential.secret_reference,
                     now,
-                    _totp_factor_label(credential.credential_id),
+                    factor_label,
                 ),
+            )
+            _register_auth_factor(
+                connection,
+                credential_id=credential.credential_id,
+                user_id=user_id,
+                kind="totp",
+                label=factor_label,
+                now=now,
             )
             _revoke_user_sessions(connection, user_id, revoked_at=now)
 
@@ -163,6 +185,13 @@ class SQLiteTotpCredentialRepository:
                 ).rowcount
             )
             if updated:
+                _disable_auth_factors(
+                    connection,
+                    user_id=user_id,
+                    kind="totp",
+                    now=now,
+                    credential_id=credential_id,
+                )
                 _revoke_user_sessions(connection, user_id, revoked_at=now)
         return updated == 1
 
@@ -263,6 +292,8 @@ class VerifiedTotp:
     rate_limit_key: str
     attempt_reservation: AttemptReservation
     capability: str
+    verified_at: int | None = None
+    expires_at: int | None = None
 
     def __repr__(self) -> str:
         return (
@@ -287,15 +318,19 @@ class TotpVerifier:
         capabilities: ProofCapability,
         provider: TotpCodeProvider | None = None,
         allow_test_provider: bool = False,
+        proof_lifetime: int = 120,
     ) -> None:
         selected_provider = provider or PyotpTotpProvider()
         if selected_provider.test_only and not allow_test_provider:
             raise ValueError("a fake TOTP provider requires explicit test opt-in")
+        if proof_lifetime < 1 or proof_lifetime > 5 * 60:
+            raise ValueError("TOTP proof lifetime is invalid")
         self._credentials = credentials
         self._secret_store = secret_store
         self._limiter = limiter
         self._provider = selected_provider
         self._capabilities = capabilities
+        self.proof_lifetime = proof_lifetime
 
     def verify(
         self,
@@ -307,6 +342,7 @@ class TotpVerifier:
         source_id: str = "local-web",
         session_id: str | None = None,
         http_method: str = "MCP",
+        credential_id: str | None = None,
     ) -> VerifiedTotp:
         user_id = canonical_user_id(user_id)
         if http_method == "POST":
@@ -315,7 +351,16 @@ class TotpVerifier:
             _bounded_identifier(session_id, name="session ID", maximum=128)
         elif http_method != "MCP" or session_id is not None or binding.action != "approve":
             raise ValueError("TOTP confirmation context is invalid")
-        rate_key = totp_rate_limit_key(user_id)
+        selected_credential_id = (
+            _bounded_identifier(credential_id, name="credential ID", maximum=256)
+            if credential_id is not None
+            else None
+        )
+        rate_key = (
+            totp_factor_rate_limit_key(user_id, selected_credential_id)
+            if selected_credential_id is not None
+            else totp_rate_limit_key(user_id)
+        )
         reservation = self._limiter.reserve(
             rate_key,
             source_key=source_rate_limit_key(source_id),
@@ -324,7 +369,11 @@ class TotpVerifier:
         credentials = tuple(
             credential
             for credential in self._credentials.active_totps(user_id)
-            if credential.user_id == user_id and not credential.disabled
+            if credential.user_id == user_id
+            and not credential.disabled
+            and (
+                selected_credential_id is None or credential.credential_id == selected_credential_id
+            )
         )
         if not credentials:
             raise TotpNotEnrolled("TOTP is not enrolled; use the authenticated web app")
@@ -373,6 +422,8 @@ class TotpVerifier:
                 rate_limit_key=rate_key,
                 attempt_id=reservation.attempt_id,
                 attempt_scope_keys=reservation.scope_keys,
+                verified_at=now,
+                expires_at=now + self.proof_lifetime,
             ),
         )
         return VerifiedTotp(
@@ -385,12 +436,17 @@ class TotpVerifier:
             rate_limit_key=rate_key,
             attempt_reservation=reservation,
             capability=capability,
+            verified_at=now,
+            expires_at=now + self.proof_lifetime,
         )
 
     def record_consumed_success(self, proof: VerifiedTotp, *, now: int) -> None:
         """Clear failures only after the proof's use ID is atomically consumed."""
 
-        if proof.rate_limit_key != totp_rate_limit_key(proof.user_id):
+        if proof.rate_limit_key not in {
+            totp_rate_limit_key(proof.user_id),
+            totp_factor_rate_limit_key(proof.user_id, proof.credential_id),
+        }:
             raise ValueError("TOTP proof has an invalid rate-limit binding")
         self._limiter.record_success(proof.attempt_reservation, now=now)
 

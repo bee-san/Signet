@@ -149,6 +149,8 @@ class ApprovalConfirmation:
     new_backup_eligible: bool | None = None
     previous_backed_up: bool | None = None
     new_backed_up: bool | None = None
+    verified_at: int | None = None
+    expires_at: int | None = None
 
     def __repr__(self) -> str:
         return (

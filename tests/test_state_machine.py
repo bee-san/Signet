@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from threading import Barrier
+from typing import Any
 
 import pytest
 
@@ -53,6 +54,38 @@ TOTP_SOURCE_KEY = source_rate_limit_key("state-machine-tests")
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def ensure_factor(
+    connection: Any,
+    credential_id: str,
+    kind: str,
+    *,
+    label: str,
+) -> None:
+    connection.execute(
+        "INSERT INTO auth_users(user_id, created_at) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        (HUMAN_USER, NOW),
+    )
+    connection.execute(
+        """
+        INSERT INTO auth_factors(
+            factor_id, credential_id, user_id, kind, label,
+            state, created_at, updated_at, created_audit_ref
+        ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        ON CONFLICT(credential_id) DO NOTHING
+        """,
+        (
+            "fac_" + digest(credential_id)[:24],
+            credential_id,
+            HUMAN_USER,
+            kind,
+            label,
+            NOW,
+            NOW,
+            "fixture:" + credential_id,
+        ),
+    )
 
 
 @pytest.fixture
@@ -172,6 +205,7 @@ def totp_confirmation(
             """,
             (TOTP_CREDENTIAL_ID, HUMAN_USER, NOW),
         )
+        ensure_factor(connection, TOTP_CREDENTIAL_ID, "totp", label="State test TOTP")
     rate_key = totp_rate_limit_key(HUMAN_USER)
     binding = ActionBinding(
         action,
@@ -821,6 +855,12 @@ def test_webauthn_challenge_cannot_cross_sessions_and_cas_rolls_back(
             """,
             (NOW,),
         )
+        ensure_factor(
+            connection,
+            "cross-session-credential",
+            "webauthn",
+            label="Cross-session passkey",
+        )
     ensure_web_session(machine)
     other_session = "other-web-session-for-tests-00000001"
     with database.transaction() as connection:
@@ -1073,6 +1113,7 @@ def test_webauthn_credential_state_and_approval_commit_atomically(
             """,
             (NOW,),
         )
+        ensure_factor(connection, "credential-one", "webauthn", label="Approval passkey")
     ensure_web_session(machine)
     machine.create_challenge(
         "challenge-one-opaque",
@@ -1161,6 +1202,7 @@ def test_invalid_webauthn_state_rolls_back_challenge_and_approval(
             """,
             (NOW,),
         )
+        ensure_factor(connection, "credential-bad", "webauthn", label="Invalid passkey")
     ensure_web_session(machine)
     machine.create_challenge(
         "challenge-bad-opaque",

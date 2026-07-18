@@ -493,6 +493,14 @@ def test_webauthn_login_completion_rotates_session_and_consumes_atomically(
     credential = repository.find_credential(WEB_CREDENTIAL_ID)
     assert stored is not None and stored.consumed_at == 23
     assert credential is not None and credential.sign_count == 8
+    with database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT last_used_at FROM auth_factors WHERE credential_id = ?",
+                (WEB_CREDENTIAL_ID,),
+            ).fetchone()[0]
+            == 23
+        )
 
 
 def test_webauthn_login_fault_rolls_back_every_auth_record(database: Database) -> None:
@@ -692,6 +700,16 @@ def test_totp_login_completion_is_durable_single_use_and_clears_attempts(
         manager.authenticate(old_token, now=24)
     with database.read() as connection:
         assert connection.execute("SELECT count(*) FROM auth_attempts").fetchone()[0] == 0
+        factor_usage = {
+            row["credential_id"]: row["last_used_at"]
+            for row in connection.execute(
+                """
+                SELECT credential_id, last_used_at FROM auth_factors
+                WHERE credential_id IN ('password-main', 'totp-main')
+                """
+            ).fetchall()
+        }
+        assert factor_usage == {"password-main": 23, "totp-main": 23}
 
     candidate = approval_request("login-then-approval-replay", now=24)
     machine = ApprovalStateMachine(database, capabilities=TEST_CAPABILITIES)
@@ -803,6 +821,13 @@ def test_approval_consumption_blocks_same_totp_step_from_login(database: Databas
         actor="human:mcp",
         now=22,
     )
+    with database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT last_used_at FROM auth_factors WHERE credential_id = 'totp-main'"
+            ).fetchone()[0]
+            == 22
+        )
 
     login_proof = totp.verify(
         USER_ID,

@@ -2636,6 +2636,8 @@ def _totp_confirmation(proof: VerifiedTotp) -> ApprovalConfirmation:
         rate_limit_key=proof.rate_limit_key,
         credential_id=proof.credential_id,
         credential_user_id=proof.user_id,
+        verified_at=proof.verified_at,
+        expires_at=proof.expires_at,
     )
 
 
@@ -2664,6 +2666,8 @@ def _webauthn_confirmation(proof: VerifiedWebAuthn) -> ApprovalConfirmation:
         new_backup_eligible=proof.new_backup_eligible,
         previous_backed_up=proof.previous_backed_up,
         new_backed_up=proof.new_backed_up,
+        verified_at=proof.verified_at,
+        expires_at=proof.expires_at,
     )
 
 

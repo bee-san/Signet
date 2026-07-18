@@ -28,6 +28,14 @@ PASSWORD_PROOF_DOMAIN = "signet.password-authenticated.v1"
 TOTP_PROOF_DOMAIN = "signet.totp-verified.v1"
 WEBAUTHN_PROOF_DOMAIN = "signet.webauthn-verified.v1"
 _PROOF_DOMAINS = frozenset({PASSWORD_PROOF_DOMAIN, TOTP_PROOF_DOMAIN, WEBAUTHN_PROOF_DOMAIN})
+FACTOR_MANAGEMENT_ACTIONS = frozenset(
+    {
+        "add_authenticator",
+        "rename_authenticator",
+        "revoke_authenticator",
+        "replace_authenticator",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +60,7 @@ class ActionBinding:
             "promote_approval",
             "promote_passthrough",
             "review_effect_mapping",
+            *FACTOR_MANAGEMENT_ACTIONS,
         }:
             raise ValueError("a supported bounded action is required")
         request_fields = (self.request_id, self.version, self.payload_hash)
@@ -158,8 +167,10 @@ def totp_proof_claims(
     rate_limit_key: str,
     attempt_id: str,
     attempt_scope_keys: Sequence[str],
+    verified_at: int | None = None,
+    expires_at: int | None = None,
 ) -> dict[str, object]:
-    return {
+    claims: dict[str, object] = {
         **_binding_claims(binding),
         "attempt_id": attempt_id,
         "attempt_scope_keys": list(attempt_scope_keys),
@@ -172,6 +183,9 @@ def totp_proof_claims(
         "use_id": use_id,
         "user_id": user_id,
     }
+    if binding.action in FACTOR_MANAGEMENT_ACTIONS:
+        claims.update({"expires_at": expires_at, "verified_at": verified_at})
+    return claims
 
 
 def webauthn_proof_claims(
@@ -192,8 +206,10 @@ def webauthn_proof_claims(
     new_backup_eligible: bool,
     previous_backed_up: bool,
     new_backed_up: bool,
+    verified_at: int | None = None,
+    expires_at: int | None = None,
 ) -> dict[str, object]:
-    return {
+    claims: dict[str, object] = {
         **_binding_claims(binding),
         "challenge_id": challenge_id,
         "credential_id": credential_id,
@@ -211,6 +227,9 @@ def webauthn_proof_claims(
         "use_id": use_id,
         "user_id": user_id,
     }
+    if binding.action in FACTOR_MANAGEMENT_ACTIONS:
+        claims.update({"expires_at": expires_at, "verified_at": verified_at})
+    return claims
 
 
 class AuthenticationError(RuntimeError):
@@ -664,6 +683,9 @@ class SQLitePasswordCredentialRepository:
         if credential.disabled or not credential.verifier.startswith("$argon2id$"):
             raise ValueError("an active Argon2id verifier is required")
         _bounded_identifier(credential.credential_id, name="credential ID", maximum=256)
+        factor_label = (
+            "Password " + hashlib.sha256(credential.credential_id.encode("utf-8")).hexdigest()[:12]
+        )
         with self.database.transaction() as connection:
             _ensure_auth_user(connection, user_id, created_at=now)
             connection.execute(
@@ -673,6 +695,7 @@ class SQLitePasswordCredentialRepository:
                 """,
                 (now, user_id),
             )
+            _disable_auth_factors(connection, user_id=user_id, kind="password", now=now)
             connection.execute(
                 """
                 INSERT INTO auth_credentials(
@@ -684,9 +707,16 @@ class SQLitePasswordCredentialRepository:
                     user_id,
                     credential.verifier.encode(),
                     now,
-                    "Password "
-                    + hashlib.sha256(credential.credential_id.encode("utf-8")).hexdigest()[:12],
+                    factor_label,
                 ),
+            )
+            _register_auth_factor(
+                connection,
+                credential_id=credential.credential_id,
+                user_id=user_id,
+                kind="password",
+                label=factor_label,
+                now=now,
             )
             _revoke_user_sessions(connection, user_id, revoked_at=now)
 
@@ -1279,11 +1309,12 @@ class SQLiteAuthenticationTransactions:
     ) -> None:
         password = connection.execute(  # type: ignore[attr-defined]
             """
-            SELECT 1 FROM auth_credentials
+            UPDATE auth_credentials SET last_used_at = ?
             WHERE credential_id = ? AND user_id = ? AND kind = 'password'
               AND disabled_at IS NULL
+            RETURNING credential_id
             """,
-            (password_credential_id, proof.user_id),
+            (now, password_credential_id, proof.user_id),
         ).fetchone()
         if password is None:
             raise InvalidCredentials("invalid credentials")
@@ -1297,6 +1328,20 @@ class SQLiteAuthenticationTransactions:
             (now, proof.credential_id, proof.user_id),
         ).fetchone()
         if credential is None:
+            raise InvalidCredentials("invalid credentials")
+        if not _mark_auth_factor_used(
+            connection,
+            credential_id=password_credential_id,
+            user_id=proof.user_id,
+            kind="password",
+            now=now,
+        ) or not _mark_auth_factor_used(
+            connection,
+            credential_id=proof.credential_id,
+            user_id=proof.user_id,
+            kind="totp",
+            now=now,
+        ):
             raise InvalidCredentials("invalid credentials")
         del session_id
         _settle_attempt_success(connection, proof.attempt_reservation)
@@ -1405,6 +1450,19 @@ def totp_rate_limit_key(user_id: str) -> str:
     return f"totp:{hashlib.sha256(canonical_user_id(user_id).encode()).hexdigest()}"
 
 
+def totp_factor_rate_limit_key(user_id: str, credential_id: str) -> str:
+    """Return a non-identifying limiter scope for one selected TOTP factor."""
+
+    selected_user = canonical_user_id(user_id)
+    selected_credential = _bounded_identifier(
+        credential_id,
+        name="credential ID",
+        maximum=256,
+    )
+    material = f"{selected_user}\x00{selected_credential}".encode()
+    return f"totp-factor:{hashlib.sha256(material).hexdigest()}"
+
+
 def source_rate_limit_key(source_id: str) -> str:
     source_id = _bounded_identifier(source_id, name="authentication source", maximum=256)
     return f"auth-source:{hashlib.sha256(source_id.encode()).hexdigest()}"
@@ -1486,6 +1544,178 @@ def _revoke_user_sessions(connection: object, user_id: str, *, revoked_at: int) 
             (revoked_at, user_id),
         ).rowcount
     )
+
+
+def _register_auth_factor(
+    connection: object,
+    *,
+    credential_id: str,
+    user_id: str,
+    kind: str,
+    label: str,
+    now: int,
+    action: str = "added",
+    operation_id: str = "internal-credential-operation",
+) -> str | None:
+    """Mirror a credential into schema-17 factor metadata when available."""
+
+    if not _factor_catalog_available(connection):
+        return None
+    factor_id = f"fac_{secrets.token_urlsafe(24)}"
+    event_id = f"evt_{secrets.token_urlsafe(24)}"
+    payload_hash = _factor_event_payload_hash(
+        user_id=user_id,
+        kind=kind,
+        label=label,
+        operation_id=operation_id,
+    )
+    connection.execute(  # type: ignore[attr-defined]
+        """
+        INSERT INTO auth_factors(
+            factor_id, credential_id, user_id, kind, label, state,
+            created_at, updated_at, created_audit_ref
+        ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        """,
+        (factor_id, credential_id, user_id, kind, label, now, now, event_id),
+    )
+    connection.execute(  # type: ignore[attr-defined]
+        """
+        INSERT INTO auth_factor_events(
+            event_id, factor_id, user_id, action, actor_factor_id,
+            operation_id, payload_hash, created_at, details_json
+        ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+        """,
+        (
+            event_id,
+            factor_id,
+            user_id,
+            action,
+            operation_id,
+            payload_hash,
+            now,
+            json.dumps({"kind": kind, "label": label}, sort_keys=True, separators=(",", ":")),
+        ),
+    )
+    return factor_id
+
+
+def _disable_auth_factors(
+    connection: object,
+    *,
+    user_id: str,
+    kind: str,
+    now: int,
+    credential_id: str | None = None,
+) -> int:
+    if not _factor_catalog_available(connection):
+        return 0
+    if credential_id is None:
+        rows = connection.execute(  # type: ignore[attr-defined]
+            """
+            SELECT factor_id, label, created_at, updated_at FROM auth_factors
+            WHERE user_id = ? AND kind = ? AND state = 'active'
+            ORDER BY factor_id
+            """,
+            (user_id, kind),
+        ).fetchall()
+    else:
+        rows = connection.execute(  # type: ignore[attr-defined]
+            """
+            SELECT factor_id, label, created_at, updated_at FROM auth_factors
+            WHERE user_id = ? AND kind = ? AND state = 'active'
+              AND credential_id = ?
+            ORDER BY factor_id
+            """,
+            (user_id, kind, credential_id),
+        ).fetchall()
+    for row in rows:
+        factor_id = str(row["factor_id"])
+        effective_now = max(now, int(row["created_at"]), int(row["updated_at"]))
+        event_id = f"evt_{secrets.token_urlsafe(24)}"
+        operation_id = "internal-credential-operation"
+        payload_hash = _factor_event_payload_hash(
+            user_id=user_id,
+            kind=kind,
+            label=str(row["label"]),
+            operation_id=operation_id,
+        )
+        connection.execute(  # type: ignore[attr-defined]
+            """
+            INSERT INTO auth_factor_events(
+                event_id, factor_id, user_id, action, actor_factor_id,
+                operation_id, payload_hash, created_at, details_json
+            ) VALUES (?, ?, ?, 'revoked', NULL, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                factor_id,
+                user_id,
+                operation_id,
+                payload_hash,
+                effective_now,
+                json.dumps({"reason": "credential repository change"}, separators=(",", ":")),
+            ),
+        )
+        connection.execute(  # type: ignore[attr-defined]
+            """
+            UPDATE auth_factors
+            SET state = 'revoked', updated_at = ?, revoked_at = ?, state_audit_ref = ?
+            WHERE factor_id = ? AND state = 'active'
+            """,
+            (effective_now, effective_now, event_id, factor_id),
+        )
+    return len(rows)
+
+
+def _factor_catalog_available(connection: object) -> bool:
+    row = connection.execute(  # type: ignore[attr-defined]
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'auth_factors'"
+    ).fetchone()
+    return row is not None
+
+
+def _mark_auth_factor_used(
+    connection: object,
+    *,
+    credential_id: str,
+    user_id: str,
+    kind: str,
+    now: int,
+) -> bool:
+    """Update safe factor metadata for the exact credential consumed."""
+
+    if not _factor_catalog_available(connection):
+        return True
+    updated = connection.execute(  # type: ignore[attr-defined]
+        """
+        UPDATE auth_factors
+        SET last_used_at = CASE
+                WHEN last_used_at IS NULL THEN max(created_at, ?)
+                WHEN last_used_at < ? THEN max(created_at, ?)
+                ELSE last_used_at
+            END,
+            updated_at = max(updated_at, ?)
+        WHERE credential_id = ? AND user_id = ? AND kind = ? AND state = 'active'
+        """,
+        (now, now, now, now, credential_id, user_id, kind),
+    ).rowcount
+    return int(updated) == 1
+
+
+def _factor_event_payload_hash(
+    *,
+    user_id: str,
+    kind: str,
+    label: str,
+    operation_id: str,
+) -> str:
+    payload = json.dumps(
+        {"kind": kind, "label": label, "operation_id": operation_id, "user_id": user_id},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _session_record(row: object) -> SessionRecord:
@@ -1589,6 +1819,14 @@ def _consume_webauthn_credential(
         ),
     ).rowcount
     if updated != 1:
+        raise InvalidCredentials("invalid WebAuthn credential state")
+    if not _mark_auth_factor_used(
+        connection,
+        credential_id=proof.credential_id,
+        user_id=proof.user_id,
+        kind="webauthn",
+        now=now,
+    ):
         raise InvalidCredentials("invalid WebAuthn credential state")
 
 

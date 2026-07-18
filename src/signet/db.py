@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - CPython's bundled driver is normal
 
 
 IntegrityError = sqlite3.IntegrityError
-LATEST_SCHEMA_VERSION = 16
+LATEST_SCHEMA_VERSION = 17
 MIN_SUPPORTED_SCHEMA_VERSION = 1
 MINIMUM_SQLITE_VERSION = (3, 51, 3)
 _MIGRATION_PATTERN = re.compile(r"^(\d{4})_[a-z0-9_]+\.sql$")

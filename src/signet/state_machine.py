@@ -17,7 +17,9 @@ from .auth import (
     WEBAUTHN_PROOF_DOMAIN,
     ActionBinding,
     ProofCapability,
+    _mark_auth_factor_used,
     canonical_user_id,
+    totp_factor_rate_limit_key,
     totp_proof_claims,
     totp_rate_limit_key,
     webauthn_proof_claims,
@@ -871,14 +873,20 @@ class ApprovalStateMachine:
             raise InvalidConfirmation("TOTP confirmation contains WebAuthn state")
 
         if confirmation.kind == ConfirmationKind.TOTP:
-            rate_key = totp_rate_limit_key(confirmation.user_id or "")
+            rate_keys = {totp_rate_limit_key(confirmation.user_id or "")}
+            if confirmation.credential_id is not None:
+                rate_keys.add(
+                    totp_factor_rate_limit_key(
+                        confirmation.user_id or "", confirmation.credential_id
+                    )
+                )
             if (
                 confirmation.credential_id is None
                 or confirmation.credential_user_id != confirmation.user_id
-                or confirmation.rate_limit_key != rate_key
+                or confirmation.rate_limit_key not in rate_keys
                 or confirmation.attempt_id is None
                 or len(confirmation.attempt_scope_keys) != 2
-                or confirmation.attempt_scope_keys[0] != rate_key
+                or confirmation.attempt_scope_keys[0] != confirmation.rate_limit_key
                 or not confirmation.attempt_scope_keys[1].startswith("auth-source:")
             ):
                 raise InvalidConfirmation("TOTP proof state is invalid")
@@ -897,6 +905,14 @@ class ApprovalStateMachine:
             ).fetchone()
             if credential is None:
                 raise InvalidConfirmation("TOTP credential is stale or unavailable")
+            if not _mark_auth_factor_used(
+                connection,
+                credential_id=confirmation.credential_id,
+                user_id=confirmation.user_id,
+                kind="totp",
+                now=now,
+            ):
+                raise InvalidConfirmation("TOTP factor metadata is stale or unavailable")
 
         try:
             connection.execute(
@@ -1016,6 +1032,8 @@ class ApprovalStateMachine:
                     rate_limit_key=confirmation.rate_limit_key,
                     attempt_id=confirmation.attempt_id,
                     attempt_scope_keys=confirmation.attempt_scope_keys,
+                    verified_at=confirmation.verified_at,
+                    expires_at=confirmation.expires_at,
                 )
                 domain = TOTP_PROOF_DOMAIN
             else:
@@ -1058,6 +1076,8 @@ class ApprovalStateMachine:
                     new_backup_eligible=new_backup_eligible,
                     previous_backed_up=previous_backed_up,
                     new_backed_up=new_backed_up,
+                    verified_at=confirmation.verified_at,
+                    expires_at=confirmation.expires_at,
                 )
                 domain = WEBAUTHN_PROOF_DOMAIN
         except (AssertionError, TypeError, ValueError):
@@ -1132,6 +1152,14 @@ class ApprovalStateMachine:
         ).rowcount
         if updated != 1:
             raise InvalidConfirmation("WebAuthn credential state is stale or unavailable")
+        if not _mark_auth_factor_used(
+            connection,
+            credential_id=credential_id,
+            user_id=credential_user_id,
+            kind="webauthn",
+            now=now,
+        ):
+            raise InvalidConfirmation("WebAuthn factor metadata is stale or unavailable")
 
     def deny(
         self,

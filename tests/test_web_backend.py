@@ -81,6 +81,7 @@ from signet.webauthn import (
 from tests.attachment_fixtures import attachment_cipher
 from tests.migration_helpers import (
     downgrade_auth_credentials_before_schema_16,
+    downgrade_auth_credentials_before_schema_17,
     verified_backup_callback,
 )
 
@@ -392,6 +393,10 @@ def password_verifier() -> Argon2PasswordVerifier:
 def downgrade_schema_13(connection: Any) -> None:
     """Restore the schema-12 shape after test-only schema-13 data injection."""
 
+    connection.execute("DROP TABLE auth_factor_challenges")
+    connection.execute("DROP TABLE auth_factor_events")
+    connection.execute("DROP TABLE auth_factors")
+    downgrade_auth_credentials_before_schema_17(connection)
     downgrade_auth_credentials_before_schema_16(connection)
     connection.execute("DROP TABLE attachment_metadata_privacy_maintenance")
     connection.execute("DROP TRIGGER IF EXISTS request_events_structured_reason_insert")
@@ -423,7 +428,7 @@ def downgrade_schema_13(connection: Any) -> None:
     connection.execute("DROP TABLE production_users")
     connection.execute("DROP TABLE production_setup_state")
     connection.execute("DROP TABLE privacy_maintenance")
-    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15, 16)")
+    connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15, 16, 17)")
     connection.execute("PRAGMA user_version = 12")
 
 
@@ -2190,12 +2195,12 @@ def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
         )
     assert backups == [12]
     with bundle.database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert (
             connection.execute(
-                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14, 15, 16)"
+                "SELECT count(*) FROM schema_meta WHERE migration_id IN (13, 14, 15, 16, 17)"
             ).fetchone()[0]
-            == 4
+            == 5
         )
 
     # Both privacy migrations are committed, so recovery must not repeat a backup.
