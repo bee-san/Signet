@@ -297,6 +297,19 @@ def test_web_health_uses_durable_maintenance_state_from_a_separate_worker(
     assert client.get("/healthz").status_code == 503
 
 
+def test_worker_state_rejects_readiness_that_contradicts_lifecycle_state(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    staged_status = assembly.status()
+
+    with pytest.raises(ValueError, match="worker readiness does not match lifecycle state"):
+        assembly.state.record_worker_state("blocked", ready=True, now=124)
+
+    assert assembly.status() == staged_status
+
+
 def test_web_health_expires_stale_durable_worker_readiness(tmp_path: Path) -> None:
     current_time = 123
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
