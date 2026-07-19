@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 from signet.auth import InvalidSession, SessionPrincipal
+from signet.authenticator_management import FactorMetadata, LastAuthenticatorError
 from signet.browser_auth import BootstrapService, BrowserAuthController
 from signet.db import Database
 from signet.web import (
@@ -174,6 +175,8 @@ class FakeBackend:
             payload_hash=HASH,
             detail_blocks=(
                 (
+                    DetailBlock("Sender", "plain_text", "autumn@example.test"),
+                    DetailBlock("Subject", "plain_text", "Tuesday release"),
                     DetailBlock("Message", "plain_text", hostile),
                     DetailBlock(
                         "Recipients",
@@ -521,6 +524,21 @@ class BlockingBackend(FakeBackend):
         )
 
 
+@dataclass
+class AuthenticatorPageBrowserAuth:
+    factors: tuple[FactorMetadata, ...]
+
+    def list_factors(self, user_id: str) -> tuple[FactorMetadata, ...]:
+        assert user_id == "autumn"
+        return self.factors
+
+
+class LastFactorBrowserAuth:
+    def apply_with_webauthn(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise LastAuthenticatorError("internal final-factor guard detail")
+
+
 @pytest.fixture
 def backend() -> FakeBackend:
     return FakeBackend()
@@ -548,6 +566,25 @@ def client(backend: FakeBackend, csrf: CsrfManager) -> TestClient:
 
 def authenticate(client: TestClient) -> None:
     client.cookies.set("__Host-signet_session", "session-good")
+
+
+def browser_auth_client(
+    backend: FakeBackend,
+    csrf: CsrfManager,
+    browser_auth: object,
+) -> TestClient:
+    app = create_web_app(
+        backend,
+        settings=WebSettings(
+            public_origin=ORIGIN,
+            allowed_hosts=("signet.test",),
+            vapid_public_key="fake-public-key",
+        ),
+        csrf=csrf,
+        browser_auth=cast(Any, browser_auth),
+        clock=lambda: NOW,
+    )
+    return TestClient(app, base_url=ORIGIN)
 
 
 def test_agent_listener_has_only_privacy_safe_health() -> None:
@@ -686,6 +723,107 @@ def test_queue_and_detail_require_session_and_ignore_mcp_bearer(client: TestClie
         assert "Viewing on Tuesday" not in response.text
 
 
+def test_expired_browser_session_renders_sign_in_recovery(client: TestClient) -> None:
+    response = client.get("/authenticators", headers={"Accept": "text/html"})
+
+    assert response.status_code == 401
+    assert "Session expired" in response.text
+    assert "Sign in again" in response.text
+    assert 'href="/login"' in response.text
+    assert '"detail":"Unauthorized"' not in response.text
+
+
+def test_stale_authenticator_tab_returns_actionable_json(client: TestClient) -> None:
+    response = client.post(
+        "/authenticators/passkeys/options",
+        json={"label": "Ignored because the session is stale"},
+        headers={"Accept": "application/json", "Origin": ORIGIN},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "error": {
+            "code": "authentication_required",
+            "message": "Your session expired or is no longer valid. Sign in again to continue.",
+        }
+    }
+
+
+def test_authenticator_page_humanizes_metadata_and_explains_lost_device_recovery(
+    backend: FakeBackend,
+    csrf: CsrfManager,
+) -> None:
+    factor = FactorMetadata(
+        factor_id="fac_" + "a" * 20,
+        credential_id="totp-travel-phone",
+        user_id="autumn",
+        kind="totp",
+        label="Travel phone",
+        state="active",
+        created_at=0,
+        updated_at=NOW - 60,
+        last_used_at=None,
+        revoked_at=None,
+        compromised_at=None,
+        created_audit_ref="audit-created",
+        state_audit_ref=None,
+    )
+
+    with browser_auth_client(
+        backend,
+        csrf,
+        AuthenticatorPageBrowserAuth((factor,)),
+    ) as selected_client:
+        authenticate(selected_client)
+        response = selected_client.get("/authenticators")
+
+    assert response.status_code == 200
+    assert "UtcTime(" not in response.text
+    assert '<time datetime="1970-01-01T00:00:00Z">1970-01-01 00:00:00 UTC</time>' in (response.text)
+    assert "Never used" in response.text
+    assert "Lost a device?" in response.text
+    assert "Sign in with another authenticator" in response.text
+    assert "mark the lost one compromised" in response.text
+    assert "contact your Signet operator" in response.text
+
+
+def test_last_authenticator_guard_returns_specific_safe_guidance(
+    backend: FakeBackend,
+    csrf: CsrfManager,
+) -> None:
+    with browser_auth_client(backend, csrf, LastFactorBrowserAuth()) as selected_client:
+        authenticate(selected_client)
+        response = selected_client.post(
+            "/authenticators/confirm/passkey/complete",
+            json={
+                "action": "revoke",
+                "operation_id": "operation-last-factor-001",
+                "factor_id": "fac_" + "a" * 20,
+                "compromised": False,
+                "challenge_id": "challenge-last-factor",
+                "assertion": {},
+            },
+            headers={
+                "Origin": ORIGIN,
+                "Accept": "application/json",
+                "X-CSRF-Token": csrf.session_token("session-id", "authenticators"),
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "authenticator_request_failed",
+            "message": (
+                "Signet kept this authenticator active because it is the final active "
+                "authenticator—the last active sign-in method for this account. Add another "
+                "authenticator before revoking it."
+            ),
+        }
+    }
+    assert "internal final-factor guard detail" not in response.text
+
+
 def test_authenticated_queue_has_security_headers_and_no_sensitive_title(
     client: TestClient,
 ) -> None:
@@ -770,6 +908,13 @@ def test_expanded_review_fragment_contains_complete_bound_context(client: TestCl
     assert '<time datetime="2027-01-15T08:10:00Z">2027-01-15 08:10:00 UTC</time>' in response.text
     assert '<script src="https://evil.test' not in response.text
     assert "&lt;script" in response.text
+    action_band = response.text.split('<section class="action-band"', 1)[1].split("</section>", 1)[
+        0
+    ]
+    assert "autumn@example.test" in action_band
+    assert "person@example.test" in action_band
+    assert "Tuesday release" in action_band
+    assert "&lt;script" in action_band
 
 
 def test_review_fragment_renders_all_distinct_confirmation_proofs(
@@ -1786,9 +1931,12 @@ def test_initial_owner_setup_is_browser_only_resumable_and_one_time(
         )
         assert unclaimed_options.status_code == 400
         with database.read() as connection:
-            assert connection.execute(
-                "SELECT count(*) FROM auth_registration_challenges"
-            ).fetchone()[0] == 0
+            assert (
+                connection.execute("SELECT count(*) FROM auth_registration_challenges").fetchone()[
+                    0
+                ]
+                == 0
+            )
 
         claimed = setup_client.post(
             "/setup/claim",

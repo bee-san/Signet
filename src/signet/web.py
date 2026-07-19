@@ -28,7 +28,10 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from signet.auth import InvalidSession, SessionPrincipal
-from signet.authenticator_management import AuthenticatorManagementError
+from signet.authenticator_management import (
+    AuthenticatorManagementError,
+    LastAuthenticatorRemovalDenied,
+)
 from signet.browser_auth import (
     BootstrapAlreadyComplete,
     BootstrapError,
@@ -1008,7 +1011,9 @@ def create_web_app(
                 now=now_fn(),
             )
         except (InvalidSession, WebUnauthorized):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED) from None
+            raise WebUnauthorized(
+                "Your session expired or is no longer valid. Sign in again to continue."
+            ) from None
 
     async def async_principal(request: Request) -> SessionPrincipal:
         return await run_in_threadpool(principal, request)
@@ -1060,16 +1065,19 @@ def create_web_app(
         )
 
     async def browser_auth_error_handler(request: Request, exc: Exception) -> Response:
-        status_code = (
-            status.HTTP_409_CONFLICT
-            if isinstance(exc, BootstrapAlreadyComplete)
-            else status.HTTP_400_BAD_REQUEST
-        )
-        message = (
-            "Setup was already completed. Reload before continuing."
-            if isinstance(exc, BootstrapAlreadyComplete)
-            else "The authenticator request was invalid, stale, or already used."
-        )
+        if isinstance(exc, BootstrapAlreadyComplete):
+            status_code = status.HTTP_409_CONFLICT
+            message = "Setup was already completed. Reload before continuing."
+        elif isinstance(exc, LastAuthenticatorRemovalDenied):
+            status_code = status.HTTP_400_BAD_REQUEST
+            message = (
+                "Signet kept this authenticator active because it is the final active "
+                "authenticator—the last active sign-in method for this account. Add another "
+                "authenticator before revoking it."
+            )
+        else:
+            status_code = status.HTTP_400_BAD_REQUEST
+            message = "The authenticator request was invalid, stale, or already used."
         if request.headers.get("accept", "").startswith("application/json"):
             return JSONResponse(
                 {"error": {"code": "authenticator_request_failed", "message": message}},

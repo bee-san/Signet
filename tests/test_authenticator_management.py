@@ -139,9 +139,9 @@ class SuccessfulRegistrationProvider:
     test_only = True
 
     def __init__(self) -> None:
-        self.credential_id = base64.urlsafe_b64encode(
-            b"atomic-passkey-credential"
-        ).rstrip(b"=").decode("ascii")
+        self.credential_id = (
+            base64.urlsafe_b64encode(b"atomic-passkey-credential").rstrip(b"=").decode("ascii")
+        )
 
     def verify(self, *args: object, **kwargs: object) -> RegistrationResult:
         del args, kwargs
@@ -471,15 +471,19 @@ def test_management_enrollment_has_zero_side_effects_until_fresh_factor_authoriz
         )
 
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM auth_registration_challenges"
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM browser_totp_enrollments"
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM browser_enrollment_authorizations"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM auth_registration_challenges").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM browser_totp_enrollments").fetchone()[0] == 0
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM browser_enrollment_authorizations").fetchone()[
+                0
+            ]
+            == 0
+        )
     assert provisioner.created_references == []
     assert registration_provider.verify_calls == 0
 
@@ -496,12 +500,15 @@ def test_management_enrollment_has_zero_side_effects_until_fresh_factor_authoriz
     assert issued.enrollment.operation_id == intent.operation_id
     assert len(provisioner.created_references) == 1
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM browser_totp_enrollments"
-        ).fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT count(*) FROM browser_enrollment_authorizations"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT count(*) FROM browser_totp_enrollments").fetchone()[0] == 1
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM browser_enrollment_authorizations").fetchone()[
+                0
+            ]
+            == 1
+        )
 
 
 def test_totp_publication_and_pending_enrollment_consumption_are_atomic(
@@ -561,21 +568,30 @@ def test_totp_publication_and_pending_enrollment_consumption_are_atomic(
         )
 
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM auth_credentials WHERE credential_id = ?",
-            (enrollment.credential_id,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            """
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM auth_credentials WHERE credential_id = ?",
+                (enrollment.credential_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                """
             SELECT consumed_at FROM browser_enrollment_authorizations
             WHERE authorization_id = ?
             """,
-            (verified.authorization_id,),
-        ).fetchone()[0] is None
-        assert connection.execute(
-            "SELECT consumed_at FROM browser_totp_enrollments WHERE enrollment_id = ?",
-            (enrollment.enrollment_id,),
-        ).fetchone()[0] is None
+                (verified.authorization_id,),
+            ).fetchone()[0]
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT consumed_at FROM browser_totp_enrollments WHERE enrollment_id = ?",
+                (enrollment.enrollment_id,),
+            ).fetchone()[0]
+            is None
+        )
     assert provisioner.get(reference).reveal() == valid_seed
 
 
@@ -638,21 +654,30 @@ def test_passkey_publication_and_registration_consumption_are_atomic(
         )
 
     with database.read() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM auth_credentials WHERE credential_id = ?",
-            (provider.credential_id,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            """
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM auth_credentials WHERE credential_id = ?",
+                (provider.credential_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                """
             SELECT consumed_at FROM browser_enrollment_authorizations
             WHERE authorization_id = ?
             """,
-            (pending.authorization_id,),
-        ).fetchone()[0] is None
-        assert connection.execute(
-            "SELECT consumed_at FROM auth_registration_challenges WHERE challenge_id = ?",
-            (challenge_id,),
-        ).fetchone()[0] is None
+                (pending.authorization_id,),
+            ).fetchone()[0]
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT consumed_at FROM auth_registration_challenges WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()[0]
+            is None
+        )
 
 
 def test_totp_enrollment_caps_precede_provisioning_and_cleanup_failures_are_retryable(
@@ -853,6 +878,46 @@ def test_management_proofs_are_action_bound_fresh_and_single_use(database: Datab
             confirmation=stale,
             now=111 + selected.proof_lifetime,
         )
+
+
+def test_totp_replacement_can_reuse_the_existing_factor_label(database: Database) -> None:
+    provisioner = RecordingProvisioner()
+    bootstrap_totp(database)
+    selected = manager(database, provisioner)
+    existing = selected.list_factors(USER_ID)[0]
+    _, session_id = session(database)
+    binding = selected.binding_for_replace_totp(
+        USER_ID,
+        existing.factor_id,
+        existing.label,
+        operation_id="op-replace-same-label",
+    )
+    proof = confirm_totp(
+        selected,
+        totp_verifier(database, provisioner),
+        binding=binding,
+        credential_id=existing.credential_id,
+        proof="fake:bootstrap-seed",
+        session_id=session_id,
+        now=101,
+    )
+
+    replacement = selected.replace_totp(
+        USER_ID,
+        existing.factor_id,
+        existing.label,
+        operation_id="op-replace-same-label",
+        confirmation=proof,
+        now=101,
+    )
+
+    assert replacement.factor_id != existing.factor_id
+    assert replacement.label == existing.label
+    assert tuple(
+        factor.factor_id for factor in selected.list_factors(USER_ID, include_inactive=False)
+    ) == (replacement.factor_id,)
+    replaced = selected.get_factor(USER_ID, existing.factor_id)
+    assert replaced is not None and replaced.state == "revoked"
 
 
 def test_lost_factor_can_be_revoked_by_another_but_never_leaves_zero_factors(

@@ -259,6 +259,21 @@
   {% set approval_available = not item.gateway_internal or (item.policy_promotion_preview and item.policy_promotion_preview.can_approve) %}
   <section class="action-band" aria-labelledby="action-{{ id_suffix }}">
     <h3 id="action-{{ id_suffix }}">{{ ('Confirm exact policy change' if approval_available else 'Resolve policy proposal') if item.gateway_internal else 'Confirm action' }}</h3>
+    <p class="muted">Re-check the exact frozen details below before approving or denying.</p>
+    <dl>
+      <div><dt>Action</dt><dd>{{ item.title }}</dd></div>
+      <div><dt>Destination</dt><dd>{{ item.destination_summary }}</dd></div>
+    </dl>
+    {% for block in item.detail_blocks %}
+    <div class="detail-block">
+      <h4>{{ block.label }}</h4>
+      {% if block.kind in ['plain_text', 'text', 'mailbox', 'whatsapp_destination'] %}
+      <pre>{{ block.value }}</pre>
+      {% else %}
+      <pre>{{ block.value|tojson(indent=2) }}</pre>
+      {% endif %}
+    </div>
+    {% endfor %}
     <div hidden aria-hidden="true">
       <input type="hidden" name="expected_version" value="{{ item.version }}">
       <input type="hidden" name="expected_payload_hash" value="{{ item.payload_hash }}">

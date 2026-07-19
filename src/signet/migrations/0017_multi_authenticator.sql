@@ -42,6 +42,18 @@ CREATE UNIQUE INDEX auth_factors_active_label
 CREATE INDEX auth_factors_user_state
     ON auth_factors(user_id, state, kind, factor_id);
 
+WITH migrated_auth_credentials AS MATERIALIZED (
+    SELECT
+        credential_id,
+        user_id,
+        kind,
+        factor_label,
+        enrolled_at,
+        disabled_at,
+        last_used_at,
+        'migration:17:' || lower(hex(randomblob(16))) AS audit_ref
+    FROM auth_credentials
+)
 INSERT INTO auth_factors(
     factor_id, credential_id, user_id, kind, label, state,
     created_at, updated_at, last_used_at, revoked_at, compromised_at,
@@ -59,9 +71,9 @@ SELECT
     last_used_at,
     disabled_at,
     NULL,
-    'migration:17:' || credential_id,
-    CASE WHEN disabled_at IS NULL THEN NULL ELSE 'migration:17:' || credential_id END
-FROM auth_credentials;
+    audit_ref,
+    CASE WHEN disabled_at IS NULL THEN NULL ELSE audit_ref END
+FROM migrated_auth_credentials;
 
 CREATE TABLE auth_factor_events (
     event_id TEXT PRIMARY KEY NOT NULL CHECK (length(event_id) BETWEEN 16 AND 128),
@@ -109,8 +121,8 @@ CREATE TABLE auth_factor_challenges (
     user_id TEXT NOT NULL,
     action TEXT NOT NULL CHECK (
         action IN (
-            'add_authenticator', 'rename_authenticator', 'revoke_authenticator',
-            'replace_authenticator'
+            'add_authenticator', 'authorize_enrollment', 'rename_authenticator',
+            'revoke_authenticator', 'replace_authenticator'
         )
     ),
     operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 128),

@@ -69,8 +69,17 @@
       {% for factor in factors %}
       <li class="authenticator-card">
         <h3>{{ factor.label }}</h3>
-        <p>{{ "Passkey" if factor.kind == "webauthn" else "TOTP app" }} · added {{ factor.created_at|utc_time }}</p>
-        {% if factor.last_used_at %}<p>Last used {{ factor.last_used_at|utc_time }}</p>{% endif %}
+        {% set created = factor.created_at|utc_time %}
+        <p>
+          {{ "Passkey" if factor.kind == "webauthn" else "TOTP app" }} · added
+          <time datetime="{{ created.iso }}">{{ created.display }}</time>
+        </p>
+        {% if factor.last_used_at is not none %}
+        {% set last_used = factor.last_used_at|utc_time %}
+        <p>Last used <time datetime="{{ last_used.iso }}">{{ last_used.display }}</time></p>
+        {% else %}
+        <p>Never used</p>
+        {% endif %}
 
         <details>
           <summary>Rename</summary>
@@ -134,6 +143,12 @@
     {% else %}
       <p>No active authenticators are available.</p>
     {% endif %}
+  </section>
+
+  <section class="warning-band" aria-labelledby="lost-device-title">
+    <h2 id="lost-device-title">Lost a device?</h2>
+    <p>Sign in with another authenticator, then mark the lost one compromised and revoke it here. The final active authenticator cannot be removed.</p>
+    <p>If you cannot use any authenticator, contact your Signet operator. Recovery is disabled by default and there is no self-service bypass.</p>
   </section>
 </section>
 {% endblock %}

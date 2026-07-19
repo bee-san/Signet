@@ -2,8 +2,14 @@
 {% block content %}
 <section class="error-state">
   <p class="eyebrow">{{ status_code }}</p>
+  {% if status_code == 401 %}
+  <h1>Session expired</h1>
+  <p>{{ message }}</p>
+  <a class="button button-primary" href="/login">Sign in again</a>
+  {% else %}
   <h1>Request not completed</h1>
   <p>{{ message }}</p>
   <a class="button button-primary" href="/">Return to queue</a>
+  {% endif %}
 </section>
 {% endblock %}

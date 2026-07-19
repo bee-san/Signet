@@ -975,27 +975,6 @@ class AuthenticatorManager:
                     binding=binding,
                     now=now,
                 )
-                connection.execute(
-                    """
-                    INSERT INTO auth_credentials(
-                        credential_id, user_id, kind, secret_reference, enrolled_at, factor_label
-                    ) VALUES (?, ?, 'totp', ?, ?, ?)
-                    """,
-                    (new_credential_id, selected_user, secret_reference, now, selected_label),
-                )
-                self._insert_factor(
-                    connection,
-                    factor_id=new_factor_id,
-                    credential_id=new_credential_id,
-                    user_id=selected_user,
-                    kind="totp",
-                    label=selected_label,
-                    action="added",
-                    actor_factor_id=actor_factor_id,
-                    operation_id=operation_id,
-                    payload_hash=binding.payload_hash or "",
-                    now=now,
-                )
                 event_id = self._insert_event(
                     connection,
                     factor_id=selected_factor,
@@ -1018,6 +997,27 @@ class AuthenticatorManager:
                 connection.execute(
                     "UPDATE auth_credentials SET disabled_at = ? WHERE credential_id = ?",
                     (now, old["credential_id"]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO auth_credentials(
+                        credential_id, user_id, kind, secret_reference, enrolled_at, factor_label
+                    ) VALUES (?, ?, 'totp', ?, ?, ?)
+                    """,
+                    (new_credential_id, selected_user, secret_reference, now, selected_label),
+                )
+                self._insert_factor(
+                    connection,
+                    factor_id=new_factor_id,
+                    credential_id=new_credential_id,
+                    user_id=selected_user,
+                    kind="totp",
+                    label=selected_label,
+                    action="added",
+                    actor_factor_id=actor_factor_id,
+                    operation_id=operation_id,
+                    payload_hash=binding.payload_hash or "",
+                    now=now,
                 )
                 _revoke_user_sessions(connection, selected_user, revoked_at=now)
         except Exception:

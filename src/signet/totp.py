@@ -375,9 +375,7 @@ class TotpVerifier:
         reservation = self._limiter.reserve(
             rate_key,
             additional_scope_keys=(
-                (totp_rate_limit_key(user_id),)
-                if selected_credential_id is not None
-                else ()
+                (totp_rate_limit_key(user_id),) if selected_credential_id is not None else ()
             ),
             source_key=source_rate_limit_key(source_id),
             now=now,

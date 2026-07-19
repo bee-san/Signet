@@ -233,9 +233,7 @@ class BootstrapService:
             ).fetchall()
         active_kinds = tuple(str(row["kind"]) for row in active)
         labels = tuple(
-            str(row["label"])
-            for row in active
-            if str(row["kind"]) in {"totp", "webauthn"}
+            str(row["label"]) for row in active if str(row["kind"]) in {"totp", "webauthn"}
         ) + tuple(str(row["label"]) for row in (*staged_passkeys, *staged_totps))
         return BootstrapStatus(
             user_id=self.owner_user_id,

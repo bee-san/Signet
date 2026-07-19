@@ -126,9 +126,7 @@ def test_bootstrap_resumes_after_restart_and_finalizes_only_once(database: Datab
     assert initial.has_password is False
     assert initial.has_authenticator is False
 
-    first.enroll_password(
-        "a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=101
-    )
+    first.enroll_password("a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=101)
     restarted = bootstrap(database)
     assert restarted.status(now=102, claimant_token=CLAIMANT_TOKEN).has_password is True
 
@@ -158,9 +156,7 @@ def test_bootstrap_resumes_after_restart_and_finalizes_only_once(database: Datab
 
 def test_bootstrap_requires_password_and_non_password_authenticator(database: Database) -> None:
     service = claimed_bootstrap(database)
-    service.enroll_password(
-        "a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=100
-    )
+    service.enroll_password("a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=100)
 
     with pytest.raises(BootstrapIncomplete):
         service.complete(claimant_token=CLAIMANT_TOKEN, now=101)
@@ -209,12 +205,8 @@ def test_bootstrap_credential_publication_rolls_back_as_one_database_transaction
 
 def test_concurrent_bootstrap_completion_has_one_winner(database: Database) -> None:
     service = claimed_bootstrap(database)
-    service.enroll_password(
-        "a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=100
-    )
-    service.enroll_passkey(
-        "Primary passkey", credential(), claimant_token=CLAIMANT_TOKEN, now=101
-    )
+    service.enroll_password("a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=100)
+    service.enroll_passkey("Primary passkey", credential(), claimant_token=CLAIMANT_TOKEN, now=101)
     barrier = Barrier(2)
 
     def complete() -> str:
@@ -268,9 +260,7 @@ def test_bootstrap_requires_one_use_local_capability_and_one_atomic_claimant(
             now=104,
         )
 
-    service.enroll_password(
-        "a sufficiently long password", claimant_token=winner, now=104
-    )
+    service.enroll_password("a sufficiently long password", claimant_token=winner, now=104)
     assert service.status(now=105, claimant_token=winner).has_password is True
 
 
@@ -509,9 +499,7 @@ def test_totp_bootstrap_enrollment_is_verified_bound_and_seed_is_not_persisted(
         session_id=None,
         now=120,
     )
-    status = bootstrap.enroll_totp(
-        verified, claimant_token=CLAIMANT_TOKEN, now=121
-    )
+    status = bootstrap.enroll_totp(verified, claimant_token=CLAIMANT_TOKEN, now=121)
     assert status.factor_labels == ("Phone app",)
     assert bootstrap.complete(claimant_token=CLAIMANT_TOKEN, now=122).complete
     assert secret.encode() not in database.path.read_bytes()

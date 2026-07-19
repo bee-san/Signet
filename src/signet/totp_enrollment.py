@@ -434,9 +434,7 @@ class TotpEnrollmentService:
                     ),
                 )
         except Exception as exc:
-            raise TotpEnrollmentCleanupError(
-                "TOTP cleanup debt could not be recorded"
-            ) from exc
+            raise TotpEnrollmentCleanupError("TOTP cleanup debt could not be recorded") from exc
 
     def _issued(self, enrollment: TotpEnrollment) -> IssuedTotpEnrollment:
         reference = SecretReference.parse(enrollment.secret_reference)
@@ -470,9 +468,7 @@ def _from_row(row: Any) -> TotpEnrollment:
         created_at=int(selected["created_at"]),
         expires_at=int(selected["expires_at"]),
         authorization_id=(
-            str(selected["authorization_id"])
-            if selected["authorization_id"] is not None
-            else None
+            str(selected["authorization_id"]) if selected["authorization_id"] is not None else None
         ),
         operation_id=(
             str(selected["operation_id"]) if selected["operation_id"] is not None else None

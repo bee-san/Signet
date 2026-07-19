@@ -216,8 +216,7 @@ class SQLiteRegistrationRepository:
                 else 0
             )
             if active >= max_active or (
-                challenge.session_id is not None
-                and active_for_session >= max_active_per_session
+                challenge.session_id is not None and active_for_session >= max_active_per_session
             ):
                 return False
             try:

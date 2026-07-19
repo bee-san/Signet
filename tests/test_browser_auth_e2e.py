@@ -331,6 +331,7 @@ class LiveBrowserAuth:
     origin: str
     backend: BrowserBackend
     database: Database
+    bootstrap_capability: str
 
 
 def _certificate(tmp_path: Path) -> tuple[Path, Path]:
@@ -428,8 +429,10 @@ def _served_browser_auth(tmp_path: Path) -> Iterator[LiveBrowserAuth]:
         origin=origin,
         provider=BrowserRegistrationProvider(),
     )
+    bootstrap = BootstrapService(database, owner_user_id=USER_ID)
+    bootstrap_capability = bootstrap.issue_capability(now=NOW)
     browser_auth = BrowserAuthController(
-        bootstrap=BootstrapService(database, owner_user_id=USER_ID),
+        bootstrap=bootstrap,
         registrations=registrations,
         manager=AuthenticatorManager(
             database,
@@ -477,7 +480,12 @@ def _served_browser_auth(tmp_path: Path) -> Iterator[LiveBrowserAuth]:
         else:
             pytest.fail("browser auth test server did not start", pytrace=False)
     try:
-        yield LiveBrowserAuth(origin=origin, backend=backend, database=database)
+        yield LiveBrowserAuth(
+            origin=origin,
+            backend=backend,
+            database=database,
+            bootstrap_capability=bootstrap_capability,
+        )
     finally:
         server.should_exit = True
         thread.join(timeout=10)
@@ -639,6 +647,8 @@ def test_browser_bootstrap_multiple_authenticators_replacement_and_safe_removal(
         )
         try:
             page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
             page.get_by_label("Password", exact=True).fill(PASSWORD)
             page.get_by_label("Confirm password").fill(PASSWORD)
             page.get_by_role("button", name="Save password").click()
@@ -689,12 +699,6 @@ def test_browser_bootstrap_multiple_authenticators_replacement_and_safe_removal(
                 pyotp.TOTP(replacement).at(NOW)
             )
             page.locator("[data-totp-enrollment] button").click()
-            page.locator("[data-pending-totp]").wait_for(state="visible")
-            page.evaluate(
-                "value => { window.__selectedPasskey = value; }",
-                factors["Laptop passkey"][0],
-            )
-            page.locator("[data-confirm-new-totp]").click()
             expect(page).to_have_url(re.compile(r"/login\?authenticators=updated$"))
             _login_totp(page, live.origin, replacement)
 
