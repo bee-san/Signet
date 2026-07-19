@@ -79,6 +79,7 @@ If credential verification succeeds but the final management request is interrup
 reload resumes at finalization instead of repeating proof or creating a second
 credential. Transient network failures retain the opaque resume handle; definitive
 4xx rejection clears it.
+If browser storage is unavailable, the active ceremony continues without a resume handle.
 Verification clears TOTP QR/manual-key values from the page. Expiry invalidates
 pending TOTP enrollments and deletes their provisioned secrets. If cleanup after
 expiry or another failed enrollment cannot be verified, Signet records cleanup debt

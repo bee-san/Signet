@@ -105,25 +105,41 @@
   const setupCeremonyKey = "signet-setup-ceremony-v1";
   const managementCeremonyKey = "signet-management-ceremony-v1";
 
+  const persistCeremony = (key, value) => {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (_) {
+      // Ceremony persistence is optional; the active request can still complete safely.
+    }
+  };
+
+  const discardCeremony = (key) => {
+    try {
+      localStorage.removeItem(key);
+    } catch (_) {
+      // Unavailable storage cannot retain a usable resume handle.
+    }
+  };
+
   const rememberSetupTotp = (enrollmentId) => {
-    localStorage.setItem(setupCeremonyKey, JSON.stringify({kind: "totp", enrollment_id: enrollmentId}));
+    persistCeremony(setupCeremonyKey, {kind: "totp", enrollment_id: enrollmentId});
   };
 
   const rememberSetupPasskey = (challengeId) => {
-    localStorage.setItem(setupCeremonyKey, JSON.stringify({kind: "passkey", challenge_id: challengeId}));
+    persistCeremony(setupCeremonyKey, {kind: "passkey", challenge_id: challengeId});
   };
 
-  const clearSetupCeremony = () => localStorage.removeItem(setupCeremonyKey);
+  const clearSetupCeremony = () => discardCeremony(setupCeremonyKey);
 
   const rememberManagementTotp = (enrollmentId) => {
-    localStorage.setItem(managementCeremonyKey, JSON.stringify({kind: "totp", enrollment_id: enrollmentId}));
+    persistCeremony(managementCeremonyKey, {kind: "totp", enrollment_id: enrollmentId});
   };
 
   const rememberManagementPasskey = (challengeId) => {
-    localStorage.setItem(managementCeremonyKey, JSON.stringify({kind: "passkey", challenge_id: challengeId}));
+    persistCeremony(managementCeremonyKey, {kind: "passkey", challenge_id: challengeId});
   };
 
-  const clearManagementCeremony = () => localStorage.removeItem(managementCeremonyKey);
+  const clearManagementCeremony = () => discardCeremony(managementCeremonyKey);
 
   const showTotpEnrollment = (form, issued) => {
     const panel = form.parentElement.querySelector("[data-totp-enrollment]");

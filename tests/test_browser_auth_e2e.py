@@ -564,6 +564,21 @@ WEBAUTHN_STUB = r"""
 """
 
 
+CEREMONY_STORAGE_FAILURE_STUB = r"""
+(() => {
+  for (const method of ["getItem", "setItem", "removeItem"]) {
+    const original = Storage.prototype[method];
+    Storage.prototype[method] = function(key, ...args) {
+      if (String(key).startsWith("signet-")) {
+        throw new DOMException("fake ceremony storage failure", "QuotaExceededError");
+      }
+      return original.call(this, key, ...args);
+    };
+  }
+})();
+"""
+
+
 def _totp_key(page: Page) -> str:
     qr_code = page.locator("[data-totp-qr]").filter(visible=True)
     expect(qr_code).to_have_attribute("src", re.compile(r"^data:image/svg\+xml"))
@@ -657,6 +672,32 @@ def test_setup_totp_ceremony_resumes_after_reload_without_browser_secret_storage
             stored = page.evaluate("() => Object.fromEntries(Object.entries(localStorage))")
             assert original_key not in json.dumps(stored)
             assert "otpauth://" not in json.dumps(stored)
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_setup_totp_continues_when_ceremony_storage_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        context.add_init_script(CEREMONY_STORAGE_FAILURE_STUB)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            start = page.locator('[data-totp-start][data-flow="setup"]')
+            start.locator('input[name="label"]').fill("Non-resumable TOTP")
+            start.get_by_role("button", name="Set up TOTP").click()
+
+            key = _totp_key(page)
+            page.locator('[data-totp-enrollment] input[name="proof"]').fill(pyotp.TOTP(key).at(NOW))
+            page.locator("[data-totp-enrollment] button").click()
+
+            expect(page.get_by_text("Added: Non-resumable TOTP")).to_be_visible()
         finally:
             context.close()
             browser.close()
