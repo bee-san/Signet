@@ -455,6 +455,21 @@ def test_production_browser_ceremony_isolation_never_calls_providers_or_mutates_
     assert wrong_session.status_code == 400
     assert durable_effects() == baseline
 
+    other_user_token = sessions.create_session(
+        "user:other",
+        auth_method="totp",
+        now=now[0],
+    )
+    foreign_user = TestClient(assembly.web, base_url=config.public_origin)
+    foreign_user.cookies.set(
+        "__Host-signet_session",
+        other_user_token,
+        domain="signet.example.test",
+        path="/",
+    )
+    assert foreign_user.get("/authenticators").status_code == 401
+    assert durable_effects() == baseline
+
     with pytest.raises(InvalidTotpEnrollment):
         enrollments.resume(
             enrollment_id,
