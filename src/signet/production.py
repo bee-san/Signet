@@ -25,6 +25,7 @@ from signet.adapters.base import ApprovalAdapter, MCPClient
 from signet.adapters.tool_access import ToolAccessAdapter
 from signet.admission import QueueAdmissionLimits
 from signet.async_support import run_sync_non_abandoning as _run_sync
+from signet.attachment_crypto import AttachmentCipher
 from signet.auth import (
     Argon2PasswordVerifier,
     PasswordAuthenticator,
@@ -67,7 +68,7 @@ from signet.gateway_tools import (
     SafeRequestSummary,
 )
 from signet.mcp_mirror import AliasToolSurface, SchemaMirror
-from signet.models import InvalidTransition
+from signet.models import InvalidTransition, ReconciliationRejected, RequestState
 from signet.notifications import SQLitePushRepository
 from signet.policy import PolicyEngine, PolicySnapshot, parse_policy_yaml
 from signet.policy_persistence import (
@@ -87,6 +88,7 @@ from signet.production_state import (
     ProductionStatus,
 )
 from signet.reconcile import ReconciliationCoordinator
+from signet.retention import RetentionManager, RetentionMatrix
 from signet.runtime import (
     MCPRuntime,
     TrustedProxySourceMiddleware,
@@ -128,6 +130,29 @@ _REQUIRED_SECRET_PURPOSES = (
     "payload_key_ref",
 )
 _MAX_PRIVATE_DOCUMENT_BYTES = 1_048_576
+
+
+def _production_retention_matrix() -> RetentionMatrix:
+    payload_delays: dict[RequestState, int | None] = dict.fromkeys(RequestState)
+    payload_delays.update(
+        {
+            RequestState.SUCCEEDED: 7 * 24 * 60 * 60,
+            RequestState.FAILED: 7 * 24 * 60 * 60,
+            RequestState.DENIED: 7 * 24 * 60 * 60,
+            RequestState.EXPIRED: 7 * 24 * 60 * 60,
+            RequestState.CANCELLED: 7 * 24 * 60 * 60,
+        }
+    )
+    attachment_delays = dict(payload_delays)
+    attachment_delays.update(
+        {
+            RequestState.SUCCEEDED: 0,
+            RequestState.DENIED: 0,
+            RequestState.EXPIRED: 24 * 60 * 60,
+            RequestState.CANCELLED: 24 * 60 * 60,
+        }
+    )
+    return RetentionMatrix(attachment_delays, payload_delays)
 
 
 class ProductionAssemblyError(RuntimeError):
@@ -196,6 +221,7 @@ class ProductionWorkers:
         database: Database | None = None,
         delivery: DeliveryDispatcher | None = None,
         reconciliation: ReconciliationCoordinator | None = None,
+        retention: RetentionManager | None = None,
         provider_sessions: ProviderSessionPool | None = None,
         interval_seconds: float = 5.0,
     ) -> None:
@@ -209,11 +235,12 @@ class ProductionWorkers:
             provider_sessions is None
         ):
             raise ValueError("production provider worker dependencies must be complete")
-        if delivery is not None and database is None:
+        if (delivery is not None or retention is not None) and database is None:
             raise ValueError("production provider workers require the database")
         self._database = database
         self._delivery = delivery
         self._reconciliation = reconciliation
+        self._retention = retention
         self._provider_sessions = provider_sessions
         self._interval_seconds = interval_seconds
         self._heartbeat_lease_seconds = max(1, math.ceil(interval_seconds * 3))
@@ -244,26 +271,51 @@ class ProductionWorkers:
             raise ValueError("production maintenance time is invalid")
         return selected_now
 
-    async def run_once(self, *, now: int | None = None) -> None:
+    async def run_once(
+        self,
+        *,
+        now: int | None = None,
+        stop: asyncio.Event | None = None,
+    ) -> None:
         selected_now = self._maintenance_time(now)
         try:
             await self._policy_promotions.publish_pending(now=selected_now)
             await _run_sync(self._approvals.sweep_expired, now=selected_now, limit=100)
             if self._delivery is not None and self._reconciliation is not None:
                 for request_id in await _run_sync(self._due_delivery_request_ids, selected_now):
+                    if stop is not None and stop.is_set():
+                        break
                     try:
                         await self._delivery.dispatch(
                             request_id,
                             worker_id="production:delivery",
-                            now=selected_now,
+                            now=self._maintenance_time(),
                             lease_seconds=30,
                         )
                     except (DeliveryError, InvalidTransition):
                         continue
-                await self._reconciliation.run_due(
-                    worker_id="production:reconciliation",
-                    now=selected_now,
+                reconciliation_now = self._maintenance_time()
+                due_reconciliations = await _run_sync(
+                    self._reconciliation.due_request_ids,
+                    now=reconciliation_now,
                     limit=16,
+                )
+                for request_id in due_reconciliations:
+                    if stop is not None and stop.is_set():
+                        break
+                    try:
+                        await self._reconciliation.reconcile_once(
+                            request_id,
+                            worker_id="production:reconciliation",
+                            now=self._maintenance_time(),
+                        )
+                    except ReconciliationRejected:
+                        continue
+            if self._retention is not None and (stop is None or not stop.is_set()):
+                await _run_sync(
+                    self._retention.run_due,
+                    now=self._maintenance_time(),
+                    limit=100,
                 )
             completed_now = self._maintenance_time(now)
         except BaseException:
@@ -321,16 +373,16 @@ class ProductionWorkers:
             if self._provider_sessions is not None:
                 await provider_stack.enter_async_context(self._provider_sessions.run())
                 self._state.record_provider_state(
-                    "ready",
+                    "active",
                     ready=True,
                     now=self._maintenance_time(),
                 )
-            await _run_sync(self._approvals.recover_startup, now=selected_now)
+            await _run_sync(self._approvals.recover_startup, now=self._maintenance_time())
             self._healthy = True
             self._state.record_worker_state("ready", ready=True, now=self._maintenance_time())
             self._startup_complete.set()
             while not stop.is_set():
-                await self.run_once()
+                await self.run_once(stop=stop)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=self._interval_seconds)
                 except TimeoutError:
@@ -374,6 +426,7 @@ class ProductionAssembly:
     provider_clients: Mapping[str, MCPClient]
     adapters: Mapping[tuple[str, str], ApprovalAdapter]
     staging: StagingStore | None
+    retention: RetentionManager | None
     provider_sessions: ProviderSessionPool | None
     authenticators: AuthenticatorManager
 
@@ -580,6 +633,27 @@ def build_production_runtime(
                 for alias, connector in config.connectors.items()
             }
         )
+        attachment_root = config.storage.attachment_staging_dir
+        attachment_reference = config.secrets.attachment_key_ref
+        if (
+            attachment_root is not None
+            and attachment_reference is not None
+            and config.storage.attachment_source_roots
+        ):
+            try:
+                staging = StagingStore(
+                    attachment_root,
+                    database=database,
+                    cipher=AttachmentCipher(
+                        secret_values["attachment_key_ref"],
+                        attachment_reference,
+                    ),
+                    allowed_source_roots=config.storage.attachment_source_roots,
+                )
+            except Exception:
+                raise ProductionAssemblyError(
+                    "production attachment retention could not be initialized"
+                ) from None
     execution_scopes = PolicyExecutionScopeResolver(mirror, clients)
     tool_access = ToolAccessAdapter()
     reviewer_adapters = {
@@ -764,7 +838,18 @@ def build_production_runtime(
     runtime_states.append(state)
     delivery: DeliveryDispatcher | None = None
     reconciliation: ReconciliationCoordinator | None = None
+    retention = (
+        RetentionManager(
+            database,
+            staging,
+            matrix=_production_retention_matrix(),
+        )
+        if staging is not None
+        else None
+    )
     if provider_sessions is not None:
+        if staging is None:
+            raise AssertionError("live provider staging is unavailable")
         request_loader = FrozenRequestLoader(
             approvals,
             payload_cipher,
@@ -787,21 +872,22 @@ def build_production_runtime(
             cast(Mapping[str, MCPClient], clients),
             reviewed_tools=reviewed_reconciliation_tools,
         )
+
     workers = ProductionWorkers(
         approvals=approvals,
         policy_promotions=policy_promotions,
         state=state,
         clock=now,
-        database=database if delivery is not None else None,
+        database=database if delivery is not None or retention is not None else None,
         delivery=delivery,
         reconciliation=reconciliation,
+        retention=retention,
         provider_sessions=provider_sessions,
     )
-    if provider_sessions is not None:
-        if mcp is not None:
-            _attach_provider_lifespan(mcp.app, provider_sessions)
-        if web is not None:
-            _attach_production_worker_lifespan(web, workers)
+    if mcp is not None and provider_sessions is not None:
+        _attach_provider_lifespan(mcp.app, provider_sessions)
+    if web is not None and (provider_sessions is not None or retention is not None):
+        _attach_production_worker_lifespan(web, workers)
 
     def production_health_probe() -> bool:
         status = state.status()
@@ -828,6 +914,7 @@ def build_production_runtime(
         provider_clients=cast(Mapping[str, MCPClient], clients),
         adapters=provider_adapters,
         staging=staging,
+        retention=retention,
         provider_sessions=provider_sessions,
         authenticators=authenticators,
     )
@@ -1037,7 +1124,10 @@ def _resolve_secret_inventory(
     try:
         for purpose, raw_reference in references.items():
             parsed_references[purpose] = SecretReference.parse(raw_reference)
-        for purpose in _REQUIRED_SECRET_PURPOSES:
+        resolved_purposes: tuple[str, ...] = _REQUIRED_SECRET_PURPOSES
+        if "attachment_key_ref" in parsed_references:
+            resolved_purposes += ("attachment_key_ref",)
+        for purpose in resolved_purposes:
             reference = parsed_references[purpose]
             value = secret_store.get(reference)
             encoded = value.reveal().encode("utf-8")

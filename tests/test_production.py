@@ -26,6 +26,7 @@ from signet.adapters.whatsapp import WhatsAppAdapter
 from signet.app import main as run_cli
 from signet.auth import SessionManager, SQLiteSessionRepository
 from signet.browser_auth import BootstrapService
+from signet.canonical import canonical_json
 from signet.config import ProductionConfig
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
 from signet.db import Database
@@ -406,14 +407,134 @@ downstreams:
         CapturingProviderSessionPool,
     )
 
+    disabled_config = config.model_copy(
+        update={
+            "capabilities": config.capabilities.model_copy(update={"live_providers_ready": False}),
+            "provider_rollout": config.provider_rollout.model_copy(update={"state": "disabled"}),
+        }
+    )
+    staged = build_production_runtime(disabled_config, secret_store=secret_store)
+    assert staged.provider_sessions is None
+    assert staged.retention is not None
+
     assembly = build_production_runtime(config, secret_store=secret_store)
 
     assert isinstance(assembly.provider_clients["fastmail"], DownstreamClient)
     assert tuple(assembly.adapters) == (("fastmail", "send_email"),)
     assert assembly.adapters[("fastmail", "send_email")].reviewed_dispatch_enabled is True
     assert assembly.staging is not None
+    assert assembly.retention is not None
     assert assembly.provider_sessions is not None
     assert captured_server_identities == {"fastmail": "f" * 64}
+
+    active_now = int(time.time())
+    assembly.state.record_provider_state("active", ready=True, now=active_now)
+    restarted = build_production_runtime(
+        config,
+        secret_store=secret_store,
+        clock=lambda: active_now,
+    )
+    assert restarted.state.status().live_providers_ready is True
+    with assembly.database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT state FROM production_connectors WHERE connector_alias = 'fastmail'"
+            ).fetchone()["state"]
+            == "active"
+        )
+
+    lifecycle_now = int(time.time())
+    recovered_at: list[int] = []
+
+    class DelayedProviderContext:
+        async def __aenter__(self) -> None:
+            nonlocal lifecycle_now
+            lifecycle_now += 10
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+    def observe_recovery(*, now: int) -> None:
+        recovered_at.append(now)
+
+    monkeypatch.setattr(assembly.workers, "_clock", lambda: lifecycle_now)
+    monkeypatch.setattr(assembly.provider_sessions, "run", DelayedProviderContext)
+    monkeypatch.setattr(assembly.workers._approvals, "recover_startup", observe_recovery)
+    stopped = asyncio.Event()
+    stopped.set()
+    asyncio.run(assembly.workers.serve(stopped))
+    assert recovered_at == [lifecycle_now]
+
+    dispatched: list[str] = []
+    reconciled: list[str] = []
+    retained: list[bool] = []
+    stop = asyncio.Event()
+
+    async def stop_after_first_dispatch(request_id: str, **_: Any) -> None:
+        dispatched.append(request_id)
+        stop.set()
+
+    async def stop_after_first_reconciliation(request_id: str, **_: Any) -> None:
+        reconciled.append(request_id)
+        stop.set()
+
+    def observe_retention(**_: Any) -> None:
+        retained.append(True)
+
+    monkeypatch.setattr(
+        assembly.workers,
+        "_due_delivery_request_ids",
+        lambda _now: ("request:first", "request:second"),
+    )
+    monkeypatch.setattr(assembly.workers._delivery, "dispatch", stop_after_first_dispatch)
+    monkeypatch.setattr(
+        assembly.workers._reconciliation,
+        "due_request_ids",
+        lambda **_: ("reconcile:first", "reconcile:second"),
+    )
+    monkeypatch.setattr(
+        assembly.workers._reconciliation,
+        "reconcile_once",
+        stop_after_first_reconciliation,
+    )
+    monkeypatch.setattr(assembly.retention, "run_due", observe_retention)
+    asyncio.run(assembly.workers.run_once(now=int(time.time()), stop=stop))
+    assert dispatched == ["request:first"]
+    assert reconciled == []
+    assert retained == []
+
+    stop.clear()
+    monkeypatch.setattr(
+        assembly.workers,
+        "_due_delivery_request_ids",
+        lambda _now: (),
+    )
+    asyncio.run(assembly.workers.run_once(now=int(time.time()), stop=stop))
+    assert reconciled == ["reconcile:first"]
+    assert retained == []
+
+    stop.clear()
+    monkeypatch.setattr(
+        assembly.workers._reconciliation,
+        "due_request_ids",
+        lambda **_: (),
+    )
+    asyncio.run(assembly.workers.run_once(now=int(time.time()), stop=stop))
+    assert retained == [True]
+
+    rolled_back = build_production_runtime(
+        disabled_config,
+        secret_store=secret_store,
+        clock=lambda: lifecycle_now,
+    )
+    assert rolled_back.retention is not None
+    with rolled_back.database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT state FROM production_connectors WHERE connector_alias = 'fastmail'"
+            ).fetchone()["state"]
+            == "disabled"
+        )
 
     missing_identity = config.connectors["fastmail"].model_copy(
         update={"server_identity_digest": None}
@@ -423,6 +544,19 @@ downstreams:
     )
     with pytest.raises(ProductionAssemblyError, match="initialization identity"):
         build_production_runtime(missing_identity_config, secret_store=secret_store)
+
+    policy_path = Path(payload["policy_path"])
+    reviewed_policy = policy_path.read_text(encoding="utf-8")
+    policy_path.write_text(
+        reviewed_policy.replace(
+            "        schema_digest: "
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+            "",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ProductionAssemblyError, match="schema digest"):
+        build_production_runtime(config, secret_store=secret_store)
 
 
 def test_production_connector_rejects_invalid_server_identity_digest(tmp_path: Path) -> None:
@@ -1082,6 +1216,35 @@ def test_production_http_surfaces_reject_non_loopback_transport_peers(tmp_path: 
         for table, expected in expected_counts.items():
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == expected
 
+        legacy_document = config.model_dump(mode="json")
+        legacy_document["storage"].pop("attachment_staging_dir")
+        legacy_document["storage"].pop("attachment_source_roots")
+        legacy_document["secrets"].pop("attachment_key_ref")
+        legacy_document.pop("provider_rollout")
+        legacy_document["connectors"]["mail"].pop("server_identity_digest")
+        legacy_digest = hashlib.sha256(canonical_json(legacy_document)).hexdigest()
+
+        legacy_connector = config.connectors["mail"].model_dump(mode="json")
+        legacy_connector.pop("server_identity_digest")
+        legacy_connector_digest = hashlib.sha256(canonical_json(legacy_connector)).hexdigest()
+
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (legacy_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (legacy_digest,),
+        )
+        connection.execute(
+            """
+            UPDATE production_connectors SET config_digest = ?
+            WHERE connector_alias = 'mail'
+            """,
+            (legacy_connector_digest,),
+        )
+
     durable_bytes = b"".join(
         path.read_bytes() for path in config.storage.data_dir.iterdir() if path.is_file()
     )
@@ -1099,6 +1262,15 @@ def test_production_http_surfaces_reject_non_loopback_transport_peers(tmp_path: 
     with second.database.read() as connection:
         for table, expected in expected_counts.items():
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == expected
+        expected_current_digest = hashlib.sha256(
+            canonical_json(config.model_dump(mode="json"))
+        ).hexdigest()
+        assert (
+            connection.execute(
+                "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()["config_digest"]
+            == expected_current_digest
+        )
 
 
 @pytest.mark.asyncio

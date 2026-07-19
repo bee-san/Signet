@@ -62,6 +62,7 @@ class ProductionStatus:
     setup_status: str
     ready: bool
     missing_prerequisites: tuple[str, ...]
+    live_providers_ready: bool
     services: Mapping[str, ProductionServiceStatus]
     factors: Mapping[str, ProductionFactorStatus]
 
@@ -93,12 +94,45 @@ class ProductionStateStore:
 
         config_digest = production_config_digest(config)
         capability_json = json.dumps(dict(capabilities), sort_keys=True, separators=(",", ":"))
+        config_changed = False
         with self.database.transaction() as connection:
             setup = connection.execute(
                 "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
             ).fetchone()
             if setup is not None and setup["config_digest"] != config_digest:
-                raise ProductionStateError("staged production config differs from durable state")
+                opposite_rollout: Literal["disabled", "enabled"] = (
+                    "disabled" if config.provider_rollout.state == "enabled" else "enabled"
+                )
+                transition_digest = production_config_digest(
+                    config,
+                    rollout_state=opposite_rollout,
+                )
+                compatible_digests = {
+                    transition_digest,
+                    _legacy_production_config_digest(config),
+                    _rollout_preparation_base_digest(config),
+                }
+                if setup["config_digest"] not in compatible_digests:
+                    raise ProductionStateError(
+                        "staged production config differs from durable state"
+                    )
+                config_changed = True
+                connection.execute(
+                    """
+                    UPDATE production_setup_state
+                    SET config_digest = ?, capability_status_json = ?,
+                        updated_at = MAX(updated_at, ?)
+                    WHERE state_id = 1 AND config_digest = ?
+                    """,
+                    (config_digest, capability_json, now, setup["config_digest"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE production_services
+                    SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                    """,
+                    (config_digest, now),
+                )
 
             owners = connection.execute("SELECT user_id FROM production_users").fetchall()
             if any(row["user_id"] != config.owner_user_id for row in owners):
@@ -118,7 +152,12 @@ class ProductionStateStore:
                 identities=secret_identities,
                 now=now,
             )
-            self._stage_connectors(connection, config, now=now)
+            self._stage_connectors(
+                connection,
+                config,
+                now=now,
+                reset_state=config_changed,
+            )
             self._stage_services(
                 connection,
                 services,
@@ -189,14 +228,14 @@ class ProductionStateStore:
 
     def record_provider_state(
         self,
-        state: Literal["ready", "blocked"],
+        state: Literal["active", "blocked"],
         *,
         ready: bool,
         now: int,
     ) -> None:
         """Atomically publish the live session-pool readiness observation."""
 
-        if (state == "ready") != ready:
+        if (state == "active") != ready:
             raise ValueError("provider readiness does not match lifecycle state")
         if not isinstance(now, int) or isinstance(now, bool) or now < 0:
             raise ValueError("production provider state time is invalid")
@@ -345,6 +384,7 @@ class ProductionStateStore:
             setup_status=setup_status,
             ready=setup_status == "ready" and not missing,
             missing_prerequisites=missing,
+            live_providers_ready=capabilities["live_providers_ready"],
             services=services,
             factors=factors,
         )
@@ -432,7 +472,13 @@ class ProductionStateStore:
                 )
 
     @staticmethod
-    def _stage_connectors(connection: Any, config: ProductionConfig, *, now: int) -> None:
+    def _stage_connectors(
+        connection: Any,
+        config: ProductionConfig,
+        *,
+        now: int,
+        reset_state: bool,
+    ) -> None:
         configured_aliases = set(config.connectors)
         stored_aliases = {
             str(row["connector_alias"])
@@ -443,13 +489,15 @@ class ProductionStateStore:
         if stored_aliases - configured_aliases:
             raise ProductionStateError("durable production connector inventory has diverged")
         for alias, connector in config.connectors.items():
-            digest = hashlib.sha256(canonical_json(connector.model_dump(mode="json"))).hexdigest()
+            document = connector.model_dump(mode="json")
+            digest = _connector_config_digest(document)
+            desired_state = "blocked" if config.provider_rollout.state == "enabled" else "disabled"
             connection.execute(
                 """
                 INSERT OR IGNORE INTO production_connectors(
                     connector_alias, config_digest, transport, credential_ref,
                     credential_identity_digest, state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'blocked', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     alias,
@@ -457,6 +505,7 @@ class ProductionStateStore:
                     connector.transport,
                     connector.credential_ref,
                     connector.credential_identity_digest,
+                    desired_state,
                     now,
                     now,
                 ),
@@ -468,13 +517,35 @@ class ProductionStateStore:
                 """,
                 (alias,),
             ).fetchone()
-            if stored is None or tuple(stored) != (
-                digest,
+            if stored is None or tuple(stored)[1:] != (
                 connector.transport,
                 connector.credential_ref,
                 connector.credential_identity_digest,
             ):
                 raise ProductionStateError("durable production connector differs from config")
+            if stored["config_digest"] != digest:
+                if not reset_state or stored["config_digest"] not in {
+                    _legacy_connector_config_digest(document),
+                    _rollout_preparation_connector_digest(document),
+                }:
+                    raise ProductionStateError("durable production connector differs from config")
+                connection.execute(
+                    """
+                    UPDATE production_connectors
+                    SET config_digest = ?, state = ?, updated_at = MAX(updated_at, ?)
+                    WHERE connector_alias = ? AND config_digest = ?
+                    """,
+                    (digest, desired_state, now, alias, stored["config_digest"]),
+                )
+            elif reset_state:
+                connection.execute(
+                    """
+                    UPDATE production_connectors
+                    SET state = ?, updated_at = MAX(updated_at, ?)
+                    WHERE connector_alias = ? AND state != ?
+                    """,
+                    (desired_state, now, alias, desired_state),
+                )
 
     @staticmethod
     def _stage_services(
@@ -524,7 +595,59 @@ class ProductionStateStore:
                 raise ProductionStateError("durable production service differs from config")
 
 
-def production_config_digest(config: ProductionConfig) -> str:
-    """Hash only the versioned non-secret config document and opaque references."""
+def production_config_digest(
+    config: ProductionConfig,
+    *,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
+) -> str:
+    """Hash the complete versioned non-secret config document."""
 
-    return hashlib.sha256(canonical_json(config.model_dump(mode="json"))).hexdigest()
+    document = config.model_dump(mode="json")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _connector_config_digest(document: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _legacy_production_config_digest(config: ProductionConfig) -> str:
+    """Reconstruct the pre-SP17 digest while allowing only new rollout fields to change."""
+
+    document = config.model_dump(mode="json")
+    document["storage"].pop("attachment_staging_dir", None)
+    document["storage"].pop("attachment_source_roots", None)
+    document["secrets"].pop("attachment_key_ref", None)
+    document["capabilities"]["live_providers_ready"] = False
+    document.pop("provider_rollout", None)
+    for connector in document["connectors"].values():
+        connector.pop("server_identity_digest", None)
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _legacy_connector_config_digest(document: dict[str, Any]) -> str:
+    legacy = dict(document)
+    legacy.pop("server_identity_digest", None)
+    return hashlib.sha256(canonical_json(legacy)).hexdigest()
+
+
+def _rollout_preparation_base_digest(config: ProductionConfig) -> str:
+    """Reconstruct the disabled digest emitted before rollout prerequisites were staged."""
+
+    document = config.model_dump(mode="json")
+    document["storage"]["attachment_staging_dir"] = None
+    document["storage"]["attachment_source_roots"] = []
+    document["secrets"]["attachment_key_ref"] = None
+    document["capabilities"]["live_providers_ready"] = False
+    document["provider_rollout"] = {"state": "disabled", "wacli": None}
+    for connector in document["connectors"].values():
+        connector["server_identity_digest"] = None
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _rollout_preparation_connector_digest(document: dict[str, Any]) -> str:
+    preparation = dict(document)
+    preparation["server_identity_digest"] = None
+    return hashlib.sha256(canonical_json(preparation)).hexdigest()

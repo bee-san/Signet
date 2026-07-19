@@ -58,6 +58,11 @@ private staging root, and re-opened and re-hashed at execution time. Missing,
 changed, oversized, or unsafe attachments fail before provider dispatch. A crash
 or transport loss after dispatch enters `outcome_unknown`; reconciliation uses
 only reviewed `search_email` and never converts ambiguity into a blind retry.
+The production maintenance worker applies the reviewed retention matrix: staged
+attachments are purged immediately after success or denial, after 24 hours for
+expired or cancelled requests, and after seven days for failures. Sensitive
+payload rows are retained for seven days in terminal states; ambiguous outcomes
+are not auto-purged.
 
 ## WhatsApp prerequisites and host blocker
 

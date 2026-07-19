@@ -309,6 +309,14 @@ def build_live_provider_bundle(
     clients: dict[str, object] = {}
     adapters: dict[tuple[str, str], ApprovalAdapter] = {}
     for alias, connector in config.connectors.items():
+        downstream = policy.downstreams[alias]
+        missing_schema_digests = tuple(
+            tool_name for tool_name, tool in downstream.tools.items() if tool.schema_digest is None
+        )
+        if missing_schema_digests:
+            raise ProductionConnectorError(
+                f"live provider policy is missing a reviewed schema digest: {alias}"
+            )
         if alias == "fastmail":
             if connector.transport != "http":
                 raise ProductionConnectorError("Fastmail requires the reviewed HTTP transport")
@@ -316,7 +324,6 @@ def build_live_provider_bundle(
                 raise ProductionConnectorError(
                     "Fastmail requires a reviewed MCP initialization identity"
                 )
-            downstream = policy.downstreams[alias]
             search_policy = downstream.tools.get("search_email")
             if search_policy is None or search_policy.mode.value != "passthrough":
                 raise ProductionConnectorError(
@@ -356,9 +363,8 @@ def build_live_provider_bundle(
         raise ProductionConnectorError("live provider rollout has no connector inventory")
     expected_schema_digests = {
         alias: {
-            tool_name: tool.schema_digest
+            tool_name: cast(str, tool.schema_digest)
             for tool_name, tool in policy.downstreams[alias].tools.items()
-            if tool.schema_digest is not None
         }
         for alias, client in clients.items()
         if isinstance(client, DownstreamClient)
