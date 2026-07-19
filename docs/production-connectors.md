@@ -29,12 +29,25 @@ every started session in reverse order, including rollback after partial startup
 
 Connector configuration contains only non-secret references and reviewed
 identity digests. `credential_identity_digest` tracks the credential inventory
-generation; Fastmail also requires `server_identity_digest` from reviewed
+generation. For HTTP connectors, Signet recomputes it from the resolved credential
+material using the deployment capability key before constructing a live client;
+rotating material under an unchanged Keychain reference therefore fails closed
+until the digest is deliberately updated. Generate the non-secret digest without
+printing either secret (replace both references with values from the private
+production config):
+
+```console
+uv run python -c 'from signet.credential_broker import KeychainSecretStore, SecretReference; from signet.production_connectors import provider_credential_identity_digest as d; s=KeychainSecretStore(); r="keychain://Signet/fastmail"; k="keychain://Signet/capability"; print(d(reference=r, secret=s.get(SecretReference.parse(r)).reveal(), identity_key=s.get(SecretReference.parse(k)).reveal().encode()))'
+```
+
+Run that command on the deployment host after each credential rotation, paste only
+its 64-character output into `credential_identity_digest`, and re-review the
+private config. Fastmail also requires `server_identity_digest` from reviewed
 discovery. Fastmail resolves credential material inside the HTTP MCP
 authorization boundary. The owned WhatsApp wrapper never receives the referenced
 secret: its credential is the descriptor-bound linked-device store, while the
-digest is retained only as execution identity. Exceptions and client
-representations redact provider details and credential material.
+configured identity digest still binds approval payloads and policy.
+Exceptions and client representations redact provider details and credential material.
 
 Approval calls remain caller-compatible: the mirrored MCP tool advertises the
 Signet `pending_approval` output schema, and the initial call durably returns that
@@ -53,11 +66,28 @@ contain:
 - exact reviewed initialize-identity and schema digests for the complete tool set; and
 - the same URL and Keychain reference as the production connector config.
 
+The Fastmail connector must also set `tls_server_certificate` to an absolute,
+owner-controlled file containing exactly one reviewed leaf certificate and set
+`tls_server_certificate_sha256` to the lowercase SHA-256 of that certificate's
+DER form. CA certificates and multi-certificate trust bundles are rejected: the
+leaf pin must authenticate before the bearer header can be transmitted. Generate
+the digest without printing credential material:
+
+```console
+openssl x509 -in /absolute/path/fastmail-server.pem -outform DER | shasum -a 256
+```
+
+Certificate rotation is a reviewed config change. Replace the file and digest
+together, then re-run the wrong-peer and startup gates before enabling dispatch.
+
 Attachments are read only from an allowed source root, encrypted at rest in the
 private staging root, and re-opened and re-hashed at execution time. Missing,
 changed, oversized, or unsafe attachments fail before provider dispatch. A crash
 or transport loss after dispatch enters `outcome_unknown`; reconciliation uses
 only reviewed `search_email` and never converts ambiguity into a blind retry.
+Attachment upload failures and cancellations also enter `outcome_unknown` and
+persist only bounded attempted/confirmed counts. Filenames and attachment contents
+are never included in outcome metadata, and provider effects are never retried blindly.
 The production maintenance worker applies the reviewed retention matrix: staged
 attachments are purged immediately after success or denial, after 24 hours for
 expired or cancelled requests, and after seven days for failures. Sensitive
@@ -68,8 +98,11 @@ are not auto-purged.
 
 The connector alias must be exactly `whatsapp` and use one hash-pinned stdio
 executable with no configured arguments. `provider_rollout.wacli` supplies a
-non-secret account name, exact expected version, dedicated HOME, linked-device
-store, CLI timeout, and output bound. The connector working directory must be the
+non-secret account name, exact `linked_jid`, exact expected version, dedicated
+HOME, linked-device store, CLI timeout, and output bound. Immediately before each
+send, the wrapper requires the read-only account inventory to contain that exact
+single account/store and requires `auth status --read-only` to report the exact
+linked JID. The connector working directory must be the
 private parent shared by HOME and the store, and its `output_limit_bytes` must
 equal the owned boundary's `max_output_bytes`; inconsistent or inapplicable
 duplicate boundary fields fail startup rather than being ignored. The policy
@@ -118,6 +151,9 @@ an unreviewed Linux binary therefore fail closed with
 
 Rollback is fail-closed: stop services, set `provider_rollout.state=disabled` and
 `live_providers_ready=false`, and restart. Pending and unknown requests remain in
-SQLite; disabling a connector never treats them as delivered and never retries
-them. Restore direct routes or credentials only through a separately reviewed
-operator change.
+SQLite; retain their reviewed connector and policy definitions (and attachment
+staging settings, when used) so the non-dispatching reviewer can still render,
+deny, or cancel them. Rollback does not expose those adapters to the gateway or
+delivery pipeline, never treats requests as delivered, and never retries them.
+Restore direct routes or credentials only through a separately reviewed operator
+change.

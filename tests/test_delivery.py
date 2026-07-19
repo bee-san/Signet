@@ -14,6 +14,7 @@ import pytest
 
 from signet.adapters.base import (
     AdapterRequest,
+    DispatchCancelledError,
     DispatchError,
     ExecutionAttempt,
     MCPClient,
@@ -113,7 +114,7 @@ class FakeClient(MCPClient):
             ).fetchone()[0]
         self.calls.append((tool_name, dict(arguments), phase))
         value = self.outcomes.pop(0)
-        if isinstance(value, Exception):
+        if isinstance(value, BaseException):
             raise value
         assert isinstance(value, Mapping)
         return value
@@ -690,6 +691,64 @@ async def test_post_boundary_errors_are_classified_without_retry(
     if expected_state == "outcome_unknown":
         expected_notifications.append("outcome_unknown_entered")
     assert notification_kinds(machine, f"error-{expected_state}") == expected_notifications
+
+
+@pytest.mark.asyncio
+async def test_dispatch_error_preserves_only_reviewed_bounded_effect_metadata(
+    machine: ApprovalStateMachine,
+) -> None:
+    enqueue_approved(machine, "partial-effect")
+    adapter = FakeAdapter()
+    error = DispatchError(
+        "ambiguous upload",
+        dispatch_may_have_occurred=True,
+        safe_metadata={
+            "state": "attachment_upload_outcome_unknown",
+            "attachment_uploads_attempted": 2,
+            "attachment_uploads_confirmed": 1,
+            "unreviewed": "must not persist",
+        },
+    )
+
+    result = await dispatcher(machine, adapter, FakeClient(machine, [error])).dispatch(
+        "partial-effect",
+        worker_id="worker",
+        now=NOW + 2,
+    )
+
+    expected = {
+        "state": "attachment_upload_outcome_unknown",
+        "attachment_uploads_attempted": 2,
+        "attachment_uploads_confirmed": 1,
+    }
+    assert result.outcome.value == "outcome_unknown"
+    assert result.safe_metadata == expected
+    assert json.loads(machine.get_request("partial-effect")["safe_outcome_json"]) == expected
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cancellation_preserves_reviewed_partial_effect_metadata(
+    machine: ApprovalStateMachine,
+) -> None:
+    enqueue_approved(machine, "cancelled-partial-effect")
+    adapter = FakeAdapter()
+    metadata = {
+        "state": "attachment_upload_outcome_unknown",
+        "attachment_uploads_attempted": 1,
+        "attachment_uploads_confirmed": 0,
+    }
+    error = DispatchCancelledError("upload cancelled", safe_metadata=metadata)
+
+    with pytest.raises(asyncio.CancelledError):
+        await dispatcher(machine, adapter, FakeClient(machine, [error])).dispatch(
+            "cancelled-partial-effect",
+            worker_id="worker",
+            now=NOW + 2,
+        )
+
+    request = machine.get_request("cancelled-partial-effect")
+    assert request["state"] == "outcome_unknown"
+    assert json.loads(request["safe_outcome_json"]) == metadata
 
 
 @pytest.mark.asyncio

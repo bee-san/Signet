@@ -48,6 +48,8 @@ class DownstreamConfig(BaseModel):
     credential_identity_digest: str
     server_identity_digest: str | None = None
     url: str | None = None
+    tls_server_certificate: Path | None = None
+    tls_server_certificate_sha256: str | None = None
     command: tuple[str, ...] = ()
     working_directory: Path | None = None
     executable_sha256: str | None = None
@@ -64,9 +66,9 @@ class DownstreamConfig(BaseModel):
 
     @field_validator("credential_identity_digest")
     @classmethod
-    def credential_identity_is_inventory_generation(cls, value: str) -> str:
+    def credential_identity_is_reviewed_material(cls, value: str) -> str:
         if not re.fullmatch(r"[a-f0-9]{64}", value):
-            raise ValueError("credential identity must be a lowercase SHA-256 inventory digest")
+            raise ValueError("credential identity must be a lowercase SHA-256 material digest")
         return value
 
     @field_validator("server_identity_digest")
@@ -74,6 +76,13 @@ class DownstreamConfig(BaseModel):
     def server_identity_is_exact(cls, value: str | None) -> str | None:
         if value is not None and not re.fullmatch(r"[a-f0-9]{64}", value):
             raise ValueError("server identity must be a lowercase SHA-256 digest")
+        return value
+
+    @field_validator("tls_server_certificate_sha256")
+    @classmethod
+    def tls_server_certificate_digest_is_exact(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError("TLS server certificate digest must be a lowercase SHA-256")
         return value
 
     @field_validator("executable_sha256")
@@ -307,6 +316,11 @@ class ProductionWacliConfig(BaseModel):
         max_length=64,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
     )
+    linked_jid: str = Field(
+        min_length=22,
+        max_length=48,
+        pattern=r"^[1-9][0-9]{6,31}@s\.whatsapp\.net$",
+    )
     home: Path
     store: Path
     expected_version: str
@@ -478,6 +492,13 @@ class ProductionConfig(BaseModel):
                     or connector.working_directory is not None
                     or connector.executable_sha256 is not None
                     or connector.execution_snapshot_root is not None
+                    or (connector.tls_server_certificate is None)
+                    != (connector.tls_server_certificate_sha256 is None)
+                    or connector.tls_server_certificate is not None
+                    and (
+                        not connector.tls_server_certificate.is_absolute()
+                        or ".." in connector.tls_server_certificate.parts
+                    )
                 ):
                     raise ValueError("production HTTP connector fields are incomplete or mixed")
             else:
@@ -486,6 +507,8 @@ class ProductionConfig(BaseModel):
                 snapshot_root = connector.execution_snapshot_root
                 if (
                     connector.url is not None
+                    or connector.tls_server_certificate is not None
+                    or connector.tls_server_certificate_sha256 is not None
                     or not connector.command
                     or working_directory is None
                     or connector.executable_sha256 is None
@@ -530,6 +553,15 @@ class ProductionConfig(BaseModel):
             raise ValueError("live provider attachment staging must be configured")
         if rollout_enabled and set(self.connectors) - {"fastmail", "whatsapp"}:
             raise ValueError("live provider rollout supports only Fastmail and WhatsApp")
+        if (
+            rollout_enabled
+            and "fastmail" in self.connectors
+            and (
+                self.connectors["fastmail"].tls_server_certificate is None
+                or self.connectors["fastmail"].tls_server_certificate_sha256 is None
+            )
+        ):
+            raise ValueError("live Fastmail rollout requires a reviewed TLS server certificate")
         if rollout_enabled and (
             ("whatsapp" in self.connectors) != (self.provider_rollout.wacli is not None)
         ):

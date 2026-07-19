@@ -71,6 +71,37 @@ class _CancellingCloseClient(_RecordingClient):
         raise asyncio.CancelledError
 
 
+class _RuntimeFailingClient(_RecordingClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.running = False
+
+    @property
+    def is_running(self) -> bool:
+        return self.running
+
+    async def start(self) -> None:
+        self.events.append("start")
+        self.running = True
+
+    async def close(self) -> None:
+        self.events.append("close")
+        self.running = False
+
+
+class _SlowCloseClient(_RecordingClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await asyncio.sleep(0.05)
+        self.events.append("close")
+        self.closed.set()
+
+
 class _DiscoveringClient(_RecordingClient):
     def __init__(
         self,
@@ -129,6 +160,24 @@ async def test_credential_bound_client_forwards_without_exposing_credential_mate
     assert "redacted" in repr(client)
 
 
+@pytest.mark.asyncio
+async def test_credential_bound_client_reports_only_its_current_lifecycle_generation() -> None:
+    delegate = _RuntimeFailingClient()
+    client = CredentialBoundClient(
+        alias="whatsapp",
+        credential_identity_digest="a" * 64,
+        delegate=delegate,
+    )
+
+    assert client.is_running is False
+    await client.start()
+    assert client.is_running is True
+    delegate.running = False
+    assert client.is_running is False
+    await client.close()
+    assert client.is_running is False
+
+
 @pytest.mark.parametrize(
     ("alias", "digest"),
     (("bad alias", "a" * 64), ("whatsapp", "not-a-digest")),
@@ -149,6 +198,56 @@ async def test_provider_session_pool_shares_one_lifecycle_across_consumers() -> 
         assert delegate.events == ["start"]
 
     assert delegate.events == ["start", "close"]
+
+
+@pytest.mark.asyncio
+async def test_provider_session_pool_fails_holder_when_a_live_client_terminates() -> None:
+    client = _RuntimeFailingClient()
+    pool = ProviderSessionPool({"fastmail": client})
+    entered = asyncio.Event()
+
+    async def serve() -> None:
+        async with pool.run():
+            entered.set()
+            await asyncio.Event().wait()
+
+    holder = asyncio.create_task(serve())
+    await entered.wait()
+    assert pool.active is True
+
+    client.running = False
+    await asyncio.sleep(0.1)
+
+    assert holder.done()
+    with pytest.raises(asyncio.CancelledError):
+        await holder
+    assert pool.active is False
+    assert client.events == ["start", "close"]
+
+
+@pytest.mark.asyncio
+async def test_provider_session_pool_repeated_cancellation_awaits_client_cleanup() -> None:
+    client = _SlowCloseClient()
+    pool = ProviderSessionPool({"fastmail": client})
+    entered = asyncio.Event()
+
+    async def hold_session() -> None:
+        async with pool.run():
+            entered.set()
+            await asyncio.Event().wait()
+
+    holder = asyncio.create_task(hold_session())
+    await entered.wait()
+    holder.cancel()
+    await client.close_started.wait()
+    holder.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await holder
+
+    assert client.closed.is_set()
+    assert pool.active is False
+    assert client.events == ["start", "close"]
 
 
 @pytest.mark.asyncio

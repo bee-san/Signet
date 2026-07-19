@@ -70,8 +70,14 @@ class ProductionStatus:
 class ProductionStateStore:
     """Seed and inspect one idempotent production inventory snapshot."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        provider_rollout_enabled: bool = False,
+    ) -> None:
         self.database = database
+        self._provider_rollout_enabled = provider_rollout_enabled
 
     def stage(
         self,
@@ -347,9 +353,23 @@ class ProductionStateStore:
                 FROM auth_credentials ORDER BY credential_id
                 """
             ).fetchall()
+            connector_rows = connection.execute(
+                """
+                SELECT state
+                FROM production_connectors ORDER BY connector_alias
+                """
+            ).fetchall()
         if setup is None:
             raise ProductionStateError("production setup state is unavailable")
         capabilities = self._parse_capabilities(setup["capability_status_json"])
+        providers_authoritatively_ready = (
+            self._provider_rollout_enabled
+            and bool(connector_rows)
+            and all(row["state"] == "active" for row in connector_rows)
+        )
+        capabilities["live_providers_ready"] = (
+            capabilities["live_providers_ready"] and providers_authoritatively_ready
+        )
         missing = tuple(name for name in _CAPABILITY_ORDER if capabilities.get(name) is not True)
         setup_status = str(setup["setup_status"])
         services = MappingProxyType(
@@ -624,12 +644,16 @@ def _legacy_production_config_digest(config: ProductionConfig) -> str:
     document.pop("provider_rollout", None)
     for connector in document["connectors"].values():
         connector.pop("server_identity_digest", None)
+        connector.pop("tls_server_certificate", None)
+        connector.pop("tls_server_certificate_sha256", None)
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
 
 def _legacy_connector_config_digest(document: dict[str, Any]) -> str:
     legacy = dict(document)
     legacy.pop("server_identity_digest", None)
+    legacy.pop("tls_server_certificate", None)
+    legacy.pop("tls_server_certificate_sha256", None)
     return hashlib.sha256(canonical_json(legacy)).hexdigest()
 
 
@@ -644,10 +668,14 @@ def _rollout_preparation_base_digest(config: ProductionConfig) -> str:
     document["provider_rollout"] = {"state": "disabled", "wacli": None}
     for connector in document["connectors"].values():
         connector["server_identity_digest"] = None
+        connector.pop("tls_server_certificate", None)
+        connector.pop("tls_server_certificate_sha256", None)
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
 
 def _rollout_preparation_connector_digest(document: dict[str, Any]) -> str:
     preparation = dict(document)
     preparation["server_identity_digest"] = None
+    preparation.pop("tls_server_certificate", None)
+    preparation.pop("tls_server_certificate_sha256", None)
     return hashlib.sha256(canonical_json(preparation)).hexdigest()

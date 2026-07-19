@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hmac
 import inspect
+import os
 import re
+import stat
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -15,19 +17,21 @@ from typing import Any, Protocol, cast
 from signet.adapters.base import ApprovalAdapter
 from signet.adapters.fastmail import FastmailAdapter
 from signet.adapters.whatsapp import WhatsAppAdapter
+from signet.async_support import await_task_while_preserving_cancellation
 from signet.attachment_crypto import AttachmentCipher
 from signet.canonical import canonical_json, sha256_hex
 from signet.config import ProductionConfig
-from signet.credential_broker import SecretReference, SecretStore
+from signet.credential_broker import Secret, SecretReference, SecretStore
 from signet.db import Database
-from signet.downstream import DownstreamClient
+from signet.downstream import DownstreamClient, pinned_tls_http_connector
 from signet.mcp_mirror import tool_schema_digest, validate_lossless_tool
 from signet.policy import PolicyMode, PolicySnapshot
-from signet.staging import StagingStore
+from signet.staging import StagingStore, open_confined_readonly, read_verified_descriptor
 from signet.wacli_wrapper import WacliConfig, WacliWrapper
 
 _ALIAS_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+_MAX_TLS_SERVER_CERTIFICATE_BYTES = 1024 * 1024
 
 
 class ProductionConnectorError(RuntimeError):
@@ -51,7 +55,7 @@ class _LifecycleClient(Protocol):
 class CredentialBoundClient:
     """Expose only a reviewed credential identity while containing its delegate."""
 
-    __slots__ = ("_alias", "_delegate", "credential_identity_digest")
+    __slots__ = ("_alias", "_delegate", "_running", "credential_identity_digest")
 
     def __init__(
         self,
@@ -70,8 +74,15 @@ class CredentialBoundClient:
         self._alias = alias
         self.credential_identity_digest = credential_identity_digest
         self._delegate = cast(_ConnectorDelegate, delegate)
+        self._running = False
+
+    @property
+    def is_running(self) -> bool:
+        delegate_state = getattr(self._delegate, "is_running", True)
+        return self._running and bool(delegate_state)
 
     async def start(self) -> None:
+        self._running = False
         start = getattr(self._delegate, "start", None)
         if not callable(start):
             start = getattr(self._delegate, "verify_version", None)
@@ -82,8 +93,10 @@ class CredentialBoundClient:
                     f"production connector lifecycle is invalid: {self._alias}"
                 )
             await result
+        self._running = True
 
     async def close(self) -> None:
+        self._running = False
         close = getattr(self._delegate, "close", None)
         if callable(close):
             result = close()
@@ -161,32 +174,49 @@ class ProviderSessionPool:
         self._lock = asyncio.Lock()
         self._users = 0
         self._started: tuple[tuple[str, _LifecycleClient], ...] = ()
+        self._holders: set[asyncio.Task[Any]] = set()
+        self._monitor_task: asyncio.Task[None] | None = None
+        self._runtime_failed = False
 
     @property
     def active(self) -> bool:
-        return bool(self._started)
+        return (
+            bool(self._started)
+            and not self._runtime_failed
+            and all(bool(getattr(client, "is_running", True)) for _, client in self._started)
+        )
 
     @asynccontextmanager
     async def run(self) -> AsyncIterator[None]:
         """Keep the full reviewed session set alive for one consumer lifecycle."""
 
-        await self._acquire()
+        holder = asyncio.current_task()
+        if holder is None:  # pragma: no cover - asyncio always supplies one here
+            raise ProductionConnectorError("production provider lifecycle has no owning task")
+        await self._acquire(holder)
         try:
             yield
         except asyncio.CancelledError:
             with suppress(asyncio.CancelledError, ProductionConnectorError):
-                await asyncio.shield(self._release())
+                await self._release_non_abandoning(holder)
             raise
         except BaseException:
-            await asyncio.shield(self._release())
+            await self._release_non_abandoning(holder)
             raise
         else:
-            await asyncio.shield(self._release())
+            await self._release_non_abandoning(holder)
 
-    async def _acquire(self) -> None:
+    async def _release_non_abandoning(self, holder: asyncio.Task[Any]) -> None:
+        release_task = asyncio.create_task(self._release(holder))
+        await await_task_while_preserving_cancellation(release_task)
+
+    async def _acquire(self, holder: asyncio.Task[Any]) -> None:
         async with self._lock:
             if self._users:
+                if not self.active:
+                    raise ProductionConnectorError("production provider session is unavailable")
                 self._users += 1
+                self._holders.add(holder)
                 return
             started: list[tuple[str, _LifecycleClient]] = []
             failed_alias = "unknown"
@@ -207,6 +237,26 @@ class ProviderSessionPool:
                 ) from None
             self._started = tuple(started)
             self._users = 1
+            self._holders.add(holder)
+            self._runtime_failed = False
+            self._monitor_task = asyncio.create_task(
+                self._monitor_runtime(),
+                name="signet-provider-session-monitor",
+            )
+
+    async def _monitor_runtime(self) -> None:
+        while True:
+            await asyncio.sleep(0.01)
+            async with self._lock:
+                if not self._started or self._runtime_failed:
+                    return
+                if all(bool(getattr(client, "is_running", True)) for _, client in self._started):
+                    continue
+                self._runtime_failed = True
+                holders = tuple(self._holders)
+            for holder in holders:
+                holder.cancel()
+            return
 
     async def _verify_identity_contract(self, alias: str, client: _LifecycleClient) -> None:
         expected_identity = self._expected_server_identity_digests.get(alias)
@@ -239,17 +289,25 @@ class ProviderSessionPool:
         if len(discovered) != len(reviewed_tools) or discovered != expected:
             raise ProductionConnectorError("production provider schema drift was detected")
 
-    async def _release(self) -> None:
+    async def _release(self, holder: asyncio.Task[Any]) -> None:
         async with self._lock:
             if self._users < 1:
                 raise ProductionConnectorError(
                     "production provider session lifecycle is unbalanced"
                 )
+            self._holders.discard(holder)
             self._users -= 1
             if self._users:
                 return
+            monitor = self._monitor_task
+            self._monitor_task = None
             started = list(self._started)
             self._started = ()
+            self._runtime_failed = False
+            if monitor is not None and monitor is not asyncio.current_task():
+                monitor.cancel()
+                with suppress(asyncio.CancelledError):
+                    await monitor
             await self._close_started(started)
 
     @staticmethod
@@ -276,12 +334,51 @@ class ProductionProviderBundle:
     sessions: ProviderSessionPool
 
 
+def provider_credential_identity_digest(
+    *,
+    reference: str,
+    secret: str,
+    identity_key: bytes,
+) -> str:
+    """Derive a deployment-keyed, non-reversible credential generation identity."""
+
+    return hmac.new(
+        identity_key,
+        b"provider_credential\x00" + reference.encode("utf-8") + b"\x00" + secret.encode("utf-8"),
+        "sha256",
+    ).hexdigest()
+
+
+def _read_reviewed_tls_server_certificate(path: Path) -> bytes:
+    if path.parent.resolve(strict=False) != path.parent:
+        raise ProductionConnectorError("reviewed TLS server certificate path is unsafe")
+    descriptor = -1
+    try:
+        descriptor = open_confined_readonly(path.parent, path)
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ProductionConnectorError("reviewed TLS server certificate permissions are unsafe")
+        payload = read_verified_descriptor(
+            descriptor,
+            maximum_bytes=_MAX_TLS_SERVER_CERTIFICATE_BYTES,
+        )
+    except ProductionConnectorError:
+        raise
+    except Exception:
+        raise ProductionConnectorError("reviewed TLS server certificate is unavailable") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return payload
+
+
 def build_live_provider_bundle(
     config: ProductionConfig,
     *,
     database: Database,
     policy: PolicySnapshot,
     secret_store: SecretStore,
+    credential_identity_key: bytes,
 ) -> ProductionProviderBundle:
     """Assemble the explicitly enabled provider paths without starting sessions."""
 
@@ -324,6 +421,13 @@ def build_live_provider_bundle(
                 raise ProductionConnectorError(
                     "Fastmail requires a reviewed MCP initialization identity"
                 )
+            if (
+                connector.tls_server_certificate is None
+                or connector.tls_server_certificate_sha256 is None
+            ):
+                raise ProductionConnectorError(
+                    "Fastmail requires a reviewed TLS server certificate"
+                )
             search_policy = downstream.tools.get("search_email")
             if search_policy is None or search_policy.mode.value != "passthrough":
                 raise ProductionConnectorError(
@@ -334,7 +438,54 @@ def build_live_provider_bundle(
                 raise ProductionConnectorError(
                     "Fastmail reconciliation account scope is inconsistent"
                 )
-            http_client = DownstreamClient(alias, connector, secret_store)
+            try:
+                credential = secret_store.get(SecretReference.parse(connector.credential_ref))
+                observed_identity = provider_credential_identity_digest(
+                    reference=connector.credential_ref,
+                    secret=credential.reveal(),
+                    identity_key=credential_identity_key,
+                )
+            except Exception:
+                raise ProductionConnectorError(
+                    "Fastmail credential identity could not be verified"
+                ) from None
+            if not hmac.compare_digest(
+                observed_identity,
+                connector.credential_identity_digest,
+            ):
+                raise ProductionConnectorError("Fastmail credential identity drift was detected")
+
+            def verify_credential(
+                secret: Secret,
+                *,
+                reference: str = connector.credential_ref,
+                expected_identity: str = connector.credential_identity_digest,
+            ) -> None:
+                startup_identity = provider_credential_identity_digest(
+                    reference=reference,
+                    secret=secret.reveal(),
+                    identity_key=credential_identity_key,
+                )
+                if not hmac.compare_digest(
+                    startup_identity,
+                    expected_identity,
+                ):
+                    raise ProductionConnectorError(
+                        "Fastmail credential identity drifted before startup"
+                    )
+
+            http_client = DownstreamClient(
+                alias,
+                connector,
+                secret_store,
+                http_connector=pinned_tls_http_connector(
+                    _read_reviewed_tls_server_certificate(
+                        connector.tls_server_certificate,
+                    ),
+                    connector.tls_server_certificate_sha256,
+                ),
+                credential_verifier=verify_credential,
+            )
             adapter = FastmailAdapter(
                 staging_store=staging,
                 account=account,
@@ -387,6 +538,46 @@ def build_live_provider_bundle(
     )
 
 
+def build_review_only_provider_adapters(
+    config: ProductionConfig,
+    *,
+    policy: PolicySnapshot,
+    staging: StagingStore | None,
+) -> Mapping[tuple[str, str], ApprovalAdapter]:
+    """Retain non-dispatching adapters so rolled-back requests remain reviewable."""
+
+    adapters: dict[tuple[str, str], ApprovalAdapter] = {}
+    for alias in config.connectors:
+        if alias == "fastmail" and "send_email" in policy.downstreams[alias].tools:
+            fastmail_adapter = FastmailAdapter(
+                staging_store=staging,
+                account=_policy_account(policy, alias, "send_email"),
+                reviewed_dispatch_enabled=False,
+            )
+            _require_approval_send(
+                policy,
+                alias,
+                "send_email",
+                fastmail_adapter.adapter_id,
+            )
+            adapters[(alias, "send_email")] = cast(ApprovalAdapter, fastmail_adapter)
+            continue
+        if alias != "whatsapp":
+            continue
+        for tool_name in ("send_text", "send_file"):
+            if tool_name not in policy.downstreams[alias].tools:
+                continue
+            whatsapp_adapter = WhatsAppAdapter(
+                tool_name=tool_name,
+                staging_store=staging,
+                account=_policy_account(policy, alias, tool_name),
+                reviewed_dispatch_enabled=False,
+            )
+            _require_approval_send(policy, alias, tool_name, whatsapp_adapter.adapter_id)
+            adapters[(alias, tool_name)] = cast(ApprovalAdapter, whatsapp_adapter)
+    return adapters
+
+
 def _policy_account(policy: PolicySnapshot, alias: str, tool_name: str) -> str:
     try:
         downstream = policy.downstreams[alias]
@@ -432,6 +623,7 @@ def _build_whatsapp(
         delegate = WacliWrapper(
             WacliConfig(
                 account=boundary.account,
+                expected_linked_jid=boundary.linked_jid,
                 executable=Path(connector.command[0]),
                 expected_version=boundary.expected_version,
                 expected_sha256=connector.executable_sha256,

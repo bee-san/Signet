@@ -11,11 +11,18 @@ import subprocess
 import time
 import traceback
 from collections.abc import Callable, Mapping
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pyotp
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -43,7 +50,11 @@ from signet.production import (
     create_production_web_app_from_environment,
     load_production_config,
 )
-from signet.production_connectors import CredentialBoundClient
+from signet.production_connectors import (
+    CredentialBoundClient,
+    ProductionConnectorError,
+    ProviderSessionPool,
+)
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
@@ -51,6 +62,27 @@ from signet.totp_enrollment import (
 )
 from signet.wacli_wrapper import WacliConfig
 from tests.migration_helpers import verified_backup_callback
+
+
+def _write_reviewed_server_certificate(tmp_path: Path) -> tuple[Path, str]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mail.example.test")])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+        .sign(key, hashes.SHA256())
+    )
+    path = tmp_path / "fastmail-server-certificate.pem"
+    path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    digest = hashlib.sha256(certificate.public_bytes(serialization.Encoding.DER)).hexdigest()
+    return path, digest
 
 
 def _production_payload(tmp_path: Path) -> dict[str, Any]:
@@ -132,6 +164,19 @@ def _secret_store(
             ("signet", "mail"): "mail-secret-value",
         }
     )
+
+
+def _provider_credential_identity(
+    *,
+    reference: str,
+    secret: str,
+    identity_key: str = "capability-secret-" * 3,
+) -> str:
+    return hmac.new(
+        identity_key.encode("utf-8"),
+        b"provider_credential\x00" + reference.encode("utf-8") + b"\x00" + secret.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 class _RecordingSecretStore:
@@ -356,13 +401,19 @@ downstreams:
         + "\n",
         encoding="utf-8",
     )
+    server_certificate, server_certificate_sha256 = _write_reviewed_server_certificate(tmp_path)
     payload["connectors"] = {
         "fastmail": {
             "transport": "http",
             "credential_ref": "keychain://signet/mail",
-            "credential_identity_digest": "a" * 64,
+            "credential_identity_digest": _provider_credential_identity(
+                reference="keychain://signet/mail",
+                secret="mail-secret-value",
+            ),
             "server_identity_digest": "f" * 64,
             "url": "https://mail.example.test/mcp",
+            "tls_server_certificate": str(server_certificate),
+            "tls_server_certificate_sha256": server_certificate_sha256,
         }
     }
     payload["storage"].update(
@@ -385,6 +436,14 @@ downstreams:
         }
     )
     captured_server_identities: dict[str, str] = {}
+    captured_reviewer_staging: list[object] = []
+    captured_reviewer_adapters: list[dict[tuple[str, str], object]] = []
+    original_reviewer = production_module.EncryptedPayloadReviewer
+
+    def capturing_reviewer(*args: Any, **kwargs: Any):
+        captured_reviewer_adapters.append(dict(cast(Mapping[tuple[str, str], object], args[2])))
+        captured_reviewer_staging.append(kwargs.get("staging"))
+        return original_reviewer(*args, **kwargs)
 
     class CapturingProviderSessionPool(production_connectors_module.ProviderSessionPool):
         def __init__(
@@ -406,6 +465,7 @@ downstreams:
         "ProviderSessionPool",
         CapturingProviderSessionPool,
     )
+    monkeypatch.setattr(production_module, "EncryptedPayloadReviewer", capturing_reviewer)
 
     disabled_config = config.model_copy(
         update={
@@ -415,6 +475,13 @@ downstreams:
     )
     staged = build_production_runtime(disabled_config, secret_store=secret_store)
     assert staged.provider_sessions is None
+    assert staged.adapters == {}
+    assert tuple(captured_reviewer_adapters[-1]) == (
+        ("fastmail", "send_email"),
+        ("gateway", "request_tool_access"),
+    )
+    disabled_fastmail = captured_reviewer_adapters[-1][("fastmail", "send_email")]
+    assert cast(Any, disabled_fastmail).reviewed_dispatch_enabled is False
     assert staged.retention is not None
 
     assembly = build_production_runtime(config, secret_store=secret_store)
@@ -423,9 +490,45 @@ downstreams:
     assert tuple(assembly.adapters) == (("fastmail", "send_email"),)
     assert assembly.adapters[("fastmail", "send_email")].reviewed_dispatch_enabled is True
     assert assembly.staging is not None
+    assert captured_reviewer_staging[-1] is assembly.staging
     assert assembly.retention is not None
     assert assembly.provider_sessions is not None
     assert captured_server_identities == {"fastmail": "f" * 64}
+
+    transport_calls: list[str] = []
+
+    @asynccontextmanager
+    async def forbidden_transport(*_args: Any, **_kwargs: Any):
+        transport_calls.append("opened")
+        yield object(), object(), lambda: None
+
+    live_client = cast(DownstreamClient, assembly.provider_clients["fastmail"])
+    monkeypatch.setattr(live_client, "_http_connector", forbidden_transport)
+    secret_store._values[("signet", "mail")] = "rotated-after-assembly"
+
+    async def start_rotated_provider() -> None:
+        assert assembly.provider_sessions is not None
+        async with assembly.provider_sessions.run():
+            pytest.fail("rotated provider credential must not become ready")
+
+    with pytest.raises(ProductionConnectorError, match="startup failed"):
+        asyncio.run(start_rotated_provider())
+    assert transport_calls == []
+    secret_store._values[("signet", "mail")] = "mail-secret-value"
+
+    rotated_secret_store = MemorySecretStore(
+        {
+            ("signet", "session"): "session-secret-" * 3,
+            ("signet", "csrf"): "csrf-secret-" * 4,
+            ("signet", "capability"): "capability-secret-" * 3,
+            ("signet", "payload"): "payload-secret-" * 3,
+            ("signet", "totp"): "totp-secret-value",
+            ("signet", "mail"): "rotated-mail-secret-value",
+            ("signet", "attachment"): "attachment-key-material-" * 3,
+        }
+    )
+    with pytest.raises(ProductionAssemblyError, match="credential identity"):
+        build_production_runtime(config, secret_store=rotated_secret_store)
 
     active_now = int(time.time())
     assembly.state.record_provider_state("active", ready=True, now=active_now)
@@ -435,6 +538,8 @@ downstreams:
         clock=lambda: active_now,
     )
     assert restarted.state.status().live_providers_ready is True
+    assert restarted.status().live_providers_ready is False
+    assert "live_providers_ready" in restarted.status().missing_prerequisites
     with assembly.database.read() as connection:
         assert (
             connection.execute(
@@ -535,6 +640,8 @@ downstreams:
             ).fetchone()["state"]
             == "disabled"
         )
+    rolled_back.state.record_provider_state("active", ready=True, now=lifecycle_now + 1)
+    assert rolled_back.status().live_providers_ready is False
 
     missing_identity = config.connectors["fastmail"].model_copy(
         update={"server_identity_digest": None}
@@ -636,6 +743,7 @@ downstreams:
         "state": "enabled",
         "wacli": {
             "account": "whatsapp-primary",
+            "linked_jid": "15551234567@s.whatsapp.net",
             "home": str(home),
             "store": str(store),
             "expected_version": "0.1.0",
@@ -1222,10 +1330,14 @@ def test_production_http_surfaces_reject_non_loopback_transport_peers(tmp_path: 
         legacy_document["secrets"].pop("attachment_key_ref")
         legacy_document.pop("provider_rollout")
         legacy_document["connectors"]["mail"].pop("server_identity_digest")
+        legacy_document["connectors"]["mail"].pop("tls_server_certificate")
+        legacy_document["connectors"]["mail"].pop("tls_server_certificate_sha256")
         legacy_digest = hashlib.sha256(canonical_json(legacy_document)).hexdigest()
 
         legacy_connector = config.connectors["mail"].model_dump(mode="json")
         legacy_connector.pop("server_identity_digest")
+        legacy_connector.pop("tls_server_certificate")
+        legacy_connector.pop("tls_server_certificate_sha256")
         legacy_connector_digest = hashlib.sha256(canonical_json(legacy_connector)).hexdigest()
 
     with assembly.database.transaction() as connection:
@@ -1939,11 +2051,163 @@ async def test_worker_startup_failure_is_unhealthy_and_persisted_fail_closed(
 
     monkeypatch.setattr(assembly.workers._approvals, "recover_startup", fail_recovery)
 
+    serving = asyncio.create_task(assembly.workers.serve(asyncio.Event()))
     with pytest.raises(RuntimeError, match="startup recovery"):
-        await assembly.workers.serve(asyncio.Event())
+        await assembly.workers.wait_started()
+    with pytest.raises(RuntimeError, match="startup recovery"):
+        await serving
 
     status = assembly.status()
     assert assembly.workers.running is False
     assert assembly.workers.healthy is False
     assert status.services["maintenance"].state == "blocked"
     assert "workers_ready" in status.missing_prerequisites
+
+
+@pytest.mark.asyncio
+async def test_provider_lifespan_starts_before_apps_and_stops_after_them() -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def original_lifespan(_app: object):
+        events.append("app:start")
+        yield
+        events.append("app:stop")
+
+    class Sessions:
+        active = False
+
+        def run(self):
+            @asynccontextmanager
+            async def provider_session():
+                self.active = True
+                events.append("provider:start")
+                yield
+                events.append("provider:stop")
+                self.active = False
+
+            return provider_session()
+
+    class State:
+        def record_provider_state(self, state: str, *, ready: bool, now: int) -> None:
+            events.append(f"state:{state}:{ready}:{now}")
+
+    app = SimpleNamespace(router=SimpleNamespace(lifespan_context=original_lifespan))
+    production_module._attach_provider_lifespan(
+        app,
+        cast(Any, Sessions()),
+        cast(Any, State()),
+        lambda: 123,
+    )
+
+    async with app.router.lifespan_context(app):
+        assert events == ["provider:start", "state:active:True:123", "app:start"]
+
+    assert events == [
+        "provider:start",
+        "state:active:True:123",
+        "app:start",
+        "app:stop",
+        "provider:stop",
+        "state:blocked:False:123",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_provider_runtime_failure_cancels_service_and_records_blocked_state() -> None:
+    events: list[str] = []
+    entered = asyncio.Event()
+
+    class Client:
+        is_running = False
+
+        async def start(self) -> None:
+            self.is_running = True
+            events.append("provider:start")
+
+        async def close(self) -> None:
+            self.is_running = False
+            events.append("provider:stop")
+
+    @asynccontextmanager
+    async def original_lifespan(_app: object):
+        events.append("app:start")
+        try:
+            yield
+        finally:
+            events.append("app:stop")
+
+    class State:
+        def record_provider_state(self, state: str, *, ready: bool, now: int) -> None:
+            events.append(f"state:{state}:{ready}:{now}")
+
+    client = Client()
+    sessions = ProviderSessionPool({"fastmail": cast(Any, client)})
+    app = SimpleNamespace(router=SimpleNamespace(lifespan_context=original_lifespan))
+    production_module._attach_provider_lifespan(
+        app,
+        sessions,
+        cast(Any, State()),
+        lambda: 123,
+    )
+
+    async def serve() -> None:
+        async with app.router.lifespan_context(app):
+            entered.set()
+            await asyncio.Event().wait()
+
+    serving = asyncio.create_task(serve())
+    await entered.wait()
+    client.is_running = False
+    await asyncio.sleep(0.1)
+
+    assert serving.done() is True
+    with pytest.raises(asyncio.CancelledError):
+        await serving
+    assert sessions.active is False
+    assert events[:3] == ["provider:start", "state:active:True:123", "app:start"]
+    assert "app:stop" in events
+    assert "provider:stop" in events
+    assert events[-1] == "state:blocked:False:123"
+
+
+@pytest.mark.asyncio
+async def test_worker_lifespan_cancellation_stops_background_task() -> None:
+    @asynccontextmanager
+    async def original_lifespan(_app: object):
+        yield
+
+    class Workers:
+        def __init__(self) -> None:
+            self.serve_entered = asyncio.Event()
+            self.serve_exited = asyncio.Event()
+            self.wait_forever = asyncio.Event()
+            self.stop_was_set = False
+
+        async def serve(self, stop: asyncio.Event) -> None:
+            self.serve_entered.set()
+            try:
+                for _ in range(20):
+                    if stop.is_set():
+                        self.stop_was_set = True
+                        return
+                    await asyncio.sleep(0.01)
+            finally:
+                self.serve_exited.set()
+
+        async def wait_started(self) -> None:
+            await self.wait_forever.wait()
+
+    workers = Workers()
+    app = SimpleNamespace(router=SimpleNamespace(lifespan_context=original_lifespan))
+    production_module._attach_production_worker_lifespan(app, cast(Any, workers))
+    entering = asyncio.create_task(app.router.lifespan_context(app).__aenter__())
+    await workers.serve_entered.wait()
+    entering.cancel()
+    await asyncio.sleep(0)
+    entering.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await entering
+
+    assert workers.stop_was_set is True
+    assert workers.serve_exited.is_set() is True

@@ -12,6 +12,7 @@ effect or no effect.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import re
@@ -34,6 +35,7 @@ from signet.adapters.base import (
     AdapterValidationError,
     ApprovalSummary,
     DetailBlock,
+    DispatchCancelledError,
     DispatchError,
     ExecutionAttempt,
     MCPClient,
@@ -753,12 +755,13 @@ class FastmailAdapter:
             )
         detached = copy_json_object(payload)
         resolved_value = detached.pop("_signet_resolved_attachments", [])
+        detached.pop("attachments", None)
         if not isinstance(resolved_value, list):
             raise AdapterValidationError("resolved attachment payload is invalid")
         self.validate(detached)
 
         uploaded: list[dict[str, Any]] = []
-        for item in resolved_value:
+        for upload_attempts, item in enumerate(resolved_value, start=1):
             if not isinstance(item, dict):
                 raise AdapterValidationError("resolved attachment payload is invalid")
             upload_arguments = {
@@ -766,23 +769,42 @@ class FastmailAdapter:
                 "content_type": item.get("mime_type"),
                 "content_base64": item.get("content_base64"),
             }
+            effect_metadata = {
+                "state": "attachment_upload_outcome_unknown",
+                "attachment_uploads_attempted": upload_attempts,
+                "attachment_uploads_confirmed": len(uploaded),
+            }
             try:
                 result = await downstream.call_tool("upload_attachment", upload_arguments)
+            except asyncio.CancelledError as exc:
+                raise DispatchCancelledError(
+                    "Fastmail attachment upload was cancelled after provider I/O began",
+                    safe_metadata=effect_metadata,
+                ) from exc
             except Exception as exc:
                 raise DispatchError(
-                    "Fastmail attachment upload failed before email dispatch",
-                    dispatch_may_have_occurred=False,
+                    "Fastmail attachment upload outcome is uncertain; email was not dispatched",
+                    dispatch_may_have_occurred=True,
+                    safe_metadata=effect_metadata,
                 ) from exc
-            if not isinstance(result, Mapping) or result.get("isError") is True:
+            if not isinstance(result, Mapping):
+                raise DispatchError(
+                    "Fastmail attachment upload returned an invalid result",
+                    dispatch_may_have_occurred=True,
+                    safe_metadata=effect_metadata,
+                )
+            if result.get("isError") is True:
                 raise DispatchError(
                     "Fastmail attachment upload was rejected before email dispatch",
-                    dispatch_may_have_occurred=False,
+                    dispatch_may_have_occurred=True,
+                    safe_metadata=effect_metadata,
                 )
             attachment_id = _reviewed_attachment_id(result)
             if attachment_id is None:
                 raise DispatchError(
                     "Fastmail attachment upload returned no reviewed identifier",
-                    dispatch_may_have_occurred=False,
+                    dispatch_may_have_occurred=True,
+                    safe_metadata=effect_metadata,
                 )
             uploaded.append(
                 {
@@ -793,7 +815,7 @@ class FastmailAdapter:
             )
 
         send_arguments = detached
-        if "attachments" in send_arguments or uploaded:
+        if uploaded:
             send_arguments["attachments"] = uploaded
         result = await downstream.call_tool(self.tool_name, send_arguments)
         if not isinstance(result, Mapping):

@@ -12,7 +12,7 @@ import stat
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, cast
@@ -24,7 +24,12 @@ from signet.access_requests import FrozenAccessRequestFactory
 from signet.adapters.base import ApprovalAdapter, MCPClient
 from signet.adapters.tool_access import ToolAccessAdapter
 from signet.admission import QueueAdmissionLimits
-from signet.async_support import run_sync_non_abandoning as _run_sync
+from signet.async_support import (
+    await_task_while_preserving_cancellation,
+)
+from signet.async_support import (
+    run_sync_non_abandoning as _run_sync,
+)
 from signet.attachment_crypto import AttachmentCipher
 from signet.auth import (
     Argon2PasswordVerifier,
@@ -81,6 +86,7 @@ from signet.production_connectors import (
     ProductionConnectorError,
     ProviderSessionPool,
     build_live_provider_bundle,
+    build_review_only_provider_adapters,
 )
 from signet.production_state import (
     ProductionServiceRecord,
@@ -247,6 +253,7 @@ class ProductionWorkers:
         self._running = False
         self._healthy = False
         self._startup_complete = asyncio.Event()
+        self._startup_error: BaseException | None = None
 
     @property
     def running(self) -> bool:
@@ -264,6 +271,8 @@ class ProductionWorkers:
         """Wait until startup is ready or has failed and begun unwinding."""
 
         await self._startup_complete.wait()
+        if self._startup_error is not None:
+            raise self._startup_error
 
     def _maintenance_time(self, now: int | None = None) -> int:
         selected_now = self._clock() if now is None else now
@@ -362,6 +371,7 @@ class ProductionWorkers:
         if self._running:
             raise RuntimeError("production workers are already running")
         self._startup_complete.clear()
+        self._startup_error = None
         self._running = True
         self._healthy = False
         failed = False
@@ -387,9 +397,10 @@ class ProductionWorkers:
                     await asyncio.wait_for(stop.wait(), timeout=self._interval_seconds)
                 except TimeoutError:
                     continue
-        except BaseException:
+        except BaseException as exc:
             failed = True
             self._healthy = False
+            self._startup_error = exc
             self._startup_complete.set()
             self._state.record_worker_state("blocked", ready=False, now=self._maintenance_time())
             raise
@@ -400,9 +411,10 @@ class ProductionWorkers:
                 await provider_stack.aclose()
             finally:
                 if self._provider_sessions is not None:
+                    provider_ready = self._provider_sessions.active
                     self._state.record_provider_state(
-                        "blocked",
-                        ready=False,
+                        "active" if provider_ready else "blocked",
+                        ready=provider_ready,
                         now=self._maintenance_time(),
                     )
             if not failed:
@@ -435,7 +447,18 @@ class ProductionAssembly:
         return self.policy_engine.snapshot
 
     def status(self) -> ProductionStatus:
-        return self.state.status()
+        status = self.state.status()
+        if self.provider_sessions is None or self.provider_sessions.active:
+            return status
+        missing = status.missing_prerequisites
+        if "live_providers_ready" not in missing:
+            missing = (*missing, "live_providers_ready")
+        return replace(
+            status,
+            ready=False,
+            missing_prerequisites=missing,
+            live_providers_ready=False,
+        )
 
 
 def load_production_config(path: str | os.PathLike[str]) -> ProductionConfig:
@@ -609,6 +632,7 @@ def build_production_runtime(
     provider_sessions: ProviderSessionPool | None = None
     staging: StagingStore | None = None
     provider_adapters: Mapping[tuple[str, str], ApprovalAdapter] = MappingProxyType({})
+    reviewer_provider_adapters: Mapping[tuple[str, str], ApprovalAdapter]
     if config.provider_rollout.state == "enabled":
         try:
             live_providers = build_live_provider_bundle(
@@ -616,11 +640,15 @@ def build_production_runtime(
                 database=database,
                 policy=policy,
                 secret_store=secret_store,
+                credential_identity_key=secret_values["capability_key_ref"]
+                .reveal()
+                .encode("utf-8"),
             )
         except ProductionConnectorError as exc:
             raise ProductionAssemblyError(str(exc)) from None
         clients: Mapping[str, object] = MappingProxyType(dict(live_providers.clients))
         provider_adapters = MappingProxyType(dict(live_providers.adapters))
+        reviewer_provider_adapters = provider_adapters
         staging = live_providers.staging
         provider_sessions = live_providers.sessions
     else:
@@ -654,10 +682,19 @@ def build_production_runtime(
                 raise ProductionAssemblyError(
                     "production attachment retention could not be initialized"
                 ) from None
+        reviewer_provider_adapters = MappingProxyType(
+            dict(
+                build_review_only_provider_adapters(
+                    config,
+                    policy=policy,
+                    staging=staging,
+                )
+            )
+        )
     execution_scopes = PolicyExecutionScopeResolver(mirror, clients)
     tool_access = ToolAccessAdapter()
     reviewer_adapters = {
-        **provider_adapters,
+        **reviewer_provider_adapters,
         (tool_access.downstream_alias, tool_access.tool_name): cast(ApprovalAdapter, tool_access),
     }
     approvals = ApprovalStateMachine(
@@ -676,6 +713,7 @@ def build_production_runtime(
         payload_cipher,
         reviewer_adapters,
         execution_scopes,
+        staging=staging,
     )
     surfaces: dict[str, AliasToolSurface] = {}
 
@@ -760,7 +798,11 @@ def build_production_runtime(
     runtime_states: list[ProductionStateStore] = []
 
     def mcp_readiness() -> bool:
-        return bool(runtime_states and runtime_states[0].status().services["mcp"].state == "ready")
+        return bool(
+            runtime_states
+            and runtime_states[0].status().services["mcp"].state == "ready"
+            and (provider_sessions is None or provider_sessions.active)
+        )
 
     def observe_mcp_lifecycle(state_name: str) -> None:
         if state_name not in {"ready", "blocked", "stopped"}:
@@ -821,7 +863,10 @@ def build_production_runtime(
         }
     )
     services = _service_inventory(config, components)
-    state = ProductionStateStore(database)
+    state = ProductionStateStore(
+        database,
+        provider_rollout_enabled=config.provider_rollout.state == "enabled",
+    )
     try:
         state.stage(
             config,
@@ -885,7 +930,7 @@ def build_production_runtime(
         provider_sessions=provider_sessions,
     )
     if mcp is not None and provider_sessions is not None:
-        _attach_provider_lifespan(mcp.app, provider_sessions)
+        _attach_provider_lifespan(mcp.app, provider_sessions, state, now)
     if web is not None and (provider_sessions is not None or retention is not None):
         _attach_production_worker_lifespan(web, workers)
 
@@ -896,6 +941,7 @@ def build_production_runtime(
         return (
             maintenance.state == "ready"
             and "workers_ready" not in status.missing_prerequisites
+            and (provider_sessions is None or provider_sessions.active)
             and 0 <= heartbeat_age <= workers.heartbeat_lease_seconds
         )
 
@@ -920,13 +966,36 @@ def build_production_runtime(
     )
 
 
-def _attach_provider_lifespan(app: Starlette, sessions: ProviderSessionPool) -> None:
+def _attach_provider_lifespan(
+    app: Starlette,
+    sessions: ProviderSessionPool,
+    state: ProductionStateStore,
+    clock: Callable[[], int],
+) -> None:
     original = app.router.lifespan_context
 
     @asynccontextmanager
     async def lifespan(selected: Starlette) -> AsyncIterator[None]:
-        async with original(selected), sessions.run():
-            yield
+        try:
+            async with sessions.run():
+                state.record_provider_state("active", ready=True, now=clock())
+                async with original(selected):
+                    yield
+        except BaseException:
+            ready = sessions.active
+            state.record_provider_state(
+                "active" if ready else "blocked",
+                ready=ready,
+                now=clock(),
+            )
+            raise
+        else:
+            ready = sessions.active
+            state.record_provider_state(
+                "active" if ready else "blocked",
+                ready=ready,
+                now=clock(),
+            )
 
     app.router.lifespan_context = lifespan
 
@@ -936,20 +1005,22 @@ def _attach_production_worker_lifespan(app: FastAPI, workers: ProductionWorkers)
 
     @asynccontextmanager
     async def lifespan(selected: FastAPI) -> AsyncIterator[None]:
-        async with original(selected):
-            stop = asyncio.Event()
-            task = asyncio.create_task(
-                workers.serve(stop),
-                name="signet-production-workers",
-            )
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            workers.serve(stop),
+            name="signet-production-workers",
+        )
+        try:
+            await asyncio.sleep(0)
             await workers.wait_started()
+            await asyncio.sleep(0)
             if task.done():
                 await task
-            try:
+            async with original(selected):
                 yield
-            finally:
-                stop.set()
-                await task
+        finally:
+            stop.set()
+            await await_task_while_preserving_cancellation(task)
 
     app.router.lifespan_context = lifespan
 

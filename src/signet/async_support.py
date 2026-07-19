@@ -11,6 +11,24 @@ from typing import Any
 import anyio
 
 
+async def await_task_while_preserving_cancellation[T](task: asyncio.Task[T]) -> T:
+    """Finish a child task before propagating cancellation of its waiter."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except BaseException:
+            break
+    if cancellation is not None:
+        with suppress(BaseException):
+            task.result()
+        raise cancellation
+    return task.result()
+
+
 async def run_sync_non_abandoning[T](
     function: Callable[..., T],
     /,

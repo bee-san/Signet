@@ -40,6 +40,7 @@ REVIEWED_WACLI_VERSION = "0.12.0"
 DEFAULT_WACLI_EXECUTABLE = Path(f"/opt/homebrew/Cellar/wacli/{REVIEWED_WACLI_VERSION}/bin/wacli")
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _HASH_RE = re.compile(r"^[a-f0-9]{64}$")
+_ExecutableSignature = tuple[int, int, int, int, str]
 _MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
 _NATIVE_EXECUTABLE_MAGICS = frozenset(
     {
@@ -93,6 +94,7 @@ class WacliConfig:
     account: str
     executable: Path = DEFAULT_WACLI_EXECUTABLE
     expected_version: str = REVIEWED_WACLI_VERSION
+    expected_linked_jid: str | None = None
     expected_sha256: str | None = None
     staging_root: Path | None = None
     home: Path | None = None
@@ -109,6 +111,15 @@ class WacliConfig:
             raise ValueError("wacli executable must be an absolute pinned path")
         if not _ACCOUNT_RE.fullmatch(self.account):
             raise ValueError("wacli account name is invalid")
+        if (
+            self.expected_linked_jid is not None
+            and re.fullmatch(
+                r"[1-9][0-9]{6,31}@s\.whatsapp\.net",
+                self.expected_linked_jid,
+            )
+            is None
+        ):
+            raise ValueError("wacli linked account identity is invalid")
         if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", self.expected_version):
             raise ValueError("wacli expected version must be an exact semantic version")
         if self.expected_sha256 is not None and not _HASH_RE.fullmatch(self.expected_sha256):
@@ -146,6 +157,8 @@ class WacliConfig:
             raise ValueError("active wacli dispatch requires a private execution snapshot root")
         if self.reviewed_dispatch_enabled and self.expected_sha256 is None:
             raise ValueError("active wacli dispatch requires a reviewed executable digest")
+        if self.reviewed_dispatch_enabled and self.expected_linked_jid is None:
+            raise ValueError("active wacli dispatch requires a reviewed linked account identity")
         if self.reviewed_dispatch_enabled:
             active_home = self.home
             active_store = self.store
@@ -639,6 +652,43 @@ class WacliWrapper:
                 raise WacliError("version_mismatch", dispatch_may_have_occurred=False)
             self._verified_signature = signature
 
+    async def _verify_linked_account(self, signature: _ExecutableSignature) -> None:
+        expected_jid = self.config.expected_linked_jid
+        store = self.config.store
+        if expected_jid is None or store is None:
+            raise WacliError(
+                "linked_account_configuration_missing",
+                dispatch_may_have_occurred=False,
+            )
+        inventory, inventory_signature = await self._run_json(
+            ("accounts", "list", "--read-only"),
+            dispatch_may_have_occurred=False,
+            required_signature=signature,
+        )
+        accounts = inventory.get("accounts")
+        if not isinstance(accounts, list) or len(accounts) != 1:
+            raise WacliError("linked_account_inventory_mismatch", dispatch_may_have_occurred=False)
+        account = accounts[0]
+        if not isinstance(account, Mapping) or (
+            account.get("name") != self.config.account
+            or account.get("default") is not True
+            or account.get("configured_store") != str(store)
+            or account.get("store_dir") != str(store)
+        ):
+            raise WacliError("linked_account_inventory_mismatch", dispatch_may_have_occurred=False)
+        status, _ = await self._run_json(
+            ("auth", "status", "--read-only"),
+            dispatch_may_have_occurred=False,
+            required_signature=inventory_signature,
+        )
+        linked_jid = status.get("linked_jid")
+        if (
+            status.get("authenticated") is not True
+            or not isinstance(linked_jid, str)
+            or not hmac.compare_digest(linked_jid, expected_jid)
+        ):
+            raise WacliError("linked_account_mismatch", dispatch_may_have_occurred=False)
+
     async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         detached = copy_json_object(arguments)
         if tool_name == "send_text":
@@ -680,6 +730,7 @@ class WacliWrapper:
         verified_signature = self._verified_signature
         if verified_signature is None:
             raise WacliError("version_verification_failed", dispatch_may_have_occurred=False)
+        await self._verify_linked_account(verified_signature)
         result, _ = await self._run_json(
             tuple(command),
             dispatch_may_have_occurred=True,
@@ -765,6 +816,7 @@ class WacliWrapper:
                         "version_verification_failed",
                         dispatch_may_have_occurred=False,
                     )
+                await self._verify_linked_account(verified_signature)
                 command = [
                     "send",
                     "file",

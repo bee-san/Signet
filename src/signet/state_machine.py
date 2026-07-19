@@ -2747,6 +2747,8 @@ class ApprovalStateMachine:
             "status",
             "state",
             "provider_status",
+            "attachment_uploads_attempted",
+            "attachment_uploads_confirmed",
             "reconciled_at",
             "delivered_at",
             "idempotency_key_applied",
