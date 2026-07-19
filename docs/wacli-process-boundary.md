@@ -1,9 +1,11 @@
 # Reviewed wacli process boundary
 
-This document describes a deferred live-assembly contract. The repository does
-not ship or activate a live WhatsApp downstream, migrate a linked-device store,
-pair a device, contact WhatsApp, or send a message. The persistent deployment
-assembly remains downstream-disabled.
+This document describes the owned process contract used by the gated production
+assembly. Configuration remains disabled by default, performs no store migration or
+pairing, and cannot contact WhatsApp until every rollout prerequisite is satisfied.
+The persistent `signet deployment` staging assembly remains downstream-disabled.
+The current reviewed artifact still cannot activate because it has no compatible
+reviewed host/artifact pair, as described below.
 
 ## Exact reviewed invocation
 

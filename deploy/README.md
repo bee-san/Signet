@@ -19,11 +19,15 @@ They cannot create a provider client or dispatch an action.
   private-file preflight used at documented Hermes and launchd boundaries, including
   a bounded recursive private-tree mode for isolated Hermes profile recovery.
 - `operations/` contains fail-closed inventory and human-evidence skeletons.
+- `config/production.example.json` is a strict, secret-free production config
+  skeleton with both provider rollout gates disabled. Placeholder paths and hostnames
+  make it inert; parsing it does not establish readiness or authorize cutover.
 
 Start with `docs/operator-runbook.md` for fake-only local verification, then use
 `docs/deployment.md` for the deferred deployment review. Do not apply a template
 merely because it parses.
-The deferred owned-provider filesystem and migration contract is documented in
-`docs/wacli-process-boundary.md`; it is not an activation procedure.
+The gated provider migration and cutover contract is documented in
+`docs/production-connectors.md`; the owned-process details and current host/artifact
+blocker are in `docs/wacli-process-boundary.md`.
 Credential enrollment, proxy changes, service startup, live discovery, route
 replacement, and provider calls require a separate human-authorized cutover.

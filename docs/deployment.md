@@ -19,14 +19,22 @@ and fresh action confirmation. A proxy supplies TLS and reachability only.
 
 ## Current deployment status
 
-This repository deliberately does not ship a live deployment factory or a
-credential-enrollment command. It does ship a runnable, persistent
-**downstream-disabled staging assembly** through `signet deployment`. That assembly
-has no downstream transport, credential resolver, provider client, delivery worker,
-or reconciliation worker. It publishes only the authenticated `approvals` MCP
-namespace; all five normative tools return `deployment_disabled`, and downstream
-paths such as `/mcp/fastmail` and `/mcp/whatsapp` do not exist. Its web process is a
-loopback status page, not the authenticated approval application.
+This repository ships two separate deployment surfaces. `signet deployment` is a
+runnable, persistent **downstream-disabled staging assembly**. It has no downstream
+transport, credential resolver, provider client, delivery worker, or reconciliation
+worker. It publishes only the authenticated `approvals` MCP namespace; all five
+normative tools return `deployment_disabled`, and downstream paths such as
+`/mcp/fastmail` and `/mcp/whatsapp` do not exist. Its web process is a loopback status
+page, not the authenticated approval application.
+
+The production assembly can wire the provider-specific Fastmail and owned `wacli`
+WhatsApp boundaries. That path is disabled by default and rejects a one-sided
+readiness change. It requires exact policy, schema, account, credential-identity,
+attachment, process, and host prerequisites before startup. The current reviewed
+`wacli` artifact still has no compatible host/artifact pair, so WhatsApp local
+process activation remains blocked. See
+[`production-connectors.md`](production-connectors.md) for migration, cutover, and
+rollback; generic plugins remain staged and cannot activate this path.
 
 The same disabled apps are installed factories at
 `signet.deployment:create_mcp_app` and `signet.deployment:create_web_app`. Factory

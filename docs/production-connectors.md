@@ -1,0 +1,118 @@
+# Production provider connectors
+
+Signet can assemble the reviewed Fastmail MCP and owned `wacli` WhatsApp provider
+boundaries, but live dispatch is an explicit, fail-closed cutover. A normal
+production config remains provider-disabled:
+
+```json
+{
+  "capabilities": {"live_providers_ready": false},
+  "provider_rollout": {"state": "disabled"}
+}
+```
+
+Both fields must be changed together. A partial change is rejected before the
+database, network, or provider process is touched. Enabling also requires an
+exact connector/policy alias inventory, encrypted attachment staging, an
+attachment key reference, and all provider-specific prerequisites below.
+Generic plugin review never changes these fields and cannot activate this path.
+
+## Shared production boundary
+
+Live clients are process-lifetime sessions shared by the MCP and web/worker
+lifespans. Startup initializes each provider before readiness is published and
+fails closed if initialization, credential resolution, version verification, or
+reviewed schema discovery fails. Fastmail's complete live `initialize` identity
+must match the connector `server_identity_digest`, and its complete `tools/list`
+entries must match the policy `schema_digest` values exactly. Shutdown closes
+every started session in reverse order, including rollback after partial startup.
+
+Connector configuration contains only non-secret references and reviewed
+identity digests. `credential_identity_digest` tracks the credential inventory
+generation; Fastmail also requires `server_identity_digest` from reviewed
+discovery. Fastmail resolves credential material inside the HTTP MCP
+authorization boundary. The owned WhatsApp wrapper never receives the referenced
+secret: its credential is the descriptor-bound linked-device store, while the
+digest is retained only as execution identity. Exceptions and client
+representations redact provider details and credential material.
+
+Approval calls remain caller-compatible: the mirrored MCP tool advertises the
+Signet `pending_approval` output schema, and the initial call durably returns that
+shape. Provider results are available only after confirmed delivery; enabling a
+live adapter does not leak the provider's output schema into the optimistic call.
+
+## Fastmail prerequisites
+
+The connector alias must be exactly `fastmail` and use HTTPS MCP. Its policy must
+contain:
+
+- `send_email` in `approval` mode with adapter `fastmail.send` and one exact
+  account scope;
+- `search_email` in reviewed read-only `passthrough` mode, on the same account,
+  for bounded reconciliation;
+- exact reviewed initialize-identity and schema digests for the complete tool set; and
+- the same URL and Keychain reference as the production connector config.
+
+Attachments are read only from an allowed source root, encrypted at rest in the
+private staging root, and re-opened and re-hashed at execution time. Missing,
+changed, oversized, or unsafe attachments fail before provider dispatch. A crash
+or transport loss after dispatch enters `outcome_unknown`; reconciliation uses
+only reviewed `search_email` and never converts ambiguity into a blind retry.
+
+## WhatsApp prerequisites and host blocker
+
+The connector alias must be exactly `whatsapp` and use one hash-pinned stdio
+executable with no configured arguments. `provider_rollout.wacli` supplies a
+non-secret account name, exact expected version, dedicated HOME, linked-device
+store, CLI timeout, and output bound. The connector working directory must be the
+private parent shared by HOME and the store, and its `output_limit_bytes` must
+equal the owned boundary's `max_output_bytes`; inconsistent or inapplicable
+duplicate boundary fields fail startup rather than being ignored. The policy
+account must be `account:<wacli-account>`, and every configured `send_text` or
+`send_file` route must use that same account.
+
+`send_file` receives only one anonymous descriptor containing decrypted approved
+bytes. The child never inherits the encrypted staging tree, arbitrary source
+paths, the agent environment, or a shell. A crash, timeout, malformed JSON, or
+oversized output is classified as an unknown outcome and is not automatically
+retried. WhatsApp has no reviewed remote lookup for reconciliation, so unknown
+outcomes remain manual.
+
+The local process boundary activates only on a supported Linux descriptor-exec
+host with a separately reviewed native `wacli` artifact. The repository's current
+macOS Homebrew artifact has no compatible reviewed host/artifact pair. macOS and
+an unreviewed Linux binary therefore fail closed with
+`process_boundary_platform_unsupported`; do not bypass that check. See
+[`wacli-process-boundary.md`](wacli-process-boundary.md).
+
+## Migration and cutover sequence
+
+1. Keep `provider_rollout.state=disabled` and `live_providers_ready=false` while
+   upgrading. Run the normal verified pre-migration backup and database migration.
+   The new config fields have defaults and do not activate a connector.
+2. Prepare mode-`0700`, owner-only attachment source/staging directories and an
+   independent attachment key in the secret broker. Never copy a live WhatsApp
+   store; follow the stopped-store migration or explicit re-pair choice in the
+   process-boundary guide.
+3. Capture the complete live Fastmail schemas using the bounded discovery path,
+   review server identity and every raw schema, place the server identity digest
+   in connector config, and place the exact tool digests in policy. Review the
+   executable identity, version, paths, and digest for any Linux `wacli` artifact.
+4. Validate config and policy while both rollout gates are still disabled. Confirm
+   connector aliases, transports, account scopes, credential identities, and
+   policy bindings are exact.
+5. Stop MCP and web/worker processes. Change both gates in one private mode-`0600`
+   config update, then start the processes. Startup must reach provider readiness
+   without schema drift. If it fails, leave dispatch stopped and inspect only
+   redacted diagnostics.
+6. Exercise one separately authorized sandbox action and verify durable delivery,
+   attachment cleanup, crash-to-unknown behavior, and reconciliation. Production
+   provider tests and CI use fakes and must not create provider effects.
+7. Remove any former direct provider credential or bypass only after the live
+   Signet route has been independently verified and a rollback has been rehearsed.
+
+Rollback is fail-closed: stop services, set `provider_rollout.state=disabled` and
+`live_providers_ready=false`, and restart. Pending and unknown requests remain in
+SQLite; disabling a connector never treats them as delivered and never retries
+them. Restore direct routes or credentials only through a separately reviewed
+operator change.
