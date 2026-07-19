@@ -739,6 +739,65 @@ def test_setup_totp_resume_handle_survives_retryable_rate_limit(tmp_path: Path) 
             browser.close()
 
 
+def test_setup_totp_completion_preserves_concurrent_passkey_resume_handle(tmp_path: Path) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        totp_page = context.new_page()
+        try:
+            totp_page.goto(f"{live.origin}/setup")
+            totp_page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            totp_page.get_by_role("button", name="Unlock owner setup").click()
+            start = totp_page.locator('[data-totp-start][data-flow="setup"]')
+            start.locator('input[name="label"]').fill("Concurrent TOTP")
+            start.get_by_role("button", name="Set up TOTP").click()
+            totp_key = _totp_key(totp_page)
+
+            passkey_state = totp_page.evaluate(
+                """async () => {
+                  const response = await fetch('/setup/passkeys/options', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]').content,
+                    },
+                    body: JSON.stringify({label: 'Concurrent passkey'}),
+                  });
+                  if (!response.ok) throw new Error(`options failed: ${response.status}`);
+                  const issued = await response.json();
+                  const state = {kind: 'passkey', challenge_id: issued.challenge_id};
+                  localStorage.setItem('signet-setup-ceremony-v1', JSON.stringify(state));
+                  return state;
+                }"""
+            )
+            assert passkey_state["kind"] == "passkey"
+
+            totp_page.route(
+                "**/setup/passkeys/resume",
+                lambda route: route.fulfill(
+                    status=429,
+                    headers={"Retry-After": "1"},
+                    content_type="application/json",
+                    body='{"error":{"message":"Please retry."}}',
+                ),
+            )
+            totp_page.locator('[data-totp-enrollment] input[name="proof"]').fill(
+                pyotp.TOTP(totp_key).at(NOW)
+            )
+            totp_page.locator("[data-totp-enrollment] button").click()
+
+            expect(totp_page.get_by_text("Added: Concurrent TOTP")).to_be_visible()
+            assert (
+                totp_page.evaluate(
+                    "() => JSON.parse(localStorage.getItem('signet-setup-ceremony-v1'))"
+                )
+                == passkey_state
+            )
+        finally:
+            context.close()
+            browser.close()
+
+
 def test_setup_totp_resume_treats_verified_response_loss_as_success(tmp_path: Path) -> None:
     with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
