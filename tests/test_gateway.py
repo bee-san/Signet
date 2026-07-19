@@ -28,6 +28,7 @@ from signet.gateway import (
     _stored_pending_call_result,
 )
 from signet.mcp_mirror import (
+    PENDING_RESULT_SCHEMA,
     SIGNET_INVOCATION_ID_META,
     AliasToolSurface,
     DomainToolError,
@@ -283,6 +284,7 @@ async def test_end_to_end_routes_all_modes_and_never_mutates_before_approval(
     async with create_connected_server_and_client_session(harness.surface.server) as client:
         listed = await client.list_tools()
         assert [tool.name for tool in listed.tools] == ["read", "local", "send", "blocked"]
+        assert listed.tools[2].outputSchema == PENDING_RESULT_SCHEMA
 
         read = await client.call_tool("read", {"query": "safe"})
         assert raw_model(read) == {

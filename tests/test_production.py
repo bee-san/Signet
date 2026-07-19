@@ -10,9 +10,9 @@ import stat
 import subprocess
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pyotp
 import pytest
@@ -21,12 +21,15 @@ from pydantic import ValidationError
 
 import signet.db as db_module
 import signet.production as production_module
+import signet.production_connectors as production_connectors_module
+from signet.adapters.whatsapp import WhatsAppAdapter
 from signet.app import main as run_cli
 from signet.auth import SessionManager, SQLiteSessionRepository
 from signet.browser_auth import BootstrapService
 from signet.config import ProductionConfig
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
 from signet.db import Database
+from signet.downstream import DownstreamClient
 from signet.policy import parse_policy_yaml
 from signet.production import (
     ProductionAssemblyError,
@@ -39,11 +42,13 @@ from signet.production import (
     create_production_web_app_from_environment,
     load_production_config,
 )
+from signet.production_connectors import CredentialBoundClient
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
     TotpEnrollmentService,
 )
+from signet.wacli_wrapper import WacliConfig
 from tests.migration_helpers import verified_backup_callback
 
 
@@ -284,6 +289,306 @@ def test_production_config_rejects_mixed_connector_transport_fields(tmp_path: Pa
 
     with pytest.raises(ValidationError, match="mixed"):
         ProductionConfig.model_validate(payload)
+
+
+def test_live_provider_rollout_is_explicit_and_disabled_by_default(tmp_path: Path) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+
+    assert config.provider_rollout.state == "disabled"
+    assert config.safe_dump()["provider_rollout"] == {
+        "state": "disabled",
+        "wacli": None,
+    }
+
+
+def test_disabled_production_connector_example_matches_strict_config_schema() -> None:
+    example = Path("deploy/config/production.example.json").read_text(encoding="utf-8")
+
+    config = ProductionConfig.model_validate_json(example)
+
+    assert config.provider_rollout.state == "disabled"
+    assert config.capabilities.live_providers_ready is False
+
+
+def test_live_provider_rollout_requires_attachment_and_readiness_records(tmp_path: Path) -> None:
+    payload = _production_payload(tmp_path)
+    payload["provider_rollout"] = {"state": "enabled"}
+
+    with pytest.raises(ValidationError, match="live provider readiness"):
+        ProductionConfig.model_validate(payload)
+
+    payload["capabilities"]["live_providers_ready"] = True
+    with pytest.raises(ValidationError, match="attachment staging"):
+        ProductionConfig.model_validate(payload)
+
+
+def test_live_fastmail_rollout_builds_hardened_client_adapter_and_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _production_payload(tmp_path)
+    source_root = tmp_path / "attachment-imports"
+    source_root.mkdir(mode=0o700)
+    Path(payload["policy_path"]).write_text(
+        """
+version: 1
+default_mode: deny
+downstreams:
+  fastmail:
+    transport: http
+    url: https://mail.example.test/mcp
+    credential_ref: keychain://signet/mail
+    account_ref: account:fastmail-primary
+    tools:
+      send_email:
+        mode: approval
+        adapter: fastmail.send
+        communication_send: true
+        account_ref: account:fastmail-primary
+        schema_digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      search_email:
+        mode: passthrough
+        reviewed_read_only: true
+        account_ref: account:fastmail-primary
+        schema_digest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    payload["connectors"] = {
+        "fastmail": {
+            "transport": "http",
+            "credential_ref": "keychain://signet/mail",
+            "credential_identity_digest": "a" * 64,
+            "server_identity_digest": "f" * 64,
+            "url": "https://mail.example.test/mcp",
+        }
+    }
+    payload["storage"].update(
+        attachment_staging_dir=str(tmp_path / "attachment-staging"),
+        attachment_source_roots=[str(source_root)],
+    )
+    payload["secrets"]["attachment_key_ref"] = "keychain://signet/attachment"
+    payload["capabilities"]["live_providers_ready"] = True
+    payload["provider_rollout"] = {"state": "enabled"}
+    config = ProductionConfig.model_validate(payload)
+    secret_store = MemorySecretStore(
+        {
+            ("signet", "session"): "session-secret-" * 3,
+            ("signet", "csrf"): "csrf-secret-" * 4,
+            ("signet", "capability"): "capability-secret-" * 3,
+            ("signet", "payload"): "payload-secret-" * 3,
+            ("signet", "totp"): "totp-secret-value",
+            ("signet", "mail"): "mail-secret-value",
+            ("signet", "attachment"): "attachment-key-material-" * 3,
+        }
+    )
+    captured_server_identities: dict[str, str] = {}
+
+    class CapturingProviderSessionPool(production_connectors_module.ProviderSessionPool):
+        def __init__(
+            self,
+            clients: Mapping[str, object],
+            *,
+            expected_schema_digests: Mapping[str, Mapping[str, str]] | None = None,
+            expected_server_identity_digests: Mapping[str, str] | None = None,
+        ) -> None:
+            captured_server_identities.update(expected_server_identity_digests or {})
+            super().__init__(
+                clients,
+                expected_schema_digests=expected_schema_digests,
+                expected_server_identity_digests=expected_server_identity_digests,
+            )
+
+    monkeypatch.setattr(
+        production_connectors_module,
+        "ProviderSessionPool",
+        CapturingProviderSessionPool,
+    )
+
+    assembly = build_production_runtime(config, secret_store=secret_store)
+
+    assert isinstance(assembly.provider_clients["fastmail"], DownstreamClient)
+    assert tuple(assembly.adapters) == (("fastmail", "send_email"),)
+    assert assembly.adapters[("fastmail", "send_email")].reviewed_dispatch_enabled is True
+    assert assembly.staging is not None
+    assert assembly.provider_sessions is not None
+    assert captured_server_identities == {"fastmail": "f" * 64}
+
+    missing_identity = config.connectors["fastmail"].model_copy(
+        update={"server_identity_digest": None}
+    )
+    missing_identity_config = config.model_copy(
+        update={"connectors": {"fastmail": missing_identity}}
+    )
+    with pytest.raises(ProductionAssemblyError, match="initialization identity"):
+        build_production_runtime(missing_identity_config, secret_store=secret_store)
+
+
+def test_production_connector_rejects_invalid_server_identity_digest(tmp_path: Path) -> None:
+    payload = _production_payload(tmp_path)
+    payload["connectors"]["mail"]["server_identity_digest"] = "not-a-digest"
+
+    with pytest.raises(ValidationError, match="server identity"):
+        ProductionConfig.model_validate(payload)
+
+
+def test_live_whatsapp_rollout_uses_owned_isolated_wacli_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _production_payload(tmp_path)
+    source_root = tmp_path / "attachment-imports"
+    source_root.mkdir(mode=0o700)
+    runtime_root = tmp_path / "wacli-runtime"
+    runtime_root.mkdir(mode=0o700)
+    home = runtime_root / "home"
+    store = runtime_root / "store"
+    home.mkdir(mode=0o700)
+    store.mkdir(mode=0o700)
+    snapshot_root = tmp_path / "wacli-execution-snapshots"
+    snapshot_root.mkdir(mode=0o700)
+    executable_path = runtime_root / "wacli"
+    executable_path.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable_path.chmod(0o700)
+    executable = str(executable_path)
+    digest = hashlib.sha256(executable_path.read_bytes()).hexdigest()
+    Path(payload["policy_path"]).write_text(
+        """
+version: 1
+default_mode: deny
+downstreams:
+  whatsapp:
+    transport: stdio
+    command_ref: connector:whatsapp
+    credential_ref: keychain://signet/whatsapp
+    account_ref: account:whatsapp-primary
+    tools:
+      send_text:
+        mode: approval
+        adapter: whatsapp.send_text
+        communication_send: true
+        account_ref: account:whatsapp-primary
+        schema_digest: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+      send_file:
+        mode: approval
+        adapter: whatsapp.send_file
+        communication_send: true
+        account_ref: account:whatsapp-primary
+        schema_digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    payload["connectors"] = {
+        "whatsapp": {
+            "transport": "stdio",
+            "credential_ref": "keychain://signet/whatsapp",
+            "credential_identity_digest": "b" * 64,
+            "command": [executable],
+            "working_directory": str(runtime_root),
+            "execution_snapshot_root": str(snapshot_root),
+            "executable_sha256": digest,
+            "output_limit_bytes": 256 * 1024,
+        }
+    }
+    payload["storage"].update(
+        attachment_staging_dir=str(tmp_path / "attachment-staging"),
+        attachment_source_roots=[str(source_root)],
+    )
+    payload["secrets"]["attachment_key_ref"] = "keychain://signet/attachment"
+    payload["capabilities"]["live_providers_ready"] = True
+    payload["provider_rollout"] = {
+        "state": "enabled",
+        "wacli": {
+            "account": "whatsapp-primary",
+            "home": str(home),
+            "store": str(store),
+            "expected_version": "0.1.0",
+        },
+    }
+    captured: list[object] = []
+
+    class CapturingWacli:
+        def __init__(self, config: object, *, staging_store: object) -> None:
+            captured.extend((config, staging_store))
+
+        async def verify_version(self) -> str:
+            return "0.1.0"
+
+        async def call_tool(
+            self,
+            tool_name: str,
+            arguments: Mapping[str, object],
+        ) -> Mapping[str, object]:
+            del tool_name, arguments
+            return {"status": "sent", "message_id": "provider-message-id"}
+
+    monkeypatch.setattr(production_connectors_module, "WacliWrapper", CapturingWacli)
+    config = ProductionConfig.model_validate(payload)
+    secrets = MemorySecretStore(
+        {
+            ("signet", "session"): "session-secret-" * 3,
+            ("signet", "csrf"): "csrf-secret-" * 4,
+            ("signet", "capability"): "capability-secret-" * 3,
+            ("signet", "payload"): "payload-secret-" * 3,
+            ("signet", "totp"): "totp-secret-value",
+            ("signet", "attachment"): "attachment-key-material-" * 3,
+        }
+    )
+    assembly = build_production_runtime(config, secret_store=secrets)
+
+    client = assembly.provider_clients["whatsapp"]
+    assert isinstance(client, CredentialBoundClient)
+    wrapper_config = cast(WacliConfig, captured[0])
+    assert client.credential_identity_digest == "b" * 64
+    assert "redacted" in repr(client)
+    assert wrapper_config.reviewed_dispatch_enabled is True
+    assert wrapper_config.home == home
+    assert wrapper_config.store == store
+    assert wrapper_config.execution_snapshot_root == snapshot_root
+    assert tuple(assembly.adapters) == (
+        ("whatsapp", "send_text"),
+        ("whatsapp", "send_file"),
+    )
+    file_adapter = cast(WhatsAppAdapter, assembly.adapters[("whatsapp", "send_file")])
+    assert file_adapter.staging_store is assembly.staging
+
+    for connector_override in (
+        {"command": (executable, "ignored-argument")},
+        {"working_directory": tmp_path / "different-runtime"},
+        {"output_limit_bytes": config.connectors["whatsapp"].output_limit_bytes + 1},
+    ):
+        misbound_connector = config.connectors["whatsapp"].model_copy(update=connector_override)
+        misbound_config = config.model_copy(update={"connectors": {"whatsapp": misbound_connector}})
+        with pytest.raises(ProductionAssemblyError, match="wacli process boundary"):
+            build_production_runtime(misbound_config, secret_store=secrets)
+
+    policy_path = Path(payload["policy_path"])
+    reviewed_policy = policy_path.read_text(encoding="utf-8")
+    policy_path.write_text(
+        reviewed_policy.replace(
+            "        mode: approval\n"
+            "        adapter: whatsapp.send_text\n"
+            "        communication_send: true\n",
+            "        mode: passthrough\n        reviewed_read_only: true\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ProductionAssemblyError, match="approval-bound"):
+        build_production_runtime(config, secret_store=secrets)
+    policy_path.write_text(reviewed_policy, encoding="utf-8")
+
+    class FailingWacli:
+        def __init__(self, config: object, *, staging_store: object) -> None:
+            del config, staging_store
+            raise RuntimeError("never-leak-provider-secret")
+
+    monkeypatch.setattr(production_connectors_module, "WacliWrapper", FailingWacli)
+    with pytest.raises(ProductionAssemblyError) as failure:
+        build_production_runtime(config, secret_store=secrets)
+    assert "never-leak-provider-secret" not in str(failure.value)
 
 
 def test_production_browser_ceremony_isolation_never_calls_providers_or_mutates_queue(

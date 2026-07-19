@@ -46,6 +46,7 @@ class DownstreamConfig(BaseModel):
     transport: Literal["http", "stdio"]
     credential_ref: str
     credential_identity_digest: str
+    server_identity_digest: str | None = None
     url: str | None = None
     command: tuple[str, ...] = ()
     working_directory: Path | None = None
@@ -66,6 +67,13 @@ class DownstreamConfig(BaseModel):
     def credential_identity_is_inventory_generation(cls, value: str) -> str:
         if not re.fullmatch(r"[a-f0-9]{64}", value):
             raise ValueError("credential identity must be a lowercase SHA-256 inventory digest")
+        return value
+
+    @field_validator("server_identity_digest")
+    @classmethod
+    def server_identity_is_exact(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError("server identity must be a lowercase SHA-256 digest")
         return value
 
     @field_validator("executable_sha256")
@@ -145,8 +153,16 @@ class ProductionStorageConfig(BaseModel):
     data_dir: Path
     backup_dir: Path
     restore_dir: Path
+    attachment_staging_dir: Path | None = None
+    attachment_source_roots: tuple[Path, ...] = ()
 
-    @field_validator("data_dir", "backup_dir", "restore_dir", mode="before")
+    @field_validator(
+        "data_dir",
+        "backup_dir",
+        "restore_dir",
+        "attachment_staging_dir",
+        mode="before",
+    )
     @classmethod
     def paths_are_absolute_and_lexical(cls, value: Any) -> Any:
         if isinstance(value, str):
@@ -157,7 +173,16 @@ class ProductionStorageConfig(BaseModel):
 
     @model_validator(mode="after")
     def paths_are_distinct(self) -> Self:
-        paths = (self.data_dir, self.backup_dir, self.restore_dir)
+        paths = tuple(
+            path
+            for path in (
+                self.data_dir,
+                self.backup_dir,
+                self.restore_dir,
+                self.attachment_staging_dir,
+            )
+            if path is not None
+        )
         if any(not path.is_absolute() or ".." in path.parts for path in paths):
             raise ValueError("production storage paths must be absolute lexical paths")
         if len(set(paths)) != len(paths):
@@ -170,8 +195,23 @@ class ProductionStorageConfig(BaseModel):
             raise ValueError("production storage paths must not overlap")
         return self
 
+    @field_validator("attachment_source_roots", mode="before")
+    @classmethod
+    def attachment_roots_are_absolute_and_lexical(cls, value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            for candidate in value:
+                if not isinstance(candidate, (str, Path)):
+                    continue
+                path = Path(candidate)
+                if not path.is_absolute() or "\x00" in str(candidate) or ".." in path.parts:
+                    raise ValueError("attachment source roots must be absolute lexical paths")
+        return value
+
     def prepare_directories(self) -> None:
-        for path in (self.data_dir, self.backup_dir, self.restore_dir):
+        paths: tuple[Path, ...] = (self.data_dir, self.backup_dir, self.restore_dir)
+        if self.attachment_staging_dir is not None:
+            paths += (self.attachment_staging_dir,)
+        for path in paths:
             try:
                 ensure_private_directory(path)
             except PrivatePathError as exc:
@@ -191,6 +231,7 @@ class ProductionSecretsConfig(BaseModel):
     csrf_secret_ref: str
     capability_key_ref: str
     payload_key_ref: str
+    attachment_key_ref: str | None = None
     totp_secret_ref: str | None = None
     vapid_private_key_ref: str | None = None
 
@@ -199,6 +240,7 @@ class ProductionSecretsConfig(BaseModel):
         "csrf_secret_ref",
         "capability_key_ref",
         "payload_key_ref",
+        "attachment_key_ref",
         "totp_secret_ref",
         "vapid_private_key_ref",
     )
@@ -223,12 +265,6 @@ class ProductionCapabilities(BaseModel):
     workers_ready: bool
     policy_ready: bool
     live_providers_ready: bool
-
-    @model_validator(mode="after")
-    def live_provider_cutover_is_not_available(self) -> Self:
-        if self.live_providers_ready:
-            raise ValueError("live provider cutover is not implemented by this production slice")
-        return self
 
     @property
     def ready(self) -> bool:
@@ -261,6 +297,66 @@ class ProductionCapabilities(BaseModel):
         )
 
 
+class ProductionWacliConfig(BaseModel):
+    """Non-secret runtime boundary for the owned WhatsApp subprocess."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    account: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+    )
+    home: Path
+    store: Path
+    expected_version: str
+    cli_timeout: str = "15s"
+    max_output_bytes: int = Field(default=256 * 1024, ge=1024, le=4 * 1024 * 1024)
+
+    @field_validator("home", "store", mode="before")
+    @classmethod
+    def runtime_paths_are_absolute_and_lexical(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            path = Path(value)
+            if not path.is_absolute() or "\x00" in value or ".." in path.parts:
+                raise ValueError("wacli runtime paths must be absolute lexical paths")
+        return value
+
+    @field_validator("expected_version")
+    @classmethod
+    def version_is_exact(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value) is None:
+            raise ValueError("wacli expected version must be exact")
+        return value
+
+    @field_validator("cli_timeout")
+    @classmethod
+    def cli_timeout_is_bounded(cls, value: str) -> str:
+        if re.fullmatch(r"[1-9][0-9]{0,2}s", value) is None:
+            raise ValueError("wacli CLI timeout must be bounded")
+        return value
+
+    @model_validator(mode="after")
+    def runtime_paths_are_isolated(self) -> Self:
+        if (
+            not self.home.is_absolute()
+            or not self.store.is_absolute()
+            or self.home == self.store
+            or self.home.parent != self.store.parent
+        ):
+            raise ValueError("wacli home and store must be isolated siblings")
+        return self
+
+
+class ProductionProviderRollout(BaseModel):
+    """Explicit two-state cutover record; omission always means disabled."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: Literal["disabled", "enabled"] = "disabled"
+    wacli: ProductionWacliConfig | None = None
+
+
 class ProductionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -279,6 +375,7 @@ class ProductionConfig(BaseModel):
     secrets: ProductionSecretsConfig
     capabilities: ProductionCapabilities
     connectors: dict[str, DownstreamConfig] = Field(default_factory=dict)
+    provider_rollout: ProductionProviderRollout = Field(default_factory=ProductionProviderRollout)
 
     @field_validator("owner_user_id")
     @classmethod
@@ -420,6 +517,23 @@ class ProductionConfig(BaseModel):
         ]
         if len(references) != len(set(references)):
             raise ValueError("production secret purposes must use distinct references")
+        rollout_enabled = self.provider_rollout.state == "enabled"
+        if rollout_enabled and not self.capabilities.live_providers_ready:
+            raise ValueError("live provider readiness must be recorded before cutover")
+        if self.capabilities.live_providers_ready and not rollout_enabled:
+            raise ValueError("live provider cutover must be explicitly enabled")
+        if rollout_enabled and (
+            self.storage.attachment_staging_dir is None
+            or not self.storage.attachment_source_roots
+            or self.secrets.attachment_key_ref is None
+        ):
+            raise ValueError("live provider attachment staging must be configured")
+        if rollout_enabled and set(self.connectors) - {"fastmail", "whatsapp"}:
+            raise ValueError("live provider rollout supports only Fastmail and WhatsApp")
+        if rollout_enabled and (
+            ("whatsapp" in self.connectors) != (self.provider_rollout.wacli is not None)
+        ):
+            raise ValueError("WhatsApp rollout requires exactly one owned wacli boundary")
         return self
 
     def prepare_directories(self) -> None:

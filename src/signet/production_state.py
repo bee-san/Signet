@@ -187,6 +187,41 @@ class ProductionStateStore:
                 ),
             )
 
+    def record_provider_state(
+        self,
+        state: Literal["ready", "blocked"],
+        *,
+        ready: bool,
+        now: int,
+    ) -> None:
+        """Atomically publish the live session-pool readiness observation."""
+
+        if (state == "ready") != ready:
+            raise ValueError("provider readiness does not match lifecycle state")
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("production provider state time is invalid")
+        with self.database.transaction() as connection:
+            setup = connection.execute(
+                "SELECT capability_status_json FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()
+            if setup is None:
+                raise ProductionStateError("production setup state is unavailable")
+            capabilities = self._parse_capabilities(setup["capability_status_json"])
+            capabilities["live_providers_ready"] = ready
+            changed = connection.execute(
+                "UPDATE production_connectors SET state = ?, updated_at = ?",
+                (state, now),
+            ).rowcount
+            if changed < 1:
+                raise ProductionStateError("production connector inventory is unavailable")
+            connection.execute(
+                """
+                UPDATE production_setup_state
+                SET capability_status_json = ?, updated_at = ? WHERE state_id = 1
+                """,
+                (json.dumps(capabilities, sort_keys=True, separators=(",", ":")), now),
+            )
+
     def record_service_state(
         self,
         service_name: str,
