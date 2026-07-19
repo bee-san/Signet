@@ -155,6 +155,8 @@
 
   const showTotpEnrollment = (form, issued) => {
     const panel = form.parentElement.querySelector("[data-totp-enrollment]");
+    const startButton = form.querySelector('button[type="submit"]');
+    if (startButton) startButton.disabled = true;
     panel.hidden = false;
     panel.dataset.enrollmentId = issued.enrollment_id;
     panel.dataset.authorizationId = issued.authorization_id || "";

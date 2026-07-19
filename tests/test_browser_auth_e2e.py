@@ -666,9 +666,11 @@ def test_setup_totp_ceremony_resumes_after_reload_without_browser_secret_storage
             original_key = _totp_key(page)
 
             page.reload()
-
             expect(page.locator("[data-totp-enrollment]:not([hidden])")).to_be_visible()
             assert _totp_key(page) == original_key
+            expect(
+                page.locator('[data-totp-start][data-flow="setup"] button[type="submit"]')
+            ).to_be_disabled()
             stored = page.evaluate("() => Object.fromEntries(Object.entries(localStorage))")
             assert original_key not in json.dumps(stored)
             assert "otpauth://" not in json.dumps(stored)
@@ -947,6 +949,9 @@ def test_totp_only_management_is_accessible_and_resumes_without_provider_effects
                 page.reload()
             assert resumed.value.status == 200, resumed.value.text()
             assert _totp_key(page) == secondary
+            expect(
+                page.locator('[data-totp-start][data-flow="management"] button[type="submit"]')
+            ).to_be_disabled()
 
             def drop_finalization_response(route: Any) -> None:
                 assert route.fetch().ok

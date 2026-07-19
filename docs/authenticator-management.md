@@ -83,6 +83,7 @@ If browser storage is unavailable, the active ceremony continues without a resum
 Resume also recognizes a server-verified ceremony whose completion response was lost.
 Completion clears a handle only while it still identifies that ceremony, preserving a newer concurrent-tab handle.
 After session revocation, reauthentication recognizes a server-committed management enrollment and clears its stale handle without replaying finalization.
+Restoring a pending TOTP enrollment disables its start control until verification completes.
 Verification clears TOTP QR/manual-key values from the page. Expiry invalidates
 pending TOTP enrollments and deletes their provisioned secrets. If cleanup after
 expiry or another failed enrollment cannot be verified, Signet records cleanup debt
