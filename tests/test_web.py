@@ -706,6 +706,29 @@ def test_oversized_passkey_login_is_rejected_before_backend(
     assert backend.actions == []
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/setup/passkeys/resume",
+        "/setup/totp/resume",
+        "/authenticators/enroll/status",
+        "/authenticators/enroll/resume",
+    ),
+)
+def test_ceremony_resume_routes_reject_oversized_bodies(
+    client: TestClient,
+    path: str,
+) -> None:
+    response = client.post(
+        path,
+        content=b"{" + b'"padding":"' + b"x" * 9000 + b'"}',
+        headers={"Content-Type": "application/json", "Origin": ORIGIN},
+    )
+
+    assert response.status_code == 413
+    assert response.headers["cache-control"] == "no-store"
+
+
 def test_queue_and_detail_require_session_and_ignore_mcp_bearer(client: TestClient) -> None:
     assert client.get("/").status_code == 401
     for path in (
