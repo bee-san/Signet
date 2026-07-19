@@ -326,6 +326,13 @@ def test_reissued_bootstrap_capability_discards_expired_claimant_staging(
     service.enroll_totp(verified, claimant_token=CLAIMANT_TOKEN, now=121)
 
     replacement = service.issue_capability(now=160, lifetime=60)
+    with pytest.raises(InvalidTotpEnrollment):
+        enrollments.resume(
+            issued.enrollment.enrollment_id,
+            user_id=USER_ID,
+            session_id=None,
+            now=160,
+        )
     new_claimant = "replacement-claimant-token-long-enough"
     service.claim(replacement, new_claimant, now=161)
     replacement_enrollment = enrollments.begin(
@@ -509,6 +516,63 @@ def test_passkey_registration_is_origin_session_account_and_replay_bound(
         )
 
 
+def test_passkey_registration_resumes_after_restart_only_for_bound_session(
+    database: Database,
+) -> None:
+    provider = RecordingRegistrationProvider()
+    first = PasskeyRegistrationService(
+        database,
+        rp_id=RP_ID,
+        origin=ORIGIN,
+        provider=provider,
+        lifetime=120,
+    )
+    issued = first.begin(
+        USER_ID,
+        "Restart-safe key",
+        flow="management",
+        session_id=SESSION_ID,
+        existing_credential_ids=(),
+        now=100,
+    )
+    original_options = json.loads(issued.options_json)
+    restarted = PasskeyRegistrationService(
+        database,
+        rp_id=RP_ID,
+        origin=ORIGIN,
+        provider=provider,
+        lifetime=120,
+    )
+
+    resumed = restarted.resume(
+        issued.challenge_id,
+        user_id=USER_ID,
+        session_id=SESSION_ID,
+        existing_credential_ids=(),
+        now=101,
+    )
+
+    assert json.loads(resumed.options_json) == original_options
+    assert resumed.challenge_id == issued.challenge_id
+    with pytest.raises(InvalidRegistrationChallenge):
+        restarted.resume(
+            issued.challenge_id,
+            user_id=OTHER_USER_ID,
+            session_id=SESSION_ID,
+            existing_credential_ids=(),
+            now=101,
+        )
+    with pytest.raises(InvalidRegistrationChallenge):
+        restarted.resume(
+            issued.challenge_id,
+            user_id=USER_ID,
+            session_id=OTHER_SESSION_ID,
+            existing_credential_ids=(),
+            now=101,
+        )
+    assert provider.expected == []
+
+
 def test_passkey_registration_rejects_expired_and_cross_flow_claims(database: Database) -> None:
     provider = RecordingRegistrationProvider()
     service = PasskeyRegistrationService(
@@ -590,8 +654,22 @@ def test_totp_bootstrap_enrollment_is_verified_bound_and_seed_is_not_persisted(
     )
     assert secret not in repr(issued)
     assert issued.manual_key == secret
+    restarted = TotpEnrollmentService(
+        database,
+        provisioner=_TotpProvisioner(store, secret),
+        secret_store=store,
+        lifetime=120,
+    )
+    resumed = restarted.resume(
+        issued.enrollment.enrollment_id,
+        user_id=USER_ID,
+        session_id=None,
+        now=101,
+    )
+    assert resumed.manual_key == secret
+    assert resumed.enrollment.enrollment_id == issued.enrollment.enrollment_id
     with pytest.raises(InvalidTotpEnrollment):
-        enrollments.resume(
+        restarted.resume(
             issued.enrollment.enrollment_id,
             user_id=OTHER_USER_ID,
             session_id=None,
@@ -606,6 +684,13 @@ def test_totp_bootstrap_enrollment_is_verified_bound_and_seed_is_not_persisted(
         session_id=None,
         now=120,
     )
+    with pytest.raises(InvalidTotpEnrollment):
+        restarted.resume(
+            issued.enrollment.enrollment_id,
+            user_id=USER_ID,
+            session_id=None,
+            now=120,
+        )
     status = bootstrap.enroll_totp(verified, claimant_token=CLAIMANT_TOKEN, now=121)
     assert status.factor_labels == ("Phone app",)
     assert bootstrap.complete(claimant_token=CLAIMANT_TOKEN, now=122).complete

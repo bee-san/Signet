@@ -60,6 +60,9 @@
     if (!region) return;
     region.textContent = message;
     region.dataset.failed = failed ? "true" : "false";
+    region.setAttribute("role", failed ? "alert" : "status");
+    region.setAttribute("aria-live", failed ? "assertive" : "polite");
+    if (failed) region.focus();
   };
 
   const post = async (url, payload) => {
@@ -70,15 +73,21 @@
       body: JSON.stringify(payload),
     });
     const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error?.message || "Authenticator request failed.");
+    if (!response.ok) {
+      const error = new Error(body.error?.message || "Authenticator request failed.");
+      error.discardCeremony = response.status >= 400 && response.status < 500;
+      throw error;
+    }
     return body;
   };
 
-  const register = async (optionsURL, completeURL, label) => {
-    const issued = await post(optionsURL, {label});
+  const completeSetupPasskey = async (issued) => {
     const credential = await navigator.credentials.create({publicKey: creationOptions(issued.publicKey)});
     if (!credential) throw new Error("Passkey creation was cancelled.");
-    return post(completeURL, {challenge_id: issued.challenge_id, credential: registrationJSON(credential)});
+    return post("/setup/passkeys/complete", {
+      challenge_id: issued.challenge_id,
+      credential: registrationJSON(credential),
+    });
   };
 
   const confirmWithPasskey = async (intent) => {
@@ -93,6 +102,41 @@
   };
 
   const operationId = () => `browser-operation-${crypto.randomUUID()}`;
+  const setupCeremonyKey = "signet-setup-ceremony-v1";
+  const managementCeremonyKey = "signet-management-ceremony-v1";
+
+  const rememberSetupTotp = (enrollmentId) => {
+    localStorage.setItem(setupCeremonyKey, JSON.stringify({kind: "totp", enrollment_id: enrollmentId}));
+  };
+
+  const rememberSetupPasskey = (challengeId) => {
+    localStorage.setItem(setupCeremonyKey, JSON.stringify({kind: "passkey", challenge_id: challengeId}));
+  };
+
+  const clearSetupCeremony = () => localStorage.removeItem(setupCeremonyKey);
+
+  const rememberManagementTotp = (enrollmentId) => {
+    localStorage.setItem(managementCeremonyKey, JSON.stringify({kind: "totp", enrollment_id: enrollmentId}));
+  };
+
+  const rememberManagementPasskey = (challengeId) => {
+    localStorage.setItem(managementCeremonyKey, JSON.stringify({kind: "passkey", challenge_id: challengeId}));
+  };
+
+  const clearManagementCeremony = () => localStorage.removeItem(managementCeremonyKey);
+
+  const showTotpEnrollment = (form, issued) => {
+    const panel = form.parentElement.querySelector("[data-totp-enrollment]");
+    panel.hidden = false;
+    panel.dataset.enrollmentId = issued.enrollment_id;
+    panel.dataset.authorizationId = issued.authorization_id || "";
+    panel.dataset.operationId = issued.operation_id || "";
+    const qrCode = panel.querySelector("[data-totp-qr]");
+    qrCode.src = issued.qr_code_data_uri;
+    qrCode.hidden = false;
+    panel.querySelector("[data-totp-key]").textContent = issued.manual_key;
+    return panel;
+  };
 
   const authorizeEnrollment = async (intent, form) => {
     const data = new FormData(form);
@@ -131,7 +175,10 @@
     button.disabled = true;
     announce("Waiting for your browser to create the passkey.");
     try {
-      await register("/setup/passkeys/options", "/setup/passkeys/complete", new FormData(form).get("label"));
+      const issued = await post("/setup/passkeys/options", {label: new FormData(form).get("label")});
+      rememberSetupPasskey(issued.challenge_id);
+      await completeSetupPasskey(issued);
+      clearSetupCeremony();
       announce("Passkey added. Reloading setup review.");
       window.location.hash = "review";
       window.location.reload();
@@ -154,9 +201,11 @@
         operation_id: operationId(),
       };
       const issued = await authorizeEnrollment(intent, form);
+      rememberManagementPasskey(issued.challenge_id);
       announce("Authorization accepted. Waiting for your browser to create the new passkey.");
       const pending = await completePasskeyEnrollment(issued);
       const result = await finalizeEnrollment("add_passkey", pending);
+      clearManagementCeremony();
       announce("Passkey added. Returning to sign in.");
       window.location.assign(result.redirect_url);
     } catch (error) {
@@ -178,15 +227,9 @@
           ? await post("/setup/totp/start", {label})
           : await authorizeEnrollment({action: "add_totp", label, operation_id: operationId()}, form);
         if (flow !== "setup" && issued.kind !== "totp") throw new Error("TOTP enrollment authorization was invalid.");
-        const panel = form.parentElement.querySelector("[data-totp-enrollment]");
-        panel.hidden = false;
-        panel.dataset.enrollmentId = issued.enrollment_id;
-        panel.dataset.authorizationId = issued.authorization_id || "";
-        panel.dataset.operationId = issued.operation_id || "";
-        const qrCode = panel.querySelector("[data-totp-qr]");
-        qrCode.src = issued.qr_code_data_uri;
-        qrCode.hidden = false;
-        panel.querySelector("[data-totp-key]").textContent = issued.manual_key;
+        if (flow === "setup") rememberSetupTotp(issued.enrollment_id);
+        else rememberManagementTotp(issued.enrollment_id);
+        showTotpEnrollment(form, issued);
         announce("TOTP key ready. Enter the current code from the new authenticator.");
       } catch (error) {
         announce(error.message || "TOTP setup failed.", true);
@@ -213,6 +256,7 @@
         qrCode.hidden = true;
         panel.querySelector("[data-totp-key]").textContent = "";
         if (flow === "setup") {
+          clearSetupCeremony();
           announce("TOTP added. Reloading setup review.");
           window.location.hash = "review";
           window.location.reload();
@@ -223,6 +267,7 @@
           throw new Error("TOTP enrollment authorization changed unexpectedly.");
         }
         const result = await finalizeEnrollment("add_totp", pending);
+        clearManagementCeremony();
         announce("TOTP added. Returning to sign in.");
         window.location.assign(result.redirect_url);
       } catch (error) {
@@ -253,4 +298,117 @@
       selected.disabled = false;
     }
   });
+
+  const resumeSetupCeremony = async () => {
+    if (window.location.pathname !== "/setup") return;
+    let state;
+    try {
+      state = JSON.parse(localStorage.getItem(setupCeremonyKey) || "null");
+    } catch (_) {
+      clearSetupCeremony();
+      return;
+    }
+    if (!state || typeof state !== "object") return;
+    if (state.kind === "passkey") {
+      if (typeof state.challenge_id !== "string") {
+        clearSetupCeremony();
+        return;
+      }
+      try {
+        const issued = await post("/setup/passkeys/resume", {challenge_id: state.challenge_id});
+        announce("Passkey setup resumed. Waiting for your browser.");
+        await completeSetupPasskey(issued);
+        clearSetupCeremony();
+        announce("Passkey added. Reloading setup review.");
+        window.location.hash = "review";
+        window.location.reload();
+      } catch (error) {
+        if (error.discardCeremony) clearSetupCeremony();
+        announce(error.message || "The saved passkey setup can no longer be resumed.", true);
+      }
+      return;
+    }
+    if (state.kind !== "totp" || typeof state.enrollment_id !== "string") return;
+    const form = document.querySelector('[data-totp-start][data-flow="setup"]');
+    if (!form) {
+      clearSetupCeremony();
+      return;
+    }
+    try {
+      const issued = await post("/setup/totp/resume", {enrollment_id: state.enrollment_id});
+      showTotpEnrollment(form, issued);
+      announce("TOTP setup resumed. Enter the current code from the new authenticator.");
+    } catch (error) {
+      if (error.discardCeremony) clearSetupCeremony();
+      announce(error.message || "The saved TOTP setup can no longer be resumed.", true);
+    }
+  };
+
+  const resumeManagementCeremony = async () => {
+    if (window.location.pathname !== "/authenticators") return;
+    let state;
+    try {
+      state = JSON.parse(localStorage.getItem(managementCeremonyKey) || "null");
+    } catch (_) {
+      clearManagementCeremony();
+      return;
+    }
+    if (!state || typeof state !== "object") return;
+    if (state.kind === "passkey") {
+      if (typeof state.challenge_id !== "string") {
+        clearManagementCeremony();
+        return;
+      }
+      try {
+        const issued = await post("/authenticators/enroll/resume", {
+          kind: "passkey",
+          challenge_id: state.challenge_id,
+        });
+        if (issued.status === "ready_to_finalize") {
+          const result = await finalizeEnrollment("add_passkey", issued);
+          clearManagementCeremony();
+          announce("Passkey added. Returning to sign in.");
+          window.location.assign(result.redirect_url);
+          return;
+        }
+        announce("Passkey setup resumed. Waiting for your browser.");
+        const pending = await completePasskeyEnrollment(issued);
+        const result = await finalizeEnrollment("add_passkey", pending);
+        clearManagementCeremony();
+        announce("Passkey added. Returning to sign in.");
+        window.location.assign(result.redirect_url);
+      } catch (error) {
+        if (error.discardCeremony) clearManagementCeremony();
+        announce(error.message || "The saved passkey setup can no longer be resumed.", true);
+      }
+      return;
+    }
+    if (state.kind !== "totp" || typeof state.enrollment_id !== "string") return;
+    const form = document.querySelector('[data-totp-start][data-flow="management"]');
+    if (!form) {
+      clearManagementCeremony();
+      return;
+    }
+    try {
+      const issued = await post("/authenticators/enroll/resume", {
+        kind: "totp",
+        enrollment_id: state.enrollment_id,
+      });
+      if (issued.status === "ready_to_finalize") {
+        const result = await finalizeEnrollment("add_totp", issued);
+        clearManagementCeremony();
+        announce("TOTP added. Returning to sign in.");
+        window.location.assign(result.redirect_url);
+        return;
+      }
+      showTotpEnrollment(form, issued);
+      announce("TOTP setup resumed. Enter the current code from the new authenticator.");
+    } catch (error) {
+      if (error.discardCeremony) clearManagementCeremony();
+      announce(error.message || "The saved TOTP setup can no longer be resumed.", true);
+    }
+  };
+
+  void resumeSetupCeremony();
+  void resumeManagementCeremony();
 })();

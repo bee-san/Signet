@@ -220,6 +220,8 @@ class TotpEnrollmentService:
             now=now,
             require_verified=False,
         )
+        if enrollment.verified_at is not None:
+            raise InvalidTotpEnrollment("TOTP enrollment is not pending verification")
         return self._issued(enrollment)
 
     def verify(

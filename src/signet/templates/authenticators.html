@@ -9,7 +9,7 @@
   <p>Add, name, or remove authenticators for this account. Every change requires a fresh confirmation from one selected existing TOTP or passkey.</p>
   <p>For safety, a successful change signs out existing browser sessions.</p>
 
-  <p data-auth-status role="status" aria-live="polite"></p>
+  <p data-auth-status role="status" aria-live="polite" tabindex="-1"></p>
 
   <section aria-labelledby="add-passkey-title">
     <h2 id="add-passkey-title">Add a passkey</h2>
@@ -17,8 +17,8 @@
       <label for="new-passkey-label">Passkey name</label>
       <input id="new-passkey-label" name="label" maxlength="64" placeholder="Laptop passkey" required>
       {% if totp_factors %}
-      <details>
-        <summary>Use an existing TOTP code instead of a passkey</summary>
+      <details{% if not passkey_factors %} open{% endif %}>
+        <summary>{% if passkey_factors %}Use an existing TOTP code instead of a passkey{% else %}Confirm with an existing TOTP code{% endif %}</summary>
         <label for="new-passkey-existing-totp">Existing TOTP authenticator</label>
         <select id="new-passkey-existing-totp" name="totp_credential_id">
           {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}
@@ -37,8 +37,8 @@
       <label for="new-totp-label">Authenticator name</label>
       <input id="new-totp-label" name="label" maxlength="64" placeholder="Phone authenticator" required>
       {% if totp_factors %}
-      <details>
-        <summary>Use an existing TOTP code instead of a passkey</summary>
+      <details{% if not passkey_factors %} open{% endif %}>
+        <summary>{% if passkey_factors %}Use an existing TOTP code instead of a passkey{% else %}Confirm with an existing TOTP code{% endif %}</summary>
         <label for="new-totp-existing-factor">Existing TOTP authenticator</label>
         <select id="new-totp-existing-factor" name="totp_credential_id">
           {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}

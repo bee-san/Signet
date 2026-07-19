@@ -69,11 +69,25 @@ database transaction. Failed authorization therefore creates no registration
 challenge or TOTP secret.
 
 Pending browser challenges and TOTP enrollments are durable and can resume only in
-their bound claimant or authenticated session until expiry. Verification clears
-TOTP QR/manual-key values from the page. Expiry invalidates pending TOTP enrollments
-and deletes their provisioned secrets. If cleanup after expiry or another failed
-enrollment cannot be verified, Signet records cleanup debt and fails closed instead
-of silently abandoning credential material.
+their bound claimant or authenticated session until expiry, including after a page
+reload or application restart. The browser stores only the opaque pending ceremony
+kind and identifier; passkey challenge options and TOTP seed material are not
+retained in browser storage, and seeds remain behind the server/secret-store
+boundary. A replaced bootstrap claim, another user or session,
+an expired ceremony, or a finalized/replayed ceremony cannot resume the old state.
+If credential verification succeeds but the final management request is interrupted,
+reload resumes at finalization instead of repeating proof or creating a second
+credential. Transient network failures retain the opaque resume handle; definitive
+4xx rejection clears it.
+Verification clears TOTP QR/manual-key values from the page. Expiry invalidates
+pending TOTP enrollments and deletes their provisioned secrets. If cleanup after
+expiry or another failed enrollment cannot be verified, Signet records cleanup debt
+and fails closed instead of silently abandoning credential material.
+
+When the account has only TOTP authenticators, management pages expand the TOTP
+proof control by default. Enrollment forms remain keyboard-submittable; failed
+proofs are announced as alerts and move focus to the error status without creating
+credential or provider effects.
 
 Use the corresponding `binding_for_*` method before verification. The returned
 `ActionBinding` includes an opaque operation ID and a SHA-256 digest of the
