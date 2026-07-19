@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from threading import Barrier
+from typing import Any
 
 import pyotp
 import pytest
@@ -66,6 +67,7 @@ CAPABILITY_KEY = b"authenticator-management-proof-key"
 CAPABILITIES = ProofCapability(CAPABILITY_KEY)
 RP_ID = "approval.example.test"
 ORIGIN = f"https://{RP_ID}"
+CLAIMANT_TOKEN = "bootstrap-claimant-token-long-enough"
 
 
 class RecordingProvisioner:
@@ -252,6 +254,76 @@ def browser_controller(
             secret_store=provisioner,
         ),
     )
+
+
+def test_bootstrap_reissue_serializes_with_passkey_enrollment_start(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioner = RecordingProvisioner()
+    controller = browser_controller(database, provisioner)
+    capability = controller.bootstrap.issue_capability(now=100, lifetime=60)
+    controller.bootstrap.claim(capability, CLAIMANT_TOKEN, now=101)
+    original_begin = controller.registrations.begin
+
+    def begin_after_reissue(*args: Any, **kwargs: Any) -> Any:
+        replacement = controller.bootstrap.issue_capability(now=160, lifetime=60)
+        controller.bootstrap.claim(replacement, CLAIMANT_TOKEN, now=161)
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(controller.registrations, "begin", begin_after_reissue)
+
+    with pytest.raises(BootstrapClaimRequired):
+        controller.begin_registration(
+            USER_ID,
+            "Stale passkey",
+            flow="bootstrap",
+            session_id=None,
+            claimant_token=CLAIMANT_TOKEN,
+            now=159,
+        )
+
+    with database.read() as connection:
+        count = connection.execute(
+            "SELECT count(*) FROM auth_registration_challenges WHERE flow = 'bootstrap'"
+        ).fetchone()[0]
+    assert count == 0
+
+
+def test_bootstrap_reissue_serializes_with_totp_enrollment_start(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioner = RecordingProvisioner()
+    controller = browser_controller(database, provisioner)
+    capability = controller.bootstrap.issue_capability(now=100, lifetime=60)
+    controller.bootstrap.claim(capability, CLAIMANT_TOKEN, now=101)
+    assert controller.totp_enrollments is not None
+    original_begin = controller.totp_enrollments.begin
+
+    def begin_after_reissue(*args: Any, **kwargs: Any) -> Any:
+        replacement = controller.bootstrap.issue_capability(now=160, lifetime=60)
+        controller.bootstrap.claim(replacement, CLAIMANT_TOKEN, now=161)
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(controller.totp_enrollments, "begin", begin_after_reissue)
+
+    with pytest.raises(BootstrapClaimRequired):
+        controller.begin_totp_enrollment(
+            USER_ID,
+            "Stale TOTP",
+            flow="bootstrap",
+            session_id=None,
+            claimant_token=CLAIMANT_TOKEN,
+            now=159,
+        )
+
+    with database.read() as connection:
+        count = connection.execute(
+            "SELECT count(*) FROM browser_totp_enrollments WHERE flow = 'bootstrap'"
+        ).fetchone()[0]
+    assert count == 0
+    assert provisioner.created_references == []
 
 
 def confirm_totp(

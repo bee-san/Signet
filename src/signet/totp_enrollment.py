@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
@@ -103,6 +104,7 @@ class TotpEnrollmentService:
         authorization_id: str | None = None,
         operation_id: str | None = None,
         now: int,
+        transaction_guard: Callable[[Any], None] | None = None,
     ) -> IssuedTotpEnrollment:
         user = canonical_user_id(user_id)
         selected_label = _label(label)
@@ -117,6 +119,8 @@ class TotpEnrollmentService:
         enrollment: TotpEnrollment | None = None
         try:
             with self.database.transaction() as connection:
+                if transaction_guard is not None:
+                    transaction_guard(connection)
                 active_for_user = int(
                     connection.execute(
                         """

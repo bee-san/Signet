@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import secrets
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
@@ -182,8 +182,11 @@ class SQLiteRegistrationRepository:
         now: int,
         max_active: int,
         max_active_per_session: int,
+        transaction_guard: Callable[[Any], None] | None = None,
     ) -> bool:
         with self.database.transaction() as connection:
+            if transaction_guard is not None:
+                transaction_guard(connection)
             connection.execute(
                 """
                 UPDATE auth_registration_challenges SET invalidated_at = ?
@@ -391,6 +394,7 @@ class PasskeyRegistrationService:
         authorization_id: str | None = None,
         operation_id: str | None = None,
         now: int,
+        transaction_guard: Callable[[Any], None] | None = None,
     ) -> IssuedRegistration:
         selected_user = canonical_user_id(user_id)
         selected_label = _label(label)
@@ -419,6 +423,7 @@ class PasskeyRegistrationService:
             now=now,
             max_active=self.max_active_per_user,
             max_active_per_session=self.max_active_per_session,
+            transaction_guard=transaction_guard,
         ):
             raise RegistrationRateLimited("too many active passkey registrations")
         try:

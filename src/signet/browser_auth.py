@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -309,6 +309,23 @@ class BootstrapService:
     def require_claim(self, claimant_token: str | None, *, now: int) -> None:
         with self.database.read() as connection:
             self._require_pending(connection, claimant_token, now=now)
+
+    def claim_transaction_guard(
+        self,
+        claimant_token: str | None,
+        *,
+        now: int,
+    ) -> Callable[[Any], None]:
+        with self.database.read() as connection:
+            state = self._require_pending(connection, claimant_token, now=now)
+            capability_id = str(state["capability_id"])
+
+        def require_same_claim(connection: Any) -> None:
+            current = self._require_pending(connection, claimant_token, now=now)
+            if not hmac.compare_digest(str(current["capability_id"]), capability_id):
+                raise BootstrapClaimRequired("bootstrap claimant changed or expired")
+
+        return require_same_claim
 
     def enroll_password(
         self,
@@ -702,8 +719,12 @@ class BrowserAuthController:
         operation_id: str | None = None,
         now: int,
     ) -> IssuedRegistration:
+        transaction_guard: Callable[[Any], None] | None = None
         if flow == "bootstrap":
-            self.bootstrap.require_claim(claimant_token, now=now)
+            transaction_guard = self.bootstrap.claim_transaction_guard(
+                claimant_token,
+                now=now,
+            )
         elif authorization_id is None or operation_id is None:
             raise BootstrapClaimRequired("fresh factor authorization is required")
         existing = tuple(
@@ -719,6 +740,7 @@ class BrowserAuthController:
             authorization_id=authorization_id,
             operation_id=operation_id,
             now=now,
+            transaction_guard=transaction_guard,
         )
 
     def complete_registration(
@@ -769,8 +791,12 @@ class BrowserAuthController:
         operation_id: str | None = None,
         now: int,
     ) -> IssuedTotpEnrollment:
+        transaction_guard: Callable[[Any], None] | None = None
         if flow == "bootstrap":
-            self.bootstrap.require_claim(claimant_token, now=now)
+            transaction_guard = self.bootstrap.claim_transaction_guard(
+                claimant_token,
+                now=now,
+            )
         elif authorization_id is None or operation_id is None:
             raise BootstrapClaimRequired("fresh factor authorization is required")
         return self._totp_enrollments().begin(
@@ -781,6 +807,7 @@ class BrowserAuthController:
             authorization_id=authorization_id,
             operation_id=operation_id,
             now=now,
+            transaction_guard=transaction_guard,
         )
 
     def verify_totp_enrollment(
