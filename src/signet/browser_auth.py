@@ -109,15 +109,53 @@ class BootstrapService:
         *,
         owner_user_id: str,
         password_enroller: PasswordEnroller | None = None,
+        totp_enrollments: TotpEnrollmentService | None = None,
     ) -> None:
         self.database = database
         self.owner_user_id = canonical_user_id(owner_user_id)
         self.password_enroller = password_enroller or Argon2PasswordEnroller()
+        self.totp_enrollments = totp_enrollments
         self._reconcile_existing_owner()
 
     def issue_capability(self, *, now: int, lifetime: int = 10 * 60) -> str:
         if now < 0 or lifetime < 60 or lifetime > 60 * 60:
             raise ValueError("bootstrap capability lifetime is invalid")
+        with self.database.read() as connection:
+            existing = connection.execute(
+                "SELECT * FROM browser_bootstrap_state WHERE state_id = 1"
+            ).fetchone()
+            if existing is not None and str(existing["user_id"]) != self.owner_user_id:
+                raise BootstrapOwnerMismatch("browser bootstrap is bound to another owner")
+            if existing is not None and str(existing["status"]) == "complete":
+                raise BootstrapAlreadyComplete("initial owner setup is already complete")
+            if (
+                existing is not None
+                and existing["capability_expires_at"] is not None
+                and now < int(existing["capability_expires_at"])
+            ):
+                raise BootstrapClaimRequired("an unexpired bootstrap ceremony already exists")
+            pending_totp_cleanup = (
+                int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM browser_totp_enrollments
+                        WHERE user_id = ? AND flow = 'bootstrap' AND consumed_at IS NULL
+                          AND cleanup_completed_at IS NULL
+                        """,
+                        (self.owner_user_id,),
+                    ).fetchone()[0]
+                )
+                if existing is not None
+                else 0
+            )
+        if pending_totp_cleanup:
+            if self.totp_enrollments is None:
+                raise BootstrapError("pending bootstrap TOTP cleanup is unavailable")
+            self.totp_enrollments.invalidate_bootstrap(
+                self.owner_user_id,
+                before=now,
+                now=now,
+            )
         capability_id = secrets.token_urlsafe(18)
         capability = f"sbc1.{capability_id}.{secrets.token_urlsafe(32)}"
         verifier = _bootstrap_verifier(capability)
@@ -154,15 +192,36 @@ class BootstrapService:
                     ),
                 )
             else:
+                remaining_totp_cleanup = int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM browser_totp_enrollments
+                        WHERE user_id = ? AND flow = 'bootstrap' AND consumed_at IS NULL
+                          AND cleanup_completed_at IS NULL
+                        """,
+                        (self.owner_user_id,),
+                    ).fetchone()[0]
+                )
+                if remaining_totp_cleanup:
+                    raise BootstrapError("pending bootstrap TOTP cleanup did not complete")
                 connection.execute(
                     """
                     UPDATE browser_bootstrap_state
                     SET capability_id = ?, capability_verifier = ?,
                         capability_expires_at = ?, claimant_verifier = NULL,
-                        claimed_at = NULL, updated_at = max(updated_at, ?)
+                        claimed_at = NULL, staged_password_verifier = NULL,
+                        updated_at = max(updated_at, ?)
                     WHERE state_id = 1 AND status = 'pending'
                     """,
                     (capability_id, verifier, expires_at, now),
+                )
+                connection.execute(
+                    """
+                    UPDATE auth_registration_challenges SET invalidated_at = ?
+                    WHERE user_id = ? AND flow = 'bootstrap'
+                      AND consumed_at IS NULL AND invalidated_at IS NULL
+                    """,
+                    (now, self.owner_user_id),
                 )
         return capability
 
@@ -258,6 +317,7 @@ class BootstrapService:
         claimant_token: str | None,
         now: int,
     ) -> BootstrapStatus:
+        self.require_claim(claimant_token, now=now)
         verifier = self.password_enroller.hash(password)
         if not verifier.startswith("$argon2id$"):
             raise ValueError("password enroller must return an Argon2id verifier")
@@ -626,7 +686,7 @@ class BrowserAuthController:
     def list_factors(self, user_id: str) -> tuple[FactorMetadata, ...]:
         return tuple(
             factor
-            for factor in self.manager.list_factors(user_id)
+            for factor in self.manager.list_factors(user_id, include_inactive=False)
             if factor.kind in ("totp", "webauthn")
         )
 

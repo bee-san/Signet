@@ -351,6 +351,33 @@ class TotpEnrollmentService:
                 ORDER BY invalidated_at, enrollment_id
                 """
             ).fetchall()
+        return self._cleanup_rows(rows, now=now)
+
+    def invalidate_bootstrap(self, user_id: str, *, before: int, now: int) -> int:
+        user = canonical_user_id(user_id)
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE browser_totp_enrollments SET invalidated_at = ?
+                WHERE user_id = ? AND flow = 'bootstrap'
+                  AND created_at < ? AND consumed_at IS NULL AND invalidated_at IS NULL
+                """,
+                (now, user, before),
+            )
+            rows = connection.execute(
+                """
+                SELECT enrollment_id, secret_reference
+                FROM browser_totp_enrollments
+                WHERE user_id = ? AND flow = 'bootstrap' AND consumed_at IS NULL
+                  AND created_at < ?
+                  AND invalidated_at IS NOT NULL AND cleanup_completed_at IS NULL
+                ORDER BY invalidated_at, enrollment_id
+                """,
+                (user, before),
+            ).fetchall()
+        return self._cleanup_rows(rows, now=now)
+
+    def _cleanup_rows(self, rows: list[Any], *, now: int) -> int:
         cleaned = 0
         for row in rows:
             self._delete_secret_verified(str(row["secret_reference"]))

@@ -961,6 +961,10 @@ def test_lost_factor_can_be_revoked_by_another_but_never_leaves_zero_factors(
     assert tuple(
         factor.factor_id for factor in selected.list_factors(USER_ID, include_inactive=False)
     ) == (second.factor_id,)
+    assert tuple(
+        factor.factor_id
+        for factor in browser_controller(database, provisioner).list_factors(USER_ID)
+    ) == (second.factor_id,)
 
     _, new_session_id = session(database, now=110)
     last_binding = selected.binding_for_revoke(

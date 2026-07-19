@@ -74,18 +74,33 @@ def main(
             parser.error(str(exc))
         return
     if args.command == "bootstrap":
+        from signet.authenticator_management import KeychainTotpSecretProvisioner
         from signet.browser_auth import BootstrapError, BootstrapService
+        from signet.credential_broker import KeychainSecretStore
         from signet.production import load_production_config
+        from signet.totp_enrollment import TotpEnrollmentCleanupError, TotpEnrollmentService
 
         try:
             config = load_production_config(args.config)
             database = Database(config.storage.database_path)
             database.initialize()
+            totp_enrollments = TotpEnrollmentService(
+                database,
+                provisioner=KeychainTotpSecretProvisioner(),
+                secret_store=KeychainSecretStore(),
+            )
             capability = BootstrapService(
                 database,
                 owner_user_id=config.owner_user_id,
+                totp_enrollments=totp_enrollments,
             ).issue_capability(now=int(time.time()), lifetime=args.lifetime)
-        except (BootstrapError, CredentialError, DatabaseError, ValueError) as exc:
+        except (
+            BootstrapError,
+            CredentialError,
+            DatabaseError,
+            TotpEnrollmentCleanupError,
+            ValueError,
+        ) as exc:
             parser.error(str(exc))
         print(capability)
         return

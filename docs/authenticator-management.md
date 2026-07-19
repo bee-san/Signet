@@ -55,6 +55,9 @@ one-use setup capability locally and one browser claims it. Password and
 authenticator material is staged for that claimant; publication and bootstrap
 completion share one database transaction. Existing valid owner credentials cause
 startup to reconcile setup as complete rather than reopen enrollment.
+Reissuing an expired capability discards the prior claimant's staged password and
+passkey state and deletes any pending bootstrap TOTP material before returning the
+replacement capability.
 
 An authenticated session and CSRF token are not sufficient to add an authenticator.
 Before Signet invokes a WebAuthn registration provider or provisions a TOTP secret,

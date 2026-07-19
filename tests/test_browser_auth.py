@@ -24,7 +24,7 @@ from signet.browser_auth import (
     BootstrapIncomplete,
     BootstrapService,
 )
-from signet.credential_broker import Secret, SecretReference
+from signet.credential_broker import CredentialError, Secret, SecretReference
 from signet.db import Database
 from signet.totp_enrollment import InvalidTotpEnrollment, TotpEnrollmentService
 from signet.webauthn import SQLiteWebAuthnRepository, WebAuthnCredential
@@ -49,6 +49,15 @@ class FastPasswordEnroller:
         if len(password) < 12:
             raise ValueError("password must contain at least 12 characters")
         return "$argon2id$fake$" + password[::-1]
+
+
+class RecordingPasswordEnroller(FastPasswordEnroller):
+    def __init__(self) -> None:
+        self.passwords: list[str] = []
+
+    def hash(self, password: str) -> str:
+        self.passwords.append(password)
+        return super().hash(password)
 
 
 class RecordingRegistrationProvider:
@@ -225,7 +234,12 @@ def test_concurrent_bootstrap_completion_has_one_winner(database: Database) -> N
 def test_bootstrap_requires_one_use_local_capability_and_one_atomic_claimant(
     database: Database,
 ) -> None:
-    service = bootstrap(database)
+    password_enroller = RecordingPasswordEnroller()
+    service = BootstrapService(
+        database,
+        owner_user_id=USER_ID,
+        password_enroller=password_enroller,
+    )
     assert service.status(now=100).has_password is False
     with pytest.raises(BootstrapClaimRequired):
         service.enroll_password(
@@ -233,6 +247,7 @@ def test_bootstrap_requires_one_use_local_capability_and_one_atomic_claimant(
             claimant_token="unclaimed-browser-token-long-enough",
             now=101,
         )
+    assert password_enroller.passwords == []
 
     capability = service.issue_capability(now=102, lifetime=60)
     barrier = Barrier(2)
@@ -262,6 +277,95 @@ def test_bootstrap_requires_one_use_local_capability_and_one_atomic_claimant(
 
     service.enroll_password("a sufficiently long password", claimant_token=winner, now=104)
     assert service.status(now=105, claimant_token=winner).has_password is True
+
+
+def test_reissued_bootstrap_capability_discards_expired_claimant_staging(
+    database: Database,
+) -> None:
+    secret = "JBSWY3DPEHPK3PXP"
+    store = _TotpSecrets()
+    enrollments = TotpEnrollmentService(
+        database,
+        provisioner=_TotpProvisioner(store, secret),
+        secret_store=store,
+        lifetime=15 * 60,
+    )
+    service = BootstrapService(
+        database,
+        owner_user_id=USER_ID,
+        password_enroller=FastPasswordEnroller(),
+        totp_enrollments=enrollments,
+    )
+    capability = service.issue_capability(now=100, lifetime=60)
+    service.claim(capability, CLAIMANT_TOKEN, now=101)
+    service.enroll_password(
+        "a sufficiently long password",
+        claimant_token=CLAIMANT_TOKEN,
+        now=102,
+    )
+    service.enroll_passkey(
+        "Prior passkey",
+        credential(),
+        claimant_token=CLAIMANT_TOKEN,
+        now=103,
+    )
+    issued = enrollments.begin(
+        USER_ID,
+        "Prior phone",
+        flow="bootstrap",
+        session_id=None,
+        now=104,
+    )
+    verified = enrollments.verify(
+        issued.enrollment.enrollment_id,
+        pyotp.TOTP(secret).at(120),
+        user_id=USER_ID,
+        session_id=None,
+        now=120,
+    )
+    service.enroll_totp(verified, claimant_token=CLAIMANT_TOKEN, now=121)
+
+    replacement = service.issue_capability(now=160, lifetime=60)
+    new_claimant = "replacement-claimant-token-long-enough"
+    service.claim(replacement, new_claimant, now=161)
+    replacement_enrollment = enrollments.begin(
+        USER_ID,
+        "Replacement phone",
+        flow="bootstrap",
+        session_id=None,
+        now=162,
+    )
+
+    assert enrollments.invalidate_bootstrap(USER_ID, before=160, now=163) == 0
+
+    status = service.status(now=161, claimant_token=new_claimant)
+    assert status.has_password is False
+    assert status.has_authenticator is False
+    assert status.factor_labels == ()
+    with database.read() as connection:
+        state = connection.execute(
+            "SELECT staged_password_verifier FROM browser_bootstrap_state WHERE state_id = 1"
+        ).fetchone()
+        passkey = connection.execute(
+            "SELECT invalidated_at FROM auth_registration_challenges WHERE flow = 'bootstrap'"
+        ).fetchone()
+        totps = connection.execute(
+            """
+            SELECT invalidated_at, cleanup_completed_at
+            FROM browser_totp_enrollments WHERE flow = 'bootstrap'
+            ORDER BY created_at, enrollment_id
+            """
+        ).fetchall()
+    assert state["staged_password_verifier"] is None
+    assert passkey["invalidated_at"] == 160
+    assert totps[0]["invalidated_at"] == 160
+    assert totps[0]["cleanup_completed_at"] == 160
+    assert totps[1]["invalidated_at"] is None
+    assert totps[1]["cleanup_completed_at"] is None
+    replacement_reference = SecretReference.parse(
+        replacement_enrollment.enrollment.secret_reference
+    )
+    assert (replacement_reference.service, replacement_reference.account) in store.values
 
 
 def test_schema_18_upgrade_backfills_existing_valid_owner_as_complete(
@@ -440,7 +544,10 @@ class _TotpSecrets:
         self.values: dict[tuple[str, str], str] = {}
 
     def get(self, reference: SecretReference) -> Secret:
-        return Secret(self.values[(reference.service, reference.account)])
+        try:
+            return Secret(self.values[(reference.service, reference.account)])
+        except KeyError:
+            raise CredentialError("secret does not exist") from None
 
 
 class _TotpProvisioner:

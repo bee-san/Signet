@@ -725,19 +725,24 @@ def _assemble_production_web(
         rp_id=config.rp_id,
         origin=config.public_origin,
     )
+    totp_enrollments = TotpEnrollmentService(
+        database,
+        provisioner=totp_provisioner,
+        secret_store=secret_store,
+    )
     browser_auth = BrowserAuthController(
-        bootstrap=BootstrapService(database, owner_user_id=config.owner_user_id),
+        bootstrap=BootstrapService(
+            database,
+            owner_user_id=config.owner_user_id,
+            totp_enrollments=totp_enrollments,
+        ),
         registrations=registrations,
         manager=authenticators,
         totp_verifier=totp,
         webauthn_issuer=webauthn_issuer,
         webauthn_verifier=webauthn_verifier,
         webauthn_repository=webauthn_repository,
-        totp_enrollments=TotpEnrollmentService(
-            database,
-            provisioner=totp_provisioner,
-            secret_store=secret_store,
-        ),
+        totp_enrollments=totp_enrollments,
     )
     authentication_transactions = SQLiteAuthenticationTransactions(
         database,
