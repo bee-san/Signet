@@ -1176,6 +1176,14 @@ class BrowserAuthController:
         )
         return self._apply(user_id, session_id, intent, verified, now=now)
 
+    def authorized_enrollment_status(
+        self,
+        user_id: str,
+        kind: Literal["passkey", "totp"],
+        registration_id: str,
+    ) -> Literal["pending", "completed"]:
+        return self.manager.authorized_enrollment_status(user_id, kind, registration_id)
+
     def complete_authorized_enrollment(
         self,
         user_id: str,

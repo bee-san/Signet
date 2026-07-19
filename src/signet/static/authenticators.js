@@ -392,6 +392,31 @@
       return;
     }
     if (!state || typeof state !== "object") return;
+    const registrationId =
+      state.kind === "passkey"
+        ? state.challenge_id
+        : state.kind === "totp"
+          ? state.enrollment_id
+          : null;
+    if (typeof registrationId !== "string") {
+      clearManagementCeremony();
+      return;
+    }
+    try {
+      const enrollment = await post("/authenticators/enroll/status", {
+        kind: state.kind,
+        registration_id: registrationId,
+      });
+      if (enrollment.status === "completed") {
+        clearManagementCeremony(state);
+        announce("Authenticator already added.");
+        return;
+      }
+    } catch (error) {
+      if (error.discardCeremony) clearManagementCeremony(state);
+      announce(error.message || "Authenticator enrollment status is unavailable.", true);
+      return;
+    }
     if (state.kind === "passkey") {
       if (typeof state.challenge_id !== "string") {
         clearManagementCeremony();

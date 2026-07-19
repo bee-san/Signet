@@ -947,19 +947,30 @@ def test_totp_only_management_is_accessible_and_resumes_without_provider_effects
                 page.reload()
             assert resumed.value.status == 200, resumed.value.text()
             assert _totp_key(page) == secondary
-            page.route("**/authenticators/enroll/finalize", lambda route: route.abort())
+
+            def drop_finalization_response(route: Any) -> None:
+                assert route.fetch().ok
+                route.abort()
+
+            page.route("**/authenticators/enroll/finalize", drop_finalization_response)
             page.locator('[data-totp-verify][data-flow="management"] input[name="proof"]').fill(
                 pyotp.TOTP(secondary).at(live.clock[0])
             )
             page.get_by_role("button", name="Verify new TOTP").click()
             expect(page.locator("[data-auth-status]")).to_contain_text("Failed")
-            page.unroute("**/authenticators/enroll/finalize")
-            with page.expect_response("**/authenticators/enroll/resume") as finalized:
-                page.reload()
-            assert finalized.value.status == 200, finalized.value.text()
-            expect(page).to_have_url(re.compile(r"/login\?authenticators=updated$"))
-            _login_totp(page, live.origin, secondary)
             assert set(_active_factors(live.database)) == {"Primary TOTP", "Secondary TOTP"}
+            page.unroute("**/authenticators/enroll/finalize")
+            page.reload()
+            expect(page.get_by_role("heading", name="Session expired")).to_be_visible()
+            _login_totp(page, live.origin, secondary)
+            with page.expect_response("**/authenticators/enroll/status") as recovered:
+                page.goto(f"{live.origin}/authenticators")
+            assert recovered.value.status == 200, recovered.value.text()
+            assert recovered.value.json()["status"] == "completed"
+            expect(page.locator("[data-auth-status]")).to_contain_text("already added")
+            assert (
+                page.evaluate("() => localStorage.getItem('signet-management-ceremony-v1')") is None
+            )
 
             page.goto(f"{live.origin}/authenticators")
             live.clock[0] += 30

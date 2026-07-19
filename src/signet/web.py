@@ -1661,6 +1661,24 @@ def create_web_app(
             ),
         )
 
+    @app.post("/authenticators/enroll/status")
+    async def authenticator_enrollment_status(request: Request) -> dict[str, str]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        body = await _json_object(request)
+        kind = body.get("kind")
+        registration_id = body.get("registration_id")
+        if kind not in {"passkey", "totp"} or not isinstance(registration_id, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        enrollment_status = await run_in_threadpool(
+            selected_auth.authorized_enrollment_status,
+            selected.user_id,
+            kind,
+            registration_id,
+        )
+        return {"status": enrollment_status}
+
     @app.post("/authenticators/passkeys/options")
     async def authenticator_passkey_options(request: Request) -> dict[str, Any]:
         selected = await async_principal(request)
