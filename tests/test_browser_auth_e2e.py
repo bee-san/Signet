@@ -198,7 +198,6 @@ class BrowserBackend:
         self.webauthn_issuer = webauthn_issuer
         self.webauthn_verifier = webauthn_verifier
         self.transactions = transactions
-        self.external_provider_calls = 0
 
     def authenticate(self, token: str | None, *, now: int) -> SessionPrincipal:
         return self.sessions.authenticate(token, now=now)
@@ -332,6 +331,7 @@ class LiveBrowserAuth:
     backend: BrowserBackend
     database: Database
     bootstrap_capability: str
+    clock: list[int]
 
 
 def _certificate(tmp_path: Path) -> tuple[Path, Path]:
@@ -449,12 +449,13 @@ def _served_browser_auth(tmp_path: Path) -> Iterator[LiveBrowserAuth]:
             secret_store=secret_store,
         ),
     )
+    clock = [NOW]
     app = create_web_app(
         cast(WebBackend, backend),
         settings=WebSettings(public_origin=origin, allowed_hosts=("localhost",)),
         csrf=CsrfManager(b"browser-e2e-csrf-signing-key" * 2),
         browser_auth=browser_auth,
-        clock=lambda: NOW,
+        clock=lambda: clock[0],
     )
     cert_path, key_path = _certificate(tmp_path)
     server = uvicorn.Server(
@@ -485,6 +486,7 @@ def _served_browser_auth(tmp_path: Path) -> Iterator[LiveBrowserAuth]:
             backend=backend,
             database=database,
             bootstrap_capability=bootstrap_capability,
+            clock=clock,
         )
     finally:
         server.should_exit = True
@@ -518,6 +520,10 @@ WEBAUTHN_STUB = r"""
   window.__selectedPasskey = null;
   Object.defineProperty(navigator, "credentials", {value: {
     create: async ({publicKey}) => {
+      if (localStorage.getItem("browser-e2e-cancel-next-create") === "true") {
+        localStorage.removeItem("browser-e2e-cancel-next-create");
+        throw new DOMException("fake passkey ceremony cancelled", "AbortError");
+      }
       const id = `browser-passkey-${next++}`;
       const rawId = bytes(id);
       localStorage.setItem("browser-e2e-next-passkey", String(next));
@@ -554,6 +560,21 @@ WEBAUTHN_STUB = r"""
       };
     },
   }, configurable: true});
+})();
+"""
+
+
+CEREMONY_STORAGE_FAILURE_STUB = r"""
+(() => {
+  for (const method of ["getItem", "setItem", "removeItem"]) {
+    const original = Storage.prototype[method];
+    Storage.prototype[method] = function(key, ...args) {
+      if (String(key).startsWith("signet-")) {
+        throw new DOMException("fake ceremony storage failure", "QuotaExceededError");
+      }
+      return original.call(this, key, ...args);
+    };
+  }
 })();
 """
 
@@ -626,6 +647,367 @@ def _remove_with_passkey(page: Page, target: str, credential_id: str) -> None:
     card.get_by_text("Remove", exact=True).click()
     page.evaluate("value => { window.__selectedPasskey = value; }", credential_id)
     card.get_by_role("button", name="Confirm removal with passkey").click()
+
+
+def test_setup_totp_ceremony_resumes_after_reload_without_browser_secret_storage(
+    tmp_path: Path,
+) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            start = page.locator('[data-totp-start][data-flow="setup"]')
+            start.locator('input[name="label"]').fill("Reload-safe TOTP")
+            start.get_by_role("button", name="Set up TOTP").click()
+            original_key = _totp_key(page)
+
+            page.reload()
+            expect(page.locator("[data-totp-enrollment]:not([hidden])")).to_be_visible()
+            assert _totp_key(page) == original_key
+            expect(
+                page.locator('[data-totp-start][data-flow="setup"] button[type="submit"]')
+            ).to_be_disabled()
+            stored = page.evaluate("() => Object.fromEntries(Object.entries(localStorage))")
+            assert original_key not in json.dumps(stored)
+            assert "otpauth://" not in json.dumps(stored)
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_setup_totp_continues_when_ceremony_storage_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        context.add_init_script(CEREMONY_STORAGE_FAILURE_STUB)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            start = page.locator('[data-totp-start][data-flow="setup"]')
+            start.locator('input[name="label"]').fill("Non-resumable TOTP")
+            start.get_by_role("button", name="Set up TOTP").click()
+
+            key = _totp_key(page)
+            page.locator('[data-totp-enrollment] input[name="proof"]').fill(pyotp.TOTP(key).at(NOW))
+            page.locator("[data-totp-enrollment] button").click()
+
+            expect(page.get_by_text("Added: Non-resumable TOTP")).to_be_visible()
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_setup_totp_resume_handle_survives_retryable_rate_limit(tmp_path: Path) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            start = page.locator('[data-totp-start][data-flow="setup"]')
+            start.locator('input[name="label"]').fill("Rate-limited TOTP")
+            start.get_by_role("button", name="Set up TOTP").click()
+            original_key = _totp_key(page)
+
+            page.route(
+                "**/setup/totp/resume",
+                lambda route: route.fulfill(
+                    status=429,
+                    headers={"Retry-After": "1"},
+                    content_type="application/json",
+                    body='{"error":{"message":"Please retry."}}',
+                ),
+            )
+            page.reload()
+
+            expect(page.locator("[data-auth-status]")).to_contain_text("Please retry")
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')")
+
+            page.unroute("**/setup/totp/resume")
+            page.reload()
+            assert _totp_key(page) == original_key
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_setup_totp_completion_preserves_concurrent_passkey_resume_handle(tmp_path: Path) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        totp_page = context.new_page()
+        try:
+            totp_page.goto(f"{live.origin}/setup")
+            totp_page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            totp_page.get_by_role("button", name="Unlock owner setup").click()
+            start = totp_page.locator('[data-totp-start][data-flow="setup"]')
+            start.locator('input[name="label"]').fill("Concurrent TOTP")
+            start.get_by_role("button", name="Set up TOTP").click()
+            totp_key = _totp_key(totp_page)
+
+            passkey_state = totp_page.evaluate(
+                """async () => {
+                  const response = await fetch('/setup/passkeys/options', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]').content,
+                    },
+                    body: JSON.stringify({label: 'Concurrent passkey'}),
+                  });
+                  if (!response.ok) throw new Error(`options failed: ${response.status}`);
+                  const issued = await response.json();
+                  const state = {kind: 'passkey', challenge_id: issued.challenge_id};
+                  localStorage.setItem('signet-setup-ceremony-v1', JSON.stringify(state));
+                  return state;
+                }"""
+            )
+            assert passkey_state["kind"] == "passkey"
+
+            totp_page.route(
+                "**/setup/passkeys/resume",
+                lambda route: route.fulfill(
+                    status=429,
+                    headers={"Retry-After": "1"},
+                    content_type="application/json",
+                    body='{"error":{"message":"Please retry."}}',
+                ),
+            )
+            totp_page.locator('[data-totp-enrollment] input[name="proof"]').fill(
+                pyotp.TOTP(totp_key).at(NOW)
+            )
+            totp_page.locator("[data-totp-enrollment] button").click()
+
+            expect(totp_page.get_by_text("Added: Concurrent TOTP")).to_be_visible()
+            assert (
+                totp_page.evaluate(
+                    "() => JSON.parse(localStorage.getItem('signet-setup-ceremony-v1'))"
+                )
+                == passkey_state
+            )
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_setup_totp_resume_treats_verified_response_loss_as_success(tmp_path: Path) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            start = page.locator('[data-totp-start][data-flow="setup"]')
+            start.locator('input[name="label"]').fill("Response-loss TOTP")
+            start.get_by_role("button", name="Set up TOTP").click()
+            key = _totp_key(page)
+
+            def drop_completed_response(route: Any) -> None:
+                assert route.fetch().ok
+                route.abort()
+
+            page.route("**/setup/totp/verify", drop_completed_response)
+            page.locator('[data-totp-enrollment] input[name="proof"]').fill(pyotp.TOTP(key).at(NOW))
+            page.locator("[data-totp-enrollment] button").click()
+
+            expect(page.locator("[data-auth-status]")).to_contain_text("Failed to fetch")
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')")
+
+            page.unroute("**/setup/totp/verify")
+            page.reload()
+            expect(page.locator("[data-auth-status]")).to_contain_text("Setup TOTP already added")
+            expect(page.get_by_text("Added: Response-loss TOTP")).to_be_visible()
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')") is None
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_setup_passkey_ceremony_resumes_after_reload(
+    tmp_path: Path,
+) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        context.add_init_script(WEBAUTHN_STUB)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            page.get_by_label("Passkey name").fill("Reload-safe passkey")
+            page.evaluate("() => localStorage.setItem('browser-e2e-cancel-next-create', 'true')")
+            page.get_by_role("button", name="Create passkey").click()
+            expect(page.locator("[data-auth-status]")).to_contain_text("cancelled")
+            state = page.evaluate(
+                "() => JSON.parse(localStorage.getItem('signet-setup-ceremony-v1'))"
+            )
+            assert isinstance(state, dict)
+            assert set(state) == {"kind", "challenge_id"}
+            assert state["kind"] == "passkey"
+
+            page.reload()
+
+            expect(page.get_by_text("Added: Reload-safe passkey")).to_be_visible()
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')") is None
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_setup_passkey_resume_treats_verified_response_loss_as_success(tmp_path: Path) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        context.add_init_script(WEBAUTHN_STUB)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            page.get_by_label("Passkey name").fill("Response-loss passkey")
+
+            def drop_completed_response(route: Any) -> None:
+                assert route.fetch().ok
+                route.abort()
+
+            page.route("**/setup/passkeys/complete", drop_completed_response)
+            page.get_by_role("button", name="Create passkey").click()
+
+            expect(page.locator("[data-auth-status]")).to_contain_text("Failed to fetch")
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')")
+
+            page.unroute("**/setup/passkeys/complete")
+            page.reload()
+            expect(page.locator("[data-auth-status]")).to_contain_text(
+                "Setup passkey already added"
+            )
+            expect(page.get_by_text("Added: Response-loss passkey")).to_be_visible()
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')") is None
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_totp_only_management_is_accessible_and_resumes_without_provider_effects(
+    tmp_path: Path,
+) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        context.add_init_script(WEBAUTHN_STUB)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            page.get_by_label("Password", exact=True).fill(PASSWORD)
+            page.get_by_label("Confirm password").fill(PASSWORD)
+            page.get_by_role("button", name="Save password").click()
+            primary = _enroll_setup_totp(page, "Primary TOTP")
+            page.get_by_role("button", name="Finish setup").click()
+            _login_totp(page, live.origin, primary)
+            page.goto(f"{live.origin}/authenticators")
+
+            form = page.locator('[data-totp-start][data-flow="management"]')
+            proof_details = form.locator("details")
+            expect(proof_details).to_have_attribute("open", "")
+            expect(
+                form.get_by_label("Current code from the existing authenticator")
+            ).to_be_visible()
+            form.get_by_label("Authenticator name").fill("Secondary TOTP")
+            invalid = "111111" if pyotp.TOTP(primary).at(NOW) == "000000" else "000000"
+            proof_input = form.get_by_label("Current code from the existing authenticator")
+            proof_input.fill(invalid)
+            proof_input.press("Enter")
+
+            status = page.locator("[data-auth-status]")
+            expect(status).to_contain_text("invalid")
+            expect(status).to_have_attribute("role", "alert")
+            expect(status).to_be_focused()
+            assert set(_active_factors(live.database)) == {"Primary TOTP"}
+
+            live.clock[0] += 30
+            form.get_by_label("Current code from the existing authenticator").fill(
+                pyotp.TOTP(primary).at(live.clock[0])
+            )
+            form.get_by_role("button", name="Set up TOTP").click()
+            secondary = _totp_key(page)
+            with page.expect_response("**/authenticators/enroll/resume") as resumed:
+                page.reload()
+            assert resumed.value.status == 200, resumed.value.text()
+            assert _totp_key(page) == secondary
+            expect(
+                page.locator('[data-totp-start][data-flow="management"] button[type="submit"]')
+            ).to_be_disabled()
+
+            def drop_finalization_response(route: Any) -> None:
+                assert route.fetch().ok
+                route.abort()
+
+            page.route("**/authenticators/enroll/finalize", drop_finalization_response)
+            page.locator('[data-totp-verify][data-flow="management"] input[name="proof"]').fill(
+                pyotp.TOTP(secondary).at(live.clock[0])
+            )
+            page.get_by_role("button", name="Verify new TOTP").click()
+            expect(page.locator("[data-auth-status]")).to_contain_text("Failed")
+            assert set(_active_factors(live.database)) == {"Primary TOTP", "Secondary TOTP"}
+            page.unroute("**/authenticators/enroll/finalize")
+            page.reload()
+            expect(page.get_by_role("heading", name="Session expired")).to_be_visible()
+            _login_totp(page, live.origin, secondary)
+            with page.expect_response("**/authenticators/enroll/status") as recovered:
+                page.goto(f"{live.origin}/authenticators")
+            assert recovered.value.status == 200, recovered.value.text()
+            assert recovered.value.json()["status"] == "completed"
+            expect(page.locator("[data-auth-status]")).to_contain_text("already added")
+            assert (
+                page.evaluate("() => localStorage.getItem('signet-management-ceremony-v1')") is None
+            )
+
+            page.goto(f"{live.origin}/authenticators")
+            live.clock[0] += 30
+            passkey_form = page.locator("[data-add-passkey]")
+            passkey_form.get_by_label("Passkey name").fill("Reload-safe managed passkey")
+            passkey_form.get_by_label("Existing TOTP authenticator").select_option(
+                label="Secondary TOTP"
+            )
+            passkey_form.get_by_label("Current code").fill(pyotp.TOTP(secondary).at(live.clock[0]))
+            page.evaluate("() => localStorage.setItem('browser-e2e-cancel-next-create', 'true')")
+            passkey_form.get_by_role("button", name="Create new passkey").click()
+            expect(page.locator("[data-auth-status]")).to_contain_text("cancelled")
+
+            page.route("**/authenticators/enroll/finalize", lambda route: route.abort())
+            with page.expect_response("**/authenticators/enroll/resume") as resumed_passkey:
+                page.reload()
+            assert resumed_passkey.value.status == 200, resumed_passkey.value.text()
+            expect(page.locator("[data-auth-status]")).to_contain_text("Failed")
+            page.unroute("**/authenticators/enroll/finalize")
+            with page.expect_response("**/authenticators/enroll/resume") as finalized_passkey:
+                page.reload()
+            assert finalized_passkey.value.status == 200, finalized_passkey.value.text()
+
+            expect(page).to_have_url(re.compile(r"/login\?authenticators=updated$"))
+            assert set(_active_factors(live.database)) == {
+                "Primary TOTP",
+                "Secondary TOTP",
+                "Reload-safe managed passkey",
+            }
+        finally:
+            context.close()
+            browser.close()
 
 
 def test_browser_bootstrap_multiple_authenticators_replacement_and_safe_removal(
@@ -721,7 +1103,6 @@ def test_browser_bootstrap_multiple_authenticators_replacement_and_safe_removal(
             _remove_with_passkey(page, "Laptop passkey", laptop_id)
             expect(page.locator("body")).to_contain_text("final active authenticator")
             assert set(_active_factors(live.database)) == {"Laptop passkey"}
-            assert live.backend.external_provider_calls == 0
             assert external_requests == []
         finally:
             context.close()

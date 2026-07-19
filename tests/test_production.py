@@ -5,12 +5,16 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
+import subprocess
+import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pyotp
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -18,6 +22,8 @@ from pydantic import ValidationError
 import signet.db as db_module
 import signet.production as production_module
 from signet.app import main as run_cli
+from signet.auth import SessionManager, SQLiteSessionRepository
+from signet.browser_auth import BootstrapService
 from signet.config import ProductionConfig
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
 from signet.db import Database
@@ -32,6 +38,11 @@ from signet.production import (
     create_production_web_app,
     create_production_web_app_from_environment,
     load_production_config,
+)
+from signet.totp_enrollment import (
+    InvalidTotpEnrollment,
+    IssuedTotpEnrollment,
+    TotpEnrollmentService,
 )
 from tests.migration_helpers import verified_backup_callback
 
@@ -100,14 +111,18 @@ downstreams:
     }
 
 
-def _secret_store(*, session_secret: str = "session-secret-" * 3) -> MemorySecretStore:
+def _secret_store(
+    *,
+    session_secret: str = "session-secret-" * 3,
+    totp_secret: str = "totp-secret-value",
+) -> MemorySecretStore:
     return MemorySecretStore(
         {
             ("signet", "session"): session_secret,
             ("signet", "csrf"): "csrf-secret-" * 4,
             ("signet", "capability"): "capability-secret-" * 3,
             ("signet", "payload"): "payload-secret-" * 3,
-            ("signet", "totp"): "totp-secret-value",
+            ("signet", "totp"): totp_secret,
             ("signet", "mail"): "mail-secret-value",
         }
     )
@@ -121,6 +136,50 @@ class _RecordingSecretStore:
     def get(self, reference: SecretReference) -> Secret:
         self.accounts.append(reference.account)
         return self._delegate.get(reference)
+
+
+class _ProvisioningSecretStore:
+    def __init__(self) -> None:
+        self.values = {
+            ("signet", "session"): "session-secret-" * 3,
+            ("signet", "csrf"): "csrf-secret-" * 4,
+            ("signet", "capability"): "capability-secret-" * 3,
+            ("signet", "payload"): "payload-secret-" * 3,
+            ("signet", "totp"): "JBSWY3DPEHPK3PXP",
+            ("signet", "mail"): "mail-secret-value",
+        }
+
+    def get(self, reference: SecretReference) -> Secret:
+        return MemorySecretStore(self.values).get(reference)
+
+
+class _FixedTotpProvisioner:
+    def __init__(self, store: _ProvisioningSecretStore) -> None:
+        self.store = store
+
+    def create(self, factor_id: str) -> str:
+        self.store.values[("Signet", factor_id)] = "JBSWY3DPEHPK3PXP"
+        return f"keychain://Signet/{factor_id}"
+
+    def delete(self, secret_reference: str) -> None:
+        reference = SecretReference.parse(secret_reference)
+        self.store.values.pop((reference.service, reference.account), None)
+
+
+class _FailOnCallProvider:
+    calls: list[tuple[str, str]] = []
+
+    def __init__(self, alias: str, *, credential_identity_digest: str) -> None:
+        self.alias = alias
+        self.credential_identity_digest = credential_identity_digest
+
+    async def call_tool(self, tool_name: str, arguments: object) -> object:
+        del arguments
+        type(self).calls.append((self.alias, tool_name))
+        raise AssertionError("browser authentication reached a production provider")
+
+    async def call_tool_raw(self, tool_name: str, arguments: object) -> object:
+        return await self.call_tool(tool_name, arguments)
 
 
 @pytest.mark.parametrize(
@@ -225,6 +284,357 @@ def test_production_config_rejects_mixed_connector_transport_fields(tmp_path: Pa
 
     with pytest.raises(ValidationError, match="mixed"):
         ProductionConfig.model_validate(payload)
+
+
+def test_production_browser_ceremony_isolation_never_calls_providers_or_mutates_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [int(time.time())]
+    secret = "JBSWY3DPEHPK3PXP"
+    store = _ProvisioningSecretStore()
+    provisioner = _FixedTotpProvisioner(store)
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    _FailOnCallProvider.calls.clear()
+    monkeypatch.setattr(
+        production_module,
+        "ProductionDisabledProviderClient",
+        _FailOnCallProvider,
+    )
+    assembly = build_production_runtime(
+        config,
+        secret_store=store,
+        totp_provisioner=provisioner,
+        clock=lambda: now[0],
+    )
+    enrollments = TotpEnrollmentService(
+        assembly.database,
+        provisioner=provisioner,
+        secret_store=store,
+    )
+    bootstrap = BootstrapService(
+        assembly.database,
+        owner_user_id=config.owner_user_id,
+        totp_enrollments=enrollments,
+    )
+    claimant = "production-browser-claimant-token-long-enough"
+    capability = bootstrap.issue_capability(now=now[0], lifetime=3600)
+    bootstrap.claim(capability, claimant, now=now[0])
+    bootstrap.enroll_password(
+        "correct horse battery staple",
+        claimant_token=claimant,
+        now=now[0],
+    )
+    initial = enrollments.begin(
+        config.owner_user_id,
+        "Primary TOTP",
+        flow="bootstrap",
+        session_id=None,
+        now=now[0],
+    )
+    verified = enrollments.verify(
+        initial.enrollment.enrollment_id,
+        pyotp.TOTP(secret).at(now[0]),
+        user_id=config.owner_user_id,
+        session_id=None,
+        now=now[0],
+    )
+    bootstrap.enroll_totp(verified, claimant_token=claimant, now=now[0])
+    assert bootstrap.complete(claimant_token=claimant, now=now[0]).complete
+
+    sessions = SessionManager(
+        SQLiteSessionRepository(assembly.database),
+        signing_key=("session-secret-" * 3).encode(),
+    )
+    owner_token = sessions.create_session(
+        config.owner_user_id,
+        auth_method="totp",
+        now=now[0],
+    )
+    owner = sessions.authenticate(owner_token, now=now[0])
+    actor_factor_id = assembly.authenticators.list_factors(config.owner_user_id)[0].factor_id
+
+    def pending(label: str) -> IssuedTotpEnrollment:
+        slug = label.lower().replace(" ", "-")
+        authorization_id = f"authorization-{slug}"
+        operation_id = f"browser-operation-{slug}"
+        with assembly.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO browser_enrollment_authorizations(
+                    authorization_id, user_id, session_id, action, factor_label,
+                    operation_id, actor_factor_id, created_at, expires_at, claimed_at
+                ) VALUES (?, ?, ?, 'add_totp', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    authorization_id,
+                    config.owner_user_id,
+                    owner.session_id,
+                    label,
+                    operation_id,
+                    actor_factor_id,
+                    now[0],
+                    now[0] + 900,
+                    now[0],
+                ),
+            )
+        return enrollments.begin(
+            config.owner_user_id,
+            label,
+            flow="management",
+            session_id=owner.session_id,
+            authorization_id=authorization_id,
+            operation_id=operation_id,
+            now=now[0],
+        )
+
+    def durable_effects() -> tuple[tuple[tuple[Any, ...], ...], tuple[tuple[Any, ...], ...]]:
+        with assembly.database.read() as connection:
+            return (
+                tuple(
+                    tuple(row)
+                    for row in connection.execute(
+                        "SELECT * FROM approval_requests ORDER BY request_id"
+                    )
+                ),
+                tuple(
+                    tuple(row)
+                    for row in connection.execute(
+                        "SELECT * FROM notification_outbox ORDER BY outbox_id"
+                    )
+                ),
+            )
+
+    def authenticated_client(token: str) -> tuple[TestClient, str]:
+        client = TestClient(assembly.web, base_url=config.public_origin)
+        client.cookies.set(
+            "__Host-signet_session",
+            token,
+            domain="signet.example.test",
+            path="/",
+        )
+        page = client.get("/authenticators")
+        assert page.status_code == 200
+        match = re.search(r'<meta name="csrf-token" content="([^"]+)">', page.text)
+        assert match is not None
+        return client, match.group(1)
+
+    baseline = durable_effects()
+    assert baseline == ((), ())
+
+    owner_client, owner_csrf = authenticated_client(owner_token)
+    stale_proof = owner_client.post(
+        "/authenticators/enroll/totp",
+        json={
+            "action": "add_totp",
+            "label": "Rejected stale proof",
+            "operation_id": "browser-operation-rejected-stale-proof",
+            "totp_proof": pyotp.TOTP(secret).at(now[0] - 90),
+            "totp_credential_id": "totp-bootstrap",
+        },
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert stale_proof.status_code == 400
+    assert durable_effects() == baseline
+
+    issued = pending("Bound enrollment")
+    assert durable_effects() == baseline
+    enrollment_id = issued.enrollment.enrollment_id
+
+    other_owner_token = sessions.create_session(
+        config.owner_user_id,
+        auth_method="totp",
+        now=now[0],
+    )
+    other_owner, other_owner_csrf = authenticated_client(other_owner_token)
+    wrong_session = other_owner.post(
+        "/authenticators/enroll/resume",
+        json={"kind": "totp", "enrollment_id": enrollment_id},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": other_owner_csrf},
+    )
+    assert wrong_session.status_code == 400
+    assert durable_effects() == baseline
+
+    other_user_token = sessions.create_session(
+        "user:other",
+        auth_method="totp",
+        now=now[0],
+    )
+    foreign_user = TestClient(assembly.web, base_url=config.public_origin)
+    foreign_user.cookies.set(
+        "__Host-signet_session",
+        other_user_token,
+        domain="signet.example.test",
+        path="/",
+    )
+    assert foreign_user.get("/authenticators").status_code == 401
+    assert durable_effects() == baseline
+
+    with pytest.raises(InvalidTotpEnrollment):
+        enrollments.resume(
+            enrollment_id,
+            user_id="user:other",
+            session_id=owner.session_id,
+            now=now[0],
+        )
+    assert durable_effects() == baseline
+
+    resumed = owner_client.post(
+        "/authenticators/enroll/resume",
+        json={"kind": "totp", "enrollment_id": enrollment_id},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert resumed.status_code == 200
+    enrollments.verify(
+        enrollment_id,
+        pyotp.TOTP(secret).at(now[0]),
+        user_id=config.owner_user_id,
+        session_id=owner.session_id,
+        now=now[0],
+    )
+    enrollments.consume(
+        enrollment_id,
+        user_id=config.owner_user_id,
+        session_id=owner.session_id,
+        now=now[0],
+    )
+    replay = owner_client.post(
+        "/authenticators/enroll/resume",
+        json={"kind": "totp", "enrollment_id": enrollment_id},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert replay.status_code == 400
+    assert durable_effects() == baseline
+
+    stale = pending("Stale enrollment")
+    stale_id = stale.enrollment.enrollment_id
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE browser_totp_enrollments
+            SET created_at = ?, expires_at = ?
+            WHERE enrollment_id = ?
+            """,
+            (now[0] - 10, now[0] - 1, stale_id),
+        )
+    stale_response = owner_client.post(
+        "/authenticators/enroll/resume",
+        json={"kind": "totp", "enrollment_id": stale_id},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert stale_response.status_code == 400
+    assert durable_effects() == baseline
+
+    expired_authorization = pending("Expired authorization")
+    expired_id = expired_authorization.enrollment.enrollment_id
+    assert expired_authorization.enrollment.authorization_id is not None
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE browser_enrollment_authorizations
+            SET expires_at = ?
+            WHERE authorization_id = ?
+            """,
+            (now[0] + 1, expired_authorization.enrollment.authorization_id),
+        )
+    now[0] += 2
+    expired_status = owner_client.post(
+        "/authenticators/enroll/status",
+        json={"kind": "totp", "registration_id": expired_id},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert expired_status.status_code == 400
+    expired_resume = owner_client.post(
+        "/authenticators/enroll/resume",
+        json={"kind": "totp", "enrollment_id": expired_id},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert expired_resume.status_code == 400
+    expired_verify = owner_client.post(
+        "/authenticators/totp/verify",
+        json={"enrollment_id": expired_id, "proof": pyotp.TOTP(secret).at(now[0])},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert expired_verify.status_code == 400
+    assert durable_effects() == baseline
+    assert _FailOnCallProvider.calls == []
+
+
+@pytest.mark.parametrize("installation", ("source", "wheel"))
+def test_bootstrap_issue_runs_from_source_and_installed_wheel(
+    tmp_path: Path,
+    installation: str,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    payload = _production_payload(tmp_path)
+    config_path = tmp_path / "production.json"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    config_path.chmod(0o600)
+
+    if installation == "source":
+        command = [
+            "uv",
+            "run",
+            "signet",
+            "bootstrap",
+            "issue",
+            "--config",
+            str(config_path),
+            "--lifetime",
+            "60",
+        ]
+        environment = os.environ.copy()
+    else:
+        dist = tmp_path / "dist"
+        built = subprocess.run(
+            ["uv", "build", "--wheel", "--out-dir", str(dist)],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert built.returncode == 0, built.stderr
+        wheels = tuple(dist.glob("*.whl"))
+        assert len(wheels) == 1
+        command = [
+            "uv",
+            "run",
+            "--quiet",
+            "--isolated",
+            "--no-project",
+            "--with",
+            str(wheels[0]),
+            "signet",
+            "bootstrap",
+            "issue",
+            "--config",
+            str(config_path),
+            "--lifetime",
+            "60",
+        ]
+        environment = os.environ.copy()
+
+    issued = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert issued.returncode == 0, issued.stderr
+    assert re.fullmatch(r"sbc1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\n", issued.stdout)
+    assert issued.stderr == ""
+    database = Database(Path(payload["storage"]["data_dir"]) / "signet.db")
+    with database.read() as connection:
+        row = connection.execute(
+            "SELECT status, capability_verifier FROM browser_bootstrap_state WHERE state_id = 1"
+        ).fetchone()
+    assert row is not None
+    assert tuple(row) == ("pending", row["capability_verifier"])
+    assert bytes(row["capability_verifier"])
+    assert issued.stdout.strip().encode() not in database.path.read_bytes()
 
 
 def test_build_production_runtime_stages_durable_provider_free_assembly(

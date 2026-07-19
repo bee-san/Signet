@@ -242,6 +242,77 @@ class AuthenticatorManager:
             ).fetchone()
         return _metadata(row) if row is not None else None
 
+    def authorized_enrollment_status(
+        self,
+        user_id: str,
+        kind: Literal["passkey", "totp"],
+        registration_id: str,
+        *,
+        now: int,
+    ) -> Literal["pending", "completed"]:
+        selected_user = canonical_user_id(user_id)
+        selected_registration = _bounded_identifier(
+            registration_id,
+            name="registration ID",
+            maximum=128,
+        )
+        if len(selected_registration) < 16:
+            raise ValueError("registration ID is invalid")
+        with self.database.read() as connection:
+            if kind == "passkey":
+                row = connection.execute(
+                    """
+                    SELECT registration.consumed_at AS registration_consumed_at,
+                           authorization.consumed_at AS authorization_consumed_at,
+                           authorization.created_at AS authorization_created_at,
+                           authorization.expires_at AS authorization_expires_at,
+                           authorization.claimed_at AS authorization_claimed_at
+                    FROM auth_registration_challenges AS registration
+                    JOIN browser_enrollment_authorizations AS authorization
+                      ON authorization.authorization_id = registration.authorization_id
+                     AND authorization.user_id = registration.user_id
+                     AND authorization.operation_id = registration.operation_id
+                     AND authorization.action = 'add_passkey'
+                    WHERE registration.challenge_id = ? AND registration.user_id = ?
+                    """,
+                    (selected_registration, selected_user),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT registration.consumed_at AS registration_consumed_at,
+                           authorization.consumed_at AS authorization_consumed_at,
+                           authorization.created_at AS authorization_created_at,
+                           authorization.expires_at AS authorization_expires_at,
+                           authorization.claimed_at AS authorization_claimed_at
+                    FROM browser_totp_enrollments AS registration
+                    JOIN browser_enrollment_authorizations AS authorization
+                      ON authorization.authorization_id = registration.authorization_id
+                     AND authorization.user_id = registration.user_id
+                     AND authorization.operation_id = registration.operation_id
+                     AND authorization.action = 'add_totp'
+                    WHERE registration.enrollment_id = ? AND registration.user_id = ?
+                    """,
+                    (selected_registration, selected_user),
+                ).fetchone()
+        if row is None:
+            raise InvalidFactorProof("browser enrollment is stale or unavailable")
+        registration_completed = row["registration_consumed_at"] is not None
+        authorization_completed = row["authorization_consumed_at"] is not None
+        if registration_completed != authorization_completed:
+            raise AuthenticatorManagementError(
+                "browser enrollment completion state is inconsistent"
+            )
+        if registration_completed:
+            return "completed"
+        if (
+            row["authorization_claimed_at"] is None
+            or int(row["authorization_created_at"]) > now
+            or int(row["authorization_expires_at"]) <= now
+        ):
+            raise InvalidFactorProof("enrollment authorization is stale or unavailable")
+        return "pending"
+
     def binding_for_add_totp(self, user_id: str, label: str, operation_id: str) -> ActionBinding:
         return self._binding(
             "add_authenticator",

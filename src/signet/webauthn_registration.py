@@ -427,29 +427,66 @@ class PasskeyRegistrationService:
         ):
             raise RegistrationRateLimited("too many active passkey registrations")
         try:
-            excluded = [
-                PublicKeyCredentialDescriptor(id=_base64url_decode(identifier))
-                for identifier in existing_credential_ids
-            ]
-            options = generate_registration_options(
-                rp_id=self.rp_id,
-                rp_name="Signet",
-                user_name=selected_user,
-                user_display_name=selected_user,
-                user_id=_user_handle(selected_user),
-                challenge=challenge_bytes,
-                timeout=self.lifetime * 1_000,
-                exclude_credentials=excluded,
-                authenticator_selection=AuthenticatorSelectionCriteria(
-                    resident_key=ResidentKeyRequirement.REQUIRED,
-                    user_verification=UserVerificationRequirement.REQUIRED,
-                ),
-            )
+            return self._issued(challenge, existing_credential_ids, now=now)
         except ValueError:
             self.repository.invalidate(challenge_id, now=now)
             raise InvalidRegistrationChallenge("stored passkey credential ID is invalid") from None
+
+    def resume(
+        self,
+        challenge_id: str,
+        *,
+        user_id: str,
+        session_id: str | None,
+        existing_credential_ids: tuple[str, ...],
+        now: int,
+    ) -> IssuedRegistration:
+        selected_user = canonical_user_id(user_id)
+        challenge = self.repository.find(challenge_id)
+        if (
+            challenge is None
+            or challenge.user_id != selected_user
+            or challenge.session_id != session_id
+            or challenge.verified_at is not None
+            or challenge.consumed_at is not None
+            or challenge.invalidated_at is not None
+            or challenge.created_at > now
+            or challenge.expires_at <= now
+        ):
+            raise InvalidRegistrationChallenge("passkey registration is stale or unavailable")
+        try:
+            return self._issued(challenge, existing_credential_ids, now=now)
+        except ValueError:
+            self.repository.invalidate(challenge_id, now=now)
+            raise InvalidRegistrationChallenge("stored passkey credential ID is invalid") from None
+
+    def _issued(
+        self,
+        challenge: RegistrationChallenge,
+        existing_credential_ids: tuple[str, ...],
+        *,
+        now: int,
+    ) -> IssuedRegistration:
+        excluded = [
+            PublicKeyCredentialDescriptor(id=_base64url_decode(identifier))
+            for identifier in existing_credential_ids
+        ]
+        options = generate_registration_options(
+            rp_id=self.rp_id,
+            rp_name="Signet",
+            user_name=challenge.user_id,
+            user_display_name=challenge.user_id,
+            user_id=_user_handle(challenge.user_id),
+            challenge=challenge.challenge,
+            timeout=(challenge.expires_at - now) * 1_000,
+            exclude_credentials=excluded,
+            authenticator_selection=AuthenticatorSelectionCriteria(
+                resident_key=ResidentKeyRequirement.REQUIRED,
+                user_verification=UserVerificationRequirement.REQUIRED,
+            ),
+        )
         return IssuedRegistration(
-            challenge_id=challenge_id,
+            challenge_id=challenge.challenge_id,
             options_json=options_to_json(options),
             expires_at=challenge.expires_at,
             authorization_id=challenge.authorization_id,

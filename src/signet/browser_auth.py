@@ -743,6 +743,36 @@ class BrowserAuthController:
             transaction_guard=transaction_guard,
         )
 
+    def resume_registration(
+        self,
+        challenge_id: str,
+        *,
+        user_id: str,
+        session_id: str | None,
+        claimant_token: str | None = None,
+        now: int,
+    ) -> IssuedRegistration:
+        if session_id is None:
+            self.bootstrap.require_claim(claimant_token, now=now)
+        else:
+            self.manager.authorized_enrollment_status(
+                user_id,
+                "passkey",
+                challenge_id,
+                now=now,
+            )
+        existing = tuple(
+            credential.credential_id
+            for credential in self.webauthn_repository.credentials_for_user(user_id)
+        )
+        return self.registrations.resume(
+            challenge_id,
+            user_id=user_id,
+            session_id=session_id,
+            existing_credential_ids=existing,
+            now=now,
+        )
+
     def complete_registration(
         self,
         challenge_id: str,
@@ -755,9 +785,34 @@ class BrowserAuthController:
     ) -> PendingRegistration:
         if session_id is None:
             self.bootstrap.require_claim(claimant_token, now=now)
+        else:
+            self.manager.authorized_enrollment_status(
+                user_id,
+                "passkey",
+                challenge_id,
+                now=now,
+            )
         return self.registrations.complete(
             challenge_id,
             credential,
+            user_id=user_id,
+            session_id=session_id,
+            now=now,
+        )
+
+    def pending_registration(
+        self,
+        challenge_id: str,
+        *,
+        user_id: str,
+        session_id: str | None,
+        claimant_token: str | None = None,
+        now: int,
+    ) -> PendingRegistration:
+        if session_id is None:
+            self.bootstrap.require_claim(claimant_token, now=now)
+        return self.registrations.pending(
+            challenge_id,
             user_id=user_id,
             session_id=session_id,
             now=now,
@@ -822,9 +877,59 @@ class BrowserAuthController:
     ) -> TotpEnrollment:
         if session_id is None:
             self.bootstrap.require_claim(claimant_token, now=now)
+        else:
+            self.manager.authorized_enrollment_status(
+                user_id,
+                "totp",
+                enrollment_id,
+                now=now,
+            )
         return self._totp_enrollments().verify(
             enrollment_id,
             proof,
+            user_id=user_id,
+            session_id=session_id,
+            now=now,
+        )
+
+    def resume_totp_enrollment(
+        self,
+        enrollment_id: str,
+        *,
+        user_id: str,
+        session_id: str | None,
+        claimant_token: str | None = None,
+        now: int,
+    ) -> IssuedTotpEnrollment:
+        if session_id is None:
+            self.bootstrap.require_claim(claimant_token, now=now)
+        else:
+            self.manager.authorized_enrollment_status(
+                user_id,
+                "totp",
+                enrollment_id,
+                now=now,
+            )
+        return self._totp_enrollments().resume(
+            enrollment_id,
+            user_id=user_id,
+            session_id=session_id,
+            now=now,
+        )
+
+    def pending_totp_enrollment(
+        self,
+        enrollment_id: str,
+        *,
+        user_id: str,
+        session_id: str | None,
+        claimant_token: str | None = None,
+        now: int,
+    ) -> TotpEnrollment:
+        if session_id is None:
+            self.bootstrap.require_claim(claimant_token, now=now)
+        return self._totp_enrollments().pending(
+            enrollment_id,
             user_id=user_id,
             session_id=session_id,
             now=now,
@@ -1098,6 +1203,21 @@ class BrowserAuthController:
             now=now,
         )
         return self._apply(user_id, session_id, intent, verified, now=now)
+
+    def authorized_enrollment_status(
+        self,
+        user_id: str,
+        kind: Literal["passkey", "totp"],
+        registration_id: str,
+        *,
+        now: int,
+    ) -> Literal["pending", "completed"]:
+        return self.manager.authorized_enrollment_status(
+            user_id,
+            kind,
+            registration_id,
+            now=now,
+        )
 
     def complete_authorized_enrollment(
         self,

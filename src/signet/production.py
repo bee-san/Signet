@@ -607,6 +607,7 @@ def build_production_runtime(
             approvals=approvals,
             reviewer=reviewer,
             policy_promotions=policy_promotions,
+            clock=now,
         )
         if "web" in components
         else None
@@ -696,6 +697,7 @@ def _assemble_production_web(
     approvals: ApprovalStateMachine,
     reviewer: EncryptedPayloadReviewer,
     policy_promotions: SQLitePolicyPromotionBoundary,
+    clock: Callable[[], int],
 ) -> FastAPI:
     sessions = SessionManager(
         SQLiteSessionRepository(database),
@@ -773,6 +775,7 @@ def _assemble_production_web(
         ),
         csrf=CsrfManager(secret_values["csrf_secret_ref"].reveal().encode("utf-8")),
         browser_auth=browser_auth,
+        clock=clock,
     )
     web.add_middleware(TrustedProxySourceMiddleware)
     return web

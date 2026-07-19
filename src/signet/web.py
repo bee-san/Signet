@@ -974,8 +974,10 @@ def create_web_app(
             ("POST", "/setup/password"): 16 * 1024,
             ("POST", "/setup/passkeys/options"): 8 * 1024,
             ("POST", "/setup/passkeys/complete"): 128 * 1024,
+            ("POST", "/setup/passkeys/resume"): 8 * 1024,
             ("POST", "/setup/totp/start"): 8 * 1024,
             ("POST", "/setup/totp/verify"): 8 * 1024,
+            ("POST", "/setup/totp/resume"): 8 * 1024,
             ("POST", "/setup/complete"): 8 * 1024,
             ("POST", "/authenticators/passkeys/options"): 8 * 1024,
             ("POST", "/authenticators/passkeys/complete"): 128 * 1024,
@@ -984,6 +986,8 @@ def create_web_app(
             ("POST", "/authenticators/confirm/passkey/options"): 16 * 1024,
             ("POST", "/authenticators/confirm/passkey/complete"): 128 * 1024,
             ("POST", "/authenticators/confirm/totp"): 16 * 1024,
+            ("POST", "/authenticators/enroll/status"): 8 * 1024,
+            ("POST", "/authenticators/enroll/resume"): 8 * 1024,
             ("POST", "/integrations/effect-reviews/totp"): 16 * 1024,
             ("POST", "/integrations/effect-reviews/passkey/options"): 32 * 1024,
             ("POST", "/integrations/effect-reviews/passkey/complete"): 128 * 1024,
@@ -1290,6 +1294,39 @@ def create_web_app(
             "publicKey": json.loads(issued.options_json),
         }
 
+    @app.post("/setup/passkeys/resume")
+    async def setup_passkey_resume(request: Request) -> dict[str, Any]:
+        require_setup_csrf(request, None)
+        body = await _json_object(request)
+        challenge_id = body.get("challenge_id")
+        if not isinstance(challenge_id, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        try:
+            issued = await run_in_threadpool(
+                selected_auth.resume_registration,
+                challenge_id,
+                user_id=selected_auth.bootstrap.owner_user_id,
+                session_id=None,
+                claimant_token=request.cookies.get(settings.bootstrap_cookie),
+                now=now_fn(),
+            )
+        except PasskeyRegistrationError:
+            await run_in_threadpool(
+                selected_auth.pending_registration,
+                challenge_id,
+                user_id=selected_auth.bootstrap.owner_user_id,
+                session_id=None,
+                claimant_token=request.cookies.get(settings.bootstrap_cookie),
+                now=now_fn(),
+            )
+            return {"kind": "passkey", "status": "registered"}
+        return {
+            "kind": "passkey",
+            "challenge_id": issued.challenge_id,
+            "publicKey": json.loads(issued.options_json),
+        }
+
     @app.post("/setup/passkeys/complete")
     async def setup_passkey_complete(request: Request) -> dict[str, Any]:
         require_setup_csrf(request, None)
@@ -1371,6 +1408,35 @@ def create_web_app(
             "status": "registered",
             "authenticator_count": len(setup_status.factor_labels),
         }
+
+    @app.post("/setup/totp/resume")
+    async def setup_totp_resume(request: Request) -> dict[str, Any]:
+        require_setup_csrf(request, None)
+        body = await _json_object(request)
+        enrollment_id = body.get("enrollment_id")
+        if not isinstance(enrollment_id, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        try:
+            issued = await run_in_threadpool(
+                selected_auth.resume_totp_enrollment,
+                enrollment_id,
+                user_id=selected_auth.bootstrap.owner_user_id,
+                session_id=None,
+                claimant_token=request.cookies.get(settings.bootstrap_cookie),
+                now=now_fn(),
+            )
+        except TotpEnrollmentError:
+            await run_in_threadpool(
+                selected_auth.pending_totp_enrollment,
+                enrollment_id,
+                user_id=selected_auth.bootstrap.owner_user_id,
+                session_id=None,
+                claimant_token=request.cookies.get(settings.bootstrap_cookie),
+                now=now_fn(),
+            )
+            return {"kind": "totp", "status": "registered"}
+        return enrollment_response(issued)
 
     @app.post("/setup/complete")
     async def setup_complete(
@@ -1599,6 +1665,25 @@ def create_web_app(
             ),
         )
 
+    @app.post("/authenticators/enroll/status")
+    async def authenticator_enrollment_status(request: Request) -> dict[str, str]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        body = await _json_object(request)
+        kind = body.get("kind")
+        registration_id = body.get("registration_id")
+        if kind not in {"passkey", "totp"} or not isinstance(registration_id, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        enrollment_status = await run_in_threadpool(
+            selected_auth.authorized_enrollment_status,
+            selected.user_id,
+            kind,
+            registration_id,
+            now=now_fn(),
+        )
+        return {"status": enrollment_status}
+
     @app.post("/authenticators/passkeys/options")
     async def authenticator_passkey_options(request: Request) -> dict[str, Any]:
         selected = await async_principal(request)
@@ -1695,6 +1780,73 @@ def create_web_app(
             "authorization_id": pending.authorization_id,
             "operation_id": pending.operation_id,
         }
+
+    @app.post("/authenticators/enroll/resume")
+    async def authenticator_enrollment_resume(request: Request) -> dict[str, Any]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        body = await _json_object(request)
+        kind = body.get("kind")
+        if kind not in {"passkey", "totp"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        issued: IssuedRegistration | IssuedTotpEnrollment
+        if kind == "passkey":
+            challenge_id = body.get("challenge_id")
+            if not isinstance(challenge_id, str):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+            selected_auth = required_browser_auth()
+            try:
+                issued = await run_in_threadpool(
+                    selected_auth.resume_registration,
+                    challenge_id,
+                    user_id=selected.user_id,
+                    session_id=selected.session_id,
+                    now=now_fn(),
+                )
+            except PasskeyRegistrationError:
+                pending = await run_in_threadpool(
+                    selected_auth.pending_registration,
+                    challenge_id,
+                    user_id=selected.user_id,
+                    session_id=selected.session_id,
+                    now=now_fn(),
+                )
+                return {
+                    "kind": "passkey",
+                    "status": "ready_to_finalize",
+                    "registration_id": pending.challenge_id,
+                    "authorization_id": pending.authorization_id,
+                    "operation_id": pending.operation_id,
+                }
+            return enrollment_response(issued)
+        enrollment_id = body.get("enrollment_id")
+        if not isinstance(enrollment_id, str):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        selected_auth = required_browser_auth()
+        try:
+            issued = await run_in_threadpool(
+                selected_auth.resume_totp_enrollment,
+                enrollment_id,
+                user_id=selected.user_id,
+                session_id=selected.session_id,
+                now=now_fn(),
+            )
+        except TotpEnrollmentError:
+            pending_totp = await run_in_threadpool(
+                selected_auth.pending_totp_enrollment,
+                enrollment_id,
+                user_id=selected.user_id,
+                session_id=selected.session_id,
+                now=now_fn(),
+            )
+            return {
+                "kind": "totp",
+                "status": "ready_to_finalize",
+                "registration_id": pending_totp.enrollment_id,
+                "authorization_id": pending_totp.authorization_id,
+                "operation_id": pending_totp.operation_id,
+            }
+        return enrollment_response(issued)
 
     @app.post("/authenticators/enroll/totp")
     async def authenticator_enrollment_totp(request: Request) -> dict[str, Any]:
