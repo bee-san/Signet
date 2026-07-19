@@ -524,6 +524,39 @@ def test_production_browser_ceremony_isolation_never_calls_providers_or_mutates_
     )
     assert stale_response.status_code == 400
     assert durable_effects() == baseline
+
+    expired_authorization = pending("Expired authorization")
+    expired_id = expired_authorization.enrollment.enrollment_id
+    assert expired_authorization.enrollment.authorization_id is not None
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE browser_enrollment_authorizations
+            SET expires_at = ?
+            WHERE authorization_id = ?
+            """,
+            (now[0] + 1, expired_authorization.enrollment.authorization_id),
+        )
+    now[0] += 2
+    expired_status = owner_client.post(
+        "/authenticators/enroll/status",
+        json={"kind": "totp", "registration_id": expired_id},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert expired_status.status_code == 400
+    expired_resume = owner_client.post(
+        "/authenticators/enroll/resume",
+        json={"kind": "totp", "enrollment_id": expired_id},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert expired_resume.status_code == 400
+    expired_verify = owner_client.post(
+        "/authenticators/totp/verify",
+        json={"enrollment_id": expired_id, "proof": pyotp.TOTP(secret).at(now[0])},
+        headers={"Origin": config.public_origin, "X-CSRF-Token": owner_csrf},
+    )
+    assert expired_verify.status_code == 400
+    assert durable_effects() == baseline
     assert _FailOnCallProvider.calls == []
 
 

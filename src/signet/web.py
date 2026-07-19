@@ -1680,6 +1680,7 @@ def create_web_app(
             selected.user_id,
             kind,
             registration_id,
+            now=now_fn(),
         )
         return {"status": enrollment_status}
 

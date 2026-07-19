@@ -247,6 +247,8 @@ class AuthenticatorManager:
         user_id: str,
         kind: Literal["passkey", "totp"],
         registration_id: str,
+        *,
+        now: int,
     ) -> Literal["pending", "completed"]:
         selected_user = canonical_user_id(user_id)
         selected_registration = _bounded_identifier(
@@ -261,7 +263,10 @@ class AuthenticatorManager:
                 row = connection.execute(
                     """
                     SELECT registration.consumed_at AS registration_consumed_at,
-                           authorization.consumed_at AS authorization_consumed_at
+                           authorization.consumed_at AS authorization_consumed_at,
+                           authorization.created_at AS authorization_created_at,
+                           authorization.expires_at AS authorization_expires_at,
+                           authorization.claimed_at AS authorization_claimed_at
                     FROM auth_registration_challenges AS registration
                     JOIN browser_enrollment_authorizations AS authorization
                       ON authorization.authorization_id = registration.authorization_id
@@ -276,7 +281,10 @@ class AuthenticatorManager:
                 row = connection.execute(
                     """
                     SELECT registration.consumed_at AS registration_consumed_at,
-                           authorization.consumed_at AS authorization_consumed_at
+                           authorization.consumed_at AS authorization_consumed_at,
+                           authorization.created_at AS authorization_created_at,
+                           authorization.expires_at AS authorization_expires_at,
+                           authorization.claimed_at AS authorization_claimed_at
                     FROM browser_totp_enrollments AS registration
                     JOIN browser_enrollment_authorizations AS authorization
                       ON authorization.authorization_id = registration.authorization_id
@@ -295,7 +303,15 @@ class AuthenticatorManager:
             raise AuthenticatorManagementError(
                 "browser enrollment completion state is inconsistent"
             )
-        return "completed" if registration_completed else "pending"
+        if registration_completed:
+            return "completed"
+        if (
+            row["authorization_claimed_at"] is None
+            or int(row["authorization_created_at"]) > now
+            or int(row["authorization_expires_at"]) <= now
+        ):
+            raise InvalidFactorProof("enrollment authorization is stale or unavailable")
+        return "pending"
 
     def binding_for_add_totp(self, user_id: str, label: str, operation_id: str) -> ActionBinding:
         return self._binding(
