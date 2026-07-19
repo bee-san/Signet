@@ -75,7 +75,8 @@
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
       const error = new Error(body.error?.message || "Authenticator request failed.");
-      error.discardCeremony = response.status >= 400 && response.status < 500;
+      error.discardCeremony =
+        response.status >= 400 && response.status < 500 && response.status !== 429;
       throw error;
     }
     return body;

@@ -703,6 +703,42 @@ def test_setup_totp_continues_when_ceremony_storage_is_unavailable(
             browser.close()
 
 
+def test_setup_totp_resume_handle_survives_retryable_rate_limit(tmp_path: Path) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            start = page.locator('[data-totp-start][data-flow="setup"]')
+            start.locator('input[name="label"]').fill("Rate-limited TOTP")
+            start.get_by_role("button", name="Set up TOTP").click()
+            original_key = _totp_key(page)
+
+            page.route(
+                "**/setup/totp/resume",
+                lambda route: route.fulfill(
+                    status=429,
+                    headers={"Retry-After": "1"},
+                    content_type="application/json",
+                    body='{"error":{"message":"Please retry."}}',
+                ),
+            )
+            page.reload()
+
+            expect(page.locator("[data-auth-status]")).to_contain_text("Please retry")
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')")
+
+            page.unroute("**/setup/totp/resume")
+            page.reload()
+            assert _totp_key(page) == original_key
+        finally:
+            context.close()
+            browser.close()
+
+
 def test_setup_passkey_ceremony_resumes_after_reload(
     tmp_path: Path,
 ) -> None:
