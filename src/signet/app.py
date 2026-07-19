@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 from collections.abc import Callable, Sequence
 from typing import Literal
 
 import uvicorn
 
 from signet.credential_broker import CredentialError
-from signet.db import DatabaseError
+from signet.db import Database, DatabaseError
 from signet.demo import DemoError, add_demo_parser, run_demo_command
 from signet.deployment import DeploymentError, add_deployment_parser, run_deployment_command
 from signet.integration_cli import (
@@ -72,6 +73,37 @@ def main(
         except IntegrationCLIError as exc:
             parser.error(str(exc))
         return
+    if args.command == "bootstrap":
+        from signet.authenticator_management import KeychainTotpSecretProvisioner
+        from signet.browser_auth import BootstrapError, BootstrapService
+        from signet.credential_broker import KeychainSecretStore
+        from signet.production import load_production_config
+        from signet.totp_enrollment import TotpEnrollmentCleanupError, TotpEnrollmentService
+
+        try:
+            config = load_production_config(args.config)
+            database = Database(config.storage.database_path)
+            database.initialize()
+            totp_enrollments = TotpEnrollmentService(
+                database,
+                provisioner=KeychainTotpSecretProvisioner(),
+                secret_store=KeychainSecretStore(),
+            )
+            capability = BootstrapService(
+                database,
+                owner_user_id=config.owner_user_id,
+                totp_enrollments=totp_enrollments,
+            ).issue_capability(now=int(time.time()), lifetime=args.lifetime)
+        except (
+            BootstrapError,
+            CredentialError,
+            DatabaseError,
+            TotpEnrollmentCleanupError,
+            ValueError,
+        ) as exc:
+            parser.error(str(exc))
+        print(capability)
+        return
     if _FACTORY_PATTERN.fullmatch(args.factory) is None:
         parser.error("--factory must be an explicit module.path:callable reference")
     if args.command in {"serve-mcp", "serve-web"}:
@@ -101,6 +133,7 @@ def main(
         port=args.port,
         server_header=False,
         limit_concurrency=args.limit_concurrency,
+        proxy_headers=False,
     )
 
 
@@ -117,6 +150,14 @@ def _parser() -> argparse.ArgumentParser:
 
     web = subcommands.add_parser("serve-web", help="serve an assembled authenticated web app")
     _factory_arguments(web, default_host="127.0.0.1", default_port=8790)
+    bootstrap = subcommands.add_parser(
+        "bootstrap",
+        help="perform an attended local owner-bootstrap ceremony",
+    )
+    bootstrap_commands = bootstrap.add_subparsers(dest="bootstrap_command", required=True)
+    issue = bootstrap_commands.add_parser("issue", help="issue one short-lived setup capability")
+    issue.add_argument("--config", required=True, help="private production JSON configuration")
+    issue.add_argument("--lifetime", type=int, choices=range(60, 3601), default=600)
     add_demo_parser(subcommands)
     add_deployment_parser(subcommands)
     add_integration_parsers(subcommands)

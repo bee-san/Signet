@@ -54,6 +54,9 @@ CORE_TABLES = {
     "policy_versions",
     "push_subscriptions",
     "auth_credentials",
+    "auth_factors",
+    "auth_factor_events",
+    "auth_factor_challenges",
     "auth_rate_windows",
     "caller_tokens",
     "mcp_caller_tokens",
@@ -394,6 +397,77 @@ def test_upgrade_requires_and_runs_a_verified_pre_migration_backup(
             ).fetchone()[0]
             == 1
         )
+
+
+def test_multi_authenticator_migration_bounds_audit_ids_for_long_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "approvals.sqlite3"
+    migrations = tmp_path / "migrations"
+    shutil.copytree(Database(path).migrations_path, migrations)
+
+    class UpgradeDatabase(Database):
+        @property
+        def migrations_path(self) -> Path:
+            return migrations
+
+    monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 16)
+    database = UpgradeDatabase(path)
+    database.initialize()
+    credential_id = "credential-" + "x" * 189
+    revoked_credential_id = "credential-" + "y" * 189
+    with database.transaction() as connection:
+        connection.execute("INSERT INTO auth_users(user_id, created_at) VALUES ('owner', 1)")
+        connection.execute(
+            """
+            INSERT INTO auth_credentials(
+                credential_id, user_id, kind, secret_reference, enrolled_at, factor_label
+            ) VALUES (?, 'owner', 'totp', 'keychain://Signet/long-credential', 1, 'Primary TOTP')
+            """,
+            (credential_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO auth_credentials(
+                credential_id, user_id, kind, secret_reference, enrolled_at, disabled_at,
+                factor_label
+            ) VALUES (
+                ?, 'owner', 'totp', 'keychain://Signet/revoked-long-credential', 1, 2,
+                'Revoked TOTP'
+            )
+            """,
+            (revoked_credential_id,),
+        )
+
+    monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 17)
+    database.initialize(
+        pre_migration_backup=verified_backup_callback(
+            tmp_path / "pre-migration-backups",
+            [],
+        )
+    )
+
+    with database.read() as connection:
+        factors = connection.execute(
+            """
+            SELECT credential_id, state, created_audit_ref, state_audit_ref
+            FROM auth_factors ORDER BY credential_id
+            """
+        ).fetchall()
+        event_ids = {
+            row["event_id"]
+            for row in connection.execute("SELECT event_id FROM auth_factor_events").fetchall()
+        }
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+    assert [factor["credential_id"] for factor in factors] == [
+        credential_id,
+        revoked_credential_id,
+    ]
+    assert all(len(factor["created_audit_ref"]) <= 128 for factor in factors)
+    assert event_ids == {factor["created_audit_ref"] for factor in factors}
+    assert factors[0]["state_audit_ref"] is None
+    assert factors[1]["state_audit_ref"] == factors[1]["created_audit_ref"]
 
 
 def test_pre_migration_publication_warning_survives_connection_close_failure(
@@ -905,6 +979,17 @@ def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None
         )
         connection.execute(
             """
+            INSERT INTO auth_factors(
+                factor_id, credential_id, user_id, kind, label,
+                state, created_at, updated_at, created_audit_ref
+            ) VALUES (
+                'fac_database-test-totp', 'database-test-totp', 'owner', 'totp',
+                'Database test TOTP', 'active', 100, 100, 'fixture:database-test-totp'
+            )
+            """
+        )
+        connection.execute(
+            """
             INSERT INTO web_sessions(
                 session_id, user_id, auth_method, auth_generation,
                 created_at, last_seen_at, absolute_expires_at
@@ -1056,3 +1141,96 @@ def test_migrated_operational_row_shapes_survive_restart(tmp_path: Path) -> None
     assert states["terminal-fixture"] == "denied"
     assert states["execution-fixture"] == "succeeded"
     assert database.integrity_check() == ("ok", ())
+
+
+def test_schema_17_factor_backfill_requires_verified_backup_and_rolls_back_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    monkeypatch.setattr("signet.db.LATEST_SCHEMA_VERSION", 16)
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute("INSERT INTO auth_users(user_id, created_at) VALUES ('owner', 10)")
+        connection.executemany(
+            """
+            INSERT INTO auth_credentials(
+                credential_id, user_id, kind, secret_reference, public_material,
+                enrolled_at, factor_label
+            ) VALUES (?, 'owner', ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    "totp-existing",
+                    "totp",
+                    "keychain://Signet/existing",
+                    None,
+                    10,
+                    "Phone",
+                ),
+                (
+                    "cGFzc2tleS1leGlzdGluZw",
+                    "webauthn",
+                    None,
+                    b"public-material",
+                    11,
+                    "Passkey",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("signet.db.LATEST_SCHEMA_VERSION", 17)
+    backups: list[int] = []
+
+    def fail_postcheck(event: str) -> None:
+        if event == "migration:transaction:postcheck":
+            raise RuntimeError("injected factor migration failure")
+
+    with pytest.raises(RuntimeError, match="injected factor migration failure"):
+        database.initialize(
+            pre_migration_backup=verified_backup_callback(tmp_path / "backups", backups),
+            fault_injector=fail_postcheck,
+        )
+    assert backups == [16]
+    with database.read() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'auth_factors'"
+            ).fetchone()[0]
+            == 0
+        )
+
+    database.initialize(
+        pre_migration_backup=verified_backup_callback(tmp_path / "backups", backups)
+    )
+    assert backups == [16, 16]
+    with database.read() as connection:
+        factors = connection.execute(
+            """
+            SELECT factor_id, credential_id, kind, label, created_audit_ref
+            FROM auth_factors ORDER BY credential_id
+            """
+        ).fetchall()
+        factor_ids = tuple(row["factor_id"] for row in factors)
+        assert len(factors) == 2
+        assert len(set(factor_ids)) == 2
+        assert {row["kind"] for row in factors} == {"totp", "webauthn"}
+        assert all(row["created_audit_ref"] for row in factors)
+        factor_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(auth_factors)")
+        }
+        assert "secret_reference" not in factor_columns
+        assert "public_material" not in factor_columns
+
+    database.initialize()
+    with database.read() as connection:
+        assert (
+            tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT factor_id FROM auth_factors ORDER BY credential_id"
+                )
+            )
+            == factor_ids
+        )

@@ -357,6 +357,41 @@ def test_sqlite_rate_limit_reservations_are_atomic_and_durable(database: Databas
     assert limiter.state("source:success").failures == 0
 
 
+def test_sqlite_rate_limit_reservations_enforce_aggregate_scope_atomically(
+    database: Database,
+) -> None:
+    limiter = SQLiteAttemptLimiter(database, lock_schedule=((2, 60),))
+    first = limiter.reserve(
+        "totp-factor:human:first",
+        additional_scope_keys=("totp:human",),
+        source_key="source:first",
+        now=100,
+    )
+    limiter.record_failure(first, now=100)
+    second = limiter.reserve(
+        "totp-factor:human:second",
+        additional_scope_keys=("totp:human",),
+        source_key="source:second",
+        now=101,
+    )
+    limiter.record_failure(second, now=101)
+
+    restarted = SQLiteAttemptLimiter(Database(database.path), lock_schedule=((2, 60),))
+    with pytest.raises(AuthenticationRateLimited):
+        restarted.reserve(
+            "totp-factor:human:third",
+            additional_scope_keys=("totp:human",),
+            source_key="source:third",
+            now=102,
+        )
+
+    assert restarted.state("totp:human").failures == 2
+    assert restarted.state("totp-factor:human:first").failures == 1
+    assert restarted.state("totp-factor:human:second").failures == 1
+    assert restarted.state("totp-factor:human:third").failures == 0
+    assert restarted.state("source:third").failures == 0
+
+
 def test_sqlite_rate_limiter_bounds_distributed_scope_storage(database: Database) -> None:
     limiter = SQLiteAttemptLimiter(
         database,
@@ -493,6 +528,14 @@ def test_webauthn_login_completion_rotates_session_and_consumes_atomically(
     credential = repository.find_credential(WEB_CREDENTIAL_ID)
     assert stored is not None and stored.consumed_at == 23
     assert credential is not None and credential.sign_count == 8
+    with database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT last_used_at FROM auth_factors WHERE credential_id = ?",
+                (WEB_CREDENTIAL_ID,),
+            ).fetchone()[0]
+            == 23
+        )
 
 
 def test_webauthn_login_fault_rolls_back_every_auth_record(database: Database) -> None:
@@ -692,6 +735,16 @@ def test_totp_login_completion_is_durable_single_use_and_clears_attempts(
         manager.authenticate(old_token, now=24)
     with database.read() as connection:
         assert connection.execute("SELECT count(*) FROM auth_attempts").fetchone()[0] == 0
+        factor_usage = {
+            row["credential_id"]: row["last_used_at"]
+            for row in connection.execute(
+                """
+                SELECT credential_id, last_used_at FROM auth_factors
+                WHERE credential_id IN ('password-main', 'totp-main')
+                """
+            ).fetchall()
+        }
+        assert factor_usage == {"password-main": 23, "totp-main": 23}
 
     candidate = approval_request("login-then-approval-replay", now=24)
     machine = ApprovalStateMachine(database, capabilities=TEST_CAPABILITIES)
@@ -803,6 +856,13 @@ def test_approval_consumption_blocks_same_totp_step_from_login(database: Databas
         actor="human:mcp",
         now=22,
     )
+    with database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT last_used_at FROM auth_factors WHERE credential_id = 'totp-main'"
+            ).fetchone()[0]
+            == 22
+        )
 
     login_proof = totp.verify(
         USER_ID,

@@ -34,6 +34,12 @@ from signet.auth import (
     SQLitePasswordCredentialRepository,
     SQLiteSessionRepository,
 )
+from signet.authenticator_management import (
+    AuthenticatorManager,
+    KeychainTotpSecretProvisioner,
+    TotpSecretProvisioner,
+)
+from signet.browser_auth import BootstrapService, BrowserAuthController
 from signet.config import ProductionConfig
 from signet.credential_broker import (
     KeychainSecretStore,
@@ -73,8 +79,8 @@ from signet.production_state import (
     ProductionStatus,
 )
 from signet.runtime import (
-    LoopbackPeerMiddleware,
     MCPRuntime,
+    TrustedProxySourceMiddleware,
     assemble_mcp_runtime,
     gateway_principal_provider,
 )
@@ -82,6 +88,7 @@ from signet.schema_registry import DurableSchemaRegistry, SchemaRegistryError
 from signet.staging import StagingError, open_confined_readonly, read_verified_descriptor
 from signet.state_machine import ApprovalStateMachine
 from signet.totp import SQLiteTotpCredentialRepository, TotpVerifier
+from signet.totp_enrollment import TotpEnrollmentService
 from signet.web import CsrfManager, WebSettings, create_web_app
 from signet.web_backend import (
     EncryptedPayloadReviewer,
@@ -94,6 +101,10 @@ from signet.webauthn import (
     SQLiteWebAuthnRepository,
     WebAuthnAssertionVerifier,
     WebAuthnChallengeIssuer,
+)
+from signet.webauthn_registration import (
+    OfficialRegistrationProvider,
+    PasskeyRegistrationService,
 )
 
 _REQUIRED_SECRET_PURPOSES = (
@@ -262,6 +273,7 @@ class ProductionAssembly:
     schema_registry: DurableSchemaRegistry
     token_registry: SQLiteTokenRegistry
     provider_clients: Mapping[str, MCPClient]
+    authenticators: AuthenticatorManager
 
     @property
     def policy(self) -> PolicySnapshot:
@@ -378,6 +390,7 @@ def build_production_runtime(
     *,
     secret_store: SecretStore,
     pre_migration_backup: PreMigrationBackup | None = None,
+    totp_provisioner: TotpSecretProvisioner | None = None,
     clock: Callable[[], int] | None = None,
     components: frozenset[str] = frozenset({"mcp", "web"}),
 ) -> ProductionAssembly:
@@ -425,6 +438,12 @@ def build_production_runtime(
         ) from None
 
     capabilities = ProofCapability(secret_values["capability_key_ref"].reveal().encode("utf-8"))
+    selected_totp_provisioner = totp_provisioner or KeychainTotpSecretProvisioner()
+    authenticators = AuthenticatorManager(
+        database,
+        capabilities=capabilities,
+        provisioner=selected_totp_provisioner,
+    )
     payload_cipher = PayloadCipher(
         secret_values["payload_key_ref"],
         secret_references["payload_key_ref"],
@@ -580,6 +599,9 @@ def build_production_runtime(
             config=config,
             secret_values=secret_values,
             capabilities=capabilities,
+            authenticators=authenticators,
+            totp_provisioner=selected_totp_provisioner,
+            secret_store=secret_store,
             limiter=limiter,
             totp=totp,
             approvals=approvals,
@@ -648,6 +670,7 @@ def build_production_runtime(
         schema_registry=schema_registry,
         token_registry=token_registry,
         provider_clients=clients,
+        authenticators=authenticators,
     )
 
 
@@ -665,6 +688,9 @@ def _assemble_production_web(
     config: ProductionConfig,
     secret_values: Mapping[str, Secret],
     capabilities: ProofCapability,
+    authenticators: AuthenticatorManager,
+    totp_provisioner: TotpSecretProvisioner,
+    secret_store: SecretStore,
     limiter: SQLiteAttemptLimiter,
     totp: TotpVerifier,
     approvals: ApprovalStateMachine,
@@ -682,12 +708,41 @@ def _assemble_production_web(
         verifier=Argon2PasswordVerifier(),
     )
     webauthn_repository = SQLiteWebAuthnRepository(database)
-    webauthn_issuer = WebAuthnChallengeIssuer(webauthn_repository, rp_id=config.rp_id)
+    webauthn_issuer = WebAuthnChallengeIssuer(
+        webauthn_repository,
+        rp_id=config.rp_id,
+        origin=config.public_origin,
+    )
     webauthn_verifier = WebAuthnAssertionVerifier(
         webauthn_repository,
         rp_id=config.rp_id,
         origin=config.public_origin,
         capabilities=capabilities,
+    )
+    registrations = PasskeyRegistrationService(
+        database,
+        provider=OfficialRegistrationProvider(),
+        rp_id=config.rp_id,
+        origin=config.public_origin,
+    )
+    totp_enrollments = TotpEnrollmentService(
+        database,
+        provisioner=totp_provisioner,
+        secret_store=secret_store,
+    )
+    browser_auth = BrowserAuthController(
+        bootstrap=BootstrapService(
+            database,
+            owner_user_id=config.owner_user_id,
+            totp_enrollments=totp_enrollments,
+        ),
+        registrations=registrations,
+        manager=authenticators,
+        totp_verifier=totp,
+        webauthn_issuer=webauthn_issuer,
+        webauthn_verifier=webauthn_verifier,
+        webauthn_repository=webauthn_repository,
+        totp_enrollments=totp_enrollments,
     )
     authentication_transactions = SQLiteAuthenticationTransactions(
         database,
@@ -717,8 +772,9 @@ def _assemble_production_web(
             allowed_hosts=config.allowed_hosts,
         ),
         csrf=CsrfManager(secret_values["csrf_secret_ref"].reveal().encode("utf-8")),
+        browser_auth=browser_auth,
     )
-    web.add_middleware(LoopbackPeerMiddleware)
+    web.add_middleware(TrustedProxySourceMiddleware)
     return web
 
 

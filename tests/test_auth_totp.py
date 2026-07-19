@@ -9,6 +9,8 @@ from signet.auth import (
     AuthenticationRateLimited,
     InMemoryAttemptLimiter,
     ProofCapability,
+    source_rate_limit_key,
+    totp_factor_rate_limit_key,
     totp_rate_limit_key,
 )
 from signet.credential_broker import MemorySecretStore, Secret
@@ -209,6 +211,133 @@ def test_totp_verifier_accepts_any_active_factor_and_skips_unavailable_factors()
     )
 
     assert proof.credential_id == "totp-second"
+
+
+def test_selected_totp_factors_share_account_lockout_without_losing_identity() -> None:
+    credentials = (
+        TotpCredential("totp-first", "human", "keychain://Signet/first-totp"),
+        TotpCredential("totp-second", "human", "keychain://Signet/second-totp"),
+    )
+    limiter = InMemoryAttemptLimiter(lock_schedule=((2, 10),))
+    selected = TotpVerifier(
+        TotpRepository({"human": credentials}),
+        MemorySecretStore(
+            {
+                ("Signet", "first-totp"): "first-secret",
+                ("Signet", "second-totp"): "second-secret",
+            }
+        ),
+        limiter,
+        capabilities=TEST_CAPABILITIES,
+        provider=FakeTotpProvider("fake:accepted"),
+        allow_test_provider=True,
+    )
+    binding = ActionBinding("approve", "request-a", 1, HASH_A)
+
+    with pytest.raises(InvalidTotp):
+        selected.verify(
+            "human",
+            "fake:wrong",
+            binding=binding,
+            now=1_000,
+            source_id="source-one",
+            session_id="session-one-long-enough",
+            http_method="POST",
+            credential_id="totp-first",
+        )
+    with pytest.raises(InvalidTotp):
+        selected.verify(
+            "human",
+            "fake:wrong",
+            binding=binding,
+            now=1_001,
+            source_id="source-two",
+            session_id="session-two-long-enough",
+            http_method="POST",
+            credential_id="totp-second",
+        )
+    with pytest.raises(AuthenticationRateLimited):
+        selected.verify(
+            "human",
+            "fake:accepted",
+            binding=binding,
+            now=1_002,
+            source_id="source-three",
+            session_id="session-three-long-enough",
+            http_method="POST",
+            credential_id="totp-first",
+        )
+
+    assert limiter.state(totp_rate_limit_key("human")).failures == 2
+    assert limiter.state(totp_factor_rate_limit_key("human", "totp-first")).failures == 1
+    assert limiter.state(totp_factor_rate_limit_key("human", "totp-second")).failures == 1
+
+
+def test_selected_totp_proof_binds_exact_factor_and_all_reserved_scopes() -> None:
+    credentials = (
+        TotpCredential("totp-first", "human", "keychain://Signet/first-totp"),
+        TotpCredential("totp-second", "human", "keychain://Signet/second-totp"),
+    )
+    limiter = InMemoryAttemptLimiter(lock_schedule=((5, 10),))
+    selected = TotpVerifier(
+        TotpRepository({"human": credentials}),
+        MemorySecretStore(
+            {
+                ("Signet", "first-totp"): "first-secret",
+                ("Signet", "second-totp"): "second-secret",
+            }
+        ),
+        limiter,
+        capabilities=TEST_CAPABILITIES,
+        provider=FakeTotpProvider("fake:accepted"),
+        allow_test_provider=True,
+    )
+
+    proof = selected.verify(
+        "human",
+        "fake:accepted",
+        binding=ActionBinding("approve", "request-a", 1, HASH_A),
+        now=1_000,
+        source_id="source-one",
+        credential_id="totp-second",
+    )
+
+    factor_key = totp_factor_rate_limit_key("human", "totp-second")
+    assert proof.credential_id == "totp-second"
+    assert proof.rate_limit_key == factor_key
+    assert proof.attempt_reservation.scope_keys == (
+        factor_key,
+        totp_rate_limit_key("human"),
+        source_rate_limit_key("source-one"),
+    )
+
+
+def test_unknown_selected_factor_is_rejected_before_rate_scope_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limiter = InMemoryAttemptLimiter()
+    reserve_calls = 0
+    original_reserve = limiter.reserve
+
+    def recording_reserve(*args: object, **kwargs: object):
+        nonlocal reserve_calls
+        reserve_calls += 1
+        return original_reserve(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(limiter, "reserve", recording_reserve)
+    selected = verifier(limiter)
+
+    with pytest.raises(TotpNotEnrolled):
+        selected.verify(
+            "human",
+            "fake:accepted",
+            binding=ActionBinding("approve", "request-a", 1, HASH_A),
+            now=1_000,
+            source_id="source-one",
+            credential_id="attacker-selected-factor",
+        )
+
+    assert reserve_calls == 0
 
 
 def test_production_provider_rejects_non_authenticator_shaped_proof() -> None:

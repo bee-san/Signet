@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 import struct
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 from signet.auth import InvalidSession, SessionPrincipal
+from signet.authenticator_management import FactorMetadata, LastAuthenticatorError
+from signet.browser_auth import BootstrapService, BrowserAuthController
+from signet.db import Database
 from signet.web import (
     ActionOptions,
     AttachmentDownload,
@@ -34,6 +38,8 @@ from signet.web import (
     create_agent_health_app,
     create_web_app,
 )
+from signet.webauthn import SQLiteWebAuthnRepository
+from signet.webauthn_registration import PasskeyRegistrationService, RegistrationResult
 
 NOW = 1_800_000_000
 ORIGIN = "https://signet.test"
@@ -44,6 +50,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @dataclass
 class FakeBackend:
     actions: list[tuple[str, str, str]] = field(default_factory=list)
+    totp_credential_ids: list[str | None] = field(default_factory=list)
     push_endpoints: list[str] = field(default_factory=list)
     conflict: bool = False
     detail_state: str = "pending_approval"
@@ -168,6 +175,8 @@ class FakeBackend:
             payload_hash=HASH,
             detail_blocks=(
                 (
+                    DetailBlock("Sender", "plain_text", "autumn@example.test"),
+                    DetailBlock("Subject", "plain_text", "Tuesday release"),
                     DetailBlock("Message", "plain_text", hostile),
                     DetailBlock(
                         "Recipients",
@@ -439,6 +448,7 @@ class FakeBackend:
         prospective_arguments_json: str | None,
         now: int,
         decision_note: str | None = None,
+        credential_id: str | None = None,
     ) -> str:
         assert principal.user_id == "autumn" and now == NOW
         if self.conflict:
@@ -446,6 +456,7 @@ class FakeBackend:
         assert expected_version == 1 and expected_payload_hash == HASH
         assert prospective_arguments_json is None
         self.actions.append((action, request_id, totp_proof))
+        self.totp_credential_ids.append(credential_id)
         self.decision_notes.append(decision_note)
         return {"approve": "approved", "deny": "denied"}.get(action, action)
 
@@ -513,6 +524,21 @@ class BlockingBackend(FakeBackend):
         )
 
 
+@dataclass
+class AuthenticatorPageBrowserAuth:
+    factors: tuple[FactorMetadata, ...]
+
+    def list_factors(self, user_id: str) -> tuple[FactorMetadata, ...]:
+        assert user_id == "autumn"
+        return self.factors
+
+
+class LastFactorBrowserAuth:
+    def apply_with_webauthn(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise LastAuthenticatorError("internal final-factor guard detail")
+
+
 @pytest.fixture
 def backend() -> FakeBackend:
     return FakeBackend()
@@ -540,6 +566,25 @@ def client(backend: FakeBackend, csrf: CsrfManager) -> TestClient:
 
 def authenticate(client: TestClient) -> None:
     client.cookies.set("__Host-signet_session", "session-good")
+
+
+def browser_auth_client(
+    backend: FakeBackend,
+    csrf: CsrfManager,
+    browser_auth: object,
+) -> TestClient:
+    app = create_web_app(
+        backend,
+        settings=WebSettings(
+            public_origin=ORIGIN,
+            allowed_hosts=("signet.test",),
+            vapid_public_key="fake-public-key",
+        ),
+        csrf=csrf,
+        browser_auth=cast(Any, browser_auth),
+        clock=lambda: NOW,
+    )
+    return TestClient(app, base_url=ORIGIN)
 
 
 def test_agent_listener_has_only_privacy_safe_health() -> None:
@@ -678,6 +723,107 @@ def test_queue_and_detail_require_session_and_ignore_mcp_bearer(client: TestClie
         assert "Viewing on Tuesday" not in response.text
 
 
+def test_expired_browser_session_renders_sign_in_recovery(client: TestClient) -> None:
+    response = client.get("/authenticators", headers={"Accept": "text/html"})
+
+    assert response.status_code == 401
+    assert "Session expired" in response.text
+    assert "Sign in again" in response.text
+    assert 'href="/login"' in response.text
+    assert '"detail":"Unauthorized"' not in response.text
+
+
+def test_stale_authenticator_tab_returns_actionable_json(client: TestClient) -> None:
+    response = client.post(
+        "/authenticators/passkeys/options",
+        json={"label": "Ignored because the session is stale"},
+        headers={"Accept": "application/json", "Origin": ORIGIN},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "error": {
+            "code": "authentication_required",
+            "message": "Your session expired or is no longer valid. Sign in again to continue.",
+        }
+    }
+
+
+def test_authenticator_page_humanizes_metadata_and_explains_lost_device_recovery(
+    backend: FakeBackend,
+    csrf: CsrfManager,
+) -> None:
+    factor = FactorMetadata(
+        factor_id="fac_" + "a" * 20,
+        credential_id="totp-travel-phone",
+        user_id="autumn",
+        kind="totp",
+        label="Travel phone",
+        state="active",
+        created_at=0,
+        updated_at=NOW - 60,
+        last_used_at=None,
+        revoked_at=None,
+        compromised_at=None,
+        created_audit_ref="audit-created",
+        state_audit_ref=None,
+    )
+
+    with browser_auth_client(
+        backend,
+        csrf,
+        AuthenticatorPageBrowserAuth((factor,)),
+    ) as selected_client:
+        authenticate(selected_client)
+        response = selected_client.get("/authenticators")
+
+    assert response.status_code == 200
+    assert "UtcTime(" not in response.text
+    assert '<time datetime="1970-01-01T00:00:00Z">1970-01-01 00:00:00 UTC</time>' in (response.text)
+    assert "Never used" in response.text
+    assert "Lost a device?" in response.text
+    assert "Sign in with another authenticator" in response.text
+    assert "mark the lost one compromised" in response.text
+    assert "contact your Signet operator" in response.text
+
+
+def test_last_authenticator_guard_returns_specific_safe_guidance(
+    backend: FakeBackend,
+    csrf: CsrfManager,
+) -> None:
+    with browser_auth_client(backend, csrf, LastFactorBrowserAuth()) as selected_client:
+        authenticate(selected_client)
+        response = selected_client.post(
+            "/authenticators/confirm/passkey/complete",
+            json={
+                "action": "revoke",
+                "operation_id": "operation-last-factor-001",
+                "factor_id": "fac_" + "a" * 20,
+                "compromised": False,
+                "challenge_id": "challenge-last-factor",
+                "assertion": {},
+            },
+            headers={
+                "Origin": ORIGIN,
+                "Accept": "application/json",
+                "X-CSRF-Token": csrf.session_token("session-id", "authenticators"),
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "authenticator_request_failed",
+            "message": (
+                "Signet kept this authenticator active because it is the final active "
+                "authenticator—the last active sign-in method for this account. Add another "
+                "authenticator before revoking it."
+            ),
+        }
+    }
+    assert "internal final-factor guard detail" not in response.text
+
+
 def test_authenticated_queue_has_security_headers_and_no_sensitive_title(
     client: TestClient,
 ) -> None:
@@ -762,6 +908,13 @@ def test_expanded_review_fragment_contains_complete_bound_context(client: TestCl
     assert '<time datetime="2027-01-15T08:10:00Z">2027-01-15 08:10:00 UTC</time>' in response.text
     assert '<script src="https://evil.test' not in response.text
     assert "&lt;script" in response.text
+    action_band = response.text.split('<section class="action-band"', 1)[1].split("</section>", 1)[
+        0
+    ]
+    assert "autumn@example.test" in action_band
+    assert "person@example.test" in action_band
+    assert "Tuesday release" in action_band
+    assert "&lt;script" in action_band
 
 
 def test_review_fragment_renders_all_distinct_confirmation_proofs(
@@ -1095,6 +1248,7 @@ def test_valid_totp_action_and_stale_conflict_are_explicit(
         "expected_version": "1",
         "expected_payload_hash": HASH,
         "totp_proof": "fake:proof",
+        "totp_credential_id": "totp-travel",
         "decision_note": "exact_request_approved",
         "csrf_token": csrf.session_token("session-id", "request:req_test"),
     }
@@ -1107,6 +1261,7 @@ def test_valid_totp_action_and_stale_conflict_are_explicit(
     assert response.status_code == 303
     assert response.headers["location"] == "/audit#decision-req_test"
     assert backend.actions == [("approve", "req_test", "fake:proof")]
+    assert backend.totp_credential_ids == ["totp-travel"]
     assert backend.decision_notes == ["exact_request_approved"]
 
     backend.conflict = True
@@ -1530,6 +1685,7 @@ def test_insecure_cookies_are_available_only_on_named_loopback_http(
             allowed_hosts=("127.0.0.1", "localhost"),
             session_cookie="signet_demo_session",
             login_csrf_cookie="signet_demo_login_csrf",
+            bootstrap_cookie="signet_demo_bootstrap_claim",
             secure_cookies=False,
             fake_only_ui=True,
         ),
@@ -1694,3 +1850,178 @@ def test_csrf_repr_redacts_key() -> None:
     assert manager.verify_session("session", "action", token)
     assert not manager.verify_session("session", "other", token)
     assert re.fullmatch(r"c1\.[a-f0-9]{64}", token)
+
+
+class _SetupRegistrationProvider:
+    test_only = True
+
+    def verify(
+        self,
+        credential: Mapping[str, Any],
+        *,
+        expected_challenge: bytes,
+        expected_rp_id: str,
+        expected_origin: str,
+    ) -> RegistrationResult:
+        assert credential["challenge"] == expected_challenge.hex()
+        assert expected_rp_id == "signet.test"
+        assert expected_origin == ORIGIN
+        return RegistrationResult(
+            credential_id=base64.urlsafe_b64encode(b"setup-passkey").rstrip(b"=").decode(),
+            public_key=b"public-key",
+            sign_count=0,
+            device_type="multi_device",
+            backed_up=True,
+            transports=("internal",),
+            discoverable=True,
+        )
+
+
+def test_initial_owner_setup_is_browser_only_resumable_and_one_time(
+    tmp_path: Path,
+    backend: FakeBackend,
+    csrf: CsrfManager,
+) -> None:
+    database = Database(tmp_path / "setup-web.db")
+    database.initialize()
+    bootstrap = BootstrapService(database, owner_user_id="user:owner")
+    registrations = PasskeyRegistrationService(
+        database,
+        provider=_SetupRegistrationProvider(),
+        rp_id="signet.test",
+        origin=ORIGIN,
+        allow_test_provider=True,
+    )
+    unused = cast(Any, object())
+    webauthn_repository = SQLiteWebAuthnRepository(database)
+    browser_auth = BrowserAuthController(
+        bootstrap=bootstrap,
+        registrations=registrations,
+        manager=unused,
+        totp_verifier=unused,
+        webauthn_issuer=unused,
+        webauthn_verifier=unused,
+        webauthn_repository=webauthn_repository,
+    )
+    app = create_web_app(
+        backend,
+        settings=WebSettings(public_origin=ORIGIN, allowed_hosts=("signet.test",)),
+        csrf=csrf,
+        browser_auth=browser_auth,
+        clock=lambda: NOW,
+    )
+    capability = bootstrap.issue_capability(now=NOW, lifetime=600)
+
+    with TestClient(app, base_url=ORIGIN) as setup_client:
+        login = setup_client.get("/login", follow_redirects=False)
+        assert login.status_code == 303
+        assert login.headers["location"] == "/setup"
+
+        page = setup_client.get("/setup")
+        token = setup_client.cookies.get("__Host-signet_login_csrf")
+        assert page.status_code == 200 and token
+        assert "Set up Signet" in page.text
+        assert "Setup is locked" in page.text
+        assert "Create your password" not in page.text
+
+        unclaimed_options = setup_client.post(
+            "/setup/passkeys/options",
+            json={"label": "Mac passkey"},
+            headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+        )
+        assert unclaimed_options.status_code == 400
+        with database.read() as connection:
+            assert (
+                connection.execute("SELECT count(*) FROM auth_registration_challenges").fetchone()[
+                    0
+                ]
+                == 0
+            )
+
+        claimed = setup_client.post(
+            "/setup/claim",
+            data={"capability": capability, "csrf_token": token},
+            headers={"Origin": ORIGIN},
+            follow_redirects=False,
+        )
+        assert claimed.status_code == 303
+        assert setup_client.cookies.get("__Host-signet_bootstrap_claim")
+
+        page = setup_client.get("/setup")
+        token = setup_client.cookies.get("__Host-signet_login_csrf")
+        assert page.status_code == 200 and token
+        assert "Create your password" in page.text
+        assert "Add an authenticator" in page.text
+
+        wrong_origin = setup_client.post(
+            "/setup/password",
+            data={
+                "password": "correct horse battery staple",
+                "password_confirmation": "correct horse battery staple",
+                "csrf_token": token,
+            },
+            headers={"Origin": "https://attacker.test"},
+        )
+        assert wrong_origin.status_code == 403
+
+        password = setup_client.post(
+            "/setup/password",
+            data={
+                "password": "correct horse battery staple",
+                "password_confirmation": "correct horse battery staple",
+                "csrf_token": token,
+            },
+            headers={"Origin": ORIGIN},
+            follow_redirects=False,
+        )
+        assert password.status_code == 303
+
+        too_early = setup_client.post(
+            "/setup/complete",
+            data={"csrf_token": token},
+            headers={"Origin": ORIGIN},
+        )
+        assert too_early.status_code == 400
+
+        options = setup_client.post(
+            "/setup/passkeys/options",
+            json={"label": "Mac passkey"},
+            headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+        )
+        assert options.status_code == 200
+        body = options.json()
+        assert body["publicKey"]["rp"]["id"] == "signet.test"
+        encoded_challenge = str(body["publicKey"]["challenge"])
+        challenge = base64.urlsafe_b64decode(
+            encoded_challenge + "=" * (-len(encoded_challenge) % 4)
+        )
+
+        completed = setup_client.post(
+            "/setup/passkeys/complete",
+            json={
+                "challenge_id": body["challenge_id"],
+                "credential": {"id": "test", "challenge": challenge.hex()},
+            },
+            headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+        )
+        assert completed.status_code == 200
+
+        finished = setup_client.post(
+            "/setup/complete",
+            data={"csrf_token": token},
+            headers={"Origin": ORIGIN},
+            follow_redirects=False,
+        )
+        assert finished.status_code == 303
+        assert finished.headers["location"] == "/login?setup=complete"
+
+        login_after_setup = setup_client.get("/login")
+        replay_token = setup_client.cookies.get("__Host-signet_login_csrf")
+        assert login_after_setup.status_code == 200 and replay_token
+        replay = setup_client.post(
+            "/setup/complete",
+            data={"csrf_token": replay_token},
+            headers={"Origin": ORIGIN},
+        )
+        assert replay.status_code == 409
+        assert "correct horse" not in replay.text

@@ -42,7 +42,10 @@ from tests.attachment_fixtures import (
     FAKE_ATTACHMENT_KEY_REF,
     attachment_cipher,
 )
-from tests.migration_helpers import downgrade_auth_credentials_before_schema_16
+from tests.migration_helpers import (
+    downgrade_auth_credentials_before_schema_16,
+    downgrade_auth_credentials_before_schema_17,
+)
 
 PAYLOAD_KEY_REF = "keychain://Signet/payload-backupfixture"
 
@@ -166,6 +169,11 @@ def _rewrite_encrypted_archive(
 
 def _downgrade_catalog_to_schema_12(database: Database) -> None:
     with database.transaction() as connection:
+        connection.execute("DROP TABLE browser_enrollment_authorizations")
+        connection.execute("DROP TABLE auth_factor_challenges")
+        connection.execute("DROP TABLE auth_factor_events")
+        connection.execute("DROP TABLE auth_factors")
+        downgrade_auth_credentials_before_schema_17(connection)
         downgrade_auth_credentials_before_schema_16(connection)
         connection.execute("DROP TABLE attachment_metadata_privacy_maintenance")
         connection.execute("DROP TRIGGER IF EXISTS request_events_structured_reason_insert")
@@ -205,6 +213,9 @@ def _downgrade_catalog_to_schema_12(database: Database) -> None:
             END
             """
         )
+        connection.execute("DROP TABLE browser_totp_enrollments")
+        connection.execute("DROP TABLE auth_registration_challenges")
+        connection.execute("DROP TABLE browser_bootstrap_state")
         connection.execute("DROP TABLE connector_effect_review_drafts")
         connection.execute("DROP TABLE connector_effect_review_challenges")
         connection.execute("DROP TABLE connector_effect_reviews")
@@ -223,7 +234,7 @@ def _downgrade_catalog_to_schema_12(database: Database) -> None:
         connection.execute("DROP TABLE production_users")
         connection.execute("DROP TABLE production_setup_state")
         connection.execute("DROP TABLE privacy_maintenance")
-        connection.execute("DELETE FROM schema_meta WHERE migration_id IN (13, 14, 15, 16)")
+        connection.execute("DELETE FROM schema_meta WHERE migration_id > 12")
         connection.execute("PRAGMA user_version = 12")
 
 

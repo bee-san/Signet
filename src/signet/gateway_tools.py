@@ -695,6 +695,8 @@ class GatewayTools:
             rate_limit_key=proof.rate_limit_key,
             credential_id=proof.credential_id,
             credential_user_id=proof.user_id,
+            verified_at=proof.verified_at,
+            expires_at=proof.expires_at,
         )
         try:
             await _run_sync(

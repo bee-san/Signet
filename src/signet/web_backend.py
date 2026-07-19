@@ -1836,6 +1836,7 @@ class WebBackend:
         prospective_arguments_json: str | None,
         now: int,
         decision_note: str | None = None,
+        credential_id: str | None = None,
     ) -> str:
         self._require_ui_principal(principal)
         request = self._require_pending_revision(
@@ -1900,6 +1901,7 @@ class WebBackend:
                 session_id=principal.session_id,
                 http_method="POST",
                 now=now,
+                credential_id=credential_id,
             )
             confirmation = _totp_confirmation(proof)
             if policy_change:
@@ -2636,6 +2638,8 @@ def _totp_confirmation(proof: VerifiedTotp) -> ApprovalConfirmation:
         rate_limit_key=proof.rate_limit_key,
         credential_id=proof.credential_id,
         credential_user_id=proof.user_id,
+        verified_at=proof.verified_at,
+        expires_at=proof.expires_at,
     )
 
 
@@ -2664,6 +2668,8 @@ def _webauthn_confirmation(proof: VerifiedWebAuthn) -> ApprovalConfirmation:
         new_backup_eligible=proof.new_backup_eligible,
         previous_backed_up=proof.previous_backed_up,
         new_backed_up=proof.new_backed_up,
+        verified_at=proof.verified_at,
+        expires_at=proof.expires_at,
     )
 
 

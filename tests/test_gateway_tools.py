@@ -278,6 +278,25 @@ def machine(tmp_path: Path) -> ApprovalStateMachine:
             """,
             (NOW,),
         )
+        connection.execute(
+            """
+            INSERT INTO auth_users(user_id, created_at)
+            VALUES ('human:one', ?) ON CONFLICT DO NOTHING
+            """,
+            (NOW,),
+        )
+        connection.execute(
+            """
+            INSERT INTO auth_factors(
+                factor_id, credential_id, user_id, kind, label,
+                state, created_at, updated_at, created_audit_ref
+            ) VALUES (
+                'fac_gateway-test-credential', 'fake:credential', 'human:one', 'totp',
+                'Gateway test TOTP', 'active', ?, ?, 'fixture:gateway-test'
+            )
+            """,
+            (NOW, NOW),
+        )
     return ApprovalStateMachine(
         database,
         capabilities=TEST_CAPABILITIES,

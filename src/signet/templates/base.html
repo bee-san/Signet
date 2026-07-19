@@ -4,11 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#123b2d">
-  <title>Signet</title>
+  <title>{% block title %}Signet{% endblock %}</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/static/icons/signet-1254.png" type="image/png">
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/app.js" defer></script>
+  {% block head %}{% endblock %}
+  {% block scripts %}{% endblock %}
 </head>
 <body data-vapid-public-key="{{ vapid_public_key|default('') }}">
   <header class="app-header">
@@ -20,6 +22,7 @@
     <nav aria-label="Primary">
       <a class="primary-queue-link" href="/">Queue</a>
       {% if integrations_available %}<a class="primary-integrations-link" href="/integrations">Integrations</a>{% endif %}
+      {% if authenticator_management_available %}<a class="primary-authenticators-link" href="/authenticators">Authenticators</a>{% endif %}
       <a class="primary-audit-link" href="/audit">Audit</a>
       <form action="/logout" method="post">
         <input type="hidden" name="csrf_token" value="{{ logout_csrf }}">

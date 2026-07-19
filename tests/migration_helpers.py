@@ -7,6 +7,13 @@ from typing import Any
 from signet.db import Database, MigrationBackupReceipt, PreMigrationBackup
 
 
+def downgrade_auth_credentials_before_schema_17(connection: Any) -> None:
+    """Restore the auth-credential shape owned by migration 17."""
+
+    connection.execute("ALTER TABLE auth_credentials DROP COLUMN transports_json")
+    connection.execute("ALTER TABLE auth_credentials DROP COLUMN discoverable")
+
+
 def downgrade_auth_credentials_before_schema_16(connection: Any) -> None:
     """Restore the auth-credential shape owned by migration 16."""
 

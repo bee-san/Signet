@@ -235,7 +235,8 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
     status = assembly.status()
 
-    assert status.schema_version == 16
+    assert status.schema_version == 19
+    assert assembly.authenticators.list_factors(config.owner_user_id) == ()
     assert status.setup_status == "staged"
     assert status.ready is False
     assert status.missing_prerequisites == (
@@ -599,6 +600,7 @@ def test_environment_factories_require_the_configured_listener_endpoint(
             "port": port,
             "server_header": False,
             "limit_concurrency": 64,
+            "proxy_headers": False,
         }
     ]
 

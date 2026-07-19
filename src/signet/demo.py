@@ -1046,6 +1046,7 @@ def build_demo(
             allowed_hosts=("127.0.0.1",),
             session_cookie="signet_demo_session",
             login_csrf_cookie="signet_demo_login_csrf",
+            bootstrap_cookie="signet_demo_bootstrap_claim",
             secure_cookies=False,
             fake_only_ui=True,
         ),

@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Set up Signet{% endblock %}
+{% block head %}<meta name="csrf-token" content="{{ login_csrf }}">{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='authenticators.js') }}" defer></script>{% endblock %}
+{% block content %}
+<section class="panel setup-panel" aria-labelledby="setup-title">
+  <p class="eyebrow">Private owner setup</p>
+  <h1 id="setup-title">Set up Signet</h1>
+  {% if not setup.claimed %}
+  <p>Setup is locked. On the Signet host, issue a one-time bootstrap capability and paste it below before it expires.</p>
+  <form action="/setup/claim" method="post" class="stack-form">
+    <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
+    <label for="bootstrap-capability">One-time bootstrap capability</label>
+    <input id="bootstrap-capability" name="capability" type="password" autocomplete="off" minlength="32" maxlength="384" required>
+    <button class="button button-primary" type="submit">Unlock owner setup</button>
+  </form>
+  {% else %}
+  <p>This one-time flow stays at this exact HTTPS address. It can be resumed after a reload or restart until you finish.</p>
+
+  <ol class="setup-progress" aria-label="Setup progress">
+    <li{% if setup.has_password %} class="complete"{% endif %}>Create password</li>
+    <li{% if setup.has_authenticator %} class="complete"{% endif %}>Add authenticator</li>
+    <li>Review and finish</li>
+  </ol>
+
+  <section aria-labelledby="password-title">
+    <h2 id="password-title">1. Create your password</h2>
+    {% if setup.has_password %}
+      <p role="status">Password saved. You can replace it before finishing setup.</p>
+    {% endif %}
+    <form action="/setup/password" method="post" class="stack-form">
+      <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
+      <label for="setup-password">Password</label>
+      <input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required>
+      <label for="setup-password-confirmation">Confirm password</label>
+      <input id="setup-password-confirmation" name="password_confirmation" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required>
+      <p class="field-help">Use at least 12 characters. Signet never displays or returns this password.</p>
+      <button class="button" type="submit">{% if setup.has_password %}Replace password{% else %}Save password{% endif %}</button>
+    </form>
+  </section>
+
+  <section id="passkey" aria-labelledby="passkey-title">
+    <h2 id="passkey-title">2. Add an authenticator</h2>
+    <p>A passkey or TOTP authenticator is required in addition to your password. This browser flow requires user verification.</p>
+    {% if setup.factor_labels %}
+      <p role="status">Added: {{ setup.factor_labels|join(", ") }}</p>
+    {% endif %}
+    <form data-setup-passkey class="stack-form">
+      <label for="setup-passkey-label">Passkey name</label>
+      <input id="setup-passkey-label" name="label" maxlength="64" value="Primary passkey" required>
+      <button class="button" type="submit">Create passkey</button>
+    </form>
+  </section>
+
+  <section aria-labelledby="setup-totp-title">
+    <h3 id="setup-totp-title">Or add TOTP</h3>
+    <p>Use an authenticator app if a passkey is not available. The setup key is shown only during this enrollment.</p>
+    <form data-totp-start data-flow="setup" class="stack-form">
+      <label for="setup-totp-label">TOTP name</label>
+      <input id="setup-totp-label" name="label" maxlength="64" value="Authenticator app" required>
+      <button class="button" type="submit">Set up TOTP</button>
+    </form>
+    <div data-totp-enrollment hidden>
+      <p>Scan this QR code with your authenticator app:</p>
+      <img data-totp-qr class="totp-qr" alt="TOTP enrollment QR code" hidden>
+      <p>Or add an account with this manual key:</p>
+      <output data-totp-key class="manual-key" aria-label="TOTP manual setup key"></output>
+      <form data-totp-verify data-flow="setup" class="stack-form">
+        <label for="setup-totp-proof">6-digit code</label>
+        <input id="setup-totp-proof" name="proof" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
+        <button class="button" type="submit">Verify and add TOTP</button>
+      </form>
+    </div>
+  </section>
+
+  <p data-auth-status role="status" aria-live="polite"></p>
+
+  <section id="review" aria-labelledby="review-title">
+    <h2 id="review-title">3. Review and finish</h2>
+    <dl>
+      <dt>Password</dt><dd>{{ "Ready" if setup.has_password else "Required" }}</dd>
+      <dt>Passkey or TOTP</dt><dd>{{ "Ready" if setup.has_authenticator else "Required" }}</dd>
+    </dl>
+    <p>Finishing is one-time. Stale tabs cannot reopen or replay this setup.</p>
+    <form action="/setup/complete" method="post">
+      <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
+      <button class="button button-primary" type="submit"{% if not setup.can_complete %} disabled aria-describedby="setup-requirements"{% endif %}>Finish setup</button>
+      {% if not setup.can_complete %}<p id="setup-requirements">Save a password and add a passkey or TOTP authenticator before finishing.</p>{% endif %}
+    </form>
+  </section>
+  {% endif %}
+</section>
+{% endblock %}
