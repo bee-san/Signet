@@ -2006,6 +2006,14 @@ def test_initial_owner_setup_is_browser_only_resumable_and_one_time(
         )
         assert completed.status_code == 200
 
+        resumed_completed = setup_client.post(
+            "/setup/passkeys/resume",
+            json={"challenge_id": body["challenge_id"]},
+            headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+        )
+        assert resumed_completed.status_code == 200
+        assert resumed_completed.json() == {"kind": "passkey", "status": "registered"}
+
         finished = setup_client.post(
             "/setup/complete",
             data={"csrf_token": token},

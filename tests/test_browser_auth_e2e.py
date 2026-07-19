@@ -739,6 +739,41 @@ def test_setup_totp_resume_handle_survives_retryable_rate_limit(tmp_path: Path) 
             browser.close()
 
 
+def test_setup_totp_resume_treats_verified_response_loss_as_success(tmp_path: Path) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            start = page.locator('[data-totp-start][data-flow="setup"]')
+            start.locator('input[name="label"]').fill("Response-loss TOTP")
+            start.get_by_role("button", name="Set up TOTP").click()
+            key = _totp_key(page)
+
+            def drop_completed_response(route: Any) -> None:
+                assert route.fetch().ok
+                route.abort()
+
+            page.route("**/setup/totp/verify", drop_completed_response)
+            page.locator('[data-totp-enrollment] input[name="proof"]').fill(pyotp.TOTP(key).at(NOW))
+            page.locator("[data-totp-enrollment] button").click()
+
+            expect(page.locator("[data-auth-status]")).to_contain_text("Failed to fetch")
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')")
+
+            page.unroute("**/setup/totp/verify")
+            page.reload()
+            expect(page.locator("[data-auth-status]")).to_contain_text("Setup TOTP already added")
+            expect(page.get_by_text("Added: Response-loss TOTP")).to_be_visible()
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')") is None
+        finally:
+            context.close()
+            browser.close()
+
+
 def test_setup_passkey_ceremony_resumes_after_reload(
     tmp_path: Path,
 ) -> None:
@@ -765,6 +800,40 @@ def test_setup_passkey_ceremony_resumes_after_reload(
             page.reload()
 
             expect(page.get_by_text("Added: Reload-safe passkey")).to_be_visible()
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')") is None
+        finally:
+            context.close()
+            browser.close()
+
+
+def test_setup_passkey_resume_treats_verified_response_loss_as_success(tmp_path: Path) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        context.add_init_script(WEBAUTHN_STUB)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup")
+            page.get_by_label("One-time bootstrap capability").fill(live.bootstrap_capability)
+            page.get_by_role("button", name="Unlock owner setup").click()
+            page.get_by_label("Passkey name").fill("Response-loss passkey")
+
+            def drop_completed_response(route: Any) -> None:
+                assert route.fetch().ok
+                route.abort()
+
+            page.route("**/setup/passkeys/complete", drop_completed_response)
+            page.get_by_role("button", name="Create passkey").click()
+
+            expect(page.locator("[data-auth-status]")).to_contain_text("Failed to fetch")
+            assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')")
+
+            page.unroute("**/setup/passkeys/complete")
+            page.reload()
+            expect(page.locator("[data-auth-status]")).to_contain_text(
+                "Setup passkey already added"
+            )
+            expect(page.get_by_text("Added: Response-loss passkey")).to_be_visible()
             assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')") is None
         finally:
             context.close()

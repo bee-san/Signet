@@ -552,7 +552,12 @@ def test_passkey_registration_resumes_after_restart_only_for_bound_session(
         now=101,
     )
 
-    assert json.loads(resumed.options_json) == original_options
+    resumed_options = json.loads(resumed.options_json)
+    assert original_options["timeout"] == 120_000
+    assert resumed_options["timeout"] == 119_000
+    assert {key: value for key, value in resumed_options.items() if key != "timeout"} == {
+        key: value for key, value in original_options.items() if key != "timeout"
+    }
     assert resumed.challenge_id == issued.challenge_id
     with pytest.raises(InvalidRegistrationChallenge):
         restarted.resume(

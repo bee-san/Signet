@@ -1298,14 +1298,25 @@ def create_web_app(
         if not isinstance(challenge_id, str):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         selected_auth = required_browser_auth()
-        issued = await run_in_threadpool(
-            selected_auth.resume_registration,
-            challenge_id,
-            user_id=selected_auth.bootstrap.owner_user_id,
-            session_id=None,
-            claimant_token=request.cookies.get(settings.bootstrap_cookie),
-            now=now_fn(),
-        )
+        try:
+            issued = await run_in_threadpool(
+                selected_auth.resume_registration,
+                challenge_id,
+                user_id=selected_auth.bootstrap.owner_user_id,
+                session_id=None,
+                claimant_token=request.cookies.get(settings.bootstrap_cookie),
+                now=now_fn(),
+            )
+        except PasskeyRegistrationError:
+            await run_in_threadpool(
+                selected_auth.pending_registration,
+                challenge_id,
+                user_id=selected_auth.bootstrap.owner_user_id,
+                session_id=None,
+                claimant_token=request.cookies.get(settings.bootstrap_cookie),
+                now=now_fn(),
+            )
+            return {"kind": "passkey", "status": "registered"}
         return {
             "kind": "passkey",
             "challenge_id": issued.challenge_id,
@@ -1402,14 +1413,25 @@ def create_web_app(
         if not isinstance(enrollment_id, str):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         selected_auth = required_browser_auth()
-        issued = await run_in_threadpool(
-            selected_auth.resume_totp_enrollment,
-            enrollment_id,
-            user_id=selected_auth.bootstrap.owner_user_id,
-            session_id=None,
-            claimant_token=request.cookies.get(settings.bootstrap_cookie),
-            now=now_fn(),
-        )
+        try:
+            issued = await run_in_threadpool(
+                selected_auth.resume_totp_enrollment,
+                enrollment_id,
+                user_id=selected_auth.bootstrap.owner_user_id,
+                session_id=None,
+                claimant_token=request.cookies.get(settings.bootstrap_cookie),
+                now=now_fn(),
+            )
+        except TotpEnrollmentError:
+            await run_in_threadpool(
+                selected_auth.pending_totp_enrollment,
+                enrollment_id,
+                user_id=selected_auth.bootstrap.owner_user_id,
+                session_id=None,
+                claimant_token=request.cookies.get(settings.bootstrap_cookie),
+                now=now_fn(),
+            )
+            return {"kind": "totp", "status": "registered"}
         return enrollment_response(issued)
 
     @app.post("/setup/complete")

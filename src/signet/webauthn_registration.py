@@ -427,7 +427,7 @@ class PasskeyRegistrationService:
         ):
             raise RegistrationRateLimited("too many active passkey registrations")
         try:
-            return self._issued(challenge, existing_credential_ids)
+            return self._issued(challenge, existing_credential_ids, now=now)
         except ValueError:
             self.repository.invalidate(challenge_id, now=now)
             raise InvalidRegistrationChallenge("stored passkey credential ID is invalid") from None
@@ -455,7 +455,7 @@ class PasskeyRegistrationService:
         ):
             raise InvalidRegistrationChallenge("passkey registration is stale or unavailable")
         try:
-            return self._issued(challenge, existing_credential_ids)
+            return self._issued(challenge, existing_credential_ids, now=now)
         except ValueError:
             self.repository.invalidate(challenge_id, now=now)
             raise InvalidRegistrationChallenge("stored passkey credential ID is invalid") from None
@@ -464,6 +464,8 @@ class PasskeyRegistrationService:
         self,
         challenge: RegistrationChallenge,
         existing_credential_ids: tuple[str, ...],
+        *,
+        now: int,
     ) -> IssuedRegistration:
         excluded = [
             PublicKeyCredentialDescriptor(id=_base64url_decode(identifier))
@@ -476,7 +478,7 @@ class PasskeyRegistrationService:
             user_display_name=challenge.user_id,
             user_id=_user_handle(challenge.user_id),
             challenge=challenge.challenge,
-            timeout=self.lifetime * 1_000,
+            timeout=(challenge.expires_at - now) * 1_000,
             exclude_credentials=excluded,
             authenticator_selection=AuthenticatorSelectionCriteria(
                 resident_key=ResidentKeyRequirement.REQUIRED,

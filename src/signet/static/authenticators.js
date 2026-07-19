@@ -333,6 +333,11 @@
       }
       try {
         const issued = await post("/setup/passkeys/resume", {challenge_id: state.challenge_id});
+        if (issued.status === "registered") {
+          clearSetupCeremony();
+          announce("Setup passkey already added.");
+          return;
+        }
         announce("Passkey setup resumed. Waiting for your browser.");
         await completeSetupPasskey(issued);
         clearSetupCeremony();
@@ -353,6 +358,11 @@
     }
     try {
       const issued = await post("/setup/totp/resume", {enrollment_id: state.enrollment_id});
+      if (issued.status === "registered") {
+        clearSetupCeremony();
+        announce("Setup TOTP already added.");
+        return;
+      }
       showTotpEnrollment(form, issued);
       announce("TOTP setup resumed. Enter the current code from the new authenticator.");
     } catch (error) {
