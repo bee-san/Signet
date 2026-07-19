@@ -1,8 +1,11 @@
-# Authenticator management backend
+# Authenticator management
 
 Signet schema 17 supports more than one active password, TOTP credential, or
-WebAuthn/passkey per account. Authenticator management is a backend boundary;
-this change does not add browser UI or enroll a real device.
+WebAuthn/passkey per account. Schemas 18 and 19 add browser bootstrap and
+authenticator-management ceremonies without weakening the backend proof boundary.
+The browser routes can enroll a real device only when a deployment deliberately
+wires and exposes the authenticated web application; tests and the disabled staging
+assembly use fake credentials and providers.
 
 ## Records and safe metadata
 
@@ -23,9 +26,11 @@ TOTP generation and storage is behind `TotpSecretProvisioner`:
   stores it in the OS keychain. It returns only a `keychain://` reference.
 - `delete(reference)` is used for best-effort cleanup when a database mutation
   rolls back.
-- The manager never receives or returns the seed. Provisioning UI must use a
-  separate one-time display boundary if one is added later; do not add seed
-  fields to `FactorMetadata` or logs.
+- The manager never receives or returns the seed. `TotpEnrollmentService` is the
+  separate one-time browser display boundary: it returns the QR/manual key only to
+  the claimed bootstrap browser or after fresh management authorization. The UI
+  removes those values immediately after verification. Do not add seed fields to
+  `FactorMetadata`, logs, screenshots, or accessibility artifacts.
 
 ## Mutation API
 
@@ -42,6 +47,30 @@ The backend exposes these guarded operations:
 
 Password records are visible in the safe factor catalogue, but rename and revoke
 remain behind the dedicated password-management boundary rather than this API.
+
+## Browser ceremonies
+
+Initial owner setup remains inaccessible until the operator issues a short-lived,
+one-use setup capability locally and one browser claims it. Password and
+authenticator material is staged for that claimant; publication and bootstrap
+completion share one database transaction. Existing valid owner credentials cause
+startup to reconcile setup as complete rather than reopen enrollment.
+
+An authenticated session and CSRF token are not sufficient to add an authenticator.
+Before Signet invokes a WebAuthn registration provider or provisions a TOTP secret,
+an active existing TOTP or passkey must freshly authorize the exact enrollment kind,
+label, operation, user, and session. The resulting enrollment authorization is
+short-lived and one-use. Finalization publishes the new credential, consumes that
+authorization, records the audit event, and revokes existing sessions in one
+database transaction. Failed authorization therefore creates no registration
+challenge or TOTP secret.
+
+Pending browser challenges and TOTP enrollments are durable and can resume only in
+their bound claimant or authenticated session until expiry. Verification clears
+TOTP QR/manual-key values from the page. Expiry invalidates pending TOTP enrollments
+and deletes their provisioned secrets. If cleanup after expiry or another failed
+enrollment cannot be verified, Signet records cleanup debt and fails closed instead
+of silently abandoning credential material.
 
 Use the corresponding `binding_for_*` method before verification. The returned
 `ActionBinding` includes an opaque operation ID and a SHA-256 digest of the
@@ -80,8 +109,9 @@ owner. Concurrent removals serialize under `BEGIN IMMEDIATE`, so two valid
 requests cannot both pass the final-factor check.
 
 Do not enable any recovery flag as a convenience. `allow_bootstrap_without_factor`
-is an operator-controlled break-glass path and must be paired with an external
-identity-recovery procedure. `allow_last_factor_revocation` and
+is an operator-controlled backend break-glass path, is not exposed by the browser
+routes, and must be paired with an external identity-recovery procedure.
+`allow_last_factor_revocation` and
 `allow_last_admin_factor_revocation` are separate explicit policy decisions;
 the administrator guard still applies unless both relevant flags are enabled.
 
@@ -90,12 +120,16 @@ lost factor `revoked` or `compromised`. Public listing should exclude inactive
 factors by passing `include_inactive=False`, but audit and operator views may
 retain them.
 
-## Schema 17 upgrade and rollback
+## Schema 17–19 upgrade and rollback
 
 Schema 17 creates `auth_factors`, `auth_factor_events`, and
 `auth_factor_challenges`, then backfills one stable factor record and migration
 audit event for every existing credential. No seed or WebAuthn public material
-is copied into the safe metadata table.
+is copied into the safe metadata table. Schema 18 adds durable browser setup,
+registration, and TOTP-enrollment state. Schema 19 adds one-use setup claims,
+staged bootstrap publication, fresh enrollment authorizations, and verified TOTP
+cleanup tracking. An upgrade with one unambiguous already configured owner
+reconciles setup as complete; it does not issue or claim a setup capability.
 
 Upgrading an existing database follows the normal Signet migration contract:
 
@@ -103,17 +137,17 @@ Upgrading an existing database follows the normal Signet migration contract:
 2. Run the pre-migration backup callback. The callback must return a
    `MigrationBackupReceipt` whose artifact SHA-256 and restored schema version
    have both been verified.
-3. Run `Database.initialize(...)`. Schema changes, backfill, migration checksum,
-   and `PRAGMA user_version = 17` commit atomically with `synchronous=FULL`.
+3. Run `Database.initialize(...)`. Schema changes, backfill, migration checksums,
+   and `PRAGMA user_version = 19` commit atomically with `synchronous=FULL`.
 4. Verify `Database.integrity_check()` and confirm every `auth_credentials` row
    has exactly one `auth_factors` row.
 5. Restart application processes only after verification succeeds.
 
-If migration or post-check fails, SQLite rolls the schema transaction back to
-version 16 and Signet does not start against a partial schema. To roll back
+If migration or post-check fails, SQLite rolls the schema transaction back to the
+pre-upgrade version and Signet does not start against a partial schema. To roll back
 after a successful migration, stop all writers and restore the verified
-pre-migration artifact; do not delete schema-17 rows or edit `schema_meta` by
-hand. Verify the restored database reports schema 16 and passes integrity
+pre-migration artifact; do not delete schema rows or edit `schema_meta` by hand.
+Verify the restored database reports its prior schema and passes integrity
 checks before starting the old binary. TOTP seed material remains in the
 keychain and is not part of the SQLite backup, so preserve the existing
 keychain backup/recovery procedure as well.
