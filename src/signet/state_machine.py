@@ -22,6 +22,7 @@ from .auth import (
     totp_factor_rate_limit_key,
     totp_proof_claims,
     totp_rate_limit_key,
+    valid_totp_attempt_scopes,
     webauthn_proof_claims,
 )
 from .db import Database, IntegrityError
@@ -885,9 +886,12 @@ class ApprovalStateMachine:
                 or confirmation.credential_user_id != confirmation.user_id
                 or confirmation.rate_limit_key not in rate_keys
                 or confirmation.attempt_id is None
-                or len(confirmation.attempt_scope_keys) != 2
-                or confirmation.attempt_scope_keys[0] != confirmation.rate_limit_key
-                or not confirmation.attempt_scope_keys[1].startswith("auth-source:")
+                or not valid_totp_attempt_scopes(
+                    confirmation.user_id or "",
+                    confirmation.credential_id or "",
+                    confirmation.rate_limit_key or "",
+                    confirmation.attempt_scope_keys,
+                )
             ):
                 raise InvalidConfirmation("TOTP proof state is invalid")
             credential = connection.execute(

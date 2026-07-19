@@ -79,8 +79,8 @@ from signet.production_state import (
     ProductionStatus,
 )
 from signet.runtime import (
-    LoopbackPeerMiddleware,
     MCPRuntime,
+    TrustedProxySourceMiddleware,
     assemble_mcp_runtime,
     gateway_principal_provider,
 )
@@ -769,7 +769,7 @@ def _assemble_production_web(
         csrf=CsrfManager(secret_values["csrf_secret_ref"].reveal().encode("utf-8")),
         browser_auth=browser_auth,
     )
-    web.add_middleware(LoopbackPeerMiddleware)
+    web.add_middleware(TrustedProxySourceMiddleware)
     return web
 
 

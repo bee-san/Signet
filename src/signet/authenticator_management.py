@@ -30,6 +30,7 @@ from signet.auth import (
     totp_factor_rate_limit_key,
     totp_proof_claims,
     totp_rate_limit_key,
+    valid_totp_attempt_scopes,
     webauthn_proof_claims,
 )
 from signet.credential_broker import CredentialError, SecretReference
@@ -41,6 +42,7 @@ FactorKind = Literal["password", "totp", "webauthn"]
 FactorState = Literal["active", "revoked", "compromised"]
 ManagementAction = Literal[
     "add_authenticator",
+    "authorize_enrollment",
     "rename_authenticator",
     "revoke_authenticator",
     "replace_authenticator",
@@ -275,6 +277,92 @@ class AuthenticatorManager:
                 "discoverable": credential.discoverable,
             },
         )
+
+    def binding_for_enrollment_authorization(
+        self,
+        user_id: str,
+        session_id: str,
+        action: Literal["add_passkey", "add_totp"],
+        label: str,
+        operation_id: str,
+    ) -> ActionBinding:
+        selected_session = _bounded_identifier(
+            session_id,
+            name="session ID",
+            maximum=128,
+        )
+        if len(selected_session) < 16:
+            raise ValueError("session ID is invalid")
+        return self._binding(
+            "authorize_enrollment",
+            user_id,
+            operation_id,
+            {
+                "action": action,
+                "label": _label(label),
+                "session_id": selected_session,
+            },
+        )
+
+    def authorize_enrollment(
+        self,
+        user_id: str,
+        session_id: str,
+        action: Literal["add_passkey", "add_totp"],
+        label: str,
+        operation_id: str,
+        confirmation: VerifiedTotp | VerifiedWebAuthn,
+        *,
+        now: int,
+        lifetime: int = 5 * 60,
+    ) -> str:
+        if lifetime <= 0 or lifetime > 10 * 60:
+            raise ValueError("enrollment authorization lifetime is invalid")
+        selected_user = canonical_user_id(user_id)
+        selected_label = _label(label)
+        binding = self.binding_for_enrollment_authorization(
+            selected_user,
+            session_id,
+            action,
+            selected_label,
+            operation_id,
+        )
+        self._validate_proof_envelope(
+            confirmation,
+            user_id=selected_user,
+            binding=binding,
+            now=now,
+        )
+        authorization_id = f"eauth_{secrets.token_urlsafe(24)}"
+        with self.database.transaction() as connection:
+            actor_factor_id = self._consume_proof(
+                connection,
+                confirmation,
+                user_id=selected_user,
+                binding=binding,
+                now=now,
+            )
+            connection.execute(
+                """
+                INSERT INTO browser_enrollment_authorizations(
+                    authorization_id, user_id, session_id, action, factor_label,
+                    operation_id, actor_factor_id, created_at, expires_at, claimed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    authorization_id,
+                    selected_user,
+                    session_id,
+                    action,
+                    selected_label,
+                    operation_id,
+                    actor_factor_id,
+                    now,
+                    now + lifetime,
+                    now,
+                ),
+            )
+        return authorization_id
 
     def binding_for_add_preprovisioned_totp(
         self,
@@ -539,6 +627,194 @@ class AuthenticatorManager:
             _revoke_user_sessions(connection, selected_user, revoked_at=now)
         factor = self.get_factor(selected_user, factor_id)
         if factor is None:  # pragma: no cover - committed invariant
+            raise AuthenticatorManagementError("new passkey factor was not persisted")
+        return factor
+
+    def add_authorized_preprovisioned_totp(
+        self,
+        user_id: str,
+        session_id: str,
+        enrollment_id: str,
+        label: str,
+        factor_id: str,
+        credential_id: str,
+        secret_reference: str,
+        operation_id: str,
+        authorization_id: str,
+        *,
+        now: int,
+    ) -> FactorMetadata:
+        selected_user = canonical_user_id(user_id)
+        selected_label = _label(label)
+        selected_factor = _factor_id(factor_id)
+        SecretReference.parse(secret_reference)
+        binding = self.binding_for_add_preprovisioned_totp(
+            selected_user,
+            selected_label,
+            selected_factor,
+            credential_id,
+            secret_reference,
+            operation_id,
+        )
+        with self.database.transaction() as connection:
+            actor_factor_id = self._consume_enrollment_authorization(
+                connection,
+                authorization_id=authorization_id,
+                user_id=selected_user,
+                session_id=session_id,
+                action="add_totp",
+                label=selected_label,
+                operation_id=operation_id,
+                now=now,
+            )
+            consumed = connection.execute(
+                """
+                UPDATE browser_totp_enrollments SET consumed_at = ?
+                WHERE enrollment_id = ? AND user_id = ? AND session_id = ?
+                  AND factor_id = ? AND credential_id = ? AND factor_label = ?
+                  AND secret_reference = ? AND authorization_id = ? AND operation_id = ?
+                  AND verified_at IS NOT NULL AND consumed_at IS NULL
+                  AND invalidated_at IS NULL AND expires_at > ?
+                """,
+                (
+                    now,
+                    enrollment_id,
+                    selected_user,
+                    session_id,
+                    selected_factor,
+                    credential_id,
+                    selected_label,
+                    secret_reference,
+                    authorization_id,
+                    operation_id,
+                    now,
+                ),
+            ).rowcount
+            if int(consumed) != 1:
+                raise InvalidFactorProof("TOTP enrollment is stale or unavailable")
+            _ensure_auth_user(connection, selected_user, created_at=now)
+            connection.execute(
+                """
+                INSERT INTO auth_credentials(
+                    credential_id, user_id, kind, secret_reference, enrolled_at, factor_label
+                ) VALUES (?, ?, 'totp', ?, ?, ?)
+                """,
+                (credential_id, selected_user, secret_reference, now, selected_label),
+            )
+            self._insert_factor(
+                connection,
+                factor_id=selected_factor,
+                credential_id=credential_id,
+                user_id=selected_user,
+                kind="totp",
+                label=selected_label,
+                action="added",
+                actor_factor_id=actor_factor_id,
+                operation_id=operation_id,
+                payload_hash=binding.payload_hash or "",
+                now=now,
+            )
+            _revoke_user_sessions(connection, selected_user, revoked_at=now)
+        factor = self.get_factor(selected_user, selected_factor)
+        if factor is None:  # pragma: no cover
+            raise AuthenticatorManagementError("new TOTP factor was not persisted")
+        return factor
+
+    def add_authorized_passkey(
+        self,
+        user_id: str,
+        session_id: str,
+        challenge_id: str,
+        label: str,
+        credential: WebAuthnCredential,
+        operation_id: str,
+        authorization_id: str,
+        *,
+        now: int,
+    ) -> FactorMetadata:
+        selected_user = canonical_user_id(user_id)
+        selected_label = _label(label)
+        if credential.user_id != selected_user or credential.disabled:
+            raise ValueError("an active user-owned passkey credential is required")
+        binding = self.binding_for_add_passkey(
+            selected_user,
+            selected_label,
+            credential,
+            operation_id,
+        )
+        factor_id = _new_factor_id()
+        with self.database.transaction() as connection:
+            actor_factor_id = self._consume_enrollment_authorization(
+                connection,
+                authorization_id=authorization_id,
+                user_id=selected_user,
+                session_id=session_id,
+                action="add_passkey",
+                label=selected_label,
+                operation_id=operation_id,
+                now=now,
+            )
+            consumed = connection.execute(
+                """
+                UPDATE auth_registration_challenges SET consumed_at = ?
+                WHERE challenge_id = ? AND user_id = ? AND session_id = ?
+                  AND factor_label = ? AND credential_id = ?
+                  AND authorization_id = ? AND operation_id = ?
+                  AND verified_at IS NOT NULL AND consumed_at IS NULL
+                  AND invalidated_at IS NULL AND expires_at > ?
+                """,
+                (
+                    now,
+                    challenge_id,
+                    selected_user,
+                    session_id,
+                    selected_label,
+                    credential.credential_id,
+                    authorization_id,
+                    operation_id,
+                    now,
+                ),
+            ).rowcount
+            if int(consumed) != 1:
+                raise InvalidFactorProof("passkey registration is stale or unavailable")
+            connection.execute(
+                """
+                INSERT INTO auth_credentials(
+                    credential_id, user_id, kind, public_material, sign_count,
+                    enrolled_at, backup_eligible, backup_state, user_handle, factor_label,
+                    transports_json, discoverable
+                ) VALUES (?, ?, 'webauthn', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    credential.credential_id,
+                    selected_user,
+                    credential.public_key,
+                    credential.sign_count,
+                    now,
+                    int(credential.device_type == "multi_device"),
+                    int(credential.backed_up),
+                    credential.user_handle,
+                    selected_label,
+                    json.dumps(list(credential.transports), separators=(",", ":")),
+                    int(credential.discoverable),
+                ),
+            )
+            self._insert_factor(
+                connection,
+                factor_id=factor_id,
+                credential_id=credential.credential_id,
+                user_id=selected_user,
+                kind="webauthn",
+                label=selected_label,
+                action="added",
+                actor_factor_id=actor_factor_id,
+                operation_id=operation_id,
+                payload_hash=binding.payload_hash or "",
+                now=now,
+            )
+            _revoke_user_sessions(connection, selected_user, revoked_at=now)
+        factor = self.get_factor(selected_user, factor_id)
+        if factor is None:  # pragma: no cover
             raise AuthenticatorManagementError("new passkey factor was not persisted")
         return factor
 
@@ -880,7 +1156,8 @@ class AuthenticatorManager:
         now: int,
     ) -> str:
         self._validate_proof_envelope(proof, user_id=user_id, binding=binding, now=now)
-        assert proof.session_id is not None
+        if proof.session_id is None:
+            raise InvalidFactorProof("factor proof is not bound to a session")
         try:
             connection.execute(  # type: ignore[attr-defined]
                 """
@@ -953,7 +1230,12 @@ class AuthenticatorManager:
                 totp_rate_limit_key(proof.user_id),
                 totp_factor_rate_limit_key(proof.user_id, proof.credential_id),
             }
-            if proof.rate_limit_key not in valid_rate_keys:
+            if proof.rate_limit_key not in valid_rate_keys or not valid_totp_attempt_scopes(
+                proof.user_id,
+                proof.credential_id,
+                proof.rate_limit_key,
+                proof.attempt_reservation.scope_keys,
+            ):
                 raise InvalidFactorProof("TOTP factor rate-limit binding is invalid")
             return (
                 TOTP_PROOF_DOMAIN,
@@ -1052,6 +1334,63 @@ class AuthenticatorManager:
         ).rowcount
         if updated != 1 or consumed != 1:
             raise InvalidFactorProof("WebAuthn factor proof is stale or unavailable")
+
+    def _consume_enrollment_authorization(
+        self,
+        connection: object,
+        *,
+        authorization_id: str,
+        user_id: str,
+        session_id: str,
+        action: Literal["add_passkey", "add_totp"],
+        label: str,
+        operation_id: str,
+        now: int,
+    ) -> str:
+        selected_authorization = _bounded_identifier(
+            authorization_id,
+            name="enrollment authorization ID",
+            maximum=128,
+        )
+        row = connection.execute(  # type: ignore[attr-defined]
+            "SELECT * FROM browser_enrollment_authorizations WHERE authorization_id = ?",
+            (selected_authorization,),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["user_id"]) != user_id
+            or str(row["session_id"]) != session_id
+            or str(row["action"]) != action
+            or str(row["factor_label"]) != label
+            or str(row["operation_id"]) != operation_id
+            or row["claimed_at"] is None
+            or row["consumed_at"] is not None
+            or int(row["created_at"]) > now
+            or int(row["expires_at"]) <= now
+        ):
+            raise InvalidFactorProof("enrollment authorization is stale or unavailable")
+        _require_active_session(
+            connection,
+            session_id,
+            user_id=user_id,
+            now=now,
+            idle_timeout=self.session_idle_timeout,
+        )
+        actor_factor_id = str(row["actor_factor_id"])
+        actor = self._active_factor_for_update(connection, user_id, actor_factor_id)
+        if str(actor["kind"]) not in {"totp", "webauthn"}:
+            raise InvalidFactorProof("enrollment authorization actor is unavailable")
+        updated = connection.execute(  # type: ignore[attr-defined]
+            """
+            UPDATE browser_enrollment_authorizations SET consumed_at = ?
+            WHERE authorization_id = ? AND consumed_at IS NULL
+              AND claimed_at IS NOT NULL AND expires_at > ?
+            """,
+            (now, selected_authorization, now),
+        ).rowcount
+        if int(updated) != 1:
+            raise InvalidFactorProof("enrollment authorization was already consumed")
+        return actor_factor_id
 
     def _active_factor_for_update(self, connection: object, user_id: str, factor_id: str) -> Any:
         row = connection.execute(  # type: ignore[attr-defined]

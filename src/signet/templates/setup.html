@@ -6,6 +6,15 @@
 <section class="panel setup-panel" aria-labelledby="setup-title">
   <p class="eyebrow">Private owner setup</p>
   <h1 id="setup-title">Set up Signet</h1>
+  {% if not setup.claimed %}
+  <p>Setup is locked. On the Signet host, issue a one-time bootstrap capability and paste it below before it expires.</p>
+  <form action="/setup/claim" method="post" class="stack-form">
+    <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
+    <label for="bootstrap-capability">One-time bootstrap capability</label>
+    <input id="bootstrap-capability" name="capability" type="password" autocomplete="off" minlength="32" maxlength="384" required>
+    <button class="button button-primary" type="submit">Unlock owner setup</button>
+  </form>
+  {% else %}
   <p>This one-time flow stays at this exact HTTPS address. It can be resumed after a reload or restart until you finish.</p>
 
   <ol class="setup-progress" aria-label="Setup progress">
@@ -79,5 +88,6 @@
       {% if not setup.can_complete %}<p id="setup-requirements">Save a password and add a passkey or TOTP authenticator before finishing.</p>{% endif %}
     </form>
   </section>
+  {% endif %}
 </section>
 {% endblock %}

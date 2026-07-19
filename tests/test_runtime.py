@@ -735,6 +735,7 @@ def test_cli_runs_only_the_explicit_factory(command: str, default_port: int) -> 
                 "port": default_port,
                 "server_header": False,
                 "limit_concurrency": 64,
+                "proxy_headers": False,
             },
         )
     ]

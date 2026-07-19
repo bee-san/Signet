@@ -169,6 +169,7 @@ def _rewrite_encrypted_archive(
 
 def _downgrade_catalog_to_schema_12(database: Database) -> None:
     with database.transaction() as connection:
+        connection.execute("DROP TABLE browser_enrollment_authorizations")
         connection.execute("DROP TABLE auth_factor_challenges")
         connection.execute("DROP TABLE auth_factor_events")
         connection.execute("DROP TABLE auth_factors")
@@ -233,7 +234,7 @@ def _downgrade_catalog_to_schema_12(database: Database) -> None:
         connection.execute("DROP TABLE production_users")
         connection.execute("DROP TABLE production_setup_state")
         connection.execute("DROP TABLE privacy_maintenance")
-        connection.execute("DELETE FROM schema_meta WHERE migration_id BETWEEN 13 AND 18")
+        connection.execute("DELETE FROM schema_meta WHERE migration_id > 12")
         connection.execute("PRAGMA user_version = 12")
 
 

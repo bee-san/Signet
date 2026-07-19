@@ -16,28 +16,19 @@
     <form data-add-passkey class="stack-form">
       <label for="new-passkey-label">Passkey name</label>
       <input id="new-passkey-label" name="label" maxlength="64" placeholder="Laptop passkey" required>
-      <button class="button" type="submit">Create new passkey</button>
-    </form>
-    <div data-pending-passkey class="confirmation-panel" hidden>
-      <h3>Confirm this passkey addition</h3>
-      <p>Use an existing authenticator—not the passkey you just created.</p>
-      <button type="button" class="button" data-confirm-new-passkey data-intent="{}">Confirm with existing passkey</button>
       {% if totp_factors %}
-      <form action="/authenticators/confirm/totp" method="post" class="stack-form">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input data-intent-field type="hidden" name="action">
-        <input data-intent-field type="hidden" name="operation_id">
-        <input data-intent-field type="hidden" name="registration_id">
-        <label for="add-passkey-totp-factor">Existing TOTP authenticator</label>
-        <select id="add-passkey-totp-factor" name="totp_credential_id" required>
+      <details>
+        <summary>Use an existing TOTP code instead of a passkey</summary>
+        <label for="new-passkey-existing-totp">Existing TOTP authenticator</label>
+        <select id="new-passkey-existing-totp" name="totp_credential_id">
           {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}
         </select>
-        <label for="add-passkey-totp">Current code</label>
-        <input id="add-passkey-totp" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" required>
-        <button class="button" type="submit">Confirm addition with TOTP</button>
-      </form>
+        <label for="new-passkey-existing-proof">Current code</label>
+        <input id="new-passkey-existing-proof" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" {% if not passkey_factors %}required{% endif %}>
+      </details>
       {% endif %}
-    </div>
+      <button class="button" type="submit">Create new passkey</button>
+    </form>
   </section>
 
   <section aria-labelledby="add-totp-title">
@@ -45,6 +36,17 @@
     <form data-totp-start data-flow="management" class="stack-form">
       <label for="new-totp-label">Authenticator name</label>
       <input id="new-totp-label" name="label" maxlength="64" placeholder="Phone authenticator" required>
+      {% if totp_factors %}
+      <details>
+        <summary>Use an existing TOTP code instead of a passkey</summary>
+        <label for="new-totp-existing-factor">Existing TOTP authenticator</label>
+        <select id="new-totp-existing-factor" name="totp_credential_id">
+          {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}
+        </select>
+        <label for="new-totp-existing-code">Current code from the existing authenticator</label>
+        <input id="new-totp-existing-code" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" {% if not passkey_factors %}required{% endif %}>
+      </details>
+      {% endif %}
       <button class="button" type="submit">Set up TOTP</button>
     </form>
     <div data-totp-enrollment hidden>
@@ -57,26 +59,6 @@
         <input id="new-totp-proof" name="proof" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
         <button class="button" type="submit">Verify new TOTP</button>
       </form>
-    </div>
-    <div data-pending-totp class="confirmation-panel" hidden>
-      <h3>Confirm this TOTP addition</h3>
-      <p>Now use a different, existing authenticator to authorize the exact addition.</p>
-      <button type="button" class="button" data-confirm-new-totp data-intent="{}">Confirm with existing passkey</button>
-      {% if totp_factors %}
-      <form action="/authenticators/confirm/totp" method="post" class="stack-form">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input data-intent-field type="hidden" name="action">
-        <input data-intent-field type="hidden" name="operation_id">
-        <input data-intent-field type="hidden" name="registration_id">
-        <label for="add-totp-existing-factor">Existing TOTP authenticator</label>
-        <select id="add-totp-existing-factor" name="totp_credential_id" required>
-          {% for factor in totp_factors %}<option value="{{ factor.credential_id }}">{{ factor.label }}</option>{% endfor %}
-        </select>
-        <label for="add-totp-existing-proof">Current code from the existing authenticator</label>
-        <input id="add-totp-existing-proof" name="totp_proof" inputmode="numeric" autocomplete="one-time-code" maxlength="128" required>
-        <button class="button" type="submit">Confirm addition with existing TOTP</button>
-      </form>
-      {% endif %}
     </div>
   </section>
 

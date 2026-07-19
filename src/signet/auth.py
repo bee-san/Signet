@@ -31,6 +31,7 @@ _PROOF_DOMAINS = frozenset({PASSWORD_PROOF_DOMAIN, TOTP_PROOF_DOMAIN, WEBAUTHN_P
 FACTOR_MANAGEMENT_ACTIONS = frozenset(
     {
         "add_authenticator",
+        "authorize_enrollment",
         "rename_authenticator",
         "revoke_authenticator",
         "replace_authenticator",
@@ -762,6 +763,7 @@ class AttemptLimiter(Protocol):
         self,
         key: str,
         *,
+        additional_scope_keys: Sequence[str] = (),
         source_key: str,
         now: int,
     ) -> AttemptReservation: ...
@@ -814,10 +816,11 @@ class InMemoryAttemptLimiter:
         self,
         key: str,
         *,
+        additional_scope_keys: Sequence[str] = (),
         source_key: str,
         now: int,
     ) -> AttemptReservation:
-        scopes = tuple(dict.fromkeys((key, source_key)))
+        scopes = _attempt_scopes(key, additional_scope_keys, source_key)
         attempt_id = secrets.token_urlsafe(18)
         with self._lock:
             retry_after = max(
@@ -902,12 +905,11 @@ class SQLiteAttemptLimiter:
         self,
         key: str,
         *,
+        additional_scope_keys: Sequence[str] = (),
         source_key: str,
         now: int,
     ) -> AttemptReservation:
-        scopes = tuple(dict.fromkeys((key, source_key)))
-        for scope in scopes:
-            _bounded_identifier(scope, name="rate-limit scope", maximum=128)
+        scopes = _attempt_scopes(key, additional_scope_keys, source_key)
         attempt_id = secrets.token_urlsafe(18)
         with self.database.transaction() as connection:
             global_row = connection.execute(
@@ -1468,6 +1470,30 @@ def source_rate_limit_key(source_id: str) -> str:
     return f"auth-source:{hashlib.sha256(source_id.encode()).hexdigest()}"
 
 
+def valid_totp_attempt_scopes(
+    user_id: str,
+    credential_id: str,
+    rate_limit_key: str,
+    scope_keys: Sequence[str],
+) -> bool:
+    aggregate_key = totp_rate_limit_key(user_id)
+    factor_key = totp_factor_rate_limit_key(user_id, credential_id)
+    prefix = (
+        (aggregate_key,)
+        if rate_limit_key == aggregate_key
+        else (factor_key, aggregate_key)
+        if rate_limit_key == factor_key
+        else ()
+    )
+    source_key = scope_keys[-1] if scope_keys else ""
+    return bool(
+        prefix
+        and tuple(scope_keys[:-1]) == prefix
+        and source_key.startswith("auth-source:")
+        and _is_sha256(source_key.removeprefix("auth-source:"))
+    )
+
+
 def canonical_user_id(user_id: str) -> str:
     if not isinstance(user_id, str):
         raise InvalidCredentials("invalid credentials")
@@ -1496,6 +1522,19 @@ def _bounded_identifier(value: str, *, name: str, maximum: int) -> str:
     if not encoded or len(encoded) > maximum or any(ord(character) < 32 for character in value):
         raise ValueError(f"{name} is invalid")
     return value
+
+
+def _attempt_scopes(
+    key: str,
+    additional_scope_keys: Sequence[str],
+    source_key: str,
+) -> tuple[str, ...]:
+    scopes = tuple(dict.fromkeys((key, *additional_scope_keys, source_key)))
+    if len(scopes) > 8:
+        raise ValueError("too many rate-limit scopes")
+    for scope in scopes:
+        _bounded_identifier(scope, name="rate-limit scope", maximum=128)
+    return scopes
 
 
 def _validate_lock_schedule(lock_schedule: tuple[tuple[int, int], ...]) -> None:

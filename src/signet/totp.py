@@ -356,16 +356,6 @@ class TotpVerifier:
             if credential_id is not None
             else None
         )
-        rate_key = (
-            totp_factor_rate_limit_key(user_id, selected_credential_id)
-            if selected_credential_id is not None
-            else totp_rate_limit_key(user_id)
-        )
-        reservation = self._limiter.reserve(
-            rate_key,
-            source_key=source_rate_limit_key(source_id),
-            now=now,
-        )
         credentials = tuple(
             credential
             for credential in self._credentials.active_totps(user_id)
@@ -377,6 +367,21 @@ class TotpVerifier:
         )
         if not credentials:
             raise TotpNotEnrolled("TOTP is not enrolled; use the authenticated web app")
+        rate_key = (
+            totp_factor_rate_limit_key(user_id, selected_credential_id)
+            if selected_credential_id is not None
+            else totp_rate_limit_key(user_id)
+        )
+        reservation = self._limiter.reserve(
+            rate_key,
+            additional_scope_keys=(
+                (totp_rate_limit_key(user_id),)
+                if selected_credential_id is not None
+                else ()
+            ),
+            source_key=source_rate_limit_key(source_id),
+            now=now,
+        )
         if not proof or len(proof) > 128:
             self._limiter.record_failure(reservation, now=now)
             raise InvalidTotp("invalid or consumed TOTP proof")

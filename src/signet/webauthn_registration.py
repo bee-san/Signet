@@ -130,6 +130,8 @@ class RegistrationChallenge:
     label: str
     created_at: int
     expires_at: int
+    authorization_id: str | None = None
+    operation_id: str | None = None
     verified_at: int | None = None
     consumed_at: int | None = None
     invalidated_at: int | None = None
@@ -147,6 +149,8 @@ class IssuedRegistration:
     challenge_id: str
     options_json: str
     expires_at: int
+    authorization_id: str | None = None
+    operation_id: str | None = None
 
     def __repr__(self) -> str:
         return "IssuedRegistration(challenge/options=<redacted>)"
@@ -157,6 +161,8 @@ class PendingRegistration:
     challenge_id: str
     label: str
     credential: WebAuthnCredential
+    authorization_id: str | None = None
+    operation_id: str | None = None
 
     def __repr__(self) -> str:
         return (
@@ -169,8 +175,22 @@ class SQLiteRegistrationRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def create(self, challenge: RegistrationChallenge, *, now: int, max_active: int) -> bool:
+    def create(
+        self,
+        challenge: RegistrationChallenge,
+        *,
+        now: int,
+        max_active: int,
+        max_active_per_session: int,
+    ) -> bool:
         with self.database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE auth_registration_challenges SET invalidated_at = ?
+                WHERE consumed_at IS NULL AND invalidated_at IS NULL AND expires_at <= ?
+                """,
+                (now, now),
+            )
             active = int(
                 connection.execute(
                     """
@@ -181,15 +201,32 @@ class SQLiteRegistrationRepository:
                     (challenge.user_id, now),
                 ).fetchone()[0]
             )
-            if active >= max_active:
+            active_for_session = (
+                int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM auth_registration_challenges
+                        WHERE user_id = ? AND session_id = ? AND consumed_at IS NULL
+                          AND invalidated_at IS NULL AND expires_at > ?
+                        """,
+                        (challenge.user_id, challenge.session_id, now),
+                    ).fetchone()[0]
+                )
+                if challenge.session_id is not None
+                else 0
+            )
+            if active >= max_active or (
+                challenge.session_id is not None
+                and active_for_session >= max_active_per_session
+            ):
                 return False
             try:
                 connection.execute(
                     """
                     INSERT INTO auth_registration_challenges(
                         challenge_id, challenge, user_id, flow, session_id,
-                        factor_label, created_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        factor_label, created_at, expires_at, authorization_id, operation_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         challenge.challenge_id,
@@ -200,6 +237,8 @@ class SQLiteRegistrationRepository:
                         challenge.label,
                         challenge.created_at,
                         challenge.expires_at,
+                        challenge.authorization_id,
+                        challenge.operation_id,
                     ),
                 )
             except IntegrityError:
@@ -244,6 +283,10 @@ class SQLiteRegistrationRepository:
             label=str(row["factor_label"]),
             created_at=int(row["created_at"]),
             expires_at=int(row["expires_at"]),
+            authorization_id=(
+                str(row["authorization_id"]) if row["authorization_id"] is not None else None
+            ),
+            operation_id=(str(row["operation_id"]) if row["operation_id"] is not None else None),
             verified_at=(int(row["verified_at"]) if row["verified_at"] is not None else None),
             consumed_at=(int(row["consumed_at"]) if row["consumed_at"] is not None else None),
             invalidated_at=(
@@ -313,6 +356,7 @@ class PasskeyRegistrationService:
         provider: RegistrationProvider,
         lifetime: int = 5 * 60,
         max_active_per_user: int = 5,
+        max_active_per_session: int = 2,
         allow_test_provider: bool = False,
     ) -> None:
         from signet.webauthn import _normalize_rp_id, _validate_origin_and_rp
@@ -324,12 +368,18 @@ class PasskeyRegistrationService:
             allow_test_provider or provider.__class__.__module__.startswith("tests")
         ):
             raise ValueError("test-only registration provider requires explicit opt-in")
-        if lifetime <= 0 or lifetime > 10 * 60 or max_active_per_user <= 0:
+        if (
+            lifetime <= 0
+            or lifetime > 10 * 60
+            or max_active_per_user <= 0
+            or max_active_per_session <= 0
+        ):
             raise ValueError("invalid registration challenge limits")
         self.repository = SQLiteRegistrationRepository(database)
         self.provider = provider
         self.lifetime = lifetime
         self.max_active_per_user = max_active_per_user
+        self.max_active_per_session = max_active_per_session
 
     def begin(
         self,
@@ -339,11 +389,18 @@ class PasskeyRegistrationService:
         flow: RegistrationFlow,
         session_id: str | None,
         existing_credential_ids: tuple[str, ...],
+        authorization_id: str | None = None,
+        operation_id: str | None = None,
         now: int,
     ) -> IssuedRegistration:
         selected_user = canonical_user_id(user_id)
         selected_label = _label(label)
         selected_session = _session_for_flow(flow, session_id)
+        selected_authorization, selected_operation = _authorization_for_flow(
+            flow,
+            authorization_id,
+            operation_id,
+        )
         challenge_bytes = secrets.token_bytes(32)
         challenge_id = _base64url_encode(secrets.token_bytes(24))
         challenge = RegistrationChallenge(
@@ -355,11 +412,14 @@ class PasskeyRegistrationService:
             label=selected_label,
             created_at=now,
             expires_at=now + self.lifetime,
+            authorization_id=selected_authorization,
+            operation_id=selected_operation,
         )
         if not self.repository.create(
             challenge,
             now=now,
             max_active=self.max_active_per_user,
+            max_active_per_session=self.max_active_per_session,
         ):
             raise RegistrationRateLimited("too many active passkey registrations")
         try:
@@ -388,6 +448,8 @@ class PasskeyRegistrationService:
             challenge_id=challenge_id,
             options_json=options_to_json(options),
             expires_at=challenge.expires_at,
+            authorization_id=challenge.authorization_id,
+            operation_id=challenge.operation_id,
         )
 
     def complete(
@@ -427,6 +489,8 @@ class PasskeyRegistrationService:
         return PendingRegistration(
             challenge_id=challenge_id,
             label=challenge.label,
+            authorization_id=challenge.authorization_id,
+            operation_id=challenge.operation_id,
             credential=WebAuthnCredential(
                 credential_id=result.credential_id,
                 user_id=selected_user,
@@ -465,6 +529,8 @@ class PasskeyRegistrationService:
         return PendingRegistration(
             challenge_id=challenge.challenge_id,
             label=challenge.label,
+            authorization_id=challenge.authorization_id,
+            operation_id=challenge.operation_id,
             credential=WebAuthnCredential(
                 credential_id=result.credential_id,
                 user_id=selected_user,
@@ -477,6 +543,27 @@ class PasskeyRegistrationService:
                 discoverable=result.discoverable,
             ),
         )
+
+
+def _authorization_for_flow(
+    flow: RegistrationFlow,
+    authorization_id: str | None,
+    operation_id: str | None,
+) -> tuple[str | None, str | None]:
+    if flow == "bootstrap":
+        if authorization_id is not None or operation_id is not None:
+            raise ValueError("bootstrap registration cannot use management authorization")
+        return None, None
+    if authorization_id is None and operation_id is None:
+        return None, None
+    if (
+        authorization_id is None
+        or operation_id is None
+        or not 16 <= len(authorization_id) <= 128
+        or not 16 <= len(operation_id) <= 128
+    ):
+        raise ValueError("management registration authorization is invalid")
+    return authorization_id, operation_id
 
 
 def _session_for_flow(flow: RegistrationFlow, session_id: str | None) -> str | None:

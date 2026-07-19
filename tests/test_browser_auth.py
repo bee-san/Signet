@@ -11,9 +11,16 @@ from typing import Any
 import pyotp
 import pytest
 
-from signet.auth import SQLitePasswordCredentialRepository
+import signet.db as db_module
+from signet.auth import (
+    SQLitePasswordCredentialRepository,
+    _ensure_auth_user,
+    _register_auth_factor,
+)
 from signet.browser_auth import (
     BootstrapAlreadyComplete,
+    BootstrapClaimRequired,
+    BootstrapError,
     BootstrapIncomplete,
     BootstrapService,
 )
@@ -26,6 +33,7 @@ from signet.webauthn_registration import (
     PasskeyRegistrationService,
     RegistrationResult,
 )
+from tests.migration_helpers import verified_backup_callback
 
 USER_ID = "owner"
 OTHER_USER_ID = "other"
@@ -33,6 +41,7 @@ ORIGIN = "https://approval.example.test"
 RP_ID = "approval.example.test"
 SESSION_ID = "session-id-long-enough-for-binding"
 OTHER_SESSION_ID = "other-session-id-long-enough-binding"
+CLAIMANT_TOKEN = "claimant-token-long-enough-for-bootstrap-binding"
 
 
 class FastPasswordEnroller:
@@ -103,28 +112,43 @@ def bootstrap(database: Database) -> BootstrapService:
     )
 
 
+def claimed_bootstrap(database: Database, *, now: int = 90) -> BootstrapService:
+    service = bootstrap(database)
+    capability = service.issue_capability(now=now, lifetime=60)
+    service.claim(capability, CLAIMANT_TOKEN, now=now + 1)
+    return service
+
+
 def test_bootstrap_resumes_after_restart_and_finalizes_only_once(database: Database) -> None:
-    first = bootstrap(database)
-    initial = first.status(now=100)
+    first = claimed_bootstrap(database)
+    initial = first.status(now=100, claimant_token=CLAIMANT_TOKEN)
     assert initial.complete is False
     assert initial.has_password is False
     assert initial.has_authenticator is False
 
-    first.enroll_password("a sufficiently long password", now=101)
+    first.enroll_password(
+        "a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=101
+    )
     restarted = bootstrap(database)
-    assert restarted.status(now=102).has_password is True
+    assert restarted.status(now=102, claimant_token=CLAIMANT_TOKEN).has_password is True
 
-    restarted.enroll_passkey("MacBook Touch ID", credential(), now=103)
-    ready = first.status(now=104)
+    restarted.enroll_passkey(
+        "MacBook Touch ID", credential(), claimant_token=CLAIMANT_TOKEN, now=103
+    )
+    ready = first.status(now=104, claimant_token=CLAIMANT_TOKEN)
     assert ready.has_authenticator is True
     assert ready.factor_labels == ("MacBook Touch ID",)
+    assert SQLitePasswordCredentialRepository(database).find_password(USER_ID) is None
+    assert SQLiteWebAuthnRepository(database).credentials_for_user(USER_ID) == ()
 
-    completed = first.complete(now=105)
+    completed = first.complete(claimant_token=CLAIMANT_TOKEN, now=105)
     assert completed.complete is True
     with pytest.raises(BootstrapAlreadyComplete):
-        restarted.complete(now=106)
+        restarted.complete(claimant_token=CLAIMANT_TOKEN, now=106)
     with pytest.raises(BootstrapAlreadyComplete):
-        restarted.enroll_password("another sufficiently long password", now=107)
+        restarted.enroll_password(
+            "another sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=107
+        )
 
     stored = SQLitePasswordCredentialRepository(database).find_password(USER_ID)
     assert stored is not None
@@ -133,23 +157,70 @@ def test_bootstrap_resumes_after_restart_and_finalizes_only_once(database: Datab
 
 
 def test_bootstrap_requires_password_and_non_password_authenticator(database: Database) -> None:
-    service = bootstrap(database)
-    service.enroll_password("a sufficiently long password", now=100)
+    service = claimed_bootstrap(database)
+    service.enroll_password(
+        "a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=100
+    )
 
     with pytest.raises(BootstrapIncomplete):
-        service.complete(now=101)
+        service.complete(claimant_token=CLAIMANT_TOKEN, now=101)
+
+
+def test_bootstrap_credential_publication_rolls_back_as_one_database_transaction(
+    database: Database,
+) -> None:
+    service = claimed_bootstrap(database)
+    service.enroll_password(
+        "a sufficiently long password",
+        claimant_token=CLAIMANT_TOKEN,
+        now=100,
+    )
+    service.enroll_passkey(
+        "Primary passkey",
+        credential(),
+        claimant_token=CLAIMANT_TOKEN,
+        now=101,
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER inject_bootstrap_completion_failure
+            BEFORE UPDATE OF status ON browser_bootstrap_state
+            WHEN NEW.status = 'complete'
+            BEGIN SELECT RAISE(ABORT, 'injected bootstrap completion failure'); END
+            """
+        )
+
+    with pytest.raises(BootstrapError, match="published atomically"):
+        service.complete(claimant_token=CLAIMANT_TOKEN, now=102)
+
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM auth_credentials").fetchone()[0] == 0
+        state = connection.execute(
+            "SELECT status, staged_password_verifier FROM browser_bootstrap_state"
+        ).fetchone()
+        assert state["status"] == "pending"
+        assert state["staged_password_verifier"] is not None
+    with database.transaction() as connection:
+        connection.execute("DROP TRIGGER inject_bootstrap_completion_failure")
+    status = service.status(now=103, claimant_token=CLAIMANT_TOKEN)
+    assert status.can_complete is True
 
 
 def test_concurrent_bootstrap_completion_has_one_winner(database: Database) -> None:
-    service = bootstrap(database)
-    service.enroll_password("a sufficiently long password", now=100)
-    service.enroll_passkey("Primary passkey", credential(), now=101)
+    service = claimed_bootstrap(database)
+    service.enroll_password(
+        "a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=100
+    )
+    service.enroll_passkey(
+        "Primary passkey", credential(), claimant_token=CLAIMANT_TOKEN, now=101
+    )
     barrier = Barrier(2)
 
     def complete() -> str:
         barrier.wait()
         try:
-            bootstrap(database).complete(now=102)
+            bootstrap(database).complete(claimant_token=CLAIMANT_TOKEN, now=102)
         except BootstrapAlreadyComplete:
             return "rejected"
         return "completed"
@@ -157,6 +228,124 @@ def test_concurrent_bootstrap_completion_has_one_winner(database: Database) -> N
     with ThreadPoolExecutor(max_workers=2) as executor:
         outcomes = tuple(executor.map(lambda _: complete(), range(2)))
     assert sorted(outcomes) == ["completed", "rejected"]
+
+
+def test_bootstrap_requires_one_use_local_capability_and_one_atomic_claimant(
+    database: Database,
+) -> None:
+    service = bootstrap(database)
+    assert service.status(now=100).has_password is False
+    with pytest.raises(BootstrapClaimRequired):
+        service.enroll_password(
+            "a sufficiently long password",
+            claimant_token="unclaimed-browser-token-long-enough",
+            now=101,
+        )
+
+    capability = service.issue_capability(now=102, lifetime=60)
+    barrier = Barrier(2)
+
+    def claim(index: int) -> str:
+        barrier.wait()
+        token = f"claimant-token-long-enough-for-race-{index}"
+        try:
+            bootstrap(database).claim(capability, token, now=103)
+        except BootstrapClaimRequired:
+            return "rejected"
+        return token
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(claim, range(2)))
+    assert sum(outcome != "rejected" for outcome in outcomes) == 1
+    winner = next(outcome for outcome in outcomes if outcome != "rejected")
+
+    with pytest.raises(BootstrapClaimRequired):
+        service.claim(capability, "third-claimant-token-long-enough", now=104)
+    with pytest.raises(BootstrapClaimRequired):
+        service.enroll_password(
+            "a sufficiently long password",
+            claimant_token="losing-claimant-token-long-enough",
+            now=104,
+        )
+
+    service.enroll_password(
+        "a sufficiently long password", claimant_token=winner, now=104
+    )
+    assert service.status(now=105, claimant_token=winner).has_password is True
+
+
+def test_schema_18_upgrade_backfills_existing_valid_owner_as_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "schema-18-owner.db"
+    monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 18)
+    database = Database(path)
+    database.initialize()
+    with database.transaction() as connection:
+        _ensure_auth_user(connection, USER_ID, created_at=50)
+        connection.execute(
+            """
+            INSERT INTO auth_credentials(
+                credential_id, user_id, kind, public_material, enrolled_at, factor_label
+            ) VALUES ('password_existing_owner', ?, 'password', ?, 50, 'Password')
+            """,
+            (USER_ID, b"$argon2id$existing"),
+        )
+        _register_auth_factor(
+            connection,
+            credential_id="password_existing_owner",
+            user_id=USER_ID,
+            kind="password",
+            label="Password",
+            now=50,
+        )
+        connection.execute(
+            """
+            INSERT INTO auth_credentials(
+                credential_id, user_id, kind, public_material, enrolled_at,
+                sign_count, backup_eligible, backup_state, user_handle,
+                factor_label, transports_json, discoverable
+            ) VALUES (?, ?, 'webauthn', ?, 50, 0, 1, 1, ?, 'Existing passkey', '[]', 1)
+            """,
+            (
+                encoded_credential_id("existing-owner-passkey"),
+                USER_ID,
+                b"existing-public-key",
+                hashlib.sha256(b"signet-webauthn-user-v1\x00" + USER_ID.encode()).digest(),
+            ),
+        )
+        _register_auth_factor(
+            connection,
+            credential_id=encoded_credential_id("existing-owner-passkey"),
+            user_id=USER_ID,
+            kind="webauthn",
+            label="Existing passkey",
+            now=50,
+        )
+        connection.execute(
+            """
+            INSERT INTO browser_bootstrap_state(
+                state_id, user_id, status, created_at, updated_at
+            ) VALUES (1, ?, 'pending', 50, 50)
+            """,
+            (USER_ID,),
+        )
+
+    monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 19)
+    versions: list[int] = []
+    database.initialize(
+        pre_migration_backup=verified_backup_callback(tmp_path / "backups", versions)
+    )
+
+    service = bootstrap(database)
+    status = service.status(now=100)
+    assert status.complete is True
+    assert status.has_password is True
+    assert status.factor_labels == ("Existing passkey",)
+    assert versions == [18]
+    with pytest.raises(BootstrapAlreadyComplete):
+        service.issue_capability(now=101)
 
 
 def test_passkey_registration_is_origin_session_account_and_replay_bound(
@@ -290,12 +479,10 @@ def test_totp_bootstrap_enrollment_is_verified_bound_and_seed_is_not_persisted(
         secret_store=store,
         lifetime=120,
     )
-    bootstrap = BootstrapService(
-        database,
-        owner_user_id=USER_ID,
-        password_enroller=FastPasswordEnroller(),
+    bootstrap = claimed_bootstrap(database)
+    bootstrap.enroll_password(
+        "correct horse battery staple", claimant_token=CLAIMANT_TOKEN, now=100
     )
-    bootstrap.enroll_password("correct horse battery staple", now=100)
 
     issued = enrollments.begin(
         USER_ID,
@@ -322,13 +509,9 @@ def test_totp_bootstrap_enrollment_is_verified_bound_and_seed_is_not_persisted(
         session_id=None,
         now=120,
     )
-    status = bootstrap.enroll_totp(verified, now=121)
-    assert status.factor_labels == ("Phone app",)
-    enrollments.consume(
-        issued.enrollment.enrollment_id,
-        user_id=USER_ID,
-        session_id=None,
-        now=121,
+    status = bootstrap.enroll_totp(
+        verified, claimant_token=CLAIMANT_TOKEN, now=121
     )
-    assert bootstrap.complete(now=122).complete
+    assert status.factor_labels == ("Phone app",)
+    assert bootstrap.complete(claimant_token=CLAIMANT_TOKEN, now=122).complete
     assert secret.encode() not in database.path.read_bytes()

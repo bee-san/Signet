@@ -1540,6 +1540,7 @@ def test_insecure_cookies_are_available_only_on_named_loopback_http(
             allowed_hosts=("127.0.0.1", "localhost"),
             session_cookie="signet_demo_session",
             login_csrf_cookie="signet_demo_login_csrf",
+            bootstrap_cookie="signet_demo_bootstrap_claim",
             secure_cookies=False,
             fake_only_ui=True,
         ),
@@ -1764,6 +1765,7 @@ def test_initial_owner_setup_is_browser_only_resumable_and_one_time(
         browser_auth=browser_auth,
         clock=lambda: NOW,
     )
+    capability = bootstrap.issue_capability(now=NOW, lifetime=600)
 
     with TestClient(app, base_url=ORIGIN) as setup_client:
         login = setup_client.get("/login", follow_redirects=False)
@@ -1774,6 +1776,32 @@ def test_initial_owner_setup_is_browser_only_resumable_and_one_time(
         token = setup_client.cookies.get("__Host-signet_login_csrf")
         assert page.status_code == 200 and token
         assert "Set up Signet" in page.text
+        assert "Setup is locked" in page.text
+        assert "Create your password" not in page.text
+
+        unclaimed_options = setup_client.post(
+            "/setup/passkeys/options",
+            json={"label": "Mac passkey"},
+            headers={"Origin": ORIGIN, "X-CSRF-Token": token},
+        )
+        assert unclaimed_options.status_code == 400
+        with database.read() as connection:
+            assert connection.execute(
+                "SELECT count(*) FROM auth_registration_challenges"
+            ).fetchone()[0] == 0
+
+        claimed = setup_client.post(
+            "/setup/claim",
+            data={"capability": capability, "csrf_token": token},
+            headers={"Origin": ORIGIN},
+            follow_redirects=False,
+        )
+        assert claimed.status_code == 303
+        assert setup_client.cookies.get("__Host-signet_bootstrap_claim")
+
+        page = setup_client.get("/setup")
+        token = setup_client.cookies.get("__Host-signet_login_csrf")
+        assert page.status_code == 200 and token
         assert "Create your password" in page.text
         assert "Add an authenticator" in page.text
 

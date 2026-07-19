@@ -92,6 +92,38 @@
     });
   };
 
+  const operationId = () => `browser-operation-${crypto.randomUUID()}`;
+
+  const authorizeEnrollment = async (intent, form) => {
+    const data = new FormData(form);
+    const proof = String(data.get("totp_proof") || "").trim();
+    if (proof) {
+      return post("/authenticators/enroll/totp", {
+        ...intent,
+        totp_proof: proof,
+        totp_credential_id: data.get("totp_credential_id") || null,
+      });
+    }
+    return confirmWithPasskey(intent);
+  };
+
+  const completePasskeyEnrollment = async (issued) => {
+    if (issued.kind !== "passkey") throw new Error("Passkey enrollment authorization was invalid.");
+    const credential = await navigator.credentials.create({publicKey: creationOptions(issued.publicKey)});
+    if (!credential) throw new Error("Passkey creation was cancelled.");
+    return post("/authenticators/passkeys/complete", {
+      challenge_id: issued.challenge_id,
+      credential: registrationJSON(credential),
+    });
+  };
+
+  const finalizeEnrollment = (action, pending) => post("/authenticators/enroll/finalize", {
+    action,
+    operation_id: pending.operation_id,
+    registration_id: pending.registration_id,
+    authorization_id: pending.authorization_id,
+  });
+
   document.querySelector("[data-setup-passkey]")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -114,20 +146,19 @@
     const form = event.currentTarget;
     const button = form.querySelector("button");
     button.disabled = true;
-    announce("Waiting for your browser to create the new passkey.");
+    announce("Confirm with an existing authenticator before creating the new passkey.");
     try {
-      const pending = await register(
-        "/authenticators/passkeys/options",
-        "/authenticators/passkeys/complete",
-        new FormData(form).get("label"),
-      );
-      const intent = {action: "add_passkey", operation_id: pending.operation_id, registration_id: pending.registration_id};
-      const panel = document.querySelector("[data-pending-passkey]");
-      panel.hidden = false;
-      panel.querySelectorAll('[data-intent-field]').forEach((field) => { field.value = intent[field.name] || ""; });
-      const passkeyButton = panel.querySelector("[data-confirm-new-passkey]");
-      passkeyButton.dataset.intent = JSON.stringify(intent);
-      announce("New passkey created. Confirm this exact addition with an existing authenticator.");
+      const intent = {
+        action: "add_passkey",
+        label: new FormData(form).get("label"),
+        operation_id: operationId(),
+      };
+      const issued = await authorizeEnrollment(intent, form);
+      announce("Authorization accepted. Waiting for your browser to create the new passkey.");
+      const pending = await completePasskeyEnrollment(issued);
+      const result = await finalizeEnrollment("add_passkey", pending);
+      announce("Passkey added. Returning to sign in.");
+      window.location.assign(result.redirect_url);
     } catch (error) {
       announce(error.message || "Passkey setup failed.", true);
       button.disabled = false;
@@ -140,15 +171,18 @@
       const button = form.querySelector("button");
       const flow = form.dataset.flow;
       button.disabled = true;
-      announce("Creating a one-time TOTP enrollment.");
+      announce(flow === "setup" ? "Creating a one-time TOTP enrollment." : "Confirm with an existing authenticator before creating the TOTP secret.");
       try {
-        const issued = await post(
-          flow === "setup" ? "/setup/totp/start" : "/authenticators/totp/start",
-          {label: new FormData(form).get("label")},
-        );
+        const label = new FormData(form).get("label");
+        const issued = flow === "setup"
+          ? await post("/setup/totp/start", {label})
+          : await authorizeEnrollment({action: "add_totp", label, operation_id: operationId()}, form);
+        if (flow !== "setup" && issued.kind !== "totp") throw new Error("TOTP enrollment authorization was invalid.");
         const panel = form.parentElement.querySelector("[data-totp-enrollment]");
         panel.hidden = false;
         panel.dataset.enrollmentId = issued.enrollment_id;
+        panel.dataset.authorizationId = issued.authorization_id || "";
+        panel.dataset.operationId = issued.operation_id || "";
         const qrCode = panel.querySelector("[data-totp-qr]");
         qrCode.src = issued.qr_code_data_uri;
         qrCode.hidden = false;
@@ -185,12 +219,12 @@
           return;
         }
         panel.hidden = true;
-        const intent = {action: "add_totp", operation_id: pending.operation_id, registration_id: pending.registration_id};
-        const confirmation = document.querySelector("[data-pending-totp]");
-        confirmation.hidden = false;
-        confirmation.querySelectorAll('[data-intent-field]').forEach((field) => { field.value = intent[field.name] || ""; });
-        confirmation.querySelector("[data-confirm-new-totp]").dataset.intent = JSON.stringify(intent);
-        announce("New TOTP verified. Confirm this exact addition with an existing authenticator.");
+        if (pending.authorization_id !== panel.dataset.authorizationId || pending.operation_id !== panel.dataset.operationId) {
+          throw new Error("TOTP enrollment authorization changed unexpectedly.");
+        }
+        const result = await finalizeEnrollment("add_totp", pending);
+        announce("TOTP added. Returning to sign in.");
+        window.location.assign(result.redirect_url);
       } catch (error) {
         announce(error.message || "TOTP verification failed.", true);
         button.disabled = false;

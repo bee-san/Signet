@@ -6,9 +6,11 @@ from dataclasses import replace
 from pathlib import Path
 from threading import Barrier
 
+import pyotp
 import pytest
 
 from signet.auth import (
+    AuthenticationRateLimited,
     InMemoryAttemptLimiter,
     PasswordCredential,
     ProofCapability,
@@ -26,13 +28,25 @@ from signet.authenticator_management import (
     LastAuthenticatorError,
     RecoveryPolicy,
 )
+from signet.browser_auth import (
+    BootstrapClaimRequired,
+    BootstrapError,
+    BootstrapService,
+    BrowserAuthController,
+    ManagementIntent,
+)
 from signet.credential_broker import CredentialError, Secret, SecretReference
-from signet.db import Database
+from signet.db import Database, IntegrityError
 from signet.totp import (
     InvalidTotp,
     SQLiteTotpCredentialRepository,
     TotpCredential,
     TotpVerifier,
+)
+from signet.totp_enrollment import (
+    TotpEnrollmentCleanupError,
+    TotpEnrollmentRateLimited,
+    TotpEnrollmentService,
 )
 from signet.webauthn import (
     FakeAssertion,
@@ -43,6 +57,7 @@ from signet.webauthn import (
     WebAuthnChallengeUnavailable,
     WebAuthnCredential,
 )
+from signet.webauthn_registration import PasskeyRegistrationService, RegistrationResult
 
 USER_ID = "human"
 OTHER_USER_ID = "other"
@@ -83,12 +98,62 @@ class RecordingProvisioner:
             raise CredentialError("test secret is unavailable") from exc
 
 
+class FailingCleanupProvisioner(RecordingProvisioner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_cleanup = True
+
+    def delete(self, reference: str) -> None:
+        if self.fail_cleanup:
+            raise CredentialError("injected Keychain cleanup failure")
+        super().delete(reference)
+
+
+class AlreadyMissingCleanupProvisioner(RecordingProvisioner):
+    def delete(self, reference: str) -> None:
+        super().delete(reference)
+        raise CredentialError("test backend reports an already-missing secret")
+
+
 class SecretBoundTotpProvider:
     test_only = True
 
     def verify_step(self, secret: Secret, proof: str, *, now: int) -> int | None:
         del now
         return 77 if proof == f"fake:{secret.reveal()}" else None
+
+
+class CountingRegistrationProvider:
+    test_only = True
+
+    def __init__(self) -> None:
+        self.verify_calls = 0
+
+    def verify(self, *args: object, **kwargs: object) -> RegistrationResult:
+        del args, kwargs
+        self.verify_calls += 1
+        raise AssertionError("registration verification was not expected")
+
+
+class SuccessfulRegistrationProvider:
+    test_only = True
+
+    def __init__(self) -> None:
+        self.credential_id = base64.urlsafe_b64encode(
+            b"atomic-passkey-credential"
+        ).rstrip(b"=").decode("ascii")
+
+    def verify(self, *args: object, **kwargs: object) -> RegistrationResult:
+        del args, kwargs
+        return RegistrationResult(
+            credential_id=self.credential_id,
+            public_key=b"atomic-passkey-public-key",
+            sign_count=0,
+            device_type="single_device",
+            backed_up=False,
+            transports=("internal",),
+            discoverable=True,
+        )
 
 
 @pytest.fixture
@@ -144,6 +209,48 @@ def totp_verifier(
         capabilities=CAPABILITIES,
         provider=SecretBoundTotpProvider(),
         allow_test_provider=True,
+    )
+
+
+def browser_controller(
+    database: Database,
+    provisioner: RecordingProvisioner,
+    *,
+    registration_provider: (
+        CountingRegistrationProvider | SuccessfulRegistrationProvider | None
+    ) = None,
+) -> BrowserAuthController:
+    webauthn_repository = SQLiteWebAuthnRepository(database)
+    return BrowserAuthController(
+        bootstrap=BootstrapService(database, owner_user_id=USER_ID),
+        registrations=PasskeyRegistrationService(
+            database,
+            provider=registration_provider or CountingRegistrationProvider(),
+            rp_id=RP_ID,
+            origin=ORIGIN,
+            allow_test_provider=True,
+        ),
+        manager=manager(database, provisioner),
+        totp_verifier=totp_verifier(database, provisioner),
+        webauthn_issuer=WebAuthnChallengeIssuer(
+            webauthn_repository,
+            rp_id=RP_ID,
+            origin=ORIGIN,
+        ),
+        webauthn_verifier=WebAuthnAssertionVerifier(
+            webauthn_repository,
+            rp_id=RP_ID,
+            origin=ORIGIN,
+            capabilities=CAPABILITIES,
+            provider=FakeWebAuthnProvider(),
+            allow_test_provider=True,
+        ),
+        webauthn_repository=webauthn_repository,
+        totp_enrollments=TotpEnrollmentService(
+            database,
+            provisioner=provisioner,
+            secret_store=provisioner,
+        ),
     )
 
 
@@ -255,7 +362,9 @@ def test_multiple_totps_are_independent_and_listing_never_exposes_secrets(
         )
 
 
-def test_totp_selected_factor_has_an_independent_rate_limit(database: Database) -> None:
+def test_totp_selected_factor_also_consumes_the_aggregate_user_limit(
+    database: Database,
+) -> None:
     provisioner = RecordingProvisioner()
     bootstrap_totp(database)
     bootstrap_totp(
@@ -288,7 +397,7 @@ def test_totp_selected_factor_has_an_independent_rate_limit(database: Database) 
             )
     assert limiter.state(totp_factor_rate_limit_key(USER_ID, "totp-bootstrap")).failures == 2
     assert limiter.state(totp_factor_rate_limit_key(USER_ID, "totp-second")).failures == 0
-    assert (
+    with pytest.raises(AuthenticationRateLimited):
         verifier.verify(
             USER_ID,
             "fake:second-bootstrap-seed",
@@ -298,9 +407,374 @@ def test_totp_selected_factor_has_an_independent_rate_limit(database: Database) 
             session_id=session_id,
             http_method="POST",
             now=103,
-        ).credential_id
-        == "totp-second"
+        )
+
+
+def test_management_enrollment_has_zero_side_effects_until_fresh_factor_authorization(
+    database: Database,
+) -> None:
+    provisioner = RecordingProvisioner()
+    bootstrap_totp(database)
+    _, session_id = session(database)
+    registration_provider = CountingRegistrationProvider()
+    controller = browser_controller(
+        database,
+        provisioner,
+        registration_provider=registration_provider,
     )
+
+    with pytest.raises(BootstrapError, match="issued authorization"):
+        controller.apply_with_totp(
+            USER_ID,
+            session_id,
+            ManagementIntent(
+                action="add_totp",
+                label="New phone",
+                operation_id="operation-bypass-enrollment-001",
+                registration_id="attacker-controlled-registration",
+            ),
+            "fake:bootstrap-seed",
+            source_id="test-source",
+            credential_id="totp-bootstrap",
+            now=101,
+        )
+    with pytest.raises(BootstrapClaimRequired):
+        controller.begin_registration(
+            USER_ID,
+            "New passkey",
+            flow="management",
+            session_id=session_id,
+            now=101,
+        )
+    with pytest.raises(BootstrapClaimRequired):
+        controller.begin_totp_enrollment(
+            USER_ID,
+            "New phone",
+            flow="management",
+            session_id=session_id,
+            now=101,
+        )
+    intent = ManagementIntent(
+        action="add_totp",
+        label="New phone",
+        operation_id="operation-add-totp-001",
+    )
+    with pytest.raises(InvalidTotp):
+        controller.authorize_enrollment_with_totp(
+            USER_ID,
+            session_id,
+            intent,
+            "fake:wrong",
+            source_id="test-source",
+            credential_id="totp-bootstrap",
+            now=102,
+        )
+
+    with database.read() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM auth_registration_challenges"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT count(*) FROM browser_totp_enrollments"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT count(*) FROM browser_enrollment_authorizations"
+        ).fetchone()[0] == 0
+    assert provisioner.created_references == []
+    assert registration_provider.verify_calls == 0
+
+    issued = controller.authorize_enrollment_with_totp(
+        USER_ID,
+        session_id,
+        intent,
+        "fake:bootstrap-seed",
+        source_id="test-source",
+        credential_id="totp-bootstrap",
+        now=103,
+    )
+    assert issued.enrollment.authorization_id is not None
+    assert issued.enrollment.operation_id == intent.operation_id
+    assert len(provisioner.created_references) == 1
+    with database.read() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM browser_totp_enrollments"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM browser_enrollment_authorizations"
+        ).fetchone()[0] == 1
+
+
+def test_totp_publication_and_pending_enrollment_consumption_are_atomic(
+    database: Database,
+) -> None:
+    provisioner = RecordingProvisioner()
+    bootstrap_totp(database)
+    _, session_id = session(database)
+    controller = browser_controller(database, provisioner)
+    intent = ManagementIntent(
+        action="add_totp",
+        label="New phone",
+        operation_id="operation-add-totp-atomic-001",
+    )
+    issued = controller.authorize_enrollment_with_totp(
+        USER_ID,
+        session_id,
+        intent,
+        "fake:bootstrap-seed",
+        source_id="test-source",
+        credential_id="totp-bootstrap",
+        now=101,
+    )
+    enrollment = issued.enrollment
+    reference = SecretReference.parse(enrollment.secret_reference)
+    valid_seed = "JBSWY3DPEHPK3PXP"
+    provisioner._values[(reference.service, reference.account)] = valid_seed
+    verified = controller.verify_totp_enrollment(
+        enrollment.enrollment_id,
+        pyotp.TOTP(valid_seed).at(102),
+        user_id=USER_ID,
+        session_id=session_id,
+        now=102,
+    )
+    assert verified.authorization_id is not None
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER inject_totp_enrollment_consume_failure
+            BEFORE UPDATE OF consumed_at ON browser_totp_enrollments
+            WHEN NEW.consumed_at IS NOT NULL
+            BEGIN SELECT RAISE(ABORT, 'injected enrollment consume failure'); END
+            """
+        )
+
+    with pytest.raises(IntegrityError, match="injected enrollment consume failure"):
+        controller.complete_authorized_enrollment(
+            USER_ID,
+            session_id,
+            ManagementIntent(
+                action="add_totp",
+                operation_id=intent.operation_id,
+                registration_id=enrollment.enrollment_id,
+                authorization_id=verified.authorization_id,
+            ),
+            now=103,
+        )
+
+    with database.read() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM auth_credentials WHERE credential_id = ?",
+            (enrollment.credential_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """
+            SELECT consumed_at FROM browser_enrollment_authorizations
+            WHERE authorization_id = ?
+            """,
+            (verified.authorization_id,),
+        ).fetchone()[0] is None
+        assert connection.execute(
+            "SELECT consumed_at FROM browser_totp_enrollments WHERE enrollment_id = ?",
+            (enrollment.enrollment_id,),
+        ).fetchone()[0] is None
+    assert provisioner.get(reference).reveal() == valid_seed
+
+
+def test_passkey_publication_and_registration_consumption_are_atomic(
+    database: Database,
+) -> None:
+    provisioner = RecordingProvisioner()
+    provider = SuccessfulRegistrationProvider()
+    bootstrap_totp(database)
+    _, session_id = session(database)
+    controller = browser_controller(
+        database,
+        provisioner,
+        registration_provider=provider,
+    )
+    intent = ManagementIntent(
+        action="add_passkey",
+        label="New passkey",
+        operation_id="operation-add-passkey-atomic-001",
+    )
+    issued = controller.authorize_enrollment_with_totp(
+        USER_ID,
+        session_id,
+        intent,
+        "fake:bootstrap-seed",
+        source_id="test-source",
+        credential_id="totp-bootstrap",
+        now=101,
+    )
+    challenge_id = issued.challenge_id  # type: ignore[union-attr]
+    pending = controller.complete_registration(
+        challenge_id,
+        {},
+        user_id=USER_ID,
+        session_id=session_id,
+        now=102,
+    )
+    assert pending.authorization_id is not None
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER inject_passkey_registration_consume_failure
+            BEFORE UPDATE OF consumed_at ON auth_registration_challenges
+            WHEN NEW.consumed_at IS NOT NULL
+            BEGIN SELECT RAISE(ABORT, 'injected registration consume failure'); END
+            """
+        )
+
+    with pytest.raises(IntegrityError, match="injected registration consume failure"):
+        controller.complete_authorized_enrollment(
+            USER_ID,
+            session_id,
+            ManagementIntent(
+                action="add_passkey",
+                operation_id=intent.operation_id,
+                registration_id=challenge_id,
+                authorization_id=pending.authorization_id,
+            ),
+            now=103,
+        )
+
+    with database.read() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM auth_credentials WHERE credential_id = ?",
+            (provider.credential_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """
+            SELECT consumed_at FROM browser_enrollment_authorizations
+            WHERE authorization_id = ?
+            """,
+            (pending.authorization_id,),
+        ).fetchone()[0] is None
+        assert connection.execute(
+            "SELECT consumed_at FROM auth_registration_challenges WHERE challenge_id = ?",
+            (challenge_id,),
+        ).fetchone()[0] is None
+
+
+def test_totp_enrollment_caps_precede_provisioning_and_cleanup_failures_are_retryable(
+    database: Database,
+) -> None:
+    provisioner = FailingCleanupProvisioner()
+    service = TotpEnrollmentService(
+        database,
+        provisioner=provisioner,
+        secret_store=provisioner,
+        lifetime=10,
+        max_active_per_user=1,
+        max_active_per_session=1,
+    )
+    issued = service.begin(
+        USER_ID,
+        "Phone",
+        flow="bootstrap",
+        session_id=None,
+        now=100,
+    )
+    with pytest.raises(TotpEnrollmentRateLimited):
+        service.begin(
+            USER_ID,
+            "Second phone",
+            flow="bootstrap",
+            session_id=None,
+            now=101,
+        )
+    assert len(provisioner.created_references) == 1
+
+    with pytest.raises(TotpEnrollmentCleanupError):
+        service.cleanup_expired(now=110)
+    with database.read() as connection:
+        row = connection.execute(
+            """
+            SELECT invalidated_at, cleanup_completed_at
+            FROM browser_totp_enrollments WHERE enrollment_id = ?
+            """,
+            (issued.enrollment.enrollment_id,),
+        ).fetchone()
+    assert row is not None
+    assert row["invalidated_at"] == 110
+    assert row["cleanup_completed_at"] is None
+
+    provisioner.fail_cleanup = False
+    assert service.cleanup_expired(now=111) == 1
+    assert issued.enrollment.secret_reference in provisioner.deleted_references
+    replacement = service.begin(
+        USER_ID,
+        "Replacement phone",
+        flow="bootstrap",
+        session_id=None,
+        now=112,
+    )
+    assert replacement.enrollment.enrollment_id != issued.enrollment.enrollment_id
+    assert len(provisioner.created_references) == 2
+
+
+def test_totp_cleanup_accepts_delete_error_only_after_absence_is_verified(
+    database: Database,
+) -> None:
+    provisioner = AlreadyMissingCleanupProvisioner()
+    service = TotpEnrollmentService(
+        database,
+        provisioner=provisioner,
+        secret_store=provisioner,
+        lifetime=10,
+    )
+    issued = service.begin(
+        USER_ID,
+        "Phone",
+        flow="bootstrap",
+        session_id=None,
+        now=100,
+    )
+
+    assert service.cleanup_expired(now=110) == 1
+    assert issued.enrollment.secret_reference in provisioner.deleted_references
+
+
+def test_failed_totp_enrollment_insert_retains_retryable_cleanup_debt(
+    database: Database,
+) -> None:
+    provisioner = FailingCleanupProvisioner()
+    service = TotpEnrollmentService(
+        database,
+        provisioner=provisioner,
+        secret_store=provisioner,
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER inject_active_totp_enrollment_insert_failure
+            BEFORE INSERT ON browser_totp_enrollments
+            WHEN NEW.invalidated_at IS NULL
+            BEGIN SELECT RAISE(ABORT, 'injected active enrollment insert failure'); END
+            """
+        )
+
+    with pytest.raises(TotpEnrollmentCleanupError, match="cleanup"):
+        service.begin(
+            USER_ID,
+            "Phone",
+            flow="bootstrap",
+            session_id=None,
+            now=100,
+        )
+
+    with database.read() as connection:
+        row = connection.execute(
+            """
+            SELECT invalidated_at, cleanup_completed_at
+            FROM browser_totp_enrollments
+            """
+        ).fetchone()
+    assert row is not None
+    assert row["invalidated_at"] == 100
+    assert row["cleanup_completed_at"] is None
+    provisioner.fail_cleanup = False
+    assert service.cleanup_expired(now=101) == 1
+    assert len(provisioner.deleted_references) == 1
 
 
 def test_management_proofs_are_action_bound_fresh_and_single_use(database: Database) -> None:

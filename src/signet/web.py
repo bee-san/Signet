@@ -53,9 +53,9 @@ from signet.effects import (
 )
 from signet.http_security import RequestBodyLimitMiddleware
 from signet.totp import TotpError
-from signet.totp_enrollment import TotpEnrollmentError
+from signet.totp_enrollment import IssuedTotpEnrollment, TotpEnrollmentError
 from signet.webauthn import WebAuthnError
-from signet.webauthn_registration import PasskeyRegistrationError
+from signet.webauthn_registration import IssuedRegistration, PasskeyRegistrationError
 
 type HumanAction = Literal[
     "approve",
@@ -71,6 +71,7 @@ type EffectTriStateInput = Literal["true", "false", "unknown"]
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _LOGIN_CSRF_COOKIE = "__Host-signet_login_csrf"
 _SESSION_COOKIE = "__Host-signet_session"
+_BOOTSTRAP_COOKIE = "__Host-signet_bootstrap_claim"
 _COOKIE_NAME_CHARACTERS = frozenset(
     "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
@@ -866,6 +867,7 @@ class WebSettings:
     vapid_public_key: str = ""
     session_cookie: str = _SESSION_COOKIE
     login_csrf_cookie: str = _LOGIN_CSRF_COOKIE
+    bootstrap_cookie: str = _BOOTSTRAP_COOKIE
     secure_cookies: bool = True
     fake_only_ui: bool = False
 
@@ -893,20 +895,23 @@ class WebSettings:
         if self.secure_cookies:
             if parsed.scheme != "https":
                 raise ValueError("secure web cookies require an HTTPS public origin")
-            if not self.session_cookie.startswith(
-                "__Host-"
-            ) or not self.login_csrf_cookie.startswith("__Host-"):
+            if (
+                not self.session_cookie.startswith("__Host-")
+                or not self.login_csrf_cookie.startswith("__Host-")
+                or not self.bootstrap_cookie.startswith("__Host-")
+            ):
                 raise ValueError("secure web cookies require __Host- cookie names")
         elif (
             parsed.scheme != "http"
             or not loopback
             or self.session_cookie.startswith("__Host-")
             or self.login_csrf_cookie.startswith("__Host-")
+            or self.bootstrap_cookie.startswith("__Host-")
         ):
             raise ValueError("insecure web cookies are restricted to named loopback cookies")
         if self.fake_only_ui == self.secure_cookies:
             raise ValueError("insecure loopback cookies and fake-only UI must be enabled together")
-        cookie_names = (self.session_cookie, self.login_csrf_cookie)
+        cookie_names = (self.session_cookie, self.login_csrf_cookie, self.bootstrap_cookie)
         if (
             not self.allowed_hosts
             or hostname not in self.allowed_hosts
@@ -986,7 +991,14 @@ def create_web_app(
     app.mount("/static", StaticFiles(directory=package_root / "static"), name="static")
 
     def source(request: Request) -> str:
-        client = request.client.host if request.client is not None else "unknown"
+        attributed = request.scope.get("state", {}).get("signet_source")
+        client = (
+            attributed
+            if isinstance(attributed, str)
+            else request.client.host
+            if request.client is not None
+            else "unknown"
+        )
         return hashlib.sha256(client.encode()).hexdigest()
 
     def principal(request: Request) -> SessionPrincipal:
@@ -1137,11 +1149,13 @@ def create_web_app(
         factor_id = body.get("factor_id")
         label = body.get("label")
         registration_id = body.get("registration_id")
+        authorization_id = body.get("authorization_id")
         compromised = body.get("compromised", False)
         if (
             (factor_id is not None and not isinstance(factor_id, str))
             or (label is not None and not isinstance(label, str))
             or (registration_id is not None and not isinstance(registration_id, str))
+            or (authorization_id is not None and not isinstance(authorization_id, str))
             or not isinstance(compromised, bool)
         ):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
@@ -1151,13 +1165,17 @@ def create_web_app(
             factor_id=factor_id,
             label=label,
             registration_id=registration_id,
+            authorization_id=authorization_id,
             compromised=compromised,
         )
 
     @app.get("/setup", response_class=HTMLResponse)
     def setup_page(request: Request) -> Response:
         selected_auth = required_browser_auth()
-        setup_status = selected_auth.bootstrap.status(now=now_fn())
+        setup_status = selected_auth.bootstrap.status(
+            now=now_fn(),
+            claimant_token=request.cookies.get(settings.bootstrap_cookie),
+        )
         if setup_status.complete:
             return Response(
                 status_code=status.HTTP_303_SEE_OTHER,
@@ -1187,6 +1205,36 @@ def create_web_app(
         )
         return response
 
+    @app.post("/setup/claim")
+    async def setup_claim(
+        request: Request,
+        capability: Annotated[str, Form(min_length=32, max_length=384)],
+        csrf_token: Annotated[str, Form()],
+    ) -> Response:
+        require_setup_csrf(request, csrf_token)
+        claimant_token = secrets.token_urlsafe(32)
+        selected_auth = required_browser_auth()
+        await run_in_threadpool(
+            selected_auth.bootstrap.claim,
+            capability,
+            claimant_token,
+            now=now_fn(),
+        )
+        response = Response(
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers={"Location": "/setup"},
+        )
+        response.set_cookie(
+            settings.bootstrap_cookie,
+            claimant_token,
+            secure=settings.secure_cookies,
+            httponly=True,
+            samesite="strict",
+            path="/",
+            max_age=60 * 60,
+        )
+        return response
+
     @app.post("/setup/password")
     async def setup_password(
         request: Request,
@@ -1201,7 +1249,12 @@ def create_web_app(
                 detail="password confirmation does not match",
             )
         selected_auth = required_browser_auth()
-        await run_in_threadpool(selected_auth.bootstrap.enroll_password, password, now=now_fn())
+        await run_in_threadpool(
+            selected_auth.bootstrap.enroll_password,
+            password,
+            claimant_token=request.cookies.get(settings.bootstrap_cookie),
+            now=now_fn(),
+        )
         return Response(
             status_code=status.HTTP_303_SEE_OTHER,
             headers={"Location": "/setup#passkey"},
@@ -1221,6 +1274,7 @@ def create_web_app(
             label,
             flow="bootstrap",
             session_id=None,
+            claimant_token=request.cookies.get(settings.bootstrap_cookie),
             now=now_fn(),
         )
         return {
@@ -1243,11 +1297,13 @@ def create_web_app(
             credential,
             user_id=selected_auth.bootstrap.owner_user_id,
             session_id=None,
+            claimant_token=request.cookies.get(settings.bootstrap_cookie),
             now=now_fn(),
         )
         setup_status = await run_in_threadpool(
             selected_auth.commit_bootstrap_passkey,
             challenge_id,
+            claimant_token=request.cookies.get(settings.bootstrap_cookie),
             now=now_fn(),
         )
         return {
@@ -1269,6 +1325,7 @@ def create_web_app(
             label,
             flow="bootstrap",
             session_id=None,
+            claimant_token=request.cookies.get(settings.bootstrap_cookie),
             now=now_fn(),
         )
         return {
@@ -1293,11 +1350,13 @@ def create_web_app(
             proof,
             user_id=selected_auth.bootstrap.owner_user_id,
             session_id=None,
+            claimant_token=request.cookies.get(settings.bootstrap_cookie),
             now=now_fn(),
         )
         setup_status = await run_in_threadpool(
             selected_auth.commit_bootstrap_totp,
             enrollment_id,
+            claimant_token=request.cookies.get(settings.bootstrap_cookie),
             now=now_fn(),
         )
         return {
@@ -1312,13 +1371,23 @@ def create_web_app(
     ) -> Response:
         require_setup_csrf(request, csrf_token)
         selected_auth = required_browser_auth()
-        await run_in_threadpool(selected_auth.bootstrap.complete, now=now_fn())
+        await run_in_threadpool(
+            selected_auth.bootstrap.complete,
+            claimant_token=request.cookies.get(settings.bootstrap_cookie),
+            now=now_fn(),
+        )
         response = Response(
             status_code=status.HTTP_303_SEE_OTHER,
             headers={"Location": "/login?setup=complete"},
         )
         response.delete_cookie(
             settings.login_csrf_cookie,
+            path="/",
+            secure=settings.secure_cookies,
+            httponly=True,
+        )
+        response.delete_cookie(
+            settings.bootstrap_cookie,
             path="/",
             secure=settings.secure_cookies,
             httponly=True,
@@ -1470,6 +1539,28 @@ def create_web_app(
         )
         return response
 
+    def enrollment_response(
+        issued: IssuedRegistration | IssuedTotpEnrollment,
+    ) -> dict[str, Any]:
+        if isinstance(issued, IssuedRegistration):
+            return {
+                "kind": "passkey",
+                "challenge_id": issued.challenge_id,
+                "publicKey": json.loads(issued.options_json),
+                "authorization_id": issued.authorization_id,
+                "operation_id": issued.operation_id,
+            }
+        enrollment = issued.enrollment
+        return {
+            "kind": "totp",
+            "enrollment_id": enrollment.enrollment_id,
+            "provisioning_uri": issued.provisioning_uri,
+            "qr_code_data_uri": issued.qr_code_data_uri,
+            "manual_key": issued.manual_key,
+            "authorization_id": enrollment.authorization_id,
+            "operation_id": enrollment.operation_id,
+        }
+
     @app.get("/authenticators", response_class=HTMLResponse)
     async def authenticators_page(request: Request) -> Response:
         selected = await async_principal(request)
@@ -1484,6 +1575,9 @@ def create_web_app(
                     **context(request, selected),
                     "factors": factors,
                     "totp_factors": tuple(factor for factor in factors if factor.kind == "totp"),
+                    "passkey_factors": tuple(
+                        factor for factor in factors if factor.kind == "webauthn"
+                    ),
                     "csrf_token": csrf.session_token(selected.session_id, "authenticators"),
                     "logout_csrf": csrf.session_token(selected.session_id, "logout"),
                     "operation_ids": {
@@ -1529,7 +1623,7 @@ def create_web_app(
         if not isinstance(challenge_id, str) or not isinstance(credential, dict):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         selected_auth = required_browser_auth()
-        await run_in_threadpool(
+        pending = await run_in_threadpool(
             selected_auth.complete_registration,
             challenge_id,
             credential,
@@ -1537,10 +1631,13 @@ def create_web_app(
             session_id=selected.session_id,
             now=now_fn(),
         )
+        if pending.authorization_id is None or pending.operation_id is None:
+            raise PasskeyRegistrationError("passkey enrollment authorization is missing")
         return {
-            "status": "confirmation_required",
+            "status": "ready_to_finalize",
             "registration_id": challenge_id,
-            "operation_id": secrets.token_urlsafe(24),
+            "authorization_id": pending.authorization_id,
+            "operation_id": pending.operation_id,
         }
 
     @app.post("/authenticators/totp/start")
@@ -1575,7 +1672,7 @@ def create_web_app(
         proof = body.get("proof")
         if not isinstance(enrollment_id, str) or not isinstance(proof, str):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
-        await run_in_threadpool(
+        pending = await run_in_threadpool(
             required_browser_auth().verify_totp_enrollment,
             enrollment_id,
             proof,
@@ -1583,10 +1680,36 @@ def create_web_app(
             session_id=selected.session_id,
             now=now_fn(),
         )
+        if pending.authorization_id is None or pending.operation_id is None:
+            raise TotpEnrollmentError("TOTP enrollment authorization is missing")
         return {
             "registration_id": enrollment_id,
-            "operation_id": secrets.token_urlsafe(24),
+            "authorization_id": pending.authorization_id,
+            "operation_id": pending.operation_id,
         }
+
+    @app.post("/authenticators/enroll/totp")
+    async def authenticator_enrollment_totp(request: Request) -> dict[str, Any]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        body = await _json_object(request)
+        proof = body.get("totp_proof")
+        credential_id = body.get("totp_credential_id")
+        if not isinstance(proof, str) or (
+            credential_id is not None and not isinstance(credential_id, str)
+        ):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        issued = await run_in_threadpool(
+            required_browser_auth().authorize_enrollment_with_totp,
+            selected.user_id,
+            selected.session_id,
+            management_intent(body),
+            proof,
+            source_id=source(request),
+            credential_id=credential_id,
+            now=now_fn(),
+        )
+        return enrollment_response(issued)
 
     @app.post("/authenticators/confirm/passkey/options")
     async def authenticator_confirmation_options(request: Request) -> dict[str, Any]:
@@ -1607,7 +1730,7 @@ def create_web_app(
         }
 
     @app.post("/authenticators/confirm/passkey/complete")
-    async def authenticator_confirmation_complete(request: Request) -> dict[str, str]:
+    async def authenticator_confirmation_complete(request: Request) -> dict[str, Any]:
         selected = await async_principal(request)
         require_csrf(request, selected, "authenticators", None)
         body = await _json_object(request)
@@ -1617,6 +1740,17 @@ def create_web_app(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         intent = management_intent(body)
         selected_auth = required_browser_auth()
+        if intent.action in {"add_passkey", "add_totp"} and intent.registration_id is None:
+            issued = await run_in_threadpool(
+                selected_auth.authorize_enrollment_with_webauthn,
+                selected.user_id,
+                selected.session_id,
+                intent,
+                challenge_id=challenge_id,
+                assertion=assertion,
+                now=now_fn(),
+            )
+            return enrollment_response(issued)
         await run_in_threadpool(
             selected_auth.apply_with_webauthn,
             selected.user_id,
@@ -1624,6 +1758,20 @@ def create_web_app(
             intent,
             challenge_id=challenge_id,
             assertion=assertion,
+            now=now_fn(),
+        )
+        return {"status": "updated", "redirect_url": "/login?authenticators=updated"}
+
+    @app.post("/authenticators/enroll/finalize")
+    async def authenticator_enrollment_finalize(request: Request) -> dict[str, str]:
+        selected = await async_principal(request)
+        require_csrf(request, selected, "authenticators", None)
+        intent = management_intent(await _json_object(request))
+        await run_in_threadpool(
+            required_browser_auth().complete_authorized_enrollment,
+            selected.user_id,
+            selected.session_id,
+            intent,
             now=now_fn(),
         )
         return {"status": "updated", "redirect_url": "/login?authenticators=updated"}

@@ -151,6 +151,53 @@ class LoopbackPeerMiddleware:
         await self._app(scope, receive, send)
 
 
+class TrustedProxySourceMiddleware:
+    """Keep the raw loopback boundary while accepting one proxy source address."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in {"http", "websocket"}:
+            await self._app(scope, receive, send)
+            return
+        client = scope.get("client")
+        raw_host = client[0] if isinstance(client, tuple) and client else None
+        if not _is_loopback_peer(raw_host):
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            else:
+                response = Response(
+                    "Forbidden",
+                    status_code=403,
+                    headers={"Cache-Control": "no-store"},
+                )
+                await response(scope, receive, send)
+            return
+        if scope["type"] == "http":
+            forwarded = [
+                value
+                for name, value in scope.get("headers", ())
+                if name.lower() == b"x-forwarded-for"
+            ]
+            if len(forwarded) > 1:
+                await _bad_forwarded_header(scope, receive, send)
+                return
+            source = raw_host
+            if forwarded:
+                try:
+                    raw_value = forwarded[0].decode("ascii")
+                    if "," in raw_value or raw_value != raw_value.strip():
+                        raise ValueError
+                    source = str(ipaddress.ip_address(raw_value))
+                except (UnicodeDecodeError, ValueError):
+                    await _bad_forwarded_header(scope, receive, send)
+                    return
+            state = scope.setdefault("state", {})
+            state["signet_source"] = source
+        await self._app(scope, receive, send)
+
+
 class CallerContextMiddleware:
     """Expose the authenticated profile to gateway-owned tool providers."""
 
@@ -511,6 +558,24 @@ def _loopback_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Addres
     if not address.is_loopback:
         raise RuntimeAssemblyError("the MCP listener must use a loopback address")
     return address
+
+
+def _is_loopback_peer(host: object) -> bool:
+    if host == "testclient":
+        return True
+    try:
+        return isinstance(host, str) and ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+async def _bad_forwarded_header(scope: Scope, receive: Receive, send: Send) -> None:
+    response = Response(
+        "Bad Request",
+        status_code=400,
+        headers={"Cache-Control": "no-store"},
+    )
+    await response(scope, receive, send)
 
 
 def _host_label(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:

@@ -393,6 +393,7 @@ def password_verifier() -> Argon2PasswordVerifier:
 def downgrade_schema_13(connection: Any) -> None:
     """Restore the schema-12 shape after test-only schema-13 data injection."""
 
+    connection.execute("DROP TABLE browser_enrollment_authorizations")
     connection.execute("DROP TABLE browser_totp_enrollments")
     connection.execute("DROP TABLE auth_registration_challenges")
     connection.execute("DROP TABLE browser_bootstrap_state")
@@ -431,7 +432,7 @@ def downgrade_schema_13(connection: Any) -> None:
     connection.execute("DROP TABLE production_users")
     connection.execute("DROP TABLE production_setup_state")
     connection.execute("DROP TABLE privacy_maintenance")
-    connection.execute("DELETE FROM schema_meta WHERE migration_id BETWEEN 13 AND 18")
+    connection.execute("DELETE FROM schema_meta WHERE migration_id > 12")
     connection.execute("PRAGMA user_version = 12")
 
 
@@ -2233,12 +2234,12 @@ def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
         )
     assert backups == [12]
     with bundle.database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
         assert (
             connection.execute(
-                "SELECT count(*) FROM schema_meta WHERE migration_id BETWEEN 13 AND 18"
+                "SELECT count(*) FROM schema_meta WHERE migration_id BETWEEN 13 AND 19"
             ).fetchone()[0]
-            == 6
+            == 7
         )
 
     # Both privacy migrations are committed, so recovery must not repeat a backup.

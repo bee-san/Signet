@@ -357,6 +357,41 @@ def test_sqlite_rate_limit_reservations_are_atomic_and_durable(database: Databas
     assert limiter.state("source:success").failures == 0
 
 
+def test_sqlite_rate_limit_reservations_enforce_aggregate_scope_atomically(
+    database: Database,
+) -> None:
+    limiter = SQLiteAttemptLimiter(database, lock_schedule=((2, 60),))
+    first = limiter.reserve(
+        "totp-factor:human:first",
+        additional_scope_keys=("totp:human",),
+        source_key="source:first",
+        now=100,
+    )
+    limiter.record_failure(first, now=100)
+    second = limiter.reserve(
+        "totp-factor:human:second",
+        additional_scope_keys=("totp:human",),
+        source_key="source:second",
+        now=101,
+    )
+    limiter.record_failure(second, now=101)
+
+    restarted = SQLiteAttemptLimiter(Database(database.path), lock_schedule=((2, 60),))
+    with pytest.raises(AuthenticationRateLimited):
+        restarted.reserve(
+            "totp-factor:human:third",
+            additional_scope_keys=("totp:human",),
+            source_key="source:third",
+            now=102,
+        )
+
+    assert restarted.state("totp:human").failures == 2
+    assert restarted.state("totp-factor:human:first").failures == 1
+    assert restarted.state("totp-factor:human:second").failures == 1
+    assert restarted.state("totp-factor:human:third").failures == 0
+    assert restarted.state("source:third").failures == 0
+
+
 def test_sqlite_rate_limiter_bounds_distributed_scope_storage(database: Database) -> None:
     limiter = SQLiteAttemptLimiter(
         database,
