@@ -46,7 +46,12 @@ private config. Fastmail also requires `server_identity_digest` from reviewed
 discovery. Fastmail resolves credential material inside the HTTP MCP
 authorization boundary. The owned WhatsApp wrapper never receives the referenced
 secret: its credential is the descriptor-bound linked-device store, while the
-configured identity digest still binds approval payloads and policy.
+configured identity digest still binds approval payloads and policy. The approval
+execution scope also hashes the complete reviewed connector boundary. For Fastmail
+this includes the URL, credential generation, TLS leaf pin, and initialization
+identity; for WhatsApp it also includes the executable identity, version, account,
+store, and linked JID. Changing any of those fields invalidates an older approval at
+the final pre-dispatch check instead of sending it through a newly targeted provider.
 Exceptions and client representations redact provider details and credential material.
 
 Approval calls remain caller-compatible: the mirrored MCP tool advertises the

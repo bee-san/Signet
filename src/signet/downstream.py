@@ -53,6 +53,7 @@ from signet.reviewed_process import (
 )
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _MAX_TOOL_NAME_LENGTH = 256
 _MAX_EXECUTABLE_LENGTH = 4096
 _MAX_ARGUMENT_COUNT = 64
@@ -585,12 +586,20 @@ class DownstreamClient:
         stdio_connector: StdioConnector = _official_stdio_connector,
         session_factory: SessionFactory = _official_session_factory,
         credential_verifier: CredentialVerifier | None = None,
+        execution_identity_digest: str | None = None,
     ) -> None:
         self._working_directory_identity = self._validate_config(alias, config)
+        if (
+            execution_identity_digest is not None
+            and _SHA256_RE.fullmatch(execution_identity_digest) is None
+        ):
+            raise DownstreamConfigurationError("execution identity digest is invalid")
         self._alias = alias
         self._config = config
         self._credential_reference = SecretReference.parse(config.credential_ref)
-        self._credential_identity_digest = config.credential_identity_digest
+        self._credential_identity_digest = (
+            execution_identity_digest or config.credential_identity_digest
+        )
         self._secret_store = secret_store
         self._http_connector = http_connector
         self._stdio_connector = stdio_connector
@@ -618,7 +627,7 @@ class DownstreamClient:
 
     @property
     def credential_identity_digest(self) -> str:
-        """Return the inventory-issued provider credential generation identity."""
+        """Return the reviewed identity bound into executable approval scopes."""
 
         return self._credential_identity_digest
 

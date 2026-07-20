@@ -54,6 +54,7 @@ from signet.production_connectors import (
     CredentialBoundClient,
     ProductionConnectorError,
     ProviderSessionPool,
+    provider_execution_identity_digest,
 )
 from signet.production_state import ProductionStateError
 from signet.totp_enrollment import (
@@ -403,14 +404,15 @@ downstreams:
         encoding="utf-8",
     )
     server_certificate, server_certificate_sha256 = _write_reviewed_server_certificate(tmp_path)
+    identity_digest = _provider_credential_identity(
+        reference="keychain://signet/mail",
+        secret="mail-secret-value",
+    )
     payload["connectors"] = {
         "fastmail": {
             "transport": "http",
             "credential_ref": "keychain://signet/mail",
-            "credential_identity_digest": _provider_credential_identity(
-                reference="keychain://signet/mail",
-                secret="mail-secret-value",
-            ),
+            "credential_identity_digest": identity_digest,
             "server_identity_digest": "f" * 64,
             "url": "https://mail.example.test/mcp",
             "tls_server_certificate": str(server_certificate),
@@ -495,6 +497,10 @@ downstreams:
     assembly = build_production_runtime(config, secret_store=secret_store)
 
     assert isinstance(assembly.provider_clients["fastmail"], DownstreamClient)
+    assert assembly.provider_clients["fastmail"].credential_identity_digest == (
+        provider_execution_identity_digest(config, "fastmail")
+    )
+    assert assembly.provider_clients["fastmail"].credential_identity_digest != identity_digest
     assert tuple(assembly.adapters) == (("fastmail", "send_email"),)
     assert assembly.adapters[("fastmail", "send_email")].reviewed_dispatch_enabled is True
     assert assembly.staging is not None
@@ -823,7 +829,24 @@ downstreams:
     client = assembly.provider_clients["whatsapp"]
     assert isinstance(client, CredentialBoundClient)
     wrapper_config = cast(WacliConfig, captured[0])
-    assert client.credential_identity_digest == "b" * 64
+    assert client.credential_identity_digest == provider_execution_identity_digest(
+        config, "whatsapp"
+    )
+    assert client.credential_identity_digest != "b" * 64
+    linked_rotation = config.model_copy(
+        update={
+            "provider_rollout": config.provider_rollout.model_copy(
+                update={
+                    "wacli": cast(Any, config.provider_rollout.wacli).model_copy(
+                        update={"linked_jid": "15557654321@s.whatsapp.net"}
+                    )
+                }
+            )
+        }
+    )
+    assert provider_execution_identity_digest(linked_rotation, "whatsapp") != (
+        client.credential_identity_digest
+    )
     assert "redacted" in repr(client)
     assert wrapper_config.reviewed_dispatch_enabled is True
     assert wrapper_config.home == home
@@ -1276,6 +1299,7 @@ def test_disabled_runtime_requires_atomic_reviewed_connector_identity_rotation(
 ) -> None:
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
     assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    previous_execution_identity = assembly.provider_clients["mail"].credential_identity_digest
     current_connector = config.connectors["mail"]
     rotated_connector = current_connector.model_copy(
         update={
@@ -1308,6 +1332,9 @@ def test_disabled_runtime_requires_atomic_reviewed_connector_identity_rotation(
         now=124,
     )
     restarted = build_production_runtime(rotated, secret_store=_secret_store(), clock=lambda: 125)
+    assert (
+        restarted.provider_clients["mail"].credential_identity_digest != previous_execution_identity
+    )
     with restarted.database.read() as connection:
         setup_digest = connection.execute(
             "SELECT config_digest FROM production_setup_state WHERE state_id = 1"

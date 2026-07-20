@@ -42,6 +42,24 @@ class ProductionConnectorError(RuntimeError):
     """A redacted live-connector assembly or lifecycle failure."""
 
 
+def provider_execution_identity_digest(config: ProductionConfig, alias: str) -> str:
+    """Bind every reviewed provider endpoint identity into approval scope."""
+
+    try:
+        connector = config.connectors[alias]
+    except KeyError:
+        raise ProductionConnectorError("provider connector identity is unavailable") from None
+    document: dict[str, Any] = {
+        "version": 1,
+        "alias": alias,
+        "connector": connector.model_dump(mode="json"),
+    }
+    if alias == "whatsapp":
+        boundary = config.provider_rollout.wacli
+        document["wacli"] = boundary.model_dump(mode="json") if boundary is not None else None
+    return sha256_hex(canonical_json(document))
+
+
 class _ConnectorDelegate(Protocol):
     async def call_tool(
         self,
@@ -503,6 +521,7 @@ def build_live_provider_bundle(
                 secret_store,
                 http_connector=http_connector,
                 credential_verifier=verify_credential,
+                execution_identity_digest=provider_execution_identity_digest(config, alias),
             )
             adapter = FastmailAdapter(
                 staging_store=staging,
@@ -660,7 +679,7 @@ def _build_whatsapp(
         raise ProductionConnectorError("WhatsApp wacli process boundary is unavailable") from None
     client = CredentialBoundClient(
         alias="whatsapp",
-        credential_identity_digest=connector.credential_identity_digest,
+        credential_identity_digest=provider_execution_identity_digest(config, "whatsapp"),
         delegate=delegate,
     )
     adapters: dict[tuple[str, str], ApprovalAdapter] = {}

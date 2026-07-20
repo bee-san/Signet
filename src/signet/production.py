@@ -87,6 +87,7 @@ from signet.production_connectors import (
     ProviderSessionPool,
     build_live_provider_bundle,
     build_review_only_provider_adapters,
+    provider_execution_identity_digest,
 )
 from signet.production_state import (
     ProductionServiceRecord,
@@ -656,9 +657,9 @@ def build_production_runtime(
             {
                 alias: ProductionDisabledProviderClient(
                     alias,
-                    credential_identity_digest=connector.credential_identity_digest,
+                    credential_identity_digest=provider_execution_identity_digest(config, alias),
                 )
-                for alias, connector in config.connectors.items()
+                for alias in config.connectors
             }
         )
         attachment_root = config.storage.attachment_staging_dir
