@@ -371,6 +371,32 @@ class ProductionProviderRollout(BaseModel):
     wacli: ProductionWacliConfig | None = None
 
 
+class ProductionCallerPrincipal(BaseModel):
+    """One reviewed Hermes profile allowed to use the approvals-only MCP route."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    namespace: str
+    allowed_aliases: tuple[Literal["approvals"], ...] = ("approvals",)
+
+    @field_validator("namespace")
+    @classmethod
+    def namespace_is_profile_scoped(cls, value: str) -> str:
+        if re.fullmatch(r"profile:[a-z][a-z0-9-]{0,63}", value) is None:
+            raise ValueError("production caller namespace must identify one Hermes profile")
+        return value
+
+    @field_validator("allowed_aliases")
+    @classmethod
+    def aliases_are_approvals_only(
+        cls,
+        value: tuple[Literal["approvals"], ...],
+    ) -> tuple[Literal["approvals"], ...]:
+        if value != ("approvals",):
+            raise ValueError("production callers may use only the approvals alias")
+        return value
+
+
 class ProductionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -388,6 +414,7 @@ class ProductionConfig(BaseModel):
     storage: ProductionStorageConfig
     secrets: ProductionSecretsConfig
     capabilities: ProductionCapabilities
+    caller_principals: tuple[ProductionCallerPrincipal, ...] = ()
     connectors: dict[str, DownstreamConfig] = Field(default_factory=dict)
     provider_rollout: ProductionProviderRollout = Field(default_factory=ProductionProviderRollout)
 
@@ -535,6 +562,9 @@ class ProductionConfig(BaseModel):
             raise ValueError("rp_id must equal the public origin host")
         if origin_host not in self.allowed_hosts:
             raise ValueError("allowed_hosts must include the public origin host")
+        namespaces = tuple(principal.namespace for principal in self.caller_principals)
+        if len(namespaces) != len(set(namespaces)):
+            raise ValueError("production caller namespaces must be unique")
         references = [
             reference for reference in self.secrets.model_dump().values() if reference is not None
         ]
@@ -567,6 +597,13 @@ class ProductionConfig(BaseModel):
         ):
             raise ValueError("WhatsApp rollout requires exactly one owned wacli boundary")
         return self
+
+    @property
+    def allowed_principals(self) -> dict[str, tuple[str, ...]]:
+        return {
+            principal.namespace: tuple(principal.allowed_aliases)
+            for principal in self.caller_principals
+        }
 
     def prepare_directories(self) -> None:
         self.storage.prepare_directories()

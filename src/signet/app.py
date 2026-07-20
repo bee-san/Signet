@@ -21,6 +21,8 @@ from signet.integration_cli import (
     run_integration_command,
 )
 from signet.runtime import RuntimeAssemblyError, _loopback_address
+from signet.setup_cli import add_setup_parsers, is_setup_command, run_setup_command
+from signet.setup_state import SetupError
 
 _FACTORY_PATTERN = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$"
@@ -71,6 +73,12 @@ def main(
         try:
             run_integration_command(args)
         except IntegrationCLIError as exc:
+            parser.error(str(exc))
+        return
+    if is_setup_command(args.command):
+        try:
+            run_setup_command(args, runner=runner or uvicorn.run)
+        except (CredentialError, DatabaseError, SetupError, ValueError) as exc:
             parser.error(str(exc))
         return
     if args.command == "bootstrap":
@@ -161,6 +169,7 @@ def _parser() -> argparse.ArgumentParser:
     add_demo_parser(subcommands)
     add_deployment_parser(subcommands)
     add_integration_parsers(subcommands)
+    add_setup_parsers(subcommands)
     return parser
 
 

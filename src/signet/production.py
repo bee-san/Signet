@@ -795,7 +795,10 @@ def build_production_runtime(
         tools=gateway_tools,
         principal_provider=gateway_principal_provider(config.owner_user_id),
     )
-    token_registry = SQLiteTokenRegistry(database, allowed_principals={})
+    token_registry = SQLiteTokenRegistry(
+        database,
+        allowed_principals=config.allowed_principals,
+    )
     runtime_states: list[ProductionStateStore] = []
 
     def mcp_readiness() -> bool:
