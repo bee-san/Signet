@@ -95,6 +95,25 @@ def database(tmp_path: Path) -> Database:
     return selected
 
 
+def test_operator_can_rotate_an_abandoned_bootstrap_capability(database: Database) -> None:
+    service = bootstrap(database)
+    abandoned = service.issue_capability(now=100, lifetime=600)
+    assert service.capability_is_current(abandoned, now=101) is True
+    assert service.capability_is_recorded(abandoned) is True
+    assert service.capability_is_current(abandoned, now=700) is False
+    assert service.capability_is_recorded(abandoned) is True
+
+    replacement = service.issue_capability(now=700, lifetime=600, replace_existing=True)
+
+    assert replacement != abandoned
+    assert service.capability_is_recorded(abandoned) is False
+    assert service.capability_is_current(replacement, now=701) is True
+    with pytest.raises(BootstrapClaimRequired):
+        service.claim(abandoned, CLAIMANT_TOKEN, now=702)
+    status = service.claim(replacement, CLAIMANT_TOKEN, now=702)
+    assert status.claimed is True
+
+
 def encoded_credential_id(identifier: str) -> str:
     return base64.urlsafe_b64encode(identifier.encode()).rstrip(b"=").decode()
 

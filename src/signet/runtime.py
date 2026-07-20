@@ -377,6 +377,7 @@ def assemble_mcp_runtime(
     per_token_concurrency_limit: int = 8,
     health_probe: Callable[[], bool] | None = None,
     readiness_probe: Callable[[], bool] | None = None,
+    health_identity: str | None = None,
     lifecycle_observer: Callable[[str], None] | None = None,
 ) -> MCPRuntime:
     """Assemble a local MCP ASGI app without contacting downstream providers."""
@@ -388,6 +389,8 @@ def assemble_mcp_runtime(
         raise RuntimeAssemblyError("the MCP session idle timeout must be 60 to 1800 seconds")
     if request_concurrency_limit < 1 or request_concurrency_limit > 256:
         raise RuntimeAssemblyError("request concurrency limit must be 1 to 256")
+    if health_identity is not None and re.fullmatch(r"[0-9a-f]{64}", health_identity) is None:
+        raise RuntimeAssemblyError("health identity must be one lowercase SHA-256 digest")
     if APPROVALS_ALIAS in aliases:
         raise RuntimeAssemblyError("the approvals alias is reserved for gateway-owned tools")
 
@@ -463,10 +466,13 @@ def assemble_mcp_runtime(
             healthy = health_probe is None or health_probe()
         except Exception:
             healthy = False
+        headers = {"Cache-Control": "no-store"}
+        if health_identity is not None:
+            headers["X-Signet-Instance"] = health_identity
         return JSONResponse(
             {"status": "ok" if healthy else "unavailable"},
             status_code=200 if healthy else 503,
-            headers={"Cache-Control": "no-store"},
+            headers=headers,
         )
 
     routes.append(

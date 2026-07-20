@@ -34,7 +34,7 @@ from signet.app import main as run_cli
 from signet.auth import SessionManager, SQLiteSessionRepository
 from signet.browser_auth import BootstrapService
 from signet.canonical import canonical_json
-from signet.config import ProductionConfig
+from signet.config import ProductionConfig, production_instance_identity
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
 from signet.db import Database
 from signet.downstream import DownstreamClient
@@ -56,7 +56,7 @@ from signet.production_connectors import (
     ProviderSessionPool,
     provider_execution_identity_digest,
 )
-from signet.production_state import ProductionStateError
+from signet.production_state import ProductionStateError, production_config_digest
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
@@ -166,6 +166,63 @@ def _secret_store(
             ("signet", "mail"): "mail-secret-value",
         }
     )
+
+
+def test_production_config_digest_migrates_only_the_empty_caller_principal_predecessor(
+    tmp_path: Path,
+) -> None:
+    payload = _production_payload(tmp_path)
+    without_principal = ProductionConfig.model_validate(payload)
+    predecessor_document = without_principal.model_dump(mode="json")
+    predecessor_document.pop("caller_principals")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor_document)).hexdigest()
+    expected_digest = production_config_digest(without_principal)
+    assembly = build_production_runtime(
+        without_principal,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+
+    migrated = build_production_runtime(
+        without_principal,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    with migrated.database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()["config_digest"]
+            == expected_digest
+        )
+
+    payload["caller_principals"] = [{"namespace": "profile:work", "allowed_aliases": ["approvals"]}]
+    with_principal = ProductionConfig.model_validate(payload)
+    assert expected_digest != production_config_digest(with_principal)
+    with migrated.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+    with pytest.raises(ProductionAssemblyError, match="differs from durable state"):
+        build_production_runtime(
+            with_principal,
+            secret_store=_secret_store(),
+            components=frozenset(),
+        )
 
 
 def _provider_credential_identity(
@@ -1274,10 +1331,16 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     ).get("/healthz")
     assert health.status_code == 503
     assert health.json() == {"status": "unavailable", "service": "signet-web"}
+    assert health.headers["X-Signet-Instance"] == production_instance_identity(
+        config.storage.data_dir.parent
+    )
     mcp_client = TestClient(assembly.mcp.app, base_url="http://127.0.0.1:8789")
     mcp_health = mcp_client.get("/healthz")
     assert mcp_health.status_code == 503
     assert mcp_health.json() == {"status": "unavailable"}
+    assert mcp_health.headers["X-Signet-Instance"] == production_instance_identity(
+        config.storage.data_dir.parent
+    )
     readiness = mcp_client.get("/readyz")
     assert readiness.status_code == 503
     assert readiness.json() == {"status": "unavailable"}

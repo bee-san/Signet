@@ -20,7 +20,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 import signet.db as db_module
 from signet.app import main
-from signet.credential_broker import CredentialError, SQLiteTokenRegistry
+from signet.credential_broker import CredentialError, SQLiteTokenRegistry, TokenRegistry
 from signet.db import Database, DatabaseError, IntegrityError
 from signet.deployment import (
     DISABLED_CONFIG_ENV,
@@ -168,6 +168,39 @@ def test_init_creates_only_private_disabled_state_and_cli_never_reprints_token(
             ]
         )
     assert not second_config.exists()
+
+
+def test_persistent_authentication_revalidates_a_concurrent_revocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, config = initialized_config(tmp_path)
+    registry = SQLiteTokenRegistry(
+        Database(config.database_path),
+        allowed_principals=config.allowed_principals,
+        clock=lambda: 100,
+    )
+    issued = registry.issue("profile:hermes", {"approvals"})
+    authenticate_snapshot = TokenRegistry.authenticate
+
+    def revoke_after_snapshot(
+        in_memory: TokenRegistry,
+        authorization_header: str | None,
+        *,
+        alias: str,
+    ) -> Any:
+        principal = authenticate_snapshot(
+            in_memory,
+            authorization_header,
+            alias=alias,
+        )
+        registry.revoke(issued.token_id)
+        return principal
+
+    monkeypatch.setattr(TokenRegistry, "authenticate", revoke_after_snapshot)
+
+    with pytest.raises(CredentialError, match="invalid bearer token"):
+        registry.authenticate(f"Bearer {issued.token}", alias="approvals")
 
 
 def test_persistent_registry_revocation_and_rotation_are_immediate(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
 from pathlib import Path
@@ -14,6 +15,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from signet.auth import canonical_user_id
 from signet.credential_broker import CredentialError, SecretReference
 from signet.private_paths import PrivatePathError, ensure_private_directory
+
+
+def production_instance_identity(root: Path) -> str:
+    """Return the public, deterministic identity used by local health probes."""
+
+    if not root.is_absolute() or ".." in root.parts:
+        raise ValueError("production root must be an absolute lexical path")
+    material = b"signet-health-instance-v1\0" + str(root).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
 
 
 def is_valid_allowed_host(host: str) -> bool:

@@ -117,7 +117,49 @@ class BootstrapService:
         self.totp_enrollments = totp_enrollments
         self._reconcile_existing_owner()
 
-    def issue_capability(self, *, now: int, lifetime: int = 10 * 60) -> str:
+    def capability_is_recorded(self, capability: str) -> bool:
+        """Return whether a capability is the recorded unclaimed handoff, even if expired."""
+
+        return self._recorded_capability(capability) is not None
+
+    def capability_is_current(self, capability: str, *, now: int) -> bool:
+        if now < 0:
+            raise ValueError("bootstrap capability time is invalid")
+        row = self._recorded_capability(capability)
+        return bool(
+            row is not None
+            and row["capability_expires_at"] is not None
+            and now < int(row["capability_expires_at"])
+        )
+
+    def _recorded_capability(self, capability: str) -> Any | None:
+        try:
+            capability_id = _bootstrap_capability_id(capability)
+            verifier = _bootstrap_verifier(capability)
+        except BootstrapError:
+            return None
+        with self.database.read() as connection:
+            row = connection.execute(
+                "SELECT * FROM browser_bootstrap_state WHERE state_id = 1"
+            ).fetchone()
+        if (
+            row is None
+            or str(row["user_id"]) != self.owner_user_id
+            or str(row["status"]) != "pending"
+            or row["claimed_at"] is not None
+            or row["capability_id"] != capability_id
+            or not hmac.compare_digest(bytes(row["capability_verifier"] or b""), verifier)
+        ):
+            return None
+        return row
+
+    def issue_capability(
+        self,
+        *,
+        now: int,
+        lifetime: int = 10 * 60,
+        replace_existing: bool = False,
+    ) -> str:
         if now < 0 or lifetime < 60 or lifetime > 60 * 60:
             raise ValueError("bootstrap capability lifetime is invalid")
         with self.database.read() as connection:
@@ -130,6 +172,7 @@ class BootstrapService:
                 raise BootstrapAlreadyComplete("initial owner setup is already complete")
             if (
                 existing is not None
+                and not replace_existing
                 and existing["capability_expires_at"] is not None
                 and now < int(existing["capability_expires_at"])
             ):
@@ -170,6 +213,7 @@ class BootstrapService:
                 raise BootstrapAlreadyComplete("initial owner setup is already complete")
             if (
                 row is not None
+                and not replace_existing
                 and row["capability_expires_at"] is not None
                 and now < int(row["capability_expires_at"])
             ):

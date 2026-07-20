@@ -119,6 +119,16 @@ class ProductionStateStore:
                     _pre_identity_hardening_production_config_digest(config),
                     _rollout_preparation_base_digest(config),
                 }
+                if not config.caller_principals:
+                    compatible_digests.update(
+                        {
+                            _pre_caller_principals_production_config_digest(config),
+                            _pre_caller_principals_production_config_digest(
+                                config,
+                                rollout_state=opposite_rollout,
+                            ),
+                        }
+                    )
                 if setup["config_digest"] not in compatible_digests:
                     raise ProductionStateError(
                         "staged production config differs from durable state"
@@ -462,8 +472,9 @@ class ProductionStateStore:
                 (next_config_digest, now, current_config_digest),
             )
 
-    def status(self) -> ProductionStatus:
-        with self.database.read() as connection:
+    def status(self, *, read_only: bool = False) -> ProductionStatus:
+        reader = self.database.read_only if read_only else self.database.read
+        with reader() as connection:
             schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             setup = connection.execute(
                 """
@@ -762,6 +773,21 @@ def production_config_digest(
 
 
 def _connector_config_digest(document: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _pre_caller_principals_production_config_digest(
+    config: ProductionConfig,
+    *,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
+) -> str:
+    """Reconstruct the digest emitted before caller authorization joined the config."""
+
+    document = config.model_dump(mode="json")
+    document.pop("caller_principals")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
 
