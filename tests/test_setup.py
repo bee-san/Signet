@@ -805,6 +805,38 @@ def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
         assert not (selected.root / "services" / name).exists()
 
 
+def test_launchd_rollback_refuses_a_changed_unit_before_stopping_services(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    selected = replace(
+        spec(tmp_path / "root-darwin-changed-unit"),
+        public_origin="https://example.com",
+    )
+    platform = ProductionSetupPlatform(command_runner=run)
+    monkeypatch.setattr(platform, "_wait_for_local_services", lambda selected: None)
+    platform._apply_private_paths(selected, "setup-service-test")
+    platform._apply_services(selected, "setup-service-test")
+    commands.clear()
+    name = next(iter(render_launchd_services(selected, active=True)))
+    (home / "Library" / "LaunchAgents" / name).write_bytes(b"foreign unit")
+
+    with pytest.raises(SetupError, match="changed or foreign"):
+        platform._rollback_services(selected, "setup-service-test")
+
+    assert commands == []
+
+
 def test_preflight_resolves_the_hermes_default_profile_to_the_hermes_home(
     tmp_path: Path,
 ) -> None:

@@ -543,6 +543,9 @@ class ProductionSetupPlatform:
             rendered: Mapping[str, bytes] = render_launchd_services(spec, active=True)
             target = Path.home() / "Library" / "LaunchAgents"
             uid = os.getuid()
+            for name, content in rendered.items():
+                _verify_exact_owned_file(target / name, content)
+                _verify_exact_owned_file(spec.root / "services" / name, content)
             for name in rendered:
                 path = target / name
                 self._stop_launchd_unit(["launchctl", "bootout", f"gui/{uid}", str(path)])
@@ -552,11 +555,15 @@ class ProductionSetupPlatform:
                 _remove_exact_owned_file(spec.root / "services" / name, content)
         else:
             rendered_text = render_systemd_services(spec, active=True)
+            target = Path.home() / ".config" / "systemd" / "user"
+            for name, content in rendered_text.items():
+                encoded = content.encode("utf-8")
+                _verify_exact_owned_file(target / name, encoded)
+                _verify_exact_owned_file(spec.root / "services" / name, encoded)
             self._run_checked(
                 ["systemctl", "--user", "disable", "--now", *rendered_text],
                 "systemd could not stop Signet",
             )
-            target = Path.home() / ".config" / "systemd" / "user"
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
                 _remove_exact_owned_file(target / name, encoded)
@@ -1055,7 +1062,7 @@ def _replace_private_file(
             temporary.unlink()
 
 
-def _remove_exact_owned_file(path: Path, expected: bytes) -> None:
+def _verify_exact_owned_file(path: Path, expected: bytes) -> None:
     if not path.exists() and not path.is_symlink():
         return
     if path.is_symlink():
@@ -1067,6 +1074,12 @@ def _remove_exact_owned_file(path: Path, expected: bytes) -> None:
         raise SetupError(f"owned resource could not be inspected: {path}") from exc
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or actual != expected:
         raise SetupError(f"refusing to remove changed or foreign resource: {path}")
+
+
+def _remove_exact_owned_file(path: Path, expected: bytes) -> None:
+    _verify_exact_owned_file(path, expected)
+    if not path.exists() and not path.is_symlink():
+        return
     path.unlink()
 
 
