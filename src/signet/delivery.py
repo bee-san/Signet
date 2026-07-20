@@ -19,7 +19,14 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, Protocol, cast
 
-from signet.adapters.base import AdapterRequest, ApprovalAdapter, MCPClient, Outcome
+from signet.adapters.base import (
+    AdapterRequest,
+    ApprovalAdapter,
+    DispatchCancelledError,
+    DispatchError,
+    MCPClient,
+    Outcome,
+)
 from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.canonical import CanonicalizationError, canonical_json
 from signet.execution_scope import ExecutionScope, ExecutionScopeResolver
@@ -112,6 +119,8 @@ _SAFE_METADATA_FIELDS = (
     "status",
     "state",
     "provider_status",
+    "attachment_uploads_attempted",
+    "attachment_uploads_confirmed",
     "reconciled_at",
     "delivered_at",
     "idempotency_key_applied",
@@ -471,12 +480,18 @@ class DeliveryDispatcher:
                 prepared.downstream,
                 prepared.payload,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            safe_outcome = (
+                standardize_safe_metadata(prepared.loaded.adapter, exc)
+                if isinstance(exc, DispatchCancelledError)
+                else None
+            )
             await _run_sync(
                 self._record_unknown,
                 lease,
                 now=now,
                 failure_reason="dispatch_cancelled",
+                safe_outcome=safe_outcome,
             )
             raise
         except Exception as exc:
@@ -506,11 +521,7 @@ class DeliveryDispatcher:
         now: int,
     ) -> DispatchResult:
         outcome = _classify(loaded.adapter, result_or_error)
-        internal_metadata = (
-            standardize_safe_metadata(loaded.adapter, result_or_error)
-            if isinstance(result_or_error, Mapping)
-            else MappingProxyType({})
-        )
+        internal_metadata = standardize_safe_metadata(loaded.adapter, result_or_error)
         aliases = (
             result_aliases_from_metadata(
                 internal_metadata, account_namespace=loaded.request.account
@@ -548,12 +559,20 @@ class DeliveryDispatcher:
             failure_reason="delivery_preparation_failed",
         )
 
-    def _record_unknown(self, lease: ExecutionLease, *, now: int, failure_reason: str) -> None:
+    def _record_unknown(
+        self,
+        lease: ExecutionLease,
+        *,
+        now: int,
+        failure_reason: str,
+        safe_outcome: Mapping[str, str | int | bool | None] | None = None,
+    ) -> None:
         self.state_machine.record_outcome(
             lease,
             classification=OutcomeClassification.UNKNOWN,
             now=now,
             failure_reason=failure_reason,
+            safe_outcome=safe_outcome,
             reconciliation_next_at=now + self.initial_reconciliation_delay,
         )
 
@@ -572,13 +591,19 @@ def stable_downstream_idempotency_key(
 
 def standardize_safe_metadata(
     adapter: ApprovalAdapter,
-    downstream_result: Mapping[str, Any],
+    downstream_result: object,
 ) -> Mapping[str, str | int | bool | None]:
     """Keep only the state machine's reviewed scalar metadata vocabulary."""
 
-    try:
-        candidate = adapter.safe_result_metadata(downstream_result)
-    except Exception:
+    candidate: Mapping[str, Any]
+    if isinstance(downstream_result, (DispatchError, DispatchCancelledError)):
+        candidate = downstream_result.safe_metadata
+    elif isinstance(downstream_result, Mapping):
+        try:
+            candidate = adapter.safe_result_metadata(downstream_result)
+        except Exception:
+            return MappingProxyType({})
+    else:
         return MappingProxyType({})
     if not isinstance(candidate, Mapping):
         return MappingProxyType({})

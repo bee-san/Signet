@@ -5,6 +5,11 @@ It is intentionally a negative readiness result: manifests, discovery snapshots,
 effect proposals, authenticated reviews, and fake worker contracts do not prove
 that provider dispatch is safe.
 
+This boundary is distinct from the closed-set, provider-specific Fastmail and
+WhatsApp production wiring documented in
+[`production-connectors.md`](production-connectors.md). Generic plugin records cannot
+select those adapters, change their rollout gates, or inherit their review.
+
 ```text
 readiness_report_version=1
 live_dispatch_enabled=false

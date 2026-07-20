@@ -10,23 +10,34 @@ import stat
 import subprocess
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pyotp
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import signet.db as db_module
 import signet.production as production_module
+import signet.production_connectors as production_connectors_module
+from signet.adapters.whatsapp import WhatsAppAdapter
 from signet.app import main as run_cli
 from signet.auth import SessionManager, SQLiteSessionRepository
 from signet.browser_auth import BootstrapService
+from signet.canonical import canonical_json
 from signet.config import ProductionConfig
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
 from signet.db import Database
+from signet.downstream import DownstreamClient
 from signet.policy import parse_policy_yaml
 from signet.production import (
     ProductionAssemblyError,
@@ -39,12 +50,41 @@ from signet.production import (
     create_production_web_app_from_environment,
     load_production_config,
 )
+from signet.production_connectors import (
+    CredentialBoundClient,
+    ProductionConnectorError,
+    ProviderSessionPool,
+    provider_execution_identity_digest,
+)
+from signet.production_state import ProductionStateError
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
     TotpEnrollmentService,
 )
+from signet.wacli_wrapper import WacliConfig
 from tests.migration_helpers import verified_backup_callback
+
+
+def _write_reviewed_server_certificate(tmp_path: Path) -> tuple[Path, str]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mail.example.test")])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+        .sign(key, hashes.SHA256())
+    )
+    path = tmp_path / "fastmail-server-certificate.pem"
+    path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    digest = hashlib.sha256(certificate.public_bytes(serialization.Encoding.DER)).hexdigest()
+    return path, digest
 
 
 def _production_payload(tmp_path: Path) -> dict[str, Any]:
@@ -126,6 +166,19 @@ def _secret_store(
             ("signet", "mail"): "mail-secret-value",
         }
     )
+
+
+def _provider_credential_identity(
+    *,
+    reference: str,
+    secret: str,
+    identity_key: str = "capability-secret-" * 3,
+) -> str:
+    return hmac.new(
+        identity_key.encode("utf-8"),
+        b"provider_credential\x00" + reference.encode("utf-8") + b"\x00" + secret.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 class _RecordingSecretStore:
@@ -284,6 +337,563 @@ def test_production_config_rejects_mixed_connector_transport_fields(tmp_path: Pa
 
     with pytest.raises(ValidationError, match="mixed"):
         ProductionConfig.model_validate(payload)
+
+
+def test_live_provider_rollout_is_explicit_and_disabled_by_default(tmp_path: Path) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+
+    assert config.provider_rollout.state == "disabled"
+    assert config.safe_dump()["provider_rollout"] == {
+        "state": "disabled",
+        "wacli": None,
+    }
+
+
+def test_disabled_production_connector_example_matches_strict_config_schema() -> None:
+    example = Path("deploy/config/production.example.json").read_text(encoding="utf-8")
+
+    config = ProductionConfig.model_validate_json(example)
+
+    assert config.provider_rollout.state == "disabled"
+    assert config.capabilities.live_providers_ready is False
+
+
+def test_live_provider_rollout_requires_attachment_and_readiness_records(tmp_path: Path) -> None:
+    payload = _production_payload(tmp_path)
+    payload["provider_rollout"] = {"state": "enabled"}
+
+    with pytest.raises(ValidationError, match="live provider readiness"):
+        ProductionConfig.model_validate(payload)
+
+    payload["capabilities"]["live_providers_ready"] = True
+    with pytest.raises(ValidationError, match="attachment staging"):
+        ProductionConfig.model_validate(payload)
+
+
+def test_live_fastmail_rollout_builds_hardened_client_adapter_and_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _production_payload(tmp_path)
+    source_root = tmp_path / "attachment-imports"
+    source_root.mkdir(mode=0o700)
+    Path(payload["policy_path"]).write_text(
+        """
+version: 1
+default_mode: deny
+downstreams:
+  fastmail:
+    transport: http
+    url: https://mail.example.test/mcp
+    credential_ref: keychain://signet/mail
+    account_ref: account:fastmail-primary
+    tools:
+      send_email:
+        mode: approval
+        adapter: fastmail.send
+        communication_send: true
+        account_ref: account:fastmail-primary
+        schema_digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      search_email:
+        mode: passthrough
+        reviewed_read_only: true
+        account_ref: account:fastmail-primary
+        schema_digest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    server_certificate, server_certificate_sha256 = _write_reviewed_server_certificate(tmp_path)
+    identity_digest = _provider_credential_identity(
+        reference="keychain://signet/mail",
+        secret="mail-secret-value",
+    )
+    payload["connectors"] = {
+        "fastmail": {
+            "transport": "http",
+            "credential_ref": "keychain://signet/mail",
+            "credential_identity_digest": identity_digest,
+            "server_identity_digest": "f" * 64,
+            "url": "https://mail.example.test/mcp",
+            "tls_server_certificate": str(server_certificate),
+            "tls_server_certificate_sha256": server_certificate_sha256,
+        }
+    }
+    payload["storage"].update(
+        attachment_staging_dir=str(tmp_path / "attachment-staging"),
+        attachment_source_roots=[str(source_root)],
+    )
+    payload["secrets"]["attachment_key_ref"] = "keychain://signet/attachment"
+    payload["capabilities"]["live_providers_ready"] = True
+    payload["provider_rollout"] = {"state": "enabled"}
+    config = ProductionConfig.model_validate(payload)
+    secret_store = MemorySecretStore(
+        {
+            ("signet", "session"): "session-secret-" * 3,
+            ("signet", "csrf"): "csrf-secret-" * 4,
+            ("signet", "capability"): "capability-secret-" * 3,
+            ("signet", "payload"): "payload-secret-" * 3,
+            ("signet", "totp"): "totp-secret-value",
+            ("signet", "mail"): "mail-secret-value",
+            ("signet", "attachment"): "attachment-key-material-" * 3,
+        }
+    )
+    captured_server_identities: dict[str, str] = {}
+    captured_reviewer_staging: list[object] = []
+    captured_reviewer_adapters: list[dict[tuple[str, str], object]] = []
+    original_reviewer = production_module.EncryptedPayloadReviewer
+
+    def capturing_reviewer(*args: Any, **kwargs: Any):
+        captured_reviewer_adapters.append(dict(cast(Mapping[tuple[str, str], object], args[2])))
+        captured_reviewer_staging.append(kwargs.get("staging"))
+        return original_reviewer(*args, **kwargs)
+
+    class CapturingProviderSessionPool(production_connectors_module.ProviderSessionPool):
+        def __init__(
+            self,
+            clients: Mapping[str, object],
+            *,
+            expected_schema_digests: Mapping[str, Mapping[str, str]] | None = None,
+            expected_server_identity_digests: Mapping[str, str] | None = None,
+        ) -> None:
+            captured_server_identities.update(expected_server_identity_digests or {})
+            super().__init__(
+                clients,
+                expected_schema_digests=expected_schema_digests,
+                expected_server_identity_digests=expected_server_identity_digests,
+            )
+
+    monkeypatch.setattr(
+        production_connectors_module,
+        "ProviderSessionPool",
+        CapturingProviderSessionPool,
+    )
+    monkeypatch.setattr(production_module, "EncryptedPayloadReviewer", capturing_reviewer)
+
+    disabled_config = config.model_copy(
+        update={
+            "capabilities": config.capabilities.model_copy(update={"live_providers_ready": False}),
+            "provider_rollout": config.provider_rollout.model_copy(update={"state": "disabled"}),
+        }
+    )
+    staged = build_production_runtime(disabled_config, secret_store=secret_store)
+    assert staged.provider_sessions is None
+    assert staged.adapters == {}
+    assert tuple(captured_reviewer_adapters[-1]) == (
+        ("fastmail", "send_email"),
+        ("gateway", "request_tool_access"),
+    )
+    disabled_fastmail = captured_reviewer_adapters[-1][("fastmail", "send_email")]
+    assert cast(Any, disabled_fastmail).reviewed_dispatch_enabled is False
+    assert staged.retention is not None
+
+    mismatched_pin = config.connectors["fastmail"].model_copy(
+        update={"tls_server_certificate_sha256": "0" * 64}
+    )
+    mismatched_pin_config = config.model_copy(update={"connectors": {"fastmail": mismatched_pin}})
+    with pytest.raises(ProductionAssemblyError, match="TLS server certificate"):
+        build_production_runtime(mismatched_pin_config, secret_store=secret_store)
+
+    assembly = build_production_runtime(config, secret_store=secret_store)
+
+    assert isinstance(assembly.provider_clients["fastmail"], DownstreamClient)
+    assert assembly.provider_clients["fastmail"].credential_identity_digest == (
+        provider_execution_identity_digest(config, "fastmail")
+    )
+    assert assembly.provider_clients["fastmail"].credential_identity_digest != identity_digest
+    assert tuple(assembly.adapters) == (("fastmail", "send_email"),)
+    assert assembly.adapters[("fastmail", "send_email")].reviewed_dispatch_enabled is True
+    assert assembly.staging is not None
+    assert captured_reviewer_staging[-1] is assembly.staging
+    assert assembly.retention is not None
+    assert assembly.provider_sessions is not None
+    assert captured_server_identities == {"fastmail": "f" * 64}
+
+    transport_calls: list[str] = []
+
+    @asynccontextmanager
+    async def forbidden_transport(*_args: Any, **_kwargs: Any):
+        transport_calls.append("opened")
+        yield object(), object(), lambda: None
+
+    live_client = cast(DownstreamClient, assembly.provider_clients["fastmail"])
+    monkeypatch.setattr(live_client, "_http_connector", forbidden_transport)
+    secret_store._values[("signet", "mail")] = "rotated-after-assembly"
+
+    async def start_rotated_provider() -> None:
+        assert assembly.provider_sessions is not None
+        async with assembly.provider_sessions.run():
+            pytest.fail("rotated provider credential must not become ready")
+
+    with pytest.raises(ProductionConnectorError, match="startup failed"):
+        asyncio.run(start_rotated_provider())
+    assert transport_calls == []
+    secret_store._values[("signet", "mail")] = "mail-secret-value"
+
+    rotated_secret_store = MemorySecretStore(
+        {
+            ("signet", "session"): "session-secret-" * 3,
+            ("signet", "csrf"): "csrf-secret-" * 4,
+            ("signet", "capability"): "capability-secret-" * 3,
+            ("signet", "payload"): "payload-secret-" * 3,
+            ("signet", "totp"): "totp-secret-value",
+            ("signet", "mail"): "rotated-mail-secret-value",
+            ("signet", "attachment"): "attachment-key-material-" * 3,
+        }
+    )
+    with pytest.raises(ProductionAssemblyError, match="credential identity"):
+        build_production_runtime(config, secret_store=rotated_secret_store)
+
+    active_now = int(time.time())
+    assembly.state.record_provider_state("active", ready=True, now=active_now)
+    restarted = build_production_runtime(
+        config,
+        secret_store=secret_store,
+        clock=lambda: active_now,
+    )
+    assert restarted.state.status().live_providers_ready is True
+    assert restarted.status().live_providers_ready is False
+    assert "live_providers_ready" in restarted.status().missing_prerequisites
+    with assembly.database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT state FROM production_connectors WHERE connector_alias = 'fastmail'"
+            ).fetchone()["state"]
+            == "active"
+        )
+
+    lifecycle_now = int(time.time())
+    recovered_at: list[int] = []
+
+    class DelayedProviderContext:
+        async def __aenter__(self) -> None:
+            nonlocal lifecycle_now
+            lifecycle_now += 10
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+    def observe_recovery(*, now: int) -> None:
+        recovered_at.append(now)
+
+    monkeypatch.setattr(assembly.workers, "_clock", lambda: lifecycle_now)
+    monkeypatch.setattr(assembly.provider_sessions, "run", DelayedProviderContext)
+    monkeypatch.setattr(assembly.workers._approvals, "recover_startup", observe_recovery)
+    stopped = asyncio.Event()
+    stopped.set()
+    asyncio.run(assembly.workers.serve(stopped))
+    assert recovered_at == [lifecycle_now]
+
+    dispatched: list[str] = []
+    reconciled: list[str] = []
+    retained: list[bool] = []
+    stop = asyncio.Event()
+
+    async def stop_after_first_dispatch(request_id: str, **_: Any) -> None:
+        dispatched.append(request_id)
+        stop.set()
+
+    async def stop_after_first_reconciliation(request_id: str, **_: Any) -> None:
+        reconciled.append(request_id)
+        stop.set()
+
+    def observe_retention(**_: Any) -> None:
+        retained.append(True)
+
+    monkeypatch.setattr(
+        assembly.workers,
+        "_due_delivery_request_ids",
+        lambda _now: ("request:first", "request:second"),
+    )
+    monkeypatch.setattr(assembly.workers._delivery, "dispatch", stop_after_first_dispatch)
+    monkeypatch.setattr(
+        assembly.workers._reconciliation,
+        "due_request_ids",
+        lambda **_: ("reconcile:first", "reconcile:second"),
+    )
+    monkeypatch.setattr(
+        assembly.workers._reconciliation,
+        "reconcile_once",
+        stop_after_first_reconciliation,
+    )
+    monkeypatch.setattr(assembly.retention, "run_due", observe_retention)
+    asyncio.run(assembly.workers.run_once(now=int(time.time()), stop=stop))
+    assert dispatched == ["request:first"]
+    assert reconciled == []
+    assert retained == []
+
+    stop.clear()
+    monkeypatch.setattr(
+        assembly.workers,
+        "_due_delivery_request_ids",
+        lambda _now: (),
+    )
+    asyncio.run(assembly.workers.run_once(now=int(time.time()), stop=stop))
+    assert reconciled == ["reconcile:first"]
+    assert retained == []
+
+    stop.clear()
+    monkeypatch.setattr(
+        assembly.workers._reconciliation,
+        "due_request_ids",
+        lambda **_: (),
+    )
+    asyncio.run(assembly.workers.run_once(now=int(time.time()), stop=stop))
+    assert retained == [True]
+
+    rolled_back = build_production_runtime(
+        disabled_config,
+        secret_store=secret_store,
+        clock=lambda: lifecycle_now,
+    )
+    assert rolled_back.retention is not None
+    with rolled_back.database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT state FROM production_connectors WHERE connector_alias = 'fastmail'"
+            ).fetchone()["state"]
+            == "disabled"
+        )
+    rolled_back.state.record_provider_state("active", ready=True, now=lifecycle_now + 1)
+    assert rolled_back.status().live_providers_ready is False
+
+    missing_identity = config.connectors["fastmail"].model_copy(
+        update={"server_identity_digest": None}
+    )
+    missing_identity_config = config.model_copy(
+        update={"connectors": {"fastmail": missing_identity}}
+    )
+    with pytest.raises(ProductionAssemblyError, match="initialization identity"):
+        build_production_runtime(missing_identity_config, secret_store=secret_store)
+
+    policy_path = Path(payload["policy_path"])
+    reviewed_policy = policy_path.read_text(encoding="utf-8")
+    policy_path.write_text(
+        reviewed_policy.replace(
+            "        schema_digest: "
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+            "",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ProductionAssemblyError, match="schema digest"):
+        build_production_runtime(config, secret_store=secret_store)
+
+
+def test_production_connector_rejects_invalid_server_identity_digest(tmp_path: Path) -> None:
+    payload = _production_payload(tmp_path)
+    payload["connectors"]["mail"]["server_identity_digest"] = "not-a-digest"
+
+    with pytest.raises(ValidationError, match="server identity"):
+        ProductionConfig.model_validate(payload)
+
+
+def test_live_whatsapp_rollout_uses_owned_isolated_wacli_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _production_payload(tmp_path)
+    source_root = tmp_path / "attachment-imports"
+    source_root.mkdir(mode=0o700)
+    runtime_root = tmp_path / "wacli-runtime"
+    runtime_root.mkdir(mode=0o700)
+    home = runtime_root / "home"
+    store = runtime_root / "store"
+    home.mkdir(mode=0o700)
+    store.mkdir(mode=0o700)
+    snapshot_root = tmp_path / "wacli-execution-snapshots"
+    snapshot_root.mkdir(mode=0o700)
+    executable_path = runtime_root / "wacli"
+    executable_path.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable_path.chmod(0o700)
+    executable = str(executable_path)
+    digest = hashlib.sha256(executable_path.read_bytes()).hexdigest()
+    Path(payload["policy_path"]).write_text(
+        """
+version: 1
+default_mode: deny
+downstreams:
+  whatsapp:
+    transport: stdio
+    command_ref: connector:whatsapp
+    credential_ref: keychain://signet/whatsapp
+    account_ref: account:whatsapp-primary
+    tools:
+      send_text:
+        mode: approval
+        adapter: whatsapp.send_text
+        communication_send: true
+        account_ref: account:whatsapp-primary
+        schema_digest: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+      send_file:
+        mode: approval
+        adapter: whatsapp.send_file
+        communication_send: true
+        account_ref: account:whatsapp-primary
+        schema_digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    payload["connectors"] = {
+        "whatsapp": {
+            "transport": "stdio",
+            "credential_ref": "keychain://signet/whatsapp",
+            "credential_identity_digest": "b" * 64,
+            "command": [executable],
+            "working_directory": str(runtime_root),
+            "execution_snapshot_root": str(snapshot_root),
+            "executable_sha256": digest,
+            "output_limit_bytes": 256 * 1024,
+        }
+    }
+    payload["storage"].update(
+        attachment_staging_dir=str(tmp_path / "attachment-staging"),
+        attachment_source_roots=[str(source_root)],
+    )
+    payload["secrets"]["attachment_key_ref"] = "keychain://signet/attachment"
+    payload["capabilities"]["live_providers_ready"] = True
+    payload["provider_rollout"] = {
+        "state": "enabled",
+        "wacli": {
+            "account": "whatsapp-primary",
+            "linked_jid": "15551234567@s.whatsapp.net",
+            "home": str(home),
+            "store": str(store),
+            "expected_version": "0.1.0",
+        },
+    }
+    captured: list[object] = []
+
+    class CapturingWacli:
+        def __init__(self, config: object, *, staging_store: object) -> None:
+            captured.extend((config, staging_store))
+
+        async def verify_version(self) -> str:
+            return "0.1.0"
+
+        async def call_tool(
+            self,
+            tool_name: str,
+            arguments: Mapping[str, object],
+        ) -> Mapping[str, object]:
+            del tool_name, arguments
+            return {"status": "sent", "message_id": "provider-message-id"}
+
+    monkeypatch.setattr(production_connectors_module, "WacliWrapper", CapturingWacli)
+    config = ProductionConfig.model_validate(payload)
+    secrets = MemorySecretStore(
+        {
+            ("signet", "session"): "session-secret-" * 3,
+            ("signet", "csrf"): "csrf-secret-" * 4,
+            ("signet", "capability"): "capability-secret-" * 3,
+            ("signet", "payload"): "payload-secret-" * 3,
+            ("signet", "totp"): "totp-secret-value",
+            ("signet", "attachment"): "attachment-key-material-" * 3,
+        }
+    )
+    assembly = build_production_runtime(config, secret_store=secrets)
+
+    predecessor_document = config.model_dump(mode="json")
+    predecessor_document["provider_rollout"]["wacli"].pop("linked_jid")
+    for connector_document in predecessor_document["connectors"].values():
+        connector_document.pop("tls_server_certificate")
+        connector_document.pop("tls_server_certificate_sha256")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor_document)).hexdigest()
+    predecessor_connector = config.connectors["whatsapp"].model_dump(mode="json")
+    predecessor_connector.pop("tls_server_certificate")
+    predecessor_connector.pop("tls_server_certificate_sha256")
+    predecessor_connector_digest = hashlib.sha256(canonical_json(predecessor_connector)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_connectors SET config_digest = ? WHERE connector_alias = ?",
+            (predecessor_connector_digest, "whatsapp"),
+        )
+    upgraded = build_production_runtime(config, secret_store=secrets)
+    with upgraded.database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()["config_digest"]
+            == hashlib.sha256(canonical_json(config.model_dump(mode="json"))).hexdigest()
+        )
+
+    client = assembly.provider_clients["whatsapp"]
+    assert isinstance(client, CredentialBoundClient)
+    wrapper_config = cast(WacliConfig, captured[0])
+    assert client.credential_identity_digest == provider_execution_identity_digest(
+        config, "whatsapp"
+    )
+    assert client.credential_identity_digest != "b" * 64
+    linked_rotation = config.model_copy(
+        update={
+            "provider_rollout": config.provider_rollout.model_copy(
+                update={
+                    "wacli": cast(Any, config.provider_rollout.wacli).model_copy(
+                        update={"linked_jid": "15557654321@s.whatsapp.net"}
+                    )
+                }
+            )
+        }
+    )
+    assert provider_execution_identity_digest(linked_rotation, "whatsapp") != (
+        client.credential_identity_digest
+    )
+    assert "redacted" in repr(client)
+    assert wrapper_config.reviewed_dispatch_enabled is True
+    assert wrapper_config.home == home
+    assert wrapper_config.store == store
+    assert wrapper_config.execution_snapshot_root == snapshot_root
+    assert tuple(assembly.adapters) == (
+        ("whatsapp", "send_text"),
+        ("whatsapp", "send_file"),
+    )
+    file_adapter = cast(WhatsAppAdapter, assembly.adapters[("whatsapp", "send_file")])
+    assert file_adapter.staging_store is assembly.staging
+
+    for connector_override in (
+        {"command": (executable, "ignored-argument")},
+        {"working_directory": tmp_path / "different-runtime"},
+        {"output_limit_bytes": config.connectors["whatsapp"].output_limit_bytes + 1},
+    ):
+        misbound_connector = config.connectors["whatsapp"].model_copy(update=connector_override)
+        misbound_config = config.model_copy(update={"connectors": {"whatsapp": misbound_connector}})
+        with pytest.raises(ProductionAssemblyError, match="wacli process boundary"):
+            build_production_runtime(misbound_config, secret_store=secrets)
+
+    policy_path = Path(payload["policy_path"])
+    reviewed_policy = policy_path.read_text(encoding="utf-8")
+    policy_path.write_text(
+        reviewed_policy.replace(
+            "        mode: approval\n"
+            "        adapter: whatsapp.send_text\n"
+            "        communication_send: true\n",
+            "        mode: passthrough\n        reviewed_read_only: true\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ProductionAssemblyError, match="approval-bound"):
+        build_production_runtime(config, secret_store=secrets)
+    policy_path.write_text(reviewed_policy, encoding="utf-8")
+
+    class FailingWacli:
+        def __init__(self, config: object, *, staging_store: object) -> None:
+            del config, staging_store
+            raise RuntimeError("never-leak-provider-secret")
+
+    monkeypatch.setattr(production_connectors_module, "WacliWrapper", FailingWacli)
+    with pytest.raises(ProductionAssemblyError) as failure:
+        build_production_runtime(config, secret_store=secrets)
+    assert "never-leak-provider-secret" not in str(failure.value)
 
 
 def test_production_browser_ceremony_isolation_never_calls_providers_or_mutates_queue(
@@ -684,6 +1294,67 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     assert isinstance(assembly.provider_clients["mail"], ProductionDisabledProviderClient)
 
 
+def test_disabled_runtime_requires_atomic_reviewed_connector_identity_rotation(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    previous_execution_identity = assembly.provider_clients["mail"].credential_identity_digest
+    current_connector = config.connectors["mail"]
+    rotated_connector = current_connector.model_copy(
+        update={
+            "credential_identity_digest": "b" * 64,
+            "server_identity_digest": "c" * 64,
+            "tls_server_certificate": tmp_path / "reviewed-next-server.pem",
+            "tls_server_certificate_sha256": "d" * 64,
+        }
+    )
+    rotated = config.model_copy(update={"connectors": {"mail": rotated_connector}})
+
+    with pytest.raises(ProductionAssemblyError, match="differs from durable state"):
+        build_production_runtime(rotated, secret_store=_secret_store(), clock=lambda: 124)
+
+    changed_endpoint = rotated_connector.model_copy(
+        update={"url": "https://other.example.test/mcp"}
+    )
+    with pytest.raises(ProductionStateError, match="only change reviewed identity fields"):
+        assembly.state.rotate_connector_identity(
+            current_config=config,
+            next_config=rotated.model_copy(update={"connectors": {"mail": changed_endpoint}}),
+            alias="mail",
+            now=124,
+        )
+
+    assembly.state.rotate_connector_identity(
+        current_config=config,
+        next_config=rotated,
+        alias="mail",
+        now=124,
+    )
+    restarted = build_production_runtime(rotated, secret_store=_secret_store(), clock=lambda: 125)
+    assert (
+        restarted.provider_clients["mail"].credential_identity_digest != previous_execution_identity
+    )
+    with restarted.database.read() as connection:
+        setup_digest = connection.execute(
+            "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+        ).fetchone()["config_digest"]
+        connector_row = connection.execute(
+            """
+            SELECT config_digest, credential_identity_digest, state
+            FROM production_connectors WHERE connector_alias = 'mail'
+            """
+        ).fetchone()
+    assert (
+        setup_digest == hashlib.sha256(canonical_json(rotated.model_dump(mode="json"))).hexdigest()
+    )
+    assert tuple(connector_row) == (
+        hashlib.sha256(canonical_json(rotated_connector.model_dump(mode="json"))).hexdigest(),
+        "b" * 64,
+        "disabled",
+    )
+
+
 def test_web_health_uses_durable_maintenance_state_from_a_separate_worker(
     tmp_path: Path,
 ) -> None:
@@ -777,6 +1448,39 @@ def test_production_http_surfaces_reject_non_loopback_transport_peers(tmp_path: 
         for table, expected in expected_counts.items():
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == expected
 
+        legacy_document = config.model_dump(mode="json")
+        legacy_document["storage"].pop("attachment_staging_dir")
+        legacy_document["storage"].pop("attachment_source_roots")
+        legacy_document["secrets"].pop("attachment_key_ref")
+        legacy_document.pop("provider_rollout")
+        legacy_document["connectors"]["mail"].pop("server_identity_digest")
+        legacy_document["connectors"]["mail"].pop("tls_server_certificate")
+        legacy_document["connectors"]["mail"].pop("tls_server_certificate_sha256")
+        legacy_digest = hashlib.sha256(canonical_json(legacy_document)).hexdigest()
+
+        legacy_connector = config.connectors["mail"].model_dump(mode="json")
+        legacy_connector.pop("server_identity_digest")
+        legacy_connector.pop("tls_server_certificate")
+        legacy_connector.pop("tls_server_certificate_sha256")
+        legacy_connector_digest = hashlib.sha256(canonical_json(legacy_connector)).hexdigest()
+
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (legacy_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (legacy_digest,),
+        )
+        connection.execute(
+            """
+            UPDATE production_connectors SET config_digest = ?
+            WHERE connector_alias = 'mail'
+            """,
+            (legacy_connector_digest,),
+        )
+
     durable_bytes = b"".join(
         path.read_bytes() for path in config.storage.data_dir.iterdir() if path.is_file()
     )
@@ -794,6 +1498,15 @@ def test_production_http_surfaces_reject_non_loopback_transport_peers(tmp_path: 
     with second.database.read() as connection:
         for table, expected in expected_counts.items():
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == expected
+        expected_current_digest = hashlib.sha256(
+            canonical_json(config.model_dump(mode="json"))
+        ).hexdigest()
+        assert (
+            connection.execute(
+                "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()["config_digest"]
+            == expected_current_digest
+        )
 
 
 @pytest.mark.asyncio
@@ -1462,11 +2175,163 @@ async def test_worker_startup_failure_is_unhealthy_and_persisted_fail_closed(
 
     monkeypatch.setattr(assembly.workers._approvals, "recover_startup", fail_recovery)
 
+    serving = asyncio.create_task(assembly.workers.serve(asyncio.Event()))
     with pytest.raises(RuntimeError, match="startup recovery"):
-        await assembly.workers.serve(asyncio.Event())
+        await assembly.workers.wait_started()
+    with pytest.raises(RuntimeError, match="startup recovery"):
+        await serving
 
     status = assembly.status()
     assert assembly.workers.running is False
     assert assembly.workers.healthy is False
     assert status.services["maintenance"].state == "blocked"
     assert "workers_ready" in status.missing_prerequisites
+
+
+@pytest.mark.asyncio
+async def test_provider_lifespan_starts_before_apps_and_stops_after_them() -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def original_lifespan(_app: object):
+        events.append("app:start")
+        yield
+        events.append("app:stop")
+
+    class Sessions:
+        active = False
+
+        def run(self):
+            @asynccontextmanager
+            async def provider_session():
+                self.active = True
+                events.append("provider:start")
+                yield
+                events.append("provider:stop")
+                self.active = False
+
+            return provider_session()
+
+    class State:
+        def record_provider_state(self, state: str, *, ready: bool, now: int) -> None:
+            events.append(f"state:{state}:{ready}:{now}")
+
+    app = SimpleNamespace(router=SimpleNamespace(lifespan_context=original_lifespan))
+    production_module._attach_provider_lifespan(
+        app,
+        cast(Any, Sessions()),
+        cast(Any, State()),
+        lambda: 123,
+    )
+
+    async with app.router.lifespan_context(app):
+        assert events == ["provider:start", "state:active:True:123", "app:start"]
+
+    assert events == [
+        "provider:start",
+        "state:active:True:123",
+        "app:start",
+        "app:stop",
+        "provider:stop",
+        "state:blocked:False:123",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_provider_runtime_failure_cancels_service_and_records_blocked_state() -> None:
+    events: list[str] = []
+    entered = asyncio.Event()
+
+    class Client:
+        is_running = False
+
+        async def start(self) -> None:
+            self.is_running = True
+            events.append("provider:start")
+
+        async def close(self) -> None:
+            self.is_running = False
+            events.append("provider:stop")
+
+    @asynccontextmanager
+    async def original_lifespan(_app: object):
+        events.append("app:start")
+        try:
+            yield
+        finally:
+            events.append("app:stop")
+
+    class State:
+        def record_provider_state(self, state: str, *, ready: bool, now: int) -> None:
+            events.append(f"state:{state}:{ready}:{now}")
+
+    client = Client()
+    sessions = ProviderSessionPool({"fastmail": cast(Any, client)})
+    app = SimpleNamespace(router=SimpleNamespace(lifespan_context=original_lifespan))
+    production_module._attach_provider_lifespan(
+        app,
+        sessions,
+        cast(Any, State()),
+        lambda: 123,
+    )
+
+    async def serve() -> None:
+        async with app.router.lifespan_context(app):
+            entered.set()
+            await asyncio.Event().wait()
+
+    serving = asyncio.create_task(serve())
+    await entered.wait()
+    client.is_running = False
+    await asyncio.sleep(0.1)
+
+    assert serving.done() is True
+    with pytest.raises(asyncio.CancelledError):
+        await serving
+    assert sessions.active is False
+    assert events[:3] == ["provider:start", "state:active:True:123", "app:start"]
+    assert "app:stop" in events
+    assert "provider:stop" in events
+    assert events[-1] == "state:blocked:False:123"
+
+
+@pytest.mark.asyncio
+async def test_worker_lifespan_cancellation_stops_background_task() -> None:
+    @asynccontextmanager
+    async def original_lifespan(_app: object):
+        yield
+
+    class Workers:
+        def __init__(self) -> None:
+            self.serve_entered = asyncio.Event()
+            self.serve_exited = asyncio.Event()
+            self.wait_forever = asyncio.Event()
+            self.stop_was_set = False
+
+        async def serve(self, stop: asyncio.Event) -> None:
+            self.serve_entered.set()
+            try:
+                for _ in range(20):
+                    if stop.is_set():
+                        self.stop_was_set = True
+                        return
+                    await asyncio.sleep(0.01)
+            finally:
+                self.serve_exited.set()
+
+        async def wait_started(self) -> None:
+            await self.wait_forever.wait()
+
+    workers = Workers()
+    app = SimpleNamespace(router=SimpleNamespace(lifespan_context=original_lifespan))
+    production_module._attach_production_worker_lifespan(app, cast(Any, workers))
+    entering = asyncio.create_task(app.router.lifespan_context(app).__aenter__())
+    await workers.serve_entered.wait()
+    entering.cancel()
+    await asyncio.sleep(0)
+    entering.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await entering
+
+    assert workers.stop_was_set is True
+    assert workers.serve_exited.is_set() is True

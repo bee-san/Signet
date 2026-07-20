@@ -62,6 +62,7 @@ class ProductionStatus:
     setup_status: str
     ready: bool
     missing_prerequisites: tuple[str, ...]
+    live_providers_ready: bool
     services: Mapping[str, ProductionServiceStatus]
     factors: Mapping[str, ProductionFactorStatus]
 
@@ -69,8 +70,14 @@ class ProductionStatus:
 class ProductionStateStore:
     """Seed and inspect one idempotent production inventory snapshot."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        provider_rollout_enabled: bool = False,
+    ) -> None:
         self.database = database
+        self._provider_rollout_enabled = provider_rollout_enabled
 
     def stage(
         self,
@@ -93,12 +100,46 @@ class ProductionStateStore:
 
         config_digest = production_config_digest(config)
         capability_json = json.dumps(dict(capabilities), sort_keys=True, separators=(",", ":"))
+        config_changed = False
         with self.database.transaction() as connection:
             setup = connection.execute(
                 "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
             ).fetchone()
             if setup is not None and setup["config_digest"] != config_digest:
-                raise ProductionStateError("staged production config differs from durable state")
+                opposite_rollout: Literal["disabled", "enabled"] = (
+                    "disabled" if config.provider_rollout.state == "enabled" else "enabled"
+                )
+                transition_digest = production_config_digest(
+                    config,
+                    rollout_state=opposite_rollout,
+                )
+                compatible_digests = {
+                    transition_digest,
+                    _legacy_production_config_digest(config),
+                    _pre_identity_hardening_production_config_digest(config),
+                    _rollout_preparation_base_digest(config),
+                }
+                if setup["config_digest"] not in compatible_digests:
+                    raise ProductionStateError(
+                        "staged production config differs from durable state"
+                    )
+                config_changed = True
+                connection.execute(
+                    """
+                    UPDATE production_setup_state
+                    SET config_digest = ?, capability_status_json = ?,
+                        updated_at = MAX(updated_at, ?)
+                    WHERE state_id = 1 AND config_digest = ?
+                    """,
+                    (config_digest, capability_json, now, setup["config_digest"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE production_services
+                    SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                    """,
+                    (config_digest, now),
+                )
 
             owners = connection.execute("SELECT user_id FROM production_users").fetchall()
             if any(row["user_id"] != config.owner_user_id for row in owners):
@@ -118,7 +159,12 @@ class ProductionStateStore:
                 identities=secret_identities,
                 now=now,
             )
-            self._stage_connectors(connection, config, now=now)
+            self._stage_connectors(
+                connection,
+                config,
+                now=now,
+                reset_state=config_changed,
+            )
             self._stage_services(
                 connection,
                 services,
@@ -187,6 +233,41 @@ class ProductionStateStore:
                 ),
             )
 
+    def record_provider_state(
+        self,
+        state: Literal["active", "blocked"],
+        *,
+        ready: bool,
+        now: int,
+    ) -> None:
+        """Atomically publish the live session-pool readiness observation."""
+
+        if (state == "active") != ready:
+            raise ValueError("provider readiness does not match lifecycle state")
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("production provider state time is invalid")
+        with self.database.transaction() as connection:
+            setup = connection.execute(
+                "SELECT capability_status_json FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()
+            if setup is None:
+                raise ProductionStateError("production setup state is unavailable")
+            capabilities = self._parse_capabilities(setup["capability_status_json"])
+            capabilities["live_providers_ready"] = ready
+            changed = connection.execute(
+                "UPDATE production_connectors SET state = ?, updated_at = ?",
+                (state, now),
+            ).rowcount
+            if changed < 1:
+                raise ProductionStateError("production connector inventory is unavailable")
+            connection.execute(
+                """
+                UPDATE production_setup_state
+                SET capability_status_json = ?, updated_at = ? WHERE state_id = 1
+                """,
+                (json.dumps(capabilities, sort_keys=True, separators=(",", ":")), now),
+            )
+
     def record_service_state(
         self,
         service_name: str,
@@ -251,6 +332,136 @@ class ProductionStateStore:
             if updated != 1:
                 raise ProductionStateError("secret rotation precondition failed")
 
+    def rotate_connector_identity(
+        self,
+        *,
+        current_config: ProductionConfig,
+        next_config: ProductionConfig,
+        alias: str,
+        now: int,
+    ) -> None:
+        """Atomically authorize reviewed identity changes while rollout is disabled."""
+
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("connector identity rotation time is invalid")
+        current_connector = current_config.connectors.get(alias)
+        next_connector = next_config.connectors.get(alias)
+        if current_connector is None or next_connector is None:
+            raise ProductionStateError("connector identity rotation alias is unavailable")
+        if any(
+            config.provider_rollout.state != "disabled" or config.capabilities.live_providers_ready
+            for config in (current_config, next_config)
+        ):
+            raise ProductionStateError(
+                "connector identity rotation requires disabled provider rollout"
+            )
+
+        current_document = current_config.model_dump(mode="json")
+        next_document = next_config.model_dump(mode="json")
+        current_identity = current_document["connectors"][alias]
+        next_identity = next_document["connectors"][alias]
+        identity_fields = (
+            "credential_identity_digest",
+            "server_identity_digest",
+            "tls_server_certificate",
+            "tls_server_certificate_sha256",
+            "executable_sha256",
+        )
+        changed = any(
+            current_identity.get(name) != next_identity.get(name) for name in identity_fields
+        )
+        for name in identity_fields:
+            current_identity[name] = next_identity.get(name)
+        if alias == "whatsapp":
+            current_wacli = current_document["provider_rollout"].get("wacli")
+            next_wacli = next_document["provider_rollout"].get("wacli")
+            if not isinstance(current_wacli, dict) or not isinstance(next_wacli, dict):
+                raise ProductionStateError("WhatsApp identity rotation requires wacli review")
+            for name in ("linked_jid", "expected_version"):
+                changed = changed or current_wacli.get(name) != next_wacli.get(name)
+                current_wacli[name] = next_wacli.get(name)
+        if not changed:
+            raise ProductionStateError("connector identity rotation requires a new identity")
+        if current_document != next_document:
+            raise ProductionStateError(
+                "connector identity rotation may only change reviewed identity fields"
+            )
+
+        current_config_digest = production_config_digest(current_config)
+        next_config_digest = production_config_digest(next_config)
+        current_connector_digest = _connector_config_digest(
+            current_connector.model_dump(mode="json")
+        )
+        next_connector_digest = _connector_config_digest(next_connector.model_dump(mode="json"))
+        with self.database.transaction() as connection:
+            setup = connection.execute(
+                """
+                SELECT config_digest, capability_status_json
+                FROM production_setup_state WHERE state_id = 1
+                """
+            ).fetchone()
+            connector = connection.execute(
+                """
+                SELECT config_digest, transport, credential_ref,
+                       credential_identity_digest, state
+                FROM production_connectors WHERE connector_alias = ?
+                """,
+                (alias,),
+            ).fetchone()
+            mismatched_services = connection.execute(
+                "SELECT COUNT(*) FROM production_services WHERE config_digest != ?",
+                (current_config_digest,),
+            ).fetchone()[0]
+            if setup is None or setup["config_digest"] != current_config_digest:
+                raise ProductionStateError("connector identity rotation config precondition failed")
+            capabilities = self._parse_capabilities(setup["capability_status_json"])
+            if capabilities["live_providers_ready"]:
+                raise ProductionStateError("connector identity rotation requires blocked providers")
+            if (
+                connector is None
+                or connector["config_digest"] != current_connector_digest
+                or connector["transport"] != current_connector.transport
+                or connector["credential_ref"] != current_connector.credential_ref
+                or connector["credential_identity_digest"]
+                != current_connector.credential_identity_digest
+                or connector["state"] != "disabled"
+                or mismatched_services
+            ):
+                raise ProductionStateError("connector identity rotation precondition failed")
+            updated_connector = connection.execute(
+                """
+                UPDATE production_connectors
+                SET config_digest = ?, credential_identity_digest = ?,
+                    state = 'disabled', updated_at = MAX(updated_at, ?)
+                WHERE connector_alias = ? AND config_digest = ? AND state = 'disabled'
+                """,
+                (
+                    next_connector_digest,
+                    next_connector.credential_identity_digest,
+                    now,
+                    alias,
+                    current_connector_digest,
+                ),
+            ).rowcount
+            updated_setup = connection.execute(
+                """
+                UPDATE production_setup_state
+                SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                WHERE state_id = 1 AND config_digest = ?
+                """,
+                (next_config_digest, now, current_config_digest),
+            ).rowcount
+            if updated_connector != 1 or updated_setup != 1:
+                raise ProductionStateError("connector identity rotation precondition failed")
+            connection.execute(
+                """
+                UPDATE production_services
+                SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                WHERE config_digest = ?
+                """,
+                (next_config_digest, now, current_config_digest),
+            )
+
     def status(self) -> ProductionStatus:
         with self.database.read() as connection:
             schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -273,9 +484,23 @@ class ProductionStateStore:
                 FROM auth_credentials ORDER BY credential_id
                 """
             ).fetchall()
+            connector_rows = connection.execute(
+                """
+                SELECT state
+                FROM production_connectors ORDER BY connector_alias
+                """
+            ).fetchall()
         if setup is None:
             raise ProductionStateError("production setup state is unavailable")
         capabilities = self._parse_capabilities(setup["capability_status_json"])
+        providers_authoritatively_ready = (
+            self._provider_rollout_enabled
+            and bool(connector_rows)
+            and all(row["state"] == "active" for row in connector_rows)
+        )
+        capabilities["live_providers_ready"] = (
+            capabilities["live_providers_ready"] and providers_authoritatively_ready
+        )
         missing = tuple(name for name in _CAPABILITY_ORDER if capabilities.get(name) is not True)
         setup_status = str(setup["setup_status"])
         services = MappingProxyType(
@@ -310,6 +535,7 @@ class ProductionStateStore:
             setup_status=setup_status,
             ready=setup_status == "ready" and not missing,
             missing_prerequisites=missing,
+            live_providers_ready=capabilities["live_providers_ready"],
             services=services,
             factors=factors,
         )
@@ -397,7 +623,13 @@ class ProductionStateStore:
                 )
 
     @staticmethod
-    def _stage_connectors(connection: Any, config: ProductionConfig, *, now: int) -> None:
+    def _stage_connectors(
+        connection: Any,
+        config: ProductionConfig,
+        *,
+        now: int,
+        reset_state: bool,
+    ) -> None:
         configured_aliases = set(config.connectors)
         stored_aliases = {
             str(row["connector_alias"])
@@ -408,13 +640,15 @@ class ProductionStateStore:
         if stored_aliases - configured_aliases:
             raise ProductionStateError("durable production connector inventory has diverged")
         for alias, connector in config.connectors.items():
-            digest = hashlib.sha256(canonical_json(connector.model_dump(mode="json"))).hexdigest()
+            document = connector.model_dump(mode="json")
+            digest = _connector_config_digest(document)
+            desired_state = "blocked" if config.provider_rollout.state == "enabled" else "disabled"
             connection.execute(
                 """
                 INSERT OR IGNORE INTO production_connectors(
                     connector_alias, config_digest, transport, credential_ref,
                     credential_identity_digest, state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'blocked', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     alias,
@@ -422,6 +656,7 @@ class ProductionStateStore:
                     connector.transport,
                     connector.credential_ref,
                     connector.credential_identity_digest,
+                    desired_state,
                     now,
                     now,
                 ),
@@ -433,13 +668,36 @@ class ProductionStateStore:
                 """,
                 (alias,),
             ).fetchone()
-            if stored is None or tuple(stored) != (
-                digest,
+            if stored is None or tuple(stored)[1:] != (
                 connector.transport,
                 connector.credential_ref,
                 connector.credential_identity_digest,
             ):
                 raise ProductionStateError("durable production connector differs from config")
+            if stored["config_digest"] != digest:
+                if not reset_state or stored["config_digest"] not in {
+                    _legacy_connector_config_digest(document),
+                    _pre_identity_hardening_connector_config_digest(document),
+                    _rollout_preparation_connector_digest(document),
+                }:
+                    raise ProductionStateError("durable production connector differs from config")
+                connection.execute(
+                    """
+                    UPDATE production_connectors
+                    SET config_digest = ?, state = ?, updated_at = MAX(updated_at, ?)
+                    WHERE connector_alias = ? AND config_digest = ?
+                    """,
+                    (digest, desired_state, now, alias, stored["config_digest"]),
+                )
+            elif reset_state:
+                connection.execute(
+                    """
+                    UPDATE production_connectors
+                    SET state = ?, updated_at = MAX(updated_at, ?)
+                    WHERE connector_alias = ? AND state != ?
+                    """,
+                    (desired_state, now, alias, desired_state),
+                )
 
     @staticmethod
     def _stage_services(
@@ -489,7 +747,87 @@ class ProductionStateStore:
                 raise ProductionStateError("durable production service differs from config")
 
 
-def production_config_digest(config: ProductionConfig) -> str:
-    """Hash only the versioned non-secret config document and opaque references."""
+def production_config_digest(
+    config: ProductionConfig,
+    *,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
+) -> str:
+    """Hash the complete versioned non-secret config document."""
 
-    return hashlib.sha256(canonical_json(config.model_dump(mode="json"))).hexdigest()
+    document = config.model_dump(mode="json")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _connector_config_digest(document: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _pre_identity_hardening_production_config_digest(config: ProductionConfig) -> str:
+    """Reconstruct the immediately preceding provider-config document shape."""
+
+    document = config.model_dump(mode="json")
+    for connector in document["connectors"].values():
+        connector.pop("tls_server_certificate", None)
+        connector.pop("tls_server_certificate_sha256", None)
+    wacli = document["provider_rollout"].get("wacli")
+    if isinstance(wacli, dict):
+        wacli.pop("linked_jid", None)
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _pre_identity_hardening_connector_config_digest(document: dict[str, Any]) -> str:
+    predecessor = dict(document)
+    predecessor.pop("tls_server_certificate", None)
+    predecessor.pop("tls_server_certificate_sha256", None)
+    return hashlib.sha256(canonical_json(predecessor)).hexdigest()
+
+
+def _legacy_production_config_digest(config: ProductionConfig) -> str:
+    """Reconstruct the pre-SP17 digest while allowing only new rollout fields to change."""
+
+    document = config.model_dump(mode="json")
+    document["storage"].pop("attachment_staging_dir", None)
+    document["storage"].pop("attachment_source_roots", None)
+    document["secrets"].pop("attachment_key_ref", None)
+    document["capabilities"]["live_providers_ready"] = False
+    document.pop("provider_rollout", None)
+    for connector in document["connectors"].values():
+        connector.pop("server_identity_digest", None)
+        connector.pop("tls_server_certificate", None)
+        connector.pop("tls_server_certificate_sha256", None)
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _legacy_connector_config_digest(document: dict[str, Any]) -> str:
+    legacy = dict(document)
+    legacy.pop("server_identity_digest", None)
+    legacy.pop("tls_server_certificate", None)
+    legacy.pop("tls_server_certificate_sha256", None)
+    return hashlib.sha256(canonical_json(legacy)).hexdigest()
+
+
+def _rollout_preparation_base_digest(config: ProductionConfig) -> str:
+    """Reconstruct the disabled digest emitted before rollout prerequisites were staged."""
+
+    document = config.model_dump(mode="json")
+    document["storage"]["attachment_staging_dir"] = None
+    document["storage"]["attachment_source_roots"] = []
+    document["secrets"]["attachment_key_ref"] = None
+    document["capabilities"]["live_providers_ready"] = False
+    document["provider_rollout"] = {"state": "disabled", "wacli": None}
+    for connector in document["connectors"].values():
+        connector["server_identity_digest"] = None
+        connector.pop("tls_server_certificate", None)
+        connector.pop("tls_server_certificate_sha256", None)
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _rollout_preparation_connector_digest(document: dict[str, Any]) -> str:
+    preparation = dict(document)
+    preparation["server_identity_digest"] = None
+    preparation.pop("tls_server_certificate", None)
+    preparation.pop("tls_server_certificate_sha256", None)
+    return hashlib.sha256(canonical_json(preparation)).hexdigest()

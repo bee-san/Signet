@@ -1,15 +1,17 @@
 # Reviewed wacli process boundary
 
-This document describes a deferred live-assembly contract. The repository does
-not ship or activate a live WhatsApp downstream, migrate a linked-device store,
-pair a device, contact WhatsApp, or send a message. The persistent deployment
-assembly remains downstream-disabled.
+This document describes the owned process contract used by the gated production
+assembly. Configuration remains disabled by default, performs no store migration or
+pairing, and cannot contact WhatsApp until every rollout prerequisite is satisfied.
+The persistent `signet deployment` staging assembly remains downstream-disabled.
+The current reviewed artifact still cannot activate because it has no compatible
+reviewed host/artifact pair, as described below.
 
 ## Exact reviewed invocation
 
-The owned wrapper pins the resolved, non-symlink Homebrew Cellar executable for
-`wacli` `0.12.0`, its SHA-256 digest, version, owner, mode, argument grammar,
-timeout, output bound, and native executable format. It never invokes a shell.
+The owned wrapper can pin a resolved, non-symlink `wacli` `0.12.0` executable,
+its SHA-256 digest, version, owner, mode, argument grammar, timeout, output bound,
+and native executable format. It never invokes a shell.
 Production configuration cannot enable script execution; tests use an opaque
 in-memory capability that cannot be represented in deployment configuration. The
 generic reviewed local-process implementation activates only on Linux with a
@@ -17,24 +19,31 @@ mounted `/proc/self/fd`. Every other host fails with
 `process_boundary_platform_unsupported` before creating an executable snapshot or
 starting a child process.
 
-The only reviewed `wacli` artifact in this no-live fixture is the macOS Homebrew
-Cellar build above. It cannot run on the Linux-only process boundary, while macOS
-does not satisfy that boundary. Consequently this fixture has no reviewed
-host/artifact pair and `wacli` activation is blocked on every host. A Linux build,
-path, owner/mode, digest, and version would require a new artifact review before it
-could use the invocation below.
+The repository contains no distributable `wacli` artifact and no independently
+verified artifact provenance record. The macOS Homebrew path and digest in the
+no-live example are local prerelease fixture inputs, not evidence that the artifact
+was externally reviewed. That build cannot run on the Linux-only process boundary,
+while macOS does not satisfy that boundary. Consequently this fixture has no
+reviewed host/artifact pair and `wacli` activation is blocked on every host. A
+Linux build requires a recorded source URL/version, acquisition method, file hash,
+native-format check, owner/mode review, reviewer, and review date before its path
+and digest can enter enabled configuration.
 
-The wrapper does not use a named `--account` lookup. It opens one reviewed store
-directory without following a symbolic link, verifies its identity immediately
-before every spawn, inherits that descriptor, and invokes:
+The wrapper does not combine named `--account` selection with the explicit store.
+It opens one reviewed store directory without following a symbolic link, verifies
+its identity immediately before every spawn, inherits that descriptor, and invokes:
 
 ```text
 /proc/self/fd/EXECUTABLE_FD --store /proc/self/fd/STORE_FD --json --timeout 15s ...
 ```
 
-The configured `account` remains the policy and adapter identity. It is not a
-second filesystem lookup. This matches the `v0.12.0` selection rule that
-`--store` chooses one exact store and cannot be combined with `--account`.
+The configured `account` remains the policy and adapter identity. Before every
+send, the wrapper runs bounded read-only `accounts list` and `auth status`
+preflights through the same descriptor-bound executable/store. It requires one
+inventory entry whose name and configured/resolved store exactly match config,
+then requires an authenticated `linked_jid` exactly equal to the configured JID.
+It still uses `--store` for the send because the `v0.12.0` selection rule forbids
+combining `--store` with `--account`.
 
 ## Required directory layout
 

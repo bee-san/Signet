@@ -9,9 +9,10 @@ htmlcov/
 
 # Virtual environments and build output
 .venv/
+*.egg-info/
+*.egg
 dist/
 build/
-*.egg-info/
 
 # Runtime state and secrets
 .env

@@ -176,6 +176,7 @@ def test_wacli_reports_unsupported_process_boundary_before_process_creation(
     _disable_reviewed_boundary(monkeypatch)
     config = WacliConfig(
         account="personal",
+        expected_linked_jid="15551234567@s.whatsapp.net",
         executable=executable,
         expected_sha256=digest,
         home=home,

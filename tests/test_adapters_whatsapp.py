@@ -61,6 +61,7 @@ def make_fake_wacli(
     version: str = "0.12.0",
     send_body: str = '{"sent":true,"message_id":"wa-safe-id"}',
     send_prelude: str = "",
+    linked_jid: str = "15551234567@s.whatsapp.net",
     fd_report: Path | None = None,
 ) -> tuple[Path, Path]:
     executable = tmp_path / "fake-wacli"
@@ -75,6 +76,26 @@ for fd in "$fd_root"/*; do
   printf '%s=%s\\n' "$fd" "$target"
 done > {str(fd_report)!r}
 """
+    account_store = str(tmp_path / "wacli-runtime" / "store")
+    account_body = json.dumps(
+        {
+            "accounts": [
+                {
+                    "name": "personal",
+                    "configured_store": account_store,
+                    "store_dir": account_store,
+                    "default": True,
+                }
+            ]
+        }
+    )
+    auth_body = json.dumps(
+        {
+            "authenticated": True,
+            "linked_jid": linked_jid,
+            "phone": linked_jid.split("@", 1)[0],
+        }
+    )
     script = f"""#!/bin/sh
 printf '%s\\n' CALL >> {str(log)!r}
 printf '%s\\n' "$@" >> {str(log)!r}
@@ -84,6 +105,8 @@ if [ "$1" = "--store" ]; then printf '%s' store > "$2/.fake-wacli-store"; fi
 {fd_probe}
 case " $* " in
   *" version "*) printf '%s' '{json.dumps({"version": version})}' ;;
+  *" accounts list "*) printf '%s' '{account_body}' ;;
+  *" auth status "*) printf '%s' '{auth_body}' ;;
   *" send "*) {send_prelude} printf '%s' '{send_body}' ;;
   *) printf '%s' '{{"error":"unexpected"}}'; exit 2 ;;
 esac
@@ -105,6 +128,7 @@ def wrapper_config(executable: Path, tmp_path: Path, **changes: Any) -> WacliCon
         directory.chmod(0o700)
     values: dict[str, Any] = {
         "account": "personal",
+        "expected_linked_jid": "15551234567@s.whatsapp.net",
         "executable": executable,
         "expected_version": "0.12.0",
         "expected_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -317,11 +341,62 @@ async def test_wacli_wrapper_is_pinned_no_shell_minimal_env_and_json_only(
     assert result == {"sent": True, "message_id": "wa-safe-id"}
     assert not marker.exists()
     assert "secret-environment-marker" not in logged
-    assert logged.count("CALL") == 2  # version preflight and the send
+    assert logged.count("CALL") == 4  # version, account/store, linked JID, and send
     assert "--store\n/proc/self/fd/" in logged
     assert "--json\n--timeout\n15s" in logged
     assert "send\ntext\n--to\n+15550102030" in logged
     assert f"--message\n{hostile_message}\n--no-preview" in logged
+
+
+@pytest.mark.asyncio
+async def test_wacli_wrapper_rejects_linked_account_drift_before_send(tmp_path: Path) -> None:
+    store = tmp_path / "store"
+    config = WacliConfig(
+        account="personal",
+        expected_linked_jid="15551234567@s.whatsapp.net",
+        store=store,
+    )
+    wrapper = object.__new__(WacliWrapper)
+    wrapper.config = config
+    calls: list[tuple[str, ...]] = []
+
+    async def run_json(
+        command: tuple[str, ...],
+        **_: object,
+    ) -> tuple[dict[str, object], tuple[int, int, int, int, str]]:
+        calls.append(command)
+        signature = (1, 2, 3, 4, "a" * 64)
+        if command[:2] == ("accounts", "list"):
+            return (
+                {
+                    "accounts": [
+                        {
+                            "name": "personal",
+                            "configured_store": str(store),
+                            "store_dir": str(store),
+                            "default": True,
+                        }
+                    ]
+                },
+                signature,
+            )
+        return (
+            {
+                "authenticated": True,
+                "linked_jid": "15557654321@s.whatsapp.net",
+                "phone": "15557654321",
+            },
+            signature,
+        )
+
+    cast(Any, wrapper)._run_json = run_json
+
+    with pytest.raises(WacliError) as captured:
+        await wrapper._verify_linked_account((1, 2, 3, 4, "a" * 64))
+
+    assert captured.value.code == "linked_account_mismatch"
+    assert captured.value.dispatch_may_have_occurred is False
+    assert calls == [("accounts", "list", "--read-only"), ("auth", "status", "--read-only")]
 
 
 @pytest.mark.asyncio
@@ -392,9 +467,10 @@ async def test_wacli_wrapper_executes_verified_descriptor_not_swapped_path(
         wrapper_config(executable, tmp_path),
         _test_capability=_TEST_ONLY_SCRIPT_CAPABILITY,
     )
-    result = await wrapper.send_text(text_arguments())
+    with pytest.raises(WacliError) as caught:
+        await wrapper.send_text(text_arguments())
 
-    assert result == {"sent": True, "message_id": "wa-safe-id"}
+    assert caught.value.code == "executable_digest_mismatch"
     assert not malicious_marker.exists()
     assert log.read_text(encoding="utf-8").count("CALL") == 2
 
@@ -623,6 +699,7 @@ def test_wacli_config_requires_absolute_pinned_executable() -> None:
     with pytest.raises(ValueError, match="reviewed executable digest"):
         WacliConfig(
             account="personal",
+            expected_linked_jid="15551234567@s.whatsapp.net",
             executable=Path("/opt/reviewed/wacli"),
             reviewed_dispatch_enabled=True,
             execution_snapshot_root=Path("/private/snapshots"),
@@ -631,6 +708,7 @@ def test_wacli_config_requires_absolute_pinned_executable() -> None:
     with pytest.raises(ValueError, match="dedicated private home and store"):
         WacliConfig(
             account="personal",
+            expected_linked_jid="15551234567@s.whatsapp.net",
             executable=Path("/opt/reviewed/wacli"),
             expected_sha256="a" * 64,
             reviewed_dispatch_enabled=True,
@@ -645,6 +723,7 @@ def test_wacli_config_requires_absolute_pinned_executable() -> None:
     with pytest.raises(ValueError, match="distinct children"):
         WacliConfig(
             account="personal",
+            expected_linked_jid="15551234567@s.whatsapp.net",
             executable=Path("/opt/reviewed/wacli"),
             expected_sha256="a" * 64,
             home=Path("/Users/operator"),
@@ -670,6 +749,7 @@ def test_wacli_config_requires_staging_and_child_runtime_trees_to_be_disjoint(
     with pytest.raises(ValueError, match="must be disjoint"):
         WacliConfig(
             account="personal",
+            expected_linked_jid="15551234567@s.whatsapp.net",
             executable=Path("/opt/reviewed/wacli"),
             expected_sha256="a" * 64,
             home=Path("/private/wacli-runtime/home"),

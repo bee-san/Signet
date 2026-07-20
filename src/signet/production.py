@@ -10,8 +10,9 @@ import math
 import os
 import stat
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, cast
@@ -23,7 +24,13 @@ from signet.access_requests import FrozenAccessRequestFactory
 from signet.adapters.base import ApprovalAdapter, MCPClient
 from signet.adapters.tool_access import ToolAccessAdapter
 from signet.admission import QueueAdmissionLimits
-from signet.async_support import run_sync_non_abandoning as _run_sync
+from signet.async_support import (
+    await_task_while_preserving_cancellation,
+)
+from signet.async_support import (
+    run_sync_non_abandoning as _run_sync,
+)
+from signet.attachment_crypto import AttachmentCipher
 from signet.auth import (
     Argon2PasswordVerifier,
     PasswordAuthenticator,
@@ -56,6 +63,7 @@ from signet.db import (
     PreMigrationBackupRequired,
     _file_sha256,
 )
+from signet.delivery import DeliveryDispatcher, DeliveryError, FrozenRequestLoader
 from signet.execution_scope import PolicyExecutionScopeResolver
 from signet.freezer import RequestFreezer
 from signet.gateway import GatewayCallPipeline, RawDownstreamClient
@@ -65,6 +73,7 @@ from signet.gateway_tools import (
     SafeRequestSummary,
 )
 from signet.mcp_mirror import AliasToolSurface, SchemaMirror
+from signet.models import InvalidTransition, ReconciliationRejected, RequestState
 from signet.notifications import SQLitePushRepository
 from signet.policy import PolicyEngine, PolicySnapshot, parse_policy_yaml
 from signet.policy_persistence import (
@@ -73,11 +82,20 @@ from signet.policy_persistence import (
     SQLitePolicyPromotionBoundary,
 )
 from signet.private_paths import PrivatePathError, require_no_acl_grants
+from signet.production_connectors import (
+    ProductionConnectorError,
+    ProviderSessionPool,
+    build_live_provider_bundle,
+    build_review_only_provider_adapters,
+    provider_execution_identity_digest,
+)
 from signet.production_state import (
     ProductionServiceRecord,
     ProductionStateStore,
     ProductionStatus,
 )
+from signet.reconcile import ReconciliationCoordinator
+from signet.retention import RetentionManager, RetentionMatrix
 from signet.runtime import (
     MCPRuntime,
     TrustedProxySourceMiddleware,
@@ -85,7 +103,12 @@ from signet.runtime import (
     gateway_principal_provider,
 )
 from signet.schema_registry import DurableSchemaRegistry, SchemaRegistryError
-from signet.staging import StagingError, open_confined_readonly, read_verified_descriptor
+from signet.staging import (
+    StagingError,
+    StagingStore,
+    open_confined_readonly,
+    read_verified_descriptor,
+)
 from signet.state_machine import ApprovalStateMachine
 from signet.totp import SQLiteTotpCredentialRepository, TotpVerifier
 from signet.totp_enrollment import TotpEnrollmentService
@@ -114,6 +137,29 @@ _REQUIRED_SECRET_PURPOSES = (
     "payload_key_ref",
 )
 _MAX_PRIVATE_DOCUMENT_BYTES = 1_048_576
+
+
+def _production_retention_matrix() -> RetentionMatrix:
+    payload_delays: dict[RequestState, int | None] = dict.fromkeys(RequestState)
+    payload_delays.update(
+        {
+            RequestState.SUCCEEDED: 7 * 24 * 60 * 60,
+            RequestState.FAILED: 7 * 24 * 60 * 60,
+            RequestState.DENIED: 7 * 24 * 60 * 60,
+            RequestState.EXPIRED: 7 * 24 * 60 * 60,
+            RequestState.CANCELLED: 7 * 24 * 60 * 60,
+        }
+    )
+    attachment_delays = dict(payload_delays)
+    attachment_delays.update(
+        {
+            RequestState.SUCCEEDED: 0,
+            RequestState.DENIED: 0,
+            RequestState.EXPIRED: 24 * 60 * 60,
+            RequestState.CANCELLED: 24 * 60 * 60,
+        }
+    )
+    return RetentionMatrix(attachment_delays, payload_delays)
 
 
 class ProductionAssemblyError(RuntimeError):
@@ -170,7 +216,7 @@ class ProductionSummaryProvider:
 
 
 class ProductionWorkers:
-    """Explicit lifecycle for provider-free maintenance in a separate process."""
+    """Explicit lifecycle for maintenance and opt-in provider delivery."""
 
     def __init__(
         self,
@@ -179,6 +225,11 @@ class ProductionWorkers:
         policy_promotions: SQLitePolicyPromotionBoundary,
         state: ProductionStateStore,
         clock: Callable[[], int],
+        database: Database | None = None,
+        delivery: DeliveryDispatcher | None = None,
+        reconciliation: ReconciliationCoordinator | None = None,
+        retention: RetentionManager | None = None,
+        provider_sessions: ProviderSessionPool | None = None,
         interval_seconds: float = 5.0,
     ) -> None:
         if interval_seconds < 0.1 or interval_seconds > 300:
@@ -187,10 +238,23 @@ class ProductionWorkers:
         self._policy_promotions = policy_promotions
         self._state = state
         self._clock = clock
+        if (delivery is None) != (reconciliation is None) or (delivery is None) != (
+            provider_sessions is None
+        ):
+            raise ValueError("production provider worker dependencies must be complete")
+        if (delivery is not None or retention is not None) and database is None:
+            raise ValueError("production provider workers require the database")
+        self._database = database
+        self._delivery = delivery
+        self._reconciliation = reconciliation
+        self._retention = retention
+        self._provider_sessions = provider_sessions
         self._interval_seconds = interval_seconds
         self._heartbeat_lease_seconds = max(1, math.ceil(interval_seconds * 3))
         self._running = False
         self._healthy = False
+        self._startup_complete = asyncio.Event()
+        self._startup_error: BaseException | None = None
 
     @property
     def running(self) -> bool:
@@ -204,17 +268,65 @@ class ProductionWorkers:
     def heartbeat_lease_seconds(self) -> int:
         return self._heartbeat_lease_seconds
 
+    async def wait_started(self) -> None:
+        """Wait until startup is ready or has failed and begun unwinding."""
+
+        await self._startup_complete.wait()
+        if self._startup_error is not None:
+            raise self._startup_error
+
     def _maintenance_time(self, now: int | None = None) -> int:
         selected_now = self._clock() if now is None else now
         if not isinstance(selected_now, int) or isinstance(selected_now, bool) or selected_now < 0:
             raise ValueError("production maintenance time is invalid")
         return selected_now
 
-    async def run_once(self, *, now: int | None = None) -> None:
+    async def run_once(
+        self,
+        *,
+        now: int | None = None,
+        stop: asyncio.Event | None = None,
+    ) -> None:
         selected_now = self._maintenance_time(now)
         try:
             await self._policy_promotions.publish_pending(now=selected_now)
             await _run_sync(self._approvals.sweep_expired, now=selected_now, limit=100)
+            if self._delivery is not None and self._reconciliation is not None:
+                for request_id in await _run_sync(self._due_delivery_request_ids, selected_now):
+                    if stop is not None and stop.is_set():
+                        break
+                    try:
+                        await self._delivery.dispatch(
+                            request_id,
+                            worker_id="production:delivery",
+                            now=self._maintenance_time(),
+                            lease_seconds=30,
+                        )
+                    except (DeliveryError, InvalidTransition):
+                        continue
+                reconciliation_now = self._maintenance_time()
+                due_reconciliations = await _run_sync(
+                    self._reconciliation.due_request_ids,
+                    now=reconciliation_now,
+                    limit=16,
+                )
+                for request_id in due_reconciliations:
+                    if stop is not None and stop.is_set():
+                        break
+                    try:
+                        await self._reconciliation.reconcile_once(
+                            request_id,
+                            worker_id="production:reconciliation",
+                            now=self._maintenance_time(),
+                        )
+                    except ReconciliationRejected:
+                        continue
+            if self._retention is not None and (stop is None or not stop.is_set()):
+                await _run_sync(
+                    self._retention.run_due,
+                    now=self._maintenance_time(),
+                    limit=100,
+                )
             completed_now = self._maintenance_time(now)
         except BaseException:
             self._healthy = False
@@ -225,6 +337,33 @@ class ProductionWorkers:
             self._healthy = True
             self._state.record_worker_state("ready", ready=True, now=completed_now)
 
+    def _due_delivery_request_ids(self, now: int) -> tuple[str, ...]:
+        if self._database is None:
+            return ()
+        with self._database.read() as connection:
+            return tuple(
+                str(row["request_id"])
+                for row in connection.execute(
+                    """
+                    SELECT request.request_id
+                    FROM approval_requests AS request
+                    LEFT JOIN execution_attempts AS attempt
+                      ON attempt.request_id = request.request_id
+                     AND attempt.version = request.current_version
+                    WHERE request.state = 'approved'
+                       OR (
+                           request.state = 'executing'
+                           AND attempt.phase IN ('preparing', 'redispatch_preparing')
+                           AND attempt.lease_expires_at <= ?
+                       )
+                    ORDER BY COALESCE(request.approved_at, request.execution_started_at),
+                             request.request_id
+                    LIMIT 16
+                    """,
+                    (now,),
+                ).fetchall()
+            )
+
     async def serve(self, stop: asyncio.Event) -> None:
         """Recover execution fences, then maintain state until the stop event is set."""
 
@@ -232,28 +371,53 @@ class ProductionWorkers:
             raise TypeError("production workers require an asyncio stop event")
         if self._running:
             raise RuntimeError("production workers are already running")
+        self._startup_complete.clear()
+        self._startup_error = None
         self._running = True
         self._healthy = False
         failed = False
+        provider_stack = AsyncExitStack()
         try:
             selected_now = self._maintenance_time()
             self._state.record_worker_state("blocked", ready=False, now=selected_now)
-            await _run_sync(self._approvals.recover_startup, now=selected_now)
+            await provider_stack.__aenter__()
+            if self._provider_sessions is not None:
+                await provider_stack.enter_async_context(self._provider_sessions.run())
+                self._state.record_provider_state(
+                    "active",
+                    ready=True,
+                    now=self._maintenance_time(),
+                )
+            await _run_sync(self._approvals.recover_startup, now=self._maintenance_time())
             self._healthy = True
             self._state.record_worker_state("ready", ready=True, now=self._maintenance_time())
+            self._startup_complete.set()
             while not stop.is_set():
-                await self.run_once()
+                await self.run_once(stop=stop)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=self._interval_seconds)
                 except TimeoutError:
                     continue
-        except BaseException:
+        except BaseException as exc:
             failed = True
             self._healthy = False
+            self._startup_error = exc
+            self._startup_complete.set()
             self._state.record_worker_state("blocked", ready=False, now=self._maintenance_time())
             raise
         finally:
             self._running = False
+            self._startup_complete.set()
+            try:
+                await provider_stack.aclose()
+            finally:
+                if self._provider_sessions is not None:
+                    provider_ready = self._provider_sessions.active
+                    self._state.record_provider_state(
+                        "active" if provider_ready else "blocked",
+                        ready=provider_ready,
+                        now=self._maintenance_time(),
+                    )
             if not failed:
                 self._healthy = False
                 self._state.record_worker_state(
@@ -273,6 +437,10 @@ class ProductionAssembly:
     schema_registry: DurableSchemaRegistry
     token_registry: SQLiteTokenRegistry
     provider_clients: Mapping[str, MCPClient]
+    adapters: Mapping[tuple[str, str], ApprovalAdapter]
+    staging: StagingStore | None
+    retention: RetentionManager | None
+    provider_sessions: ProviderSessionPool | None
     authenticators: AuthenticatorManager
 
     @property
@@ -280,7 +448,18 @@ class ProductionAssembly:
         return self.policy_engine.snapshot
 
     def status(self) -> ProductionStatus:
-        return self.state.status()
+        status = self.state.status()
+        if self.provider_sessions is None or self.provider_sessions.active:
+            return status
+        missing = status.missing_prerequisites
+        if "live_providers_ready" not in missing:
+            missing = (*missing, "live_providers_ready")
+        return replace(
+            status,
+            ready=False,
+            missing_prerequisites=missing,
+            live_providers_ready=False,
+        )
 
 
 def load_production_config(path: str | os.PathLike[str]) -> ProductionConfig:
@@ -352,7 +531,7 @@ def create_production_mcp_app_from_environment(
     *,
     secret_store: SecretStore | None = None,
 ) -> Starlette:
-    """ASGI factory for the provider-disabled MCP service."""
+    """ASGI factory for the configured fail-closed MCP service."""
 
     return create_production_mcp_runtime(
         _production_config_path_from_environment(),
@@ -394,7 +573,7 @@ def build_production_runtime(
     clock: Callable[[], int] | None = None,
     components: frozenset[str] = frozenset({"mcp", "web"}),
 ) -> ProductionAssembly:
-    """Assemble MCP, web, and provider-free workers without any provider calls."""
+    """Assemble MCP, web, and workers without dispatching provider calls."""
 
     if not components <= {"mcp", "web"}:
         raise ProductionAssemblyError("production component selection is invalid")
@@ -451,19 +630,73 @@ def build_production_runtime(
     freezer = RequestFreezer(payload_cipher)
     engine = PolicyEngine(policy)
     mirror = SchemaMirror(policy)
-    clients: Mapping[str, ProductionDisabledProviderClient] = MappingProxyType(
-        {
-            alias: ProductionDisabledProviderClient(
-                alias,
-                credential_identity_digest=connector.credential_identity_digest,
+    provider_sessions: ProviderSessionPool | None = None
+    staging: StagingStore | None = None
+    provider_adapters: Mapping[tuple[str, str], ApprovalAdapter] = MappingProxyType({})
+    reviewer_provider_adapters: Mapping[tuple[str, str], ApprovalAdapter]
+    if config.provider_rollout.state == "enabled":
+        try:
+            live_providers = build_live_provider_bundle(
+                config,
+                database=database,
+                policy=policy,
+                secret_store=secret_store,
+                credential_identity_key=secret_values["capability_key_ref"]
+                .reveal()
+                .encode("utf-8"),
             )
-            for alias, connector in config.connectors.items()
-        }
-    )
+        except ProductionConnectorError as exc:
+            raise ProductionAssemblyError(str(exc)) from None
+        clients: Mapping[str, object] = MappingProxyType(dict(live_providers.clients))
+        provider_adapters = MappingProxyType(dict(live_providers.adapters))
+        reviewer_provider_adapters = provider_adapters
+        staging = live_providers.staging
+        provider_sessions = live_providers.sessions
+    else:
+        clients = MappingProxyType(
+            {
+                alias: ProductionDisabledProviderClient(
+                    alias,
+                    credential_identity_digest=provider_execution_identity_digest(config, alias),
+                )
+                for alias in config.connectors
+            }
+        )
+        attachment_root = config.storage.attachment_staging_dir
+        attachment_reference = config.secrets.attachment_key_ref
+        if (
+            attachment_root is not None
+            and attachment_reference is not None
+            and config.storage.attachment_source_roots
+        ):
+            try:
+                staging = StagingStore(
+                    attachment_root,
+                    database=database,
+                    cipher=AttachmentCipher(
+                        secret_values["attachment_key_ref"],
+                        attachment_reference,
+                    ),
+                    allowed_source_roots=config.storage.attachment_source_roots,
+                )
+            except Exception:
+                raise ProductionAssemblyError(
+                    "production attachment retention could not be initialized"
+                ) from None
+        reviewer_provider_adapters = MappingProxyType(
+            dict(
+                build_review_only_provider_adapters(
+                    config,
+                    policy=policy,
+                    staging=staging,
+                )
+            )
+        )
     execution_scopes = PolicyExecutionScopeResolver(mirror, clients)
     tool_access = ToolAccessAdapter()
     reviewer_adapters = {
-        (tool_access.downstream_alias, tool_access.tool_name): cast(ApprovalAdapter, tool_access)
+        **reviewer_provider_adapters,
+        (tool_access.downstream_alias, tool_access.tool_name): cast(ApprovalAdapter, tool_access),
     }
     approvals = ApprovalStateMachine(
         database,
@@ -481,6 +714,7 @@ def build_production_runtime(
         payload_cipher,
         reviewer_adapters,
         execution_scopes,
+        staging=staging,
     )
     surfaces: dict[str, AliasToolSurface] = {}
 
@@ -515,7 +749,7 @@ def build_production_runtime(
         mirror=mirror,
         downstream_clients=cast(Mapping[str, RawDownstreamClient], clients),
         local_handlers={},
-        adapters={},
+        adapters={adapter.adapter_id: adapter for adapter in provider_adapters.values()},
         execution_scopes=execution_scopes,
         freezer=freezer,
         enqueuer=approvals,
@@ -565,7 +799,11 @@ def build_production_runtime(
     runtime_states: list[ProductionStateStore] = []
 
     def mcp_readiness() -> bool:
-        return bool(runtime_states and runtime_states[0].status().services["mcp"].state == "ready")
+        return bool(
+            runtime_states
+            and runtime_states[0].status().services["mcp"].state == "ready"
+            and (provider_sessions is None or provider_sessions.active)
+        )
 
     def observe_mcp_lifecycle(state_name: str) -> None:
         if state_name not in {"ready", "blocked", "stopped"}:
@@ -626,7 +864,10 @@ def build_production_runtime(
         }
     )
     services = _service_inventory(config, components)
-    state = ProductionStateStore(database)
+    state = ProductionStateStore(
+        database,
+        provider_rollout_enabled=config.provider_rollout.state == "enabled",
+    )
     try:
         state.stage(
             config,
@@ -641,12 +882,58 @@ def build_production_runtime(
             raise _post_migration_startup_failure(verified_backup_version) from None
         raise ProductionAssemblyError(str(exc)) from None
     runtime_states.append(state)
+    delivery: DeliveryDispatcher | None = None
+    reconciliation: ReconciliationCoordinator | None = None
+    retention = (
+        RetentionManager(
+            database,
+            staging,
+            matrix=_production_retention_matrix(),
+        )
+        if staging is not None
+        else None
+    )
+    if provider_sessions is not None:
+        if staging is None:
+            raise AssertionError("live provider staging is unavailable")
+        request_loader = FrozenRequestLoader(
+            approvals,
+            payload_cipher,
+            provider_adapters,
+            execution_scopes,
+        )
+        delivery = DeliveryDispatcher(
+            approvals,
+            request_loader,
+            cast(Mapping[str, MCPClient], clients),
+        )
+        reviewed_reconciliation_tools = {
+            route: adapter.reconciliation_tools & frozenset(policy.downstreams[route[0]].tools)
+            for route, adapter in provider_adapters.items()
+        }
+        reconciliation = ReconciliationCoordinator(
+            approvals,
+            request_loader,
+            delivery,
+            cast(Mapping[str, MCPClient], clients),
+            reviewed_tools=reviewed_reconciliation_tools,
+        )
+
     workers = ProductionWorkers(
         approvals=approvals,
         policy_promotions=policy_promotions,
         state=state,
         clock=now,
+        database=database if delivery is not None or retention is not None else None,
+        delivery=delivery,
+        reconciliation=reconciliation,
+        retention=retention,
+        provider_sessions=provider_sessions,
     )
+    if mcp is not None and provider_sessions is not None:
+        _attach_provider_lifespan(mcp.app, provider_sessions, state, now)
+    if web is not None and (provider_sessions is not None or retention is not None):
+        _attach_production_worker_lifespan(web, workers)
 
     def production_health_probe() -> bool:
         status = state.status()
@@ -655,6 +942,7 @@ def build_production_runtime(
         return (
             maintenance.state == "ready"
             and "workers_ready" not in status.missing_prerequisites
+            and (provider_sessions is None or provider_sessions.active)
             and 0 <= heartbeat_age <= workers.heartbeat_lease_seconds
         )
 
@@ -670,9 +958,72 @@ def build_production_runtime(
         state=state,
         schema_registry=schema_registry,
         token_registry=token_registry,
-        provider_clients=clients,
+        provider_clients=cast(Mapping[str, MCPClient], clients),
+        adapters=provider_adapters,
+        staging=staging,
+        retention=retention,
+        provider_sessions=provider_sessions,
         authenticators=authenticators,
     )
+
+
+def _attach_provider_lifespan(
+    app: Starlette,
+    sessions: ProviderSessionPool,
+    state: ProductionStateStore,
+    clock: Callable[[], int],
+) -> None:
+    original = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(selected: Starlette) -> AsyncIterator[None]:
+        try:
+            async with sessions.run():
+                state.record_provider_state("active", ready=True, now=clock())
+                async with original(selected):
+                    yield
+        except BaseException:
+            ready = sessions.active
+            state.record_provider_state(
+                "active" if ready else "blocked",
+                ready=ready,
+                now=clock(),
+            )
+            raise
+        else:
+            ready = sessions.active
+            state.record_provider_state(
+                "active" if ready else "blocked",
+                ready=ready,
+                now=clock(),
+            )
+
+    app.router.lifespan_context = lifespan
+
+
+def _attach_production_worker_lifespan(app: FastAPI, workers: ProductionWorkers) -> None:
+    original = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(selected: FastAPI) -> AsyncIterator[None]:
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            workers.serve(stop),
+            name="signet-production-workers",
+        )
+        try:
+            await asyncio.sleep(0)
+            await workers.wait_started()
+            await asyncio.sleep(0)
+            if task.done():
+                await task
+            async with original(selected):
+                yield
+        finally:
+            stop.set()
+            await await_task_while_preserving_cancellation(task)
+
+    app.router.lifespan_context = lifespan
 
 
 def _post_migration_startup_failure(previous_version: int) -> ProductionAssemblyError:
@@ -845,7 +1196,10 @@ def _resolve_secret_inventory(
     try:
         for purpose, raw_reference in references.items():
             parsed_references[purpose] = SecretReference.parse(raw_reference)
-        for purpose in _REQUIRED_SECRET_PURPOSES:
+        resolved_purposes: tuple[str, ...] = _REQUIRED_SECRET_PURPOSES
+        if "attachment_key_ref" in parsed_references:
+            resolved_purposes += ("attachment_key_ref",)
+        for purpose in resolved_purposes:
             reference = parsed_references[purpose]
             value = secret_store.get(reference)
             encoded = value.reveal().encode("utf-8")

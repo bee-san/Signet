@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import ipaddress
 import json
+import ssl
 import traceback
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,7 +18,11 @@ import anyio
 import httpx
 import mcp.types as types
 import pytest
-from mcp import StdioServerParameters
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+from mcp import ClientSession, StdioServerParameters
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_client_server_memory_streams
 
@@ -31,6 +37,7 @@ from signet.downstream import (
     _bounded_response_hook,
     _BoundedHTTPResponseStream,
     _official_stdio_connector,
+    pinned_tls_http_connector,
     structured_adapter_result,
     validate_call_tool_result,
 )
@@ -38,6 +45,155 @@ from signet.mcp_mirror import raw_model
 from signet.reviewed_process import _TEST_ONLY_SCRIPT_CAPABILITY
 
 SECRET = "credential-material-that-must-not-leak"
+
+
+def _write_self_signed_tls_identity(
+    directory: Path,
+    *,
+    name: str,
+    certificate_authority: bool = False,
+) -> tuple[Path, Path, str]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=certificate_authority, path_length=None), True)
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    certificate_path = directory / f"{name}.pem"
+    key_path = directory / f"{name}-key.pem"
+    certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    digest = hashlib.sha256(certificate.public_bytes(serialization.Encoding.DER)).hexdigest()
+    return certificate_path, key_path, digest
+
+
+@pytest.mark.asyncio
+async def test_pinned_tls_rejects_wrong_peer_before_sending_bearer_header(tmp_path: Path) -> None:
+    reviewed_cert, _, reviewed_digest = _write_self_signed_tls_identity(
+        tmp_path,
+        name="reviewed",
+    )
+    wrong_cert, wrong_key, _ = _write_self_signed_tls_identity(tmp_path, name="wrong")
+    received_application_bytes = 0
+
+    async def record_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal received_application_bytes
+        received_application_bytes += len(await reader.read(65_536))
+        writer.close()
+        await writer.wait_closed()
+
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(wrong_cert, wrong_key)
+    server = await asyncio.start_server(
+        record_request,
+        "127.0.0.1",
+        0,
+        ssl=server_context,
+    )
+    port = server.sockets[0].getsockname()[1]
+    connector = pinned_tls_http_connector(
+        reviewed_cert.read_bytes(),
+        reviewed_digest,
+    )
+    try:
+        with pytest.raises(BaseExceptionGroup):
+            async with connector(
+                f"https://127.0.0.1:{port}/mcp",
+                {"Authorization": f"Bearer {SECRET}"},
+                0.2,
+                1_048_576,
+            ) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert received_application_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_pinned_tls_allows_reviewed_peer_to_receive_bearer_header(
+    tmp_path: Path,
+) -> None:
+    reviewed_cert, reviewed_key, reviewed_digest = _write_self_signed_tls_identity(
+        tmp_path,
+        name="reviewed-peer",
+    )
+    received_headers = b""
+
+    async def receive_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal received_headers
+        try:
+            received_headers = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=1)
+            writer.write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(reviewed_cert, reviewed_key)
+    server = await asyncio.start_server(
+        receive_request,
+        host="127.0.0.1",
+        port=0,
+        ssl=server_context,
+    )
+    port = server.sockets[0].getsockname()[1]
+    connector = pinned_tls_http_connector(
+        reviewed_cert.read_bytes(),
+        reviewed_digest,
+    )
+    try:
+        with pytest.raises(BaseExceptionGroup):
+            async with connector(
+                f"https://127.0.0.1:{port}/mcp",
+                {"Authorization": f"Bearer {SECRET}"},
+                0.2,
+                1_048_576,
+            ) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert f"Authorization: Bearer {SECRET}\r\n".encode("ascii") in received_headers
+
+
+def test_pinned_tls_requires_one_reviewed_leaf_certificate(tmp_path: Path) -> None:
+    leaf, _, digest = _write_self_signed_tls_identity(tmp_path, name="leaf")
+    authority, _, authority_digest = _write_self_signed_tls_identity(
+        tmp_path,
+        name="authority",
+        certificate_authority=True,
+    )
+
+    with pytest.raises(DownstreamConfigurationError, match="identity"):
+        pinned_tls_http_connector(leaf.read_bytes(), "0" * 64)
+    with pytest.raises(DownstreamConfigurationError, match="leaf"):
+        pinned_tls_http_connector(authority.read_bytes(), authority_digest)
+    with pytest.raises(DownstreamConfigurationError, match="exactly one"):
+        pinned_tls_http_connector(leaf.read_bytes() * 2, digest)
 
 
 def _http_config(**changes: Any) -> DownstreamConfig:

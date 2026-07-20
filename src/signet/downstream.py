@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import hmac
 import json
 import os
 import re
 import signal
+import ssl
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import (
     AbstractAsyncContextManager,
@@ -24,6 +27,8 @@ from urllib.parse import urlsplit
 import anyio
 import httpx
 import mcp.types as types
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
@@ -48,6 +53,7 @@ from signet.reviewed_process import (
 )
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _MAX_TOOL_NAME_LENGTH = 256
 _MAX_EXECUTABLE_LENGTH = 4096
 _MAX_ARGUMENT_COUNT = 64
@@ -157,6 +163,7 @@ class DownstreamSession(Protocol):
 
 
 SessionFactory = Callable[[Any, Any, timedelta], AbstractAsyncContextManager[DownstreamSession]]
+CredentialVerifier = Callable[[Secret], None]
 
 
 class _BoundedHTTPResponseStream(httpx.AsyncByteStream):
@@ -238,6 +245,8 @@ async def _official_http_connector(
     headers: Mapping[str, str],
     timeout_seconds: float,
     output_limit_bytes: int,
+    *,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> AsyncIterator[TransportStreams]:
     timeout = httpx.Timeout(timeout_seconds)
     async with (
@@ -245,6 +254,7 @@ async def _official_http_connector(
             headers={**dict(headers), "Accept-Encoding": "identity"},
             timeout=timeout,
             trust_env=False,
+            verify=ssl_context if ssl_context is not None else True,
             event_hooks={"response": [_bounded_response_hook(output_limit_bytes)]},
         ) as http_client,
         streamable_http_client(
@@ -254,6 +264,62 @@ async def _official_http_connector(
         ) as streams,
     ):
         yield cast(TransportStreams, streams)
+
+
+def pinned_tls_http_connector(
+    server_certificate_pem: bytes,
+    expected_certificate_sha256: str,
+) -> HTTPConnector:
+    """Build an HTTP connector pinned to one reviewed leaf certificate."""
+
+    try:
+        certificates = x509.load_pem_x509_certificates(server_certificate_pem)
+    except ValueError as exc:
+        raise DownstreamConfigurationError("reviewed TLS server certificate is invalid") from exc
+    if len(certificates) != 1:
+        raise DownstreamConfigurationError(
+            "reviewed TLS identity must contain exactly one certificate"
+        )
+    certificate = certificates[0]
+    try:
+        constraints = certificate.extensions.get_extension_for_class(x509.BasicConstraints).value
+    except x509.ExtensionNotFound:
+        constraints = None
+    if constraints is not None and constraints.ca:
+        raise DownstreamConfigurationError("reviewed TLS identity must be a leaf certificate")
+    certificate_der = certificate.public_bytes(serialization.Encoding.DER)
+    if not hmac.compare_digest(
+        hashlib.sha256(certificate_der).hexdigest(),
+        expected_certificate_sha256,
+    ):
+        raise DownstreamConfigurationError("reviewed TLS certificate identity drift was detected")
+    certificate_pem = certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    try:
+        context.load_verify_locations(cadata=certificate_pem)
+    except ssl.SSLError as exc:
+        raise DownstreamConfigurationError("reviewed TLS server certificate is invalid") from exc
+
+    @asynccontextmanager
+    async def connect(
+        url: str,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        output_limit_bytes: int,
+    ) -> AsyncIterator[TransportStreams]:
+        async with _official_http_connector(
+            url,
+            headers,
+            timeout_seconds,
+            output_limit_bytes,
+            ssl_context=context,
+        ) as streams:
+            yield streams
+
+    return connect
 
 
 @asynccontextmanager
@@ -519,16 +585,26 @@ class DownstreamClient:
         http_connector: HTTPConnector = _official_http_connector,
         stdio_connector: StdioConnector = _official_stdio_connector,
         session_factory: SessionFactory = _official_session_factory,
+        credential_verifier: CredentialVerifier | None = None,
+        execution_identity_digest: str | None = None,
     ) -> None:
         self._working_directory_identity = self._validate_config(alias, config)
+        if (
+            execution_identity_digest is not None
+            and _SHA256_RE.fullmatch(execution_identity_digest) is None
+        ):
+            raise DownstreamConfigurationError("execution identity digest is invalid")
         self._alias = alias
         self._config = config
         self._credential_reference = SecretReference.parse(config.credential_ref)
-        self._credential_identity_digest = config.credential_identity_digest
+        self._credential_identity_digest = (
+            execution_identity_digest or config.credential_identity_digest
+        )
         self._secret_store = secret_store
         self._http_connector = http_connector
         self._stdio_connector = stdio_connector
         self._session_factory = session_factory
+        self._credential_verifier = credential_verifier
         self._state = _Lifecycle.NEW
         self._session: DownstreamSession | None = None
         self._initialize_result: dict[str, Any] | None = None
@@ -551,7 +627,7 @@ class DownstreamClient:
 
     @property
     def credential_identity_digest(self) -> str:
-        """Return the inventory-issued provider credential generation identity."""
+        """Return the reviewed identity bound into executable approval scopes."""
 
         return self._credential_identity_digest
 
@@ -759,6 +835,8 @@ class DownstreamClient:
                         raise DownstreamConfigurationError(
                             "downstream credential material is unavailable"
                         )
+                    if self._credential_verifier is not None:
+                        self._credential_verifier(credential)
                     streams = await self._enter_transport(stack, credential)
                     if len(streams) not in (2, 3):
                         raise DownstreamProtocolError(

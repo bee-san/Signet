@@ -15,6 +15,7 @@ read-only lookup or return ``Reconciliation.INCONCLUSIVE`` without making a call
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -48,9 +49,24 @@ class AdapterProtocolError(AdapterError):
 class DispatchError(AdapterError):
     """A dispatch failed with an explicit side-effect characterization."""
 
-    def __init__(self, message: str, *, dispatch_may_have_occurred: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        dispatch_may_have_occurred: bool,
+        safe_metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.dispatch_may_have_occurred = dispatch_may_have_occurred
+        self.safe_metadata = MappingProxyType(dict(safe_metadata or {}))
+
+
+class DispatchCancelledError(asyncio.CancelledError):
+    """Cancellation after a provider effect may have begun, with bounded metadata."""
+
+    def __init__(self, message: str, *, safe_metadata: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.safe_metadata = MappingProxyType(dict(safe_metadata))
 
 
 class Outcome(StrEnum):

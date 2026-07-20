@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "mode": "production",
+  "owner_user_id": "user:replace-with-canonical-owner",
+  "public_origin": "https://signet.example.invalid",
+  "rp_id": "signet.example.invalid",
+  "allowed_hosts": [
+    "signet.example.invalid",
+    "127.0.0.1",
+    "localhost"
+  ],
+  "mcp_host": "127.0.0.1",
+  "mcp_port": 8789,
+  "web_host": "127.0.0.1",
+  "web_port": 8790,
+  "policy_path": "/ABSOLUTE/PRIVATE/SIGNET/policy.yaml",
+  "storage": {
+    "data_dir": "/ABSOLUTE/PRIVATE/SIGNET/data",
+    "backup_dir": "/ABSOLUTE/PRIVATE/SIGNET/backups",
+    "restore_dir": "/ABSOLUTE/PRIVATE/SIGNET/restore"
+  },
+  "secrets": {
+    "session_secret_ref": "keychain://Signet/session",
+    "csrf_secret_ref": "keychain://Signet/csrf",
+    "capability_key_ref": "keychain://Signet/capability",
+    "payload_key_ref": "keychain://Signet/payload",
+    "totp_secret_ref": "keychain://Signet/totp",
+    "vapid_private_key_ref": null
+  },
+  "capabilities": {
+    "storage_ready": true,
+    "secret_broker_ready": true,
+    "mcp_ready": true,
+    "web_ready": true,
+    "workers_ready": true,
+    "policy_ready": true,
+    "live_providers_ready": false
+  },
+  "connectors": {
+    "fastmail": {
+      "transport": "http",
+      "credential_ref": "keychain://Signet/fastmail",
+      "credential_identity_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "server_identity_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "url": "https://REPLACE-WITH-REVIEWED-FAKE-OR-LIVE-ENDPOINT.invalid/mcp"
+    }
+  },
+  "provider_rollout": {
+    "state": "disabled"
+  }
+}

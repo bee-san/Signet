@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from collections.abc import Mapping
@@ -12,6 +13,7 @@ import pytest
 from signet.adapters import (
     AdapterRequest,
     AdapterValidationError,
+    DispatchError,
     ExecutionAttempt,
     FastmailAdapter,
     Outcome,
@@ -141,6 +143,17 @@ def test_fastmail_fixture_validates_and_private_summary_is_complete() -> None:
     assert "recipient_count" in audit
 
 
+def test_fastmail_canonicalizes_omitted_attachments_before_freezing() -> None:
+    adapter = FastmailAdapter(account="primary")
+    arguments = fixture_arguments()
+    arguments.pop("attachments")
+
+    canonical = adapter.canonicalize(arguments)
+
+    assert canonical == {**arguments, "attachments": []}
+    assert adapter.freeze_attachments(arguments) == ()
+
+
 def test_fastmail_legacy_attachment_type_is_explicitly_unverified() -> None:
     adapter = FastmailAdapter(account="primary")
     arguments = fixture_arguments()
@@ -212,7 +225,9 @@ async def test_fastmail_preserves_exact_executable_address_values() -> None:
     await adapter.execute(downstream, prepared)
 
     assert canonical == arguments
-    assert downstream.calls == [("send_email", arguments)]
+    expected = dict(arguments)
+    expected.pop("attachments")
+    assert downstream.calls == [("send_email", expected)]
 
 
 def test_fastmail_recipient_review_exposes_idn_display_name_nfc_and_bcc_context() -> None:
@@ -358,6 +373,171 @@ async def test_fastmail_stages_locally_then_uploads_and_sends_once_after_prepare
         "provider_status": "sent",
         "thread_id": "thread-safe-id",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "upload_result",
+    [
+        TimeoutError("ambiguous upload timeout"),
+        {"unexpected": "malformed upload result"},
+        {"isError": True},
+    ],
+)
+async def test_fastmail_ambiguous_upload_result_is_not_a_definite_pre_dispatch_failure(
+    tmp_path: Path,
+    upload_result: object,
+) -> None:
+    store, source_root = staging_store(tmp_path)
+    source = source_root / "report.txt"
+    source.write_text("inert attachment", encoding="utf-8")
+    adapter = FastmailAdapter(
+        staging_store=store,
+        account="primary",
+        reviewed_dispatch_enabled=True,
+    )
+    reference = adapter.stage_attachment(
+        source,
+        filename="report.txt",
+        mime_type="text/plain",
+    )
+    arguments = fixture_arguments()
+    arguments["attachments"] = [reference]
+    payload = adapter.prepare_for_execution(adapter_request(arguments))
+
+    class AmbiguousUploadClient(FakeFastmailClient):
+        async def call_tool(
+            self,
+            tool_name: str,
+            arguments: Mapping[str, Any],
+        ) -> Mapping[str, Any]:
+            self.calls.append((tool_name, dict(arguments)))
+            if tool_name != "upload_attachment":
+                raise AssertionError("email dispatch must not follow an ambiguous upload")
+            if isinstance(upload_result, BaseException):
+                raise upload_result
+            return cast(Mapping[str, Any], upload_result)
+
+    downstream = AmbiguousUploadClient()
+    with pytest.raises(DispatchError) as captured:
+        await adapter.execute(downstream, payload)
+
+    assert captured.value.dispatch_may_have_occurred is True
+    assert captured.value.safe_metadata == {
+        "state": "attachment_upload_outcome_unknown",
+        "attachment_uploads_attempted": 1,
+        "attachment_uploads_confirmed": 0,
+    }
+    assert [call[0] for call in downstream.calls] == ["upload_attachment"]
+
+
+@pytest.mark.asyncio
+async def test_fastmail_cancellation_during_upload_propagates_after_one_provider_effect(
+    tmp_path: Path,
+) -> None:
+    store, source_root = staging_store(tmp_path)
+    source = source_root / "report.txt"
+    source.write_text("inert attachment", encoding="utf-8")
+    adapter = FastmailAdapter(
+        staging_store=store,
+        account="primary",
+        reviewed_dispatch_enabled=True,
+    )
+    reference = adapter.stage_attachment(
+        source,
+        filename="report.txt",
+        mime_type="text/plain",
+    )
+    arguments = fixture_arguments()
+    arguments["attachments"] = [reference]
+    payload = adapter.prepare_for_execution(adapter_request(arguments))
+
+    class CancelledUploadClient(FakeFastmailClient):
+        async def call_tool(
+            self,
+            tool_name: str,
+            arguments: Mapping[str, Any],
+        ) -> Mapping[str, Any]:
+            self.calls.append((tool_name, dict(arguments)))
+            raise asyncio.CancelledError
+
+    downstream = CancelledUploadClient()
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await adapter.execute(downstream, payload)
+
+    assert captured.value.safe_metadata == {
+        "state": "attachment_upload_outcome_unknown",
+        "attachment_uploads_attempted": 1,
+        "attachment_uploads_confirmed": 0,
+    }
+    assert [call[0] for call in downstream.calls] == ["upload_attachment"]
+
+
+@pytest.mark.asyncio
+async def test_fastmail_later_upload_failure_never_retries_or_dispatches_email(
+    tmp_path: Path,
+) -> None:
+    store, source_root = staging_store(tmp_path)
+    adapter = FastmailAdapter(
+        staging_store=store,
+        account="primary",
+        reviewed_dispatch_enabled=True,
+    )
+    references = []
+    for index in range(2):
+        source = source_root / f"report-{index}.txt"
+        source.write_text(f"inert attachment {index}", encoding="utf-8")
+        references.append(
+            adapter.stage_attachment(
+                source,
+                filename=source.name,
+                mime_type="text/plain",
+            )
+        )
+    arguments = fixture_arguments()
+    arguments["attachments"] = references
+    payload = adapter.prepare_for_execution(adapter_request(arguments))
+
+    class LaterFailureClient(FakeFastmailClient):
+        async def call_tool(
+            self,
+            tool_name: str,
+            arguments: Mapping[str, Any],
+        ) -> Mapping[str, Any]:
+            self.calls.append((tool_name, dict(arguments)))
+            if len(self.calls) == 1:
+                return {"attachmentId": "first-reviewed-id"}
+            raise TimeoutError("second upload outcome is ambiguous")
+
+    downstream = LaterFailureClient()
+    with pytest.raises(DispatchError) as captured:
+        await adapter.execute(downstream, payload)
+
+    assert captured.value.dispatch_may_have_occurred is True
+    assert captured.value.safe_metadata == {
+        "state": "attachment_upload_outcome_unknown",
+        "attachment_uploads_attempted": 2,
+        "attachment_uploads_confirmed": 1,
+    }
+    assert [call[0] for call in downstream.calls] == [
+        "upload_attachment",
+        "upload_attachment",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fastmail_execute_discards_unreviewed_provider_attachment_handles() -> None:
+    adapter = FastmailAdapter(account="primary", reviewed_dispatch_enabled=True)
+    payload = fixture_arguments()
+    payload["attachments"] = [{"attachment_id": "unreviewed-remote-object"}]
+    payload["_signet_resolved_attachments"] = []
+    downstream = FakeFastmailClient()
+
+    await adapter.execute(downstream, payload)
+
+    expected = fixture_arguments()
+    expected.pop("attachments")
+    assert downstream.calls == [("send_email", expected)]
 
 
 def test_fastmail_safe_result_accepts_only_the_reviewed_shape_and_statuses() -> None:
