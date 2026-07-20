@@ -7,7 +7,7 @@
   <p class="eyebrow">Private owner setup</p>
   <h1 id="setup-title">Set up Signet</h1>
   {% if not setup.claimed %}
-  <p>Setup is locked. On the Signet host, issue a one-time bootstrap capability and paste it below before it expires.</p>
+  <p>Setup is locked. Use the exact private URL printed by <code>signet setup</code>. If browser handoff is unavailable, enter a one-time bootstrap value below before it expires.</p>
   <form action="/setup/claim" method="post" class="stack-form">
     <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
     <label for="bootstrap-capability">One-time bootstrap capability</label>
