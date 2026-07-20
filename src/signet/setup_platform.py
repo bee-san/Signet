@@ -147,7 +147,7 @@ def render_launchd_services(spec: SetupSpec, *, active: bool = False) -> dict[st
 
 def render_systemd_services(spec: SetupSpec, *, active: bool = False) -> dict[str, str]:
     config = _systemd_quote(str(spec.root / _CONFIG_NAME))
-    executable = _systemd_quote(str(spec.executable))
+    executable = _systemd_executable(str(spec.executable))
     result: dict[str, str] = {}
     for component in ("mcp", "web"):
         lines = [
@@ -157,7 +157,7 @@ def render_systemd_services(spec: SetupSpec, *, active: bool = False) -> dict[st
             "",
             "[Service]",
             "Type=simple",
-            f"ExecStart={executable} production serve-{component} --config {config}",
+            f"ExecStart=:{executable} production serve-{component} --config {config}",
             "Restart=on-failure",
             "RestartSec=10",
             "UMask=0077",
@@ -1285,10 +1285,16 @@ def _remove_profile_environment(
 def _systemd_quote(value: str) -> str:
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError("service path contains a control character")
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$").replace("%", "%%")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     if not any(character.isspace() or character in "\\\"'" for character in value):
         return escaped
     return f'"{escaped}"'
+
+
+def _systemd_executable(value: str) -> str:
+    if any(character in '\\"' for character in value):
+        raise ValueError("systemd executable path contains an unsupported quote or backslash")
+    return _systemd_quote(value)
 
 
 def _now() -> int:

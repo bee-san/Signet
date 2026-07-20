@@ -289,21 +289,34 @@ def test_service_plans_use_installed_executable_and_remain_inert(tmp_path: Path)
 def test_systemd_service_plan_uses_systemd_native_path_escaping() -> None:
     selected = replace(
         spec(Path('/tmp/Signet $HOME/%h/"quoted"/state\\dir')),
-        executable=Path('/opt/Signet $BIN/%E/"quoted"/bin\\signet'),
+        executable=Path("/opt/Signet ${BIN}/%E/bin signet"),
     )
 
     unit = render_systemd_services(selected)["signet-mcp.service"]
 
     assert (
-        'ExecStart="/opt/Signet $$BIN/%%E/\\"quoted\\"/bin\\\\signet" '
+        'ExecStart=:"/opt/Signet ${BIN}/%%E/bin signet" '
         "production serve-mcp --config "
-        '"/tmp/Signet $$HOME/%%h/\\"quoted\\"/state\\\\dir/production.json"'
+        '"/tmp/Signet $HOME/%%h/\\"quoted\\"/state\\\\dir/production.json"'
     ) in unit
+
+
+@pytest.mark.parametrize("unsupported", ['"', "\\"])
+def test_systemd_service_plan_rejects_unrepresentable_executable_paths(
+    unsupported: str,
+) -> None:
+    selected = replace(
+        spec(Path("/tmp/signet")),
+        executable=Path(f"/opt/signet/{unsupported}/bin/signet"),
+    )
+
+    with pytest.raises(ValueError, match="systemd executable path"):
+        render_systemd_services(selected)
 
 
 @pytest.mark.skipif(shutil.which("systemd-analyze") is None, reason="systemd is unavailable")
 def test_systemd_service_plan_passes_systemd_analyze(tmp_path: Path) -> None:
-    executable = tmp_path / 'bin $BIN %E "quoted" \\ signet'
+    executable = tmp_path / "bin ${BIN} %E signet"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o700)
     selected = replace(
