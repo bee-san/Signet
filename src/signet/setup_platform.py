@@ -341,6 +341,11 @@ class ProductionSetupPlatform:
             or stat.S_IMODE(metadata.st_mode) & 0o022
         ):
             raise SetupError("the installed Signet executable is not a reviewed executable file")
+        if sys.platform == "linux":
+            try:
+                _systemd_executable(str(spec.executable))
+            except ValueError as exc:
+                raise SetupError(str(exc)) from exc
         for profile in spec.hermes_profiles:
             directory = self._hermes_profile_directory(profile)
             if not directory.is_dir() or directory.is_symlink():

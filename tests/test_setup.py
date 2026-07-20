@@ -408,6 +408,20 @@ def test_preflight_resolves_the_hermes_default_profile_to_the_hermes_home(
     )
 
 
+def test_preflight_rejects_linux_executable_paths_systemd_cannot_represent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / 'signet"bin'
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+    selected = replace(spec(tmp_path / "signet"), executable=executable)
+    monkeypatch.setattr(setup_platform.sys, "platform", "linux")
+
+    with pytest.raises(SetupError, match="systemd executable path"):
+        ProductionSetupPlatform()._apply_preflight(selected, "setup_0123456789abcdef")
+
+
 def test_configuration_rollback_uses_the_selected_policy_mode(tmp_path: Path) -> None:
     root = tmp_path / "signet"
     root.mkdir(mode=0o700)
