@@ -19,13 +19,19 @@ and fresh action confirmation. A proxy supplies TLS and reachability only.
 
 ## Current deployment status
 
-This repository ships two separate deployment surfaces. `signet deployment` is a
-runnable, persistent **downstream-disabled staging assembly**. It has no downstream
-transport, credential resolver, provider client, delivery worker, or reconciliation
-worker. It publishes only the authenticated `approvals` MCP namespace; all five
-normative tools return `deployment_disabled`, and downstream paths such as
-`/mcp/fastmail` and `/mcp/whatsapp` do not exist. Its web process is a loopback status
-page, not the authenticated approval application.
+This repository ships a packaged production setup path plus the older disabled staging
+surface. `signet setup` creates a resumable, marker-owned production assembly with all
+providers disabled, installs the two loopback services, prepares multiple existing
+Hermes profiles with disabled MCP entries, and opens the real owner browser ceremony.
+On a derived `*.ts.net` origin it conservatively manages only a free Tailscale Serve
+HTTPS 8443 listener. Read [`setup.md`](setup.md) before running it.
+
+`signet deployment` remains a runnable, persistent **downstream-disabled staging
+assembly**. It has no downstream transport, credential resolver, provider client,
+delivery worker, or reconciliation worker. It publishes only the authenticated
+`approvals` MCP namespace; all five normative tools return `deployment_disabled`, and
+downstream paths such as `/mcp/fastmail` and `/mcp/whatsapp` do not exist. Its web
+process is a loopback status page, not the authenticated approval application.
 
 The production assembly can wire the provider-specific Fastmail and owned `wacli`
 WhatsApp boundaries. That path is disabled by default and rejects a one-sided
@@ -44,20 +50,22 @@ from the verified config instead of duplicating them on the command line.
 
 Everything under `deploy/` is an inert, secret-free template. The launchd examples
 contain nonexistent absolute-path placeholders and cannot start until the disabled
-state and templates are reviewed. Nothing in the repository has:
+state and templates are reviewed. The packaged setup command is separate: it changes
+real user resources only after an explicit plan confirmation. Repository contents and
+CI results are not evidence that any particular host has:
 
 - inspected a live Hermes, Tailscale, Homepage, launchd, Keychain, provider, or
   browser-session configuration;
-- enrolled a passkey, password, or TOTP;
+- completed a password, passkey, or TOTP ceremony;
 - captured or approved live provider schemas;
 - installed or started a service;
 - changed a Serve/Funnel route or Homepage card;
-- replaced a Hermes route or removed a direct credential;
+- replaced a Hermes route or removed a direct credential; or
 - sent a real email or WhatsApp message.
 
-Those are deferred human-authorized cutover steps. Running the disabled staging
-assembly or seeing a healthy process does not complete or authorize any of them.
-Automated implementation and CI remain fake-provider/downstream-disabled.
+Provider cutover remains a separate human-authorized operation. Running setup or
+seeing healthy processes does not complete or authorize it. Automated CI remains
+fake-provider/downstream-disabled.
 
 For copy-pasteable fake-only startup, a disposable Hermes profile, command
 verification, troubleshooting, and a restore drill, use
