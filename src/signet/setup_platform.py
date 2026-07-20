@@ -8,7 +8,6 @@ import os
 import plistlib
 import re
 import secrets
-import shlex
 import stat
 import subprocess
 import sys
@@ -1286,9 +1285,10 @@ def _remove_profile_environment(
 def _systemd_quote(value: str) -> str:
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError("service path contains a control character")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$").replace("%", "%%")
     if not any(character.isspace() or character in "\\\"'" for character in value):
-        return value
-    return shlex.quote(value)
+        return escaped
+    return f'"{escaped}"'
 
 
 def _now() -> int:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -283,6 +284,46 @@ def test_service_plans_use_installed_executable_and_remain_inert(tmp_path: Path)
     assert set(systemd) == {"signet-mcp.service", "signet-web.service"}
     assert all("/opt/signet/bin/signet production serve-" in value for value in systemd.values())
     assert all("WantedBy" not in value for value in systemd.values())
+
+
+def test_systemd_service_plan_uses_systemd_native_path_escaping() -> None:
+    selected = replace(
+        spec(Path('/tmp/Signet $HOME/%h/"quoted"/state\\dir')),
+        executable=Path('/opt/Signet $BIN/%E/"quoted"/bin\\signet'),
+    )
+
+    unit = render_systemd_services(selected)["signet-mcp.service"]
+
+    assert (
+        'ExecStart="/opt/Signet $$BIN/%%E/\\"quoted\\"/bin\\\\signet" '
+        "production serve-mcp --config "
+        '"/tmp/Signet $$HOME/%%h/\\"quoted\\"/state\\\\dir/production.json"'
+    ) in unit
+
+
+@pytest.mark.skipif(shutil.which("systemd-analyze") is None, reason="systemd is unavailable")
+def test_systemd_service_plan_passes_systemd_analyze(tmp_path: Path) -> None:
+    executable = tmp_path / 'bin $BIN %E "quoted" \\ signet'
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+    selected = replace(
+        spec(tmp_path / 'state $HOME %h "quoted" \\ data'),
+        executable=executable,
+    )
+    unit_paths: list[Path] = []
+    for name, content in render_systemd_services(selected).items():
+        path = tmp_path / name
+        path.write_text(content, encoding="utf-8")
+        unit_paths.append(path)
+
+    result = subprocess.run(
+        ["systemd-analyze", "verify", *(str(path) for path in unit_paths)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("platform_name", ["darwin", "linux"])
