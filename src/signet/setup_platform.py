@@ -343,7 +343,7 @@ class ProductionSetupPlatform:
             raise SetupError("the installed Signet executable is not a reviewed executable file")
         if sys.platform == "linux":
             try:
-                _systemd_executable(str(spec.executable))
+                render_systemd_services(spec)
             except ValueError as exc:
                 raise SetupError(str(exc)) from exc
         for profile in spec.hermes_profiles:
