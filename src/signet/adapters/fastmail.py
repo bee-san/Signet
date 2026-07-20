@@ -579,7 +579,9 @@ class FastmailAdapter:
 
     def canonicalize(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         self.validate(arguments)
-        return copy_json_object(arguments)
+        canonical = copy_json_object(arguments)
+        canonical.setdefault("attachments", [])
+        return canonical
 
     def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
         canonical = self.canonicalize(arguments)

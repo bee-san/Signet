@@ -143,6 +143,17 @@ def test_fastmail_fixture_validates_and_private_summary_is_complete() -> None:
     assert "recipient_count" in audit
 
 
+def test_fastmail_canonicalizes_omitted_attachments_before_freezing() -> None:
+    adapter = FastmailAdapter(account="primary")
+    arguments = fixture_arguments()
+    arguments.pop("attachments")
+
+    canonical = adapter.canonicalize(arguments)
+
+    assert canonical == {**arguments, "attachments": []}
+    assert adapter.freeze_attachments(arguments) == ()
+
+
 def test_fastmail_legacy_attachment_type_is_explicitly_unverified() -> None:
     adapter = FastmailAdapter(account="primary")
     arguments = fixture_arguments()
