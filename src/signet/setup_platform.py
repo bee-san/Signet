@@ -22,7 +22,8 @@ from urllib.parse import quote, urlsplit
 import keyring
 import yaml
 
-from signet.browser_auth import BootstrapAlreadyComplete, BootstrapClaimRequired, BootstrapService
+from signet.browser_auth import BootstrapAlreadyComplete, BootstrapService
+from signet.config import production_instance_identity
 from signet.credential_broker import CredentialError, KeychainSecretStore
 from signet.db import Database
 from signet.private_paths import (
@@ -176,9 +177,17 @@ def browser_assisted_setup(
     *,
     output: Callable[[str], None] = print,
     opener: Callable[[str], bool] = webbrowser.open,
+    open_browser: bool = True,
+    handoff_path: Path | None = None,
 ) -> None:
     public_url = f"{public_origin}/setup"
     output(f"Owner setup URL: {public_url}")
+    if not open_browser:
+        if bootstrap_value is not None:
+            if handoff_path is None:
+                raise SetupError("the private owner setup handoff path is unavailable")
+            output(f"Private owner setup capability file: {handoff_path}")
+        return
     if bootstrap_value is None:
         private_url = public_url
     else:
@@ -302,11 +311,9 @@ class ProductionSetupPlatform:
             except SetupError:
                 result[f"tailscale:{port}"] = "unavailable"
             else:
-                private_route = (
-                    _document_mentions_port(serve, port)
-                    and _document_contains_value(serve, "http://127.0.0.1:8790")
-                    and not _document_mentions_port(funnel, port)
-                )
+                private_route = _document_has_managed_route(
+                    serve, port, "http://127.0.0.1:8790"
+                ) and not _document_mentions_port(funnel, port)
                 result[f"tailscale:{port}"] = "active" if private_route else "missing_or_changed"
         return result
 
@@ -314,7 +321,12 @@ class ProductionSetupPlatform:
         purposes = (*_SECRET_PURPOSES, "browser-bootstrap")
         errors: list[str] = []
         for purpose in purposes:
-            if preserve_backup and purpose == "backup":
+            if preserve_backup and purpose in {
+                "capability",
+                "payload",
+                "attachment",
+                "backup",
+            }:
                 continue
             account = _secret_account(setup_id, purpose)
             try:
@@ -521,7 +533,7 @@ class ProductionSetupPlatform:
                 ["systemctl", "--user", "enable", "--now", *rendered_text],
                 "systemd could not start Signet",
             )
-        self._wait_for_local_services()
+        self._wait_for_local_services(spec)
         self._apply_tailnet_route(spec)
 
     def _rollback_services(self, spec: SetupSpec, setup_id: str) -> None:
@@ -531,38 +543,35 @@ class ProductionSetupPlatform:
             rendered: Mapping[str, bytes] = render_launchd_services(spec, active=True)
             target = Path.home() / "Library" / "LaunchAgents"
             uid = os.getuid()
+            for name in rendered:
+                path = target / name
+                self._run_checked(
+                    ["launchctl", "bootout", f"gui/{uid}", str(path)],
+                    "launchd could not stop Signet",
+                )
             for name, content in rendered.items():
                 path = target / name
-                self.command_runner(
-                    ["launchctl", "bootout", f"gui/{uid}", str(path)],
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
                 _remove_exact_owned_file(path, content)
                 _remove_exact_owned_file(spec.root / "services" / name, content)
         else:
             rendered_text = render_systemd_services(spec, active=True)
-            self.command_runner(
+            self._run_checked(
                 ["systemctl", "--user", "disable", "--now", *rendered_text],
-                text=True,
-                capture_output=True,
-                check=False,
+                "systemd could not stop Signet",
             )
             target = Path.home() / ".config" / "systemd" / "user"
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
                 _remove_exact_owned_file(target / name, encoded)
                 _remove_exact_owned_file(spec.root / "services" / name, encoded)
-            self.command_runner(
+            self._run_checked(
                 ["systemctl", "--user", "daemon-reload"],
-                text=True,
-                capture_output=True,
-                check=False,
+                "systemd reload after rollback failed",
             )
 
-    def _wait_for_local_services(self) -> None:
+    def _wait_for_local_services(self, spec: SetupSpec) -> None:
         pending = {8789, 8790}
+        expected_identity = production_instance_identity(spec.root)
         deadline = time.monotonic() + 20
         while pending and time.monotonic() < deadline:
             for port in tuple(pending):
@@ -571,7 +580,10 @@ class ProductionSetupPlatform:
                     connection.request("GET", "/healthz")
                     response = connection.getresponse()
                     response.read(4097)
-                    if response.status == 200:
+                    if (
+                        response.status == 200
+                        and response.getheader("X-Signet-Instance") == expected_identity
+                    ):
                         pending.remove(port)
                 except OSError:
                     pass
@@ -602,7 +614,7 @@ class ProductionSetupPlatform:
             if _document_mentions_port(current_funnel, port):
                 raise SetupError("the managed Tailscale listener is now exposed by Funnel")
             if _document_mentions_port(current_serve, port):
-                if not _document_contains_value(current_serve, target):
+                if not _document_has_managed_route(current_serve, port, target):
                     raise SetupError("the managed Tailscale listener changed ownership")
                 return
         else:
@@ -627,10 +639,7 @@ class ProductionSetupPlatform:
             ["tailscale", "serve", "status", "--json"],
             "Tailscale Serve verification failed",
         )
-        if not _document_mentions_port(after, port) or not _document_contains_value(
-            after,
-            target,
-        ):
+        if not _document_has_managed_route(after, port, target):
             raise SetupError("Tailscale Serve listener did not match the requested private route")
         _create_or_verify_private_file(
             spec.root / "services" / "tailscale-serve-after.json",
@@ -642,7 +651,15 @@ class ProductionSetupPlatform:
         record_path = spec.root / "services" / "tailscale-serve-before.json"
         if port is None or not record_path.exists():
             return
-        _read_owned_json(record_path)
+        before = _read_owned_json(record_path)
+        if not isinstance(before, dict) or set(before) != {"serve", "funnel"}:
+            raise SetupError("Tailscale rollback record is invalid")
+        if _document_mentions_port(before["serve"], port) or _document_mentions_port(
+            before["funnel"], port
+        ):
+            raise SetupError("Tailscale rollback record does not describe a free listener")
+        after_path = spec.root / "services" / "tailscale-serve-after.json"
+        recorded_after = _read_owned_json(after_path) if after_path.exists() else None
         current_serve = self._tailscale_json(
             ["tailscale", "serve", "status", "--json"],
             "Tailscale Serve status is unavailable",
@@ -653,20 +670,23 @@ class ProductionSetupPlatform:
         )
         if _document_mentions_port(current_funnel, port):
             raise SetupError("refusing to remove a listener now exposed by Funnel")
-        if not _document_mentions_port(current_serve, port):
-            return
-        if not _document_contains_value(current_serve, "http://127.0.0.1:8790"):
-            raise SetupError("refusing to remove a changed Tailscale listener")
-        self._run_checked(
-            ["tailscale", "serve", f"--https={port}", "off"],
-            "Tailscale Serve listener rollback failed",
-        )
-        after = self._tailscale_json(
-            ["tailscale", "serve", "status", "--json"],
-            "Tailscale Serve rollback verification failed",
-        )
-        if _document_mentions_port(after, port):
+        target = "http://127.0.0.1:8790"
+        if _document_mentions_port(current_serve, port):
+            if not _document_has_managed_route(current_serve, port, target):
+                raise SetupError("refusing to remove a changed Tailscale listener")
+            self._run_checked(
+                ["tailscale", "serve", f"--https={port}", "off"],
+                "Tailscale Serve listener rollback failed",
+            )
+            current_serve = self._tailscale_json(
+                ["tailscale", "serve", "status", "--json"],
+                "Tailscale Serve rollback verification failed",
+            )
+        if _document_mentions_port(current_serve, port):
             raise SetupError("Tailscale Serve listener remains after rollback")
+        if recorded_after is not None:
+            _remove_exact_owned_file(after_path, _canonical_json_bytes(recorded_after))
+        _remove_exact_owned_file(record_path, _canonical_json_bytes(before))
 
     def _tailscale_json(self, command: list[str], message: str) -> Any:
         result = self.command_runner(
@@ -719,8 +739,16 @@ class ProductionSetupPlatform:
                 token=token,
                 setup_id=setup_id,
             )
-            _replace_private_file(config_path, merged)
-            _replace_private_file(env_path, updated_env)
+            _replace_private_file(
+                config_path,
+                merged,
+                expected_content=existing_config,
+            )
+            _replace_private_file(
+                env_path,
+                updated_env,
+                expected_content=existing_env,
+            )
         self.output(
             "Hermes profiles staged with disabled Signet MCP entries. Signet did not restart "
             "the gateway; review and enable each entry, then run /reload-mcp in that profile."
@@ -742,22 +770,26 @@ class ProductionSetupPlatform:
             token = _existing_profile_token(current_env, token_name=token_name)
             if _has_profile_token_assignment(current_env, token_name=token_name) and token is None:
                 raise SetupError("Hermes profile has a foreign Signet token assignment")
-            _replace_private_file(
-                config_path,
-                _remove_hermes_config(
-                    current_config,
-                    token_name=token_name,
-                    setup_id=setup_id,
-                ),
-            )
-            _replace_private_file(
-                env_path,
-                _remove_profile_environment(
-                    current_env,
-                    token_name=token_name,
-                    setup_id=setup_id,
-                ),
-            )
+            if config_path.exists() or config_path.is_symlink():
+                _replace_private_file(
+                    config_path,
+                    _remove_hermes_config(
+                        current_config,
+                        token_name=token_name,
+                        setup_id=setup_id,
+                    ),
+                    expected_content=current_config,
+                )
+            if env_path.exists() or env_path.is_symlink():
+                _replace_private_file(
+                    env_path,
+                    _remove_profile_environment(
+                        current_env,
+                        token_name=token_name,
+                        setup_id=setup_id,
+                    ),
+                    expected_content=current_env,
+                )
             if token is not None:
                 token_id = token.removeprefix("sgt_").split(".", 1)[0]
                 assembly.token_registry.revoke(token_id)
@@ -778,7 +810,27 @@ class ProductionSetupPlatform:
             stored = keyring.get_password(_SERVICE_NAME, account)
         except Exception as exc:
             raise SetupError("the browser setup handoff store is unavailable") from exc
-        status = bootstrap.status(now=_now())
+        now = _now()
+        handoff_path = spec.root / ".owner-bootstrap-capability"
+        handoff_exists = handoff_path.exists() or handoff_path.is_symlink()
+        existing_handoff = _read_optional_private_file(handoff_path)
+        handoff_capability: str | None = None
+        if handoff_exists:
+            handoff_capability = _decode_owner_handoff(existing_handoff)
+        handoff_is_recorded = bool(
+            handoff_capability is not None and bootstrap.capability_is_recorded(handoff_capability)
+        )
+        handoff_is_current = bool(
+            handoff_capability is not None
+            and bootstrap.capability_is_current(handoff_capability, now=now)
+        )
+        if (
+            handoff_capability is not None
+            and not handoff_is_recorded
+            and handoff_capability != stored
+        ):
+            raise SetupError("the private owner setup handoff changed or is ambiguous")
+        status = bootstrap.status(now=now)
         with assembly.database.read() as connection:
             state = connection.execute(
                 "SELECT claimed_at FROM browser_bootstrap_state WHERE state_id = 1"
@@ -786,39 +838,66 @@ class ProductionSetupPlatform:
         already_claimed = state is not None and state["claimed_at"] is not None
         if status.complete or already_claimed:
             capability: str | None = None
-        elif stored is not None:
+        elif handoff_is_current:
+            capability = handoff_capability
+        elif stored is not None and bootstrap.capability_is_current(stored, now=now):
             capability = stored
         else:
             try:
-                capability = bootstrap.issue_capability(now=_now())
+                capability = bootstrap.issue_capability(
+                    now=now,
+                    replace_existing=True,
+                )
             except BootstrapAlreadyComplete:
                 capability = None
-            except BootstrapClaimRequired as exc:
-                raise SetupError(
-                    "an earlier unclaimed owner ceremony is still active; retry after it expires"
-                ) from exc
+        if capability is not None and not spec.open_browser:
+            _replace_private_file(
+                handoff_path,
+                capability.encode("utf-8") + b"\n",
+                expected_content=existing_handoff,
+            )
+        if capability is not None and capability != stored:
             try:
-                if capability is None:  # pragma: no cover - issue returned one or raised
-                    raise AssertionError("browser bootstrap did not issue its handoff")
                 keyring.set_password(_SERVICE_NAME, account, capability)
             except Exception as exc:
                 raise SetupError("the browser setup handoff could not be stored") from exc
-        if spec.open_browser:
-            browser_assisted_setup(
-                spec.public_origin,
-                capability,
-                output=self.output,
-                opener=self.opener,
+        if (spec.open_browser or capability is None) and handoff_exists:
+            if handoff_capability is None:  # pragma: no cover - validated above
+                raise AssertionError("browser bootstrap handoff validation was incomplete")
+            _remove_exact_owned_file(
+                handoff_path,
+                handoff_capability.encode("utf-8") + b"\n",
             )
-        else:
-            self.output(f"Owner setup URL: {spec.public_origin}/setup")
+        browser_assisted_setup(
+            spec.public_origin,
+            capability,
+            output=self.output,
+            opener=self.opener,
+            open_browser=spec.open_browser,
+            handoff_path=handoff_path if capability is not None else None,
+        )
 
     def _rollback_owner_bootstrap(self, spec: SetupSpec, setup_id: str) -> None:
-        del spec
         account = _secret_account(setup_id, "browser-bootstrap")
+        handoff_path = spec.root / ".owner-bootstrap-capability"
         try:
-            if keyring.get_password(_SERVICE_NAME, account) is not None:
+            capability = keyring.get_password(_SERVICE_NAME, account)
+            if handoff_path.exists() or handoff_path.is_symlink():
+                encoded_handoff = _read_optional_private_file(handoff_path)
+                handoff_capability = _decode_owner_handoff(encoded_handoff)
+                if capability != handoff_capability and not BootstrapService(
+                    Database(spec.root / "data" / "signet.db"),
+                    owner_user_id=spec.owner_user_id,
+                ).capability_is_recorded(handoff_capability):
+                    raise SetupError("the private owner setup handoff is ambiguous")
+                _remove_exact_owned_file(
+                    handoff_path,
+                    encoded_handoff,
+                )
+            if capability is not None:
                 keyring.delete_password(_SERVICE_NAME, account)
+        except SetupError:
+            raise
         except Exception as exc:
             raise SetupError("browser setup handoff cleanup failed") from exc
 
@@ -835,6 +914,16 @@ class ProductionSetupPlatform:
 
 def _secret_account(setup_id: str, purpose: str) -> str:
     return f"{setup_id}-{purpose}"
+
+
+def _decode_owner_handoff(encoded: bytes) -> str:
+    try:
+        capability = encoded.decode("utf-8").removesuffix("\n")
+    except UnicodeDecodeError:
+        raise SetupError("the private owner setup handoff changed or is ambiguous") from None
+    if not capability or encoded != capability.encode("utf-8") + b"\n":
+        raise SetupError("the private owner setup handoff changed or is ambiguous")
+    return capability
 
 
 def _secret_reference(setup_id: str, purpose: str) -> str:
@@ -894,6 +983,7 @@ def _replace_private_file(
     *,
     require_absent: bool = False,
     parent_private: bool = True,
+    expected_content: bytes | None = None,
 ) -> None:
     try:
         prepare_parent = ensure_private_directory if parent_private else ensure_owned_directory
@@ -935,6 +1025,11 @@ def _replace_private_file(
                 raise SetupError(f"resource already exists: {path}") from exc
             temporary.unlink()
         else:
+            if expected_content is not None:
+                if path.exists() or path.is_symlink():
+                    _require_exact_owned_file(path, expected_content)
+                elif expected_content != b"":
+                    raise SetupError(f"owned resource changed or is ambiguous: {path}")
             os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
@@ -1022,6 +1117,37 @@ def _document_mentions_port(document: Any, port: int) -> bool:
     return False
 
 
+def _document_has_managed_route(document: Any, port: int, target: str) -> bool:
+    scopes: list[Any] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if _document_mentions_port(key, port):
+                    scopes.append(child)
+                else:
+                    collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    def proxy_targets(value: Any) -> set[str]:
+        found: set[str] = set()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(key, str) and key.casefold() == "proxy" and isinstance(child, str):
+                    found.add(child)
+                else:
+                    found.update(proxy_targets(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.update(proxy_targets(child))
+        return found
+
+    collect(document)
+    return bool(scopes) and all(proxy_targets(scope) == {target} for scope in scopes)
+
+
 def _document_contains_value(document: Any, expected: str) -> bool:
     if isinstance(document, str):
         return document == expected
@@ -1052,7 +1178,7 @@ def _merge_hermes_config(
     expected = _hermes_server(token_name)
     existing = servers.get(_HERMES_SERVER_NAME) if isinstance(servers, dict) else None
     if existing is not None:
-        if existing != expected:
+        if not _is_owned_hermes_server(existing, token_name=token_name):
             raise SetupError("Hermes profile has a conflicting Signet MCP server")
         _, owned = _remove_owned_block(
             text,
@@ -1115,7 +1241,10 @@ def _remove_hermes_config(
     document = _yaml_document(encoded)
     servers = document.get("mcp_servers")
     existing = servers.get(_HERMES_SERVER_NAME) if isinstance(servers, dict) else None
-    if existing is not None and existing != _hermes_server(token_name):
+    if existing is not None and not _is_owned_hermes_server(
+        existing,
+        token_name=token_name,
+    ):
         raise SetupError("Hermes profile has a changed or foreign Signet MCP server")
     restored, removed = _remove_owned_block(
         text,
@@ -1197,6 +1326,14 @@ def _yaml_document(encoded: bytes) -> dict[str, Any]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise SetupError("Hermes profile config must contain one mapping")
     return dict(value)
+
+
+def _is_owned_hermes_server(value: Any, *, token_name: str) -> bool:
+    if not isinstance(value, dict) or not isinstance(value.get("enabled"), bool):
+        return False
+    normalized = dict(value)
+    normalized["enabled"] = False
+    return normalized == _hermes_server(token_name)
 
 
 def _hermes_server(token_name: str) -> dict[str, Any]:

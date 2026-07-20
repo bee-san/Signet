@@ -73,18 +73,25 @@ class SetupSpec:
         if canonical_user_id(self.owner_user_id) != self.owner_user_id:
             raise ValueError("setup owner must be a canonical user ID")
         parsed = urlsplit(self.public_origin)
-        hostname = parsed.hostname
         try:
             port = parsed.port
         except ValueError:
-            port = None
-        canonical = f"https://{hostname}" if hostname else ""
+            raise ValueError("setup origin must be one canonical HTTPS origin") from None
+        try:
+            hostname = (
+                parsed.hostname.encode("idna").decode("ascii").lower()
+                if parsed.hostname is not None
+                else None
+            )
+        except UnicodeError:
+            raise ValueError("setup origin must be one canonical HTTPS origin") from None
+        authority = f"[{hostname}]" if hostname is not None and ":" in hostname else hostname
+        canonical = f"https://{authority}" if authority else ""
         if port not in (None, 443):
             canonical += f":{port}"
         if (
             parsed.scheme != "https"
             or hostname is None
-            or hostname != hostname.lower()
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path
@@ -246,6 +253,26 @@ class SetupJournalStore:
             replace=False,
         )
 
+    def owned_setup_id(self, spec: SetupSpec) -> str | None:
+        """Recover the durable setup ID without creating or replacing state."""
+
+        if not self.owner_path.exists():
+            return None
+        owner = self._read_document(self.owner_path, label="setup owner marker")
+        accepted_digests = {spec.digest}
+        if spec.policy_mode == "deny":
+            accepted_digests.add(spec.legacy_deny_digest)
+        setup_id = owner.get("setup_id")
+        if (
+            set(owner) != {"version", "setup_id", "spec_digest"}
+            or owner.get("version") != 1
+            or owner.get("spec_digest") not in accepted_digests
+            or not isinstance(setup_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", setup_id) is None
+        ):
+            raise SetupError("setup root is owned by a different setup specification")
+        return setup_id
+
     def load_optional(self) -> SetupJournal | None:
         if not self.journal_path.exists():
             return None
@@ -391,7 +418,11 @@ class SetupEngine:
 
     def apply(self, spec: SetupSpec) -> SetupJournal:
         existing = self.store.load_optional()
-        setup_id = existing.setup_id if existing is not None else _new_setup_id()
+        setup_id = (
+            existing.setup_id
+            if existing is not None
+            else self.store.owned_setup_id(spec) or _new_setup_id()
+        )
         self.store.prepare(spec, setup_id)
         journal = existing or SetupJournal(
             version=1,
@@ -404,7 +435,19 @@ class SetupEngine:
         self._require_spec(journal, spec)
         if journal.status == "completed":
             return journal
-        reinstalling_integrations = journal.status == "uninstalled"
+        integration_names = {"services", "hermes_profiles", "owner_bootstrap"}
+        reinstalling_integrations = journal.status == "uninstalled" or (
+            journal.status in {"applying", "failed"}
+            and any(
+                record.name in integration_names and record.status == "rolled_back"
+                for record in journal.steps
+            )
+            and all(
+                record.status == "completed"
+                for record in journal.steps
+                if record.name not in integration_names
+            )
+        )
         if journal.status in {"rolling_back", "rolled_back", "rollback_failed"}:
             raise SetupError("setup is in rollback state; finish rollback before applying again")
         journal.status = "applying"
@@ -465,6 +508,7 @@ class SetupEngine:
                 "applying",
                 "completed",
                 "failed",
+                "rolling_back",
                 "rollback_failed",
             }:
                 continue
@@ -476,10 +520,13 @@ class SetupEngine:
                 record.status = "rollback_failed"
                 record.error_kind = type(exc).__name__
                 failures.append(record.name)
+                self.store.save(journal)
+                if record.name == "services":
+                    break
             else:
                 record.status = "rolled_back"
                 record.error_kind = None
-            self.store.save(journal)
+                self.store.save(journal)
         journal.status = "rollback_failed" if failures else final_status
         self.store.save(journal)
         if failures:

@@ -8,11 +8,12 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-import keyring
-
+from signet.attachment_crypto import AttachmentCipher
 from signet.backup import BackupBundleManager, BackupError, RestoredBundle
 from signet.credential_broker import KeychainSecretStore, SecretReference
+from signet.db import Database
 from signet.production import create_production_assembly, load_production_config
+from signet.production_state import ProductionStateStore
 from signet.setup_platform import ProductionSetupPlatform
 from signet.setup_state import (
     PolicyMode,
@@ -22,6 +23,7 @@ from signet.setup_state import (
     SetupJournalStore,
     SetupSpec,
 )
+from signet.staging import StagingStore
 
 
 class SetupOperations:
@@ -61,13 +63,15 @@ class SetupOperations:
             "services": self.platform.service_status(self.spec()),
         }
         try:
-            assembly = create_production_assembly(
-                self.root / "production.json",
-                secret_store=KeychainSecretStore(),
-                components=frozenset(),
-            )
-            production = assembly.status()
-            result["provider_rollout"] = assembly.config.provider_rollout.state
+            config = load_production_config(self.root / "production.json")
+            database_path = config.storage.database_path
+            if database_path.is_symlink() or not database_path.is_file():
+                raise SetupError("production database is unavailable for read-only inspection")
+            production = ProductionStateStore(
+                Database(database_path),
+                provider_rollout_enabled=config.provider_rollout.state == "enabled",
+            ).status(read_only=True)
+            result["provider_rollout"] = config.provider_rollout.state
         except Exception as exc:
             result["production"] = {
                 "available": False,
@@ -216,24 +220,27 @@ class SetupOperations:
         return self.platform.service_status(self.spec())
 
     def _backup_manager(self, journal: SetupJournal) -> BackupBundleManager:
-        assembly = create_production_assembly(
-            self.root / "production.json",
-            secret_store=KeychainSecretStore(),
-            components=frozenset(),
+        secret_store = KeychainSecretStore()
+        backup_reference = SecretReference.parse(
+            f"keychain://Signet-Setup/{journal.setup_id}-backup"
         )
-        if assembly.staging is None:
-            raise SetupError("attachment staging is unavailable for encrypted backup")
-        account = f"{journal.setup_id}-backup"
+        attachment_reference_value = f"keychain://Signet-Setup/{journal.setup_id}-attachment"
+        attachment_reference = SecretReference.parse(attachment_reference_value)
         try:
-            raw = keyring.get_password("Signet-Setup", account)
+            backup_secret = secret_store.get(backup_reference)
+            attachment_secret = secret_store.get(attachment_reference)
         except Exception as exc:
-            raise SetupError("backup key is unavailable") from exc
-        if raw is None:
-            raise SetupError("backup key is unavailable")
-        encryption_key = hashlib.sha256(raw.encode("utf-8")).digest()
+            raise SetupError("backup recovery secrets are unavailable") from exc
+        database = Database(self.root / "data" / "signet.db")
+        staging = StagingStore(
+            self.root / "staging",
+            database=database,
+            cipher=AttachmentCipher(attachment_secret, attachment_reference_value),
+        )
+        encryption_key = hashlib.sha256(backup_secret.reveal().encode("utf-8")).digest()
         return BackupBundleManager(
-            assembly.database,
-            staging=assembly.staging,
+            database,
+            staging=staging,
             encryption_key=encryption_key,
         )
 

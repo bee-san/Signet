@@ -446,6 +446,31 @@ class Database:
             connection.close()
 
     @contextmanager
+    def read_only(self) -> Iterator[Any]:
+        """Open an existing database without creating files or changing pragmas."""
+
+        if not self.path.is_absolute():
+            raise DatabaseError("read-only database path must be absolute")
+        try:
+            connection = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+                timeout=self.timeout,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+        except sqlite3.Error as exc:
+            raise DatabaseError("database is unavailable for read-only inspection") from exc
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute(f"PRAGMA busy_timeout={int(self.timeout * 1000)}")
+            yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
     def transaction(self, *, mode: str = "IMMEDIATE") -> Iterator[Any]:
         begin = _BEGIN_STATEMENTS.get(mode)
         if begin is None:
