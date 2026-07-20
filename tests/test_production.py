@@ -55,6 +55,7 @@ from signet.production_connectors import (
     ProductionConnectorError,
     ProviderSessionPool,
 )
+from signet.production_state import ProductionStateError
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
@@ -484,6 +485,13 @@ downstreams:
     assert cast(Any, disabled_fastmail).reviewed_dispatch_enabled is False
     assert staged.retention is not None
 
+    mismatched_pin = config.connectors["fastmail"].model_copy(
+        update={"tls_server_certificate_sha256": "0" * 64}
+    )
+    mismatched_pin_config = config.model_copy(update={"connectors": {"fastmail": mismatched_pin}})
+    with pytest.raises(ProductionAssemblyError, match="TLS server certificate"):
+        build_production_runtime(mismatched_pin_config, secret_store=secret_store)
+
     assembly = build_production_runtime(config, secret_store=secret_store)
 
     assert isinstance(assembly.provider_clients["fastmail"], DownstreamClient)
@@ -779,6 +787,38 @@ downstreams:
         }
     )
     assembly = build_production_runtime(config, secret_store=secrets)
+
+    predecessor_document = config.model_dump(mode="json")
+    predecessor_document["provider_rollout"]["wacli"].pop("linked_jid")
+    for connector_document in predecessor_document["connectors"].values():
+        connector_document.pop("tls_server_certificate")
+        connector_document.pop("tls_server_certificate_sha256")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor_document)).hexdigest()
+    predecessor_connector = config.connectors["whatsapp"].model_dump(mode="json")
+    predecessor_connector.pop("tls_server_certificate")
+    predecessor_connector.pop("tls_server_certificate_sha256")
+    predecessor_connector_digest = hashlib.sha256(canonical_json(predecessor_connector)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_connectors SET config_digest = ? WHERE connector_alias = ?",
+            (predecessor_connector_digest, "whatsapp"),
+        )
+    upgraded = build_production_runtime(config, secret_store=secrets)
+    with upgraded.database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()["config_digest"]
+            == hashlib.sha256(canonical_json(config.model_dump(mode="json"))).hexdigest()
+        )
 
     client = assembly.provider_clients["whatsapp"]
     assert isinstance(client, CredentialBoundClient)
@@ -1229,6 +1269,63 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     assert assembly.workers.healthy is False
     assert set(assembly.provider_clients) == {"mail"}
     assert isinstance(assembly.provider_clients["mail"], ProductionDisabledProviderClient)
+
+
+def test_disabled_runtime_requires_atomic_reviewed_connector_identity_rotation(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    current_connector = config.connectors["mail"]
+    rotated_connector = current_connector.model_copy(
+        update={
+            "credential_identity_digest": "b" * 64,
+            "server_identity_digest": "c" * 64,
+            "tls_server_certificate": tmp_path / "reviewed-next-server.pem",
+            "tls_server_certificate_sha256": "d" * 64,
+        }
+    )
+    rotated = config.model_copy(update={"connectors": {"mail": rotated_connector}})
+
+    with pytest.raises(ProductionAssemblyError, match="differs from durable state"):
+        build_production_runtime(rotated, secret_store=_secret_store(), clock=lambda: 124)
+
+    changed_endpoint = rotated_connector.model_copy(
+        update={"url": "https://other.example.test/mcp"}
+    )
+    with pytest.raises(ProductionStateError, match="only change reviewed identity fields"):
+        assembly.state.rotate_connector_identity(
+            current_config=config,
+            next_config=rotated.model_copy(update={"connectors": {"mail": changed_endpoint}}),
+            alias="mail",
+            now=124,
+        )
+
+    assembly.state.rotate_connector_identity(
+        current_config=config,
+        next_config=rotated,
+        alias="mail",
+        now=124,
+    )
+    restarted = build_production_runtime(rotated, secret_store=_secret_store(), clock=lambda: 125)
+    with restarted.database.read() as connection:
+        setup_digest = connection.execute(
+            "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+        ).fetchone()["config_digest"]
+        connector_row = connection.execute(
+            """
+            SELECT config_digest, credential_identity_digest, state
+            FROM production_connectors WHERE connector_alias = 'mail'
+            """
+        ).fetchone()
+    assert (
+        setup_digest == hashlib.sha256(canonical_json(rotated.model_dump(mode="json"))).hexdigest()
+    )
+    assert tuple(connector_row) == (
+        hashlib.sha256(canonical_json(rotated_connector.model_dump(mode="json"))).hexdigest(),
+        "b" * 64,
+        "disabled",
+    )
 
 
 def test_web_health_uses_durable_maintenance_state_from_a_separate_worker(

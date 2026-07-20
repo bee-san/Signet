@@ -201,6 +201,31 @@ async def test_provider_session_pool_shares_one_lifecycle_across_consumers() -> 
 
 
 @pytest.mark.asyncio
+async def test_provider_session_pool_tracks_nested_holders_until_their_final_release() -> None:
+    client = _RuntimeFailingClient()
+    pool = ProviderSessionPool({"fastmail": client})
+    entered = asyncio.Event()
+
+    async def serve() -> None:
+        async with pool.run():
+            async with pool.run():
+                pass
+            entered.set()
+            await asyncio.Event().wait()
+
+    holder = asyncio.create_task(serve())
+    await entered.wait()
+    client.running = False
+    await asyncio.sleep(0.1)
+
+    assert holder.done()
+    with pytest.raises(asyncio.CancelledError):
+        await holder
+    assert pool.active is False
+    assert client.events == ["start", "close"]
+
+
+@pytest.mark.asyncio
 async def test_provider_session_pool_fails_holder_when_a_live_client_terminates() -> None:
     client = _RuntimeFailingClient()
     pool = ProviderSessionPool({"fastmail": client})

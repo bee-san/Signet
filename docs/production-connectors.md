@@ -157,3 +157,37 @@ deny, or cancel them. Rollback does not expose those adapters to the gateway or
 delivery pipeline, never treats requests as delivered, and never retries them.
 Restore direct routes or credentials only through a separately reviewed operator
 change.
+
+Credential generations, TLS leaf pins, reviewed MCP identities, and the reviewed
+wacli binary/version and linked WhatsApp JID rotate through an explicit
+compare-and-swap transition. First run
+and stop the deployment with the current config in the disabled state shown
+above. Prepare a second private config that changes only the reviewed identity
+fields, then run the transition while all services remain stopped:
+
+```bash
+uv run --frozen python - "$CURRENT_CONFIG" "$NEXT_CONFIG" fastmail <<'PY'
+import sys
+import time
+from pathlib import Path
+
+from signet.db import Database
+from signet.production import load_production_config
+from signet.production_state import ProductionStateStore
+
+current = load_production_config(Path(sys.argv[1]))
+next_config = load_production_config(Path(sys.argv[2]))
+state = ProductionStateStore(Database(current.storage.data_dir / "signet.db"))
+state.rotate_connector_identity(
+    current_config=current,
+    next_config=next_config,
+    alias=sys.argv[3],
+    now=int(time.time()),
+)
+PY
+```
+
+The transition rejects enabled/provider-ready state, stale durable digests, and
+changes outside the selected connector's identity fields. Replace the deployed
+config with `NEXT_CONFIG` only after the command succeeds; then repeat the
+disabled preflight before re-enabling rollout.

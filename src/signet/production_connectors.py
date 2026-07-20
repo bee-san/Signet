@@ -23,7 +23,11 @@ from signet.canonical import canonical_json, sha256_hex
 from signet.config import ProductionConfig
 from signet.credential_broker import Secret, SecretReference, SecretStore
 from signet.db import Database
-from signet.downstream import DownstreamClient, pinned_tls_http_connector
+from signet.downstream import (
+    DownstreamClient,
+    DownstreamConfigurationError,
+    pinned_tls_http_connector,
+)
 from signet.mcp_mirror import tool_schema_digest, validate_lossless_tool
 from signet.policy import PolicyMode, PolicySnapshot
 from signet.staging import StagingStore, open_confined_readonly, read_verified_descriptor
@@ -174,7 +178,7 @@ class ProviderSessionPool:
         self._lock = asyncio.Lock()
         self._users = 0
         self._started: tuple[tuple[str, _LifecycleClient], ...] = ()
-        self._holders: set[asyncio.Task[Any]] = set()
+        self._holders: dict[asyncio.Task[Any], int] = {}
         self._monitor_task: asyncio.Task[None] | None = None
         self._runtime_failed = False
 
@@ -216,7 +220,7 @@ class ProviderSessionPool:
                 if not self.active:
                     raise ProductionConnectorError("production provider session is unavailable")
                 self._users += 1
-                self._holders.add(holder)
+                self._holders[holder] = self._holders.get(holder, 0) + 1
                 return
             started: list[tuple[str, _LifecycleClient]] = []
             failed_alias = "unknown"
@@ -237,7 +241,7 @@ class ProviderSessionPool:
                 ) from None
             self._started = tuple(started)
             self._users = 1
-            self._holders.add(holder)
+            self._holders[holder] = 1
             self._runtime_failed = False
             self._monitor_task = asyncio.create_task(
                 self._monitor_runtime(),
@@ -295,7 +299,15 @@ class ProviderSessionPool:
                 raise ProductionConnectorError(
                     "production provider session lifecycle is unbalanced"
                 )
-            self._holders.discard(holder)
+            holder_uses = self._holders.get(holder, 0)
+            if holder_uses < 1:
+                raise ProductionConnectorError(
+                    "production provider session holder lifecycle is unbalanced"
+                )
+            if holder_uses == 1:
+                del self._holders[holder]
+            else:
+                self._holders[holder] = holder_uses - 1
             self._users -= 1
             if self._users:
                 return
@@ -474,16 +486,22 @@ def build_live_provider_bundle(
                         "Fastmail credential identity drifted before startup"
                     )
 
-            http_client = DownstreamClient(
-                alias,
-                connector,
-                secret_store,
-                http_connector=pinned_tls_http_connector(
+            try:
+                http_connector = pinned_tls_http_connector(
                     _read_reviewed_tls_server_certificate(
                         connector.tls_server_certificate,
                     ),
                     connector.tls_server_certificate_sha256,
-                ),
+                )
+            except DownstreamConfigurationError:
+                raise ProductionConnectorError(
+                    "Fastmail reviewed TLS server certificate is invalid"
+                ) from None
+            http_client = DownstreamClient(
+                alias,
+                connector,
+                secret_store,
+                http_connector=http_connector,
                 credential_verifier=verify_credential,
             )
             adapter = FastmailAdapter(

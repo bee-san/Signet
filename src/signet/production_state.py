@@ -116,6 +116,7 @@ class ProductionStateStore:
                 compatible_digests = {
                     transition_digest,
                     _legacy_production_config_digest(config),
+                    _pre_identity_hardening_production_config_digest(config),
                     _rollout_preparation_base_digest(config),
                 }
                 if setup["config_digest"] not in compatible_digests:
@@ -330,6 +331,136 @@ class ProductionStateStore:
             ).rowcount
             if updated != 1:
                 raise ProductionStateError("secret rotation precondition failed")
+
+    def rotate_connector_identity(
+        self,
+        *,
+        current_config: ProductionConfig,
+        next_config: ProductionConfig,
+        alias: str,
+        now: int,
+    ) -> None:
+        """Atomically authorize reviewed identity changes while rollout is disabled."""
+
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("connector identity rotation time is invalid")
+        current_connector = current_config.connectors.get(alias)
+        next_connector = next_config.connectors.get(alias)
+        if current_connector is None or next_connector is None:
+            raise ProductionStateError("connector identity rotation alias is unavailable")
+        if any(
+            config.provider_rollout.state != "disabled" or config.capabilities.live_providers_ready
+            for config in (current_config, next_config)
+        ):
+            raise ProductionStateError(
+                "connector identity rotation requires disabled provider rollout"
+            )
+
+        current_document = current_config.model_dump(mode="json")
+        next_document = next_config.model_dump(mode="json")
+        current_identity = current_document["connectors"][alias]
+        next_identity = next_document["connectors"][alias]
+        identity_fields = (
+            "credential_identity_digest",
+            "server_identity_digest",
+            "tls_server_certificate",
+            "tls_server_certificate_sha256",
+            "executable_sha256",
+        )
+        changed = any(
+            current_identity.get(name) != next_identity.get(name) for name in identity_fields
+        )
+        for name in identity_fields:
+            current_identity[name] = next_identity.get(name)
+        if alias == "whatsapp":
+            current_wacli = current_document["provider_rollout"].get("wacli")
+            next_wacli = next_document["provider_rollout"].get("wacli")
+            if not isinstance(current_wacli, dict) or not isinstance(next_wacli, dict):
+                raise ProductionStateError("WhatsApp identity rotation requires wacli review")
+            for name in ("linked_jid", "expected_version"):
+                changed = changed or current_wacli.get(name) != next_wacli.get(name)
+                current_wacli[name] = next_wacli.get(name)
+        if not changed:
+            raise ProductionStateError("connector identity rotation requires a new identity")
+        if current_document != next_document:
+            raise ProductionStateError(
+                "connector identity rotation may only change reviewed identity fields"
+            )
+
+        current_config_digest = production_config_digest(current_config)
+        next_config_digest = production_config_digest(next_config)
+        current_connector_digest = _connector_config_digest(
+            current_connector.model_dump(mode="json")
+        )
+        next_connector_digest = _connector_config_digest(next_connector.model_dump(mode="json"))
+        with self.database.transaction() as connection:
+            setup = connection.execute(
+                """
+                SELECT config_digest, capability_status_json
+                FROM production_setup_state WHERE state_id = 1
+                """
+            ).fetchone()
+            connector = connection.execute(
+                """
+                SELECT config_digest, transport, credential_ref,
+                       credential_identity_digest, state
+                FROM production_connectors WHERE connector_alias = ?
+                """,
+                (alias,),
+            ).fetchone()
+            mismatched_services = connection.execute(
+                "SELECT COUNT(*) FROM production_services WHERE config_digest != ?",
+                (current_config_digest,),
+            ).fetchone()[0]
+            if setup is None or setup["config_digest"] != current_config_digest:
+                raise ProductionStateError("connector identity rotation config precondition failed")
+            capabilities = self._parse_capabilities(setup["capability_status_json"])
+            if capabilities["live_providers_ready"]:
+                raise ProductionStateError("connector identity rotation requires blocked providers")
+            if (
+                connector is None
+                or connector["config_digest"] != current_connector_digest
+                or connector["transport"] != current_connector.transport
+                or connector["credential_ref"] != current_connector.credential_ref
+                or connector["credential_identity_digest"]
+                != current_connector.credential_identity_digest
+                or connector["state"] != "disabled"
+                or mismatched_services
+            ):
+                raise ProductionStateError("connector identity rotation precondition failed")
+            updated_connector = connection.execute(
+                """
+                UPDATE production_connectors
+                SET config_digest = ?, credential_identity_digest = ?,
+                    state = 'disabled', updated_at = MAX(updated_at, ?)
+                WHERE connector_alias = ? AND config_digest = ? AND state = 'disabled'
+                """,
+                (
+                    next_connector_digest,
+                    next_connector.credential_identity_digest,
+                    now,
+                    alias,
+                    current_connector_digest,
+                ),
+            ).rowcount
+            updated_setup = connection.execute(
+                """
+                UPDATE production_setup_state
+                SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                WHERE state_id = 1 AND config_digest = ?
+                """,
+                (next_config_digest, now, current_config_digest),
+            ).rowcount
+            if updated_connector != 1 or updated_setup != 1:
+                raise ProductionStateError("connector identity rotation precondition failed")
+            connection.execute(
+                """
+                UPDATE production_services
+                SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                WHERE config_digest = ?
+                """,
+                (next_config_digest, now, current_config_digest),
+            )
 
     def status(self) -> ProductionStatus:
         with self.database.read() as connection:
@@ -546,6 +677,7 @@ class ProductionStateStore:
             if stored["config_digest"] != digest:
                 if not reset_state or stored["config_digest"] not in {
                     _legacy_connector_config_digest(document),
+                    _pre_identity_hardening_connector_config_digest(document),
                     _rollout_preparation_connector_digest(document),
                 }:
                     raise ProductionStateError("durable production connector differs from config")
@@ -631,6 +763,26 @@ def production_config_digest(
 
 def _connector_config_digest(document: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _pre_identity_hardening_production_config_digest(config: ProductionConfig) -> str:
+    """Reconstruct the immediately preceding provider-config document shape."""
+
+    document = config.model_dump(mode="json")
+    for connector in document["connectors"].values():
+        connector.pop("tls_server_certificate", None)
+        connector.pop("tls_server_certificate_sha256", None)
+    wacli = document["provider_rollout"].get("wacli")
+    if isinstance(wacli, dict):
+        wacli.pop("linked_jid", None)
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _pre_identity_hardening_connector_config_digest(document: dict[str, Any]) -> str:
+    predecessor = dict(document)
+    predecessor.pop("tls_server_certificate", None)
+    predecessor.pop("tls_server_certificate_sha256", None)
+    return hashlib.sha256(canonical_json(predecessor)).hexdigest()
 
 
 def _legacy_production_config_digest(config: ProductionConfig) -> str:
