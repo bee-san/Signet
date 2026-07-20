@@ -775,6 +775,8 @@ def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
             bootouts += 1
             if bootouts == 2:
                 return subprocess.CompletedProcess(command, 1, "", "stop failed")
+            if bootouts == 3:
+                return subprocess.CompletedProcess(command, 3, "", "No such process")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
@@ -787,14 +789,20 @@ def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
     monkeypatch.setattr(platform, "_wait_for_local_services", lambda selected: None)
     platform._apply_private_paths(selected, "setup-service-test")
     platform._apply_services(selected, "setup-service-test")
+    rendered = render_launchd_services(selected, active=True)
 
     with pytest.raises(SetupError, match="launchd could not stop"):
         platform._rollback_services(selected, "setup-service-test")
 
     target = home / "Library" / "LaunchAgents"
-    for name in render_launchd_services(selected, active=True):
+    for name in rendered:
         assert (target / name).is_file()
         assert (selected.root / "services" / name).is_file()
+
+    platform._rollback_services(selected, "setup-service-test")
+    for name in rendered:
+        assert not (target / name).exists()
+        assert not (selected.root / "services" / name).exists()
 
 
 def test_preflight_resolves_the_hermes_default_profile_to_the_hermes_home(

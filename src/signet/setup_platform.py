@@ -545,10 +545,7 @@ class ProductionSetupPlatform:
             uid = os.getuid()
             for name in rendered:
                 path = target / name
-                self._run_checked(
-                    ["launchctl", "bootout", f"gui/{uid}", str(path)],
-                    "launchd could not stop Signet",
-                )
+                self._stop_launchd_unit(["launchctl", "bootout", f"gui/{uid}", str(path)])
             for name, content in rendered.items():
                 path = target / name
                 _remove_exact_owned_file(path, content)
@@ -910,6 +907,18 @@ class ProductionSetupPlatform:
         )
         if result.returncode != 0:
             raise SetupError(message)
+
+    def _stop_launchd_unit(self, command: list[str]) -> None:
+        result = self.command_runner(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+        already_stopped = "no such process" in detail or "could not find service" in detail
+        if result.returncode != 0 and not already_stopped:
+            raise SetupError("launchd could not stop Signet")
 
 
 def _secret_account(setup_id: str, purpose: str) -> str:
