@@ -1183,7 +1183,11 @@ def _yaml_document(encoded: bytes) -> dict[str, Any]:
     if not encoded.strip():
         return {}
     try:
-        value = yaml.load(encoded, Loader=_UniqueKeyLoader)
+        loader = _UniqueKeyLoader(encoded)
+        try:
+            value = loader.get_single_data()
+        finally:
+            loader.dispose()  # type: ignore[no-untyped-call]
     except (UnicodeError, yaml.YAMLError):
         raise SetupError("Hermes profile config is invalid YAML") from None
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
