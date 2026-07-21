@@ -170,6 +170,20 @@ def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Pat
     assert all(len(migration["checksum"]) == 64 for migration in migrations)
 
 
+def test_read_only_snapshot_hardens_its_directory_under_a_restrictive_umask(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+
+    previous_umask = os.umask(0o777)
+    try:
+        with database.read_only() as connection:
+            assert connection.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        os.umask(previous_umask)
+
+
 def test_read_only_database_connections_use_a_private_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -453,9 +453,11 @@ class Database:
             raise DatabaseError("read-only database path must be absolute")
         snapshot_directory = tempfile.TemporaryDirectory(prefix="signet-read-only-")
         try:
+            snapshot_root = Path(snapshot_directory.name)
+            snapshot_root.chmod(0o700)
             database_path = _copy_stable_database_snapshot(
                 self.path,
-                Path(snapshot_directory.name),
+                snapshot_root,
             )
         except BaseException:
             snapshot_directory.cleanup()
