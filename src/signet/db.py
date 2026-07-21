@@ -14,6 +14,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -31,7 +32,6 @@ try:  # pragma: no cover - selection depends on the runtime build
     import pysqlite3 as sqlite3  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - CPython's bundled driver is normal
     import sqlite3
-
 
 IntegrityError = sqlite3.IntegrityError
 LATEST_SCHEMA_VERSION = 19
@@ -447,28 +447,42 @@ class Database:
 
     @contextmanager
     def read_only(self) -> Iterator[Any]:
-        """Open an existing database without creating files or changing pragmas."""
+        """Open one stable snapshot, including committed live-WAL frames when present."""
 
         if not self.path.is_absolute():
             raise DatabaseError("read-only database path must be absolute")
+        snapshot_directory = tempfile.TemporaryDirectory(prefix="signet-read-only-")
+        try:
+            database_path = _copy_stable_database_snapshot(
+                self.path,
+                Path(snapshot_directory.name),
+            )
+        except BaseException:
+            snapshot_directory.cleanup()
+            raise
         try:
             connection = sqlite3.connect(
-                f"{self.path.as_uri()}?mode=ro&immutable=1",
+                f"{database_path.as_uri()}?mode=ro",
                 uri=True,
                 timeout=self.timeout,
                 isolation_level=None,
                 check_same_thread=False,
             )
         except sqlite3.Error as exc:
+            snapshot_directory.cleanup()
             raise DatabaseError("database is unavailable for read-only inspection") from exc
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute(f"PRAGMA busy_timeout={int(self.timeout * 1000)}")
+            connection.execute("BEGIN")
             yield connection
         finally:
+            if connection.in_transaction:
+                connection.rollback()
             connection.close()
+            snapshot_directory.cleanup()
 
     @contextmanager
     def transaction(self, *, mode: str = "IMMEDIATE") -> Iterator[Any]:
@@ -808,6 +822,162 @@ def _require_private_file(path: Path, *, label: str) -> None:
             raise DatabaseError(f"the {label} must be an owned mode-0600 regular file")
     finally:
         os.close(descriptor)
+
+
+def _copy_stable_database_snapshot(source: Path, destination: Path) -> Path:
+    snapshot = destination / source.name
+    snapshot_wal = Path(f"{snapshot}-wal")
+    source_wal = Path(f"{source}-wal")
+    for _ in range(8):
+        main_descriptor = -1
+        wal_descriptor = -1
+        try:
+            opened_main = _open_snapshot_source(source, "database")
+            if opened_main is None:  # pragma: no cover - required source invariant
+                raise FileNotFoundError(source)
+            main_descriptor, before_main = opened_main
+            opened_wal = _open_snapshot_source(source_wal, "database WAL", optional=True)
+            if opened_wal is None:
+                before_wal = None
+            else:
+                wal_descriptor, before_wal = opened_wal
+
+            copied_main_digest = _copy_descriptor_to_private_file(
+                main_descriptor,
+                snapshot,
+            )
+            copied_wal_digest = (
+                _copy_descriptor_to_private_file(wal_descriptor, snapshot_wal)
+                if before_wal is not None
+                else None
+            )
+            after_main = os.fstat(main_descriptor)
+            after_wal = os.fstat(wal_descriptor) if before_wal is not None else None
+            stable = (
+                _stable_copy_identity(before_main) == _stable_copy_identity(after_main)
+                and _optional_stable_copy_identity(before_wal)
+                == _optional_stable_copy_identity(after_wal)
+                and copied_main_digest == _descriptor_sha256(main_descriptor)
+                and copied_wal_digest
+                == (_descriptor_sha256(wal_descriptor) if before_wal is not None else None)
+                and _descriptor_still_names_path(source, main_descriptor)
+                and (
+                    _descriptor_still_names_path(source_wal, wal_descriptor)
+                    if before_wal is not None
+                    else not source_wal.exists() and not source_wal.is_symlink()
+                )
+            )
+        except FileNotFoundError:
+            stable = False
+        finally:
+            if wal_descriptor >= 0:
+                os.close(wal_descriptor)
+            if main_descriptor >= 0:
+                os.close(main_descriptor)
+        if stable:
+            return snapshot
+        else:
+            snapshot.unlink(missing_ok=True)
+            snapshot_wal.unlink(missing_ok=True)
+    raise DatabaseError("database changed during read-only snapshot")
+
+
+def _open_snapshot_source(
+    path: Path,
+    label: str,
+    *,
+    optional: bool = False,
+) -> tuple[int, os.stat_result] | None:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    except OSError as exc:
+        raise DatabaseError(f"the {label} snapshot source is unavailable or unsafe") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not _private_file_metadata(metadata) or not _descriptor_still_names_path(
+            path,
+            descriptor,
+        ):
+            raise DatabaseError(f"the {label} snapshot source is unavailable or unsafe")
+        return descriptor, metadata
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _copy_descriptor_to_private_file(descriptor: int, destination: Path) -> str:
+    output = -1
+    digest = hashlib.sha256()
+    try:
+        output = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        os.fchmod(output, 0o600)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output, view)
+                if written <= 0:
+                    raise OSError("short database snapshot write")
+                view = view[written:]
+        os.fsync(output)
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise DatabaseError("database snapshot could not be copied safely") from exc
+    finally:
+        if output >= 0:
+            os.close(output)
+    return digest.hexdigest()
+
+
+def _descriptor_sha256(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _descriptor_still_names_path(path: Path, descriptor: int) -> bool:
+    try:
+        named = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    opened = os.fstat(descriptor)
+    return (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino)
+
+
+def _optional_stable_copy_identity(
+    metadata: os.stat_result | None,
+) -> tuple[int, ...] | None:
+    return _stable_copy_identity(metadata) if metadata is not None else None
+
+
+def _stable_copy_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
 
 
 def _private_file_metadata(metadata: os.stat_result) -> bool:

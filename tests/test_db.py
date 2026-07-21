@@ -170,7 +170,7 @@ def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Pat
     assert all(len(migration["checksum"]) == 64 for migration in migrations)
 
 
-def test_read_only_database_connections_use_immutable_mode(
+def test_read_only_database_connections_use_a_private_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -189,7 +189,10 @@ def test_read_only_database_connections_use_immutable_mode(
     with database.read_only() as connection:
         assert connection.execute("SELECT count(*) FROM schema_meta").fetchone()[0] > 0
 
-    assert opened == [f"{path.as_uri()}?mode=ro&immutable=1"]
+    assert len(opened) == 1
+    assert opened[0].endswith("/approvals.sqlite3?mode=ro")
+    assert "immutable" not in opened[0]
+    assert path.as_uri() not in opened[0]
     assert not Path(f"{path}-shm").exists()
 
 
@@ -824,6 +827,102 @@ def test_preflight_schema_version_reads_committed_wal(
     finally:
         reader.rollback()
         reader.close()
+
+
+def test_read_only_database_is_wal_aware_and_uses_one_stable_snapshot(tmp_path: Path) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute("CREATE TABLE read_only_probe(value INTEGER NOT NULL)")
+        connection.execute("INSERT INTO read_only_probe(value) VALUES (1)")
+
+    pinned = database.connect()
+    try:
+        pinned.execute("BEGIN")
+        pinned.execute("SELECT value FROM read_only_probe").fetchone()
+        with database.transaction() as connection:
+            connection.execute("UPDATE read_only_probe SET value = 2")
+        with database.read_only() as connection:
+            assert connection.execute("SELECT value FROM read_only_probe").fetchone()[0] == 2
+            with database.transaction() as writer:
+                writer.execute("UPDATE read_only_probe SET value = 3")
+            assert connection.execute("SELECT value FROM read_only_probe").fetchone()[0] == 2
+        with database.read_only() as connection:
+            assert connection.execute("SELECT value FROM read_only_probe").fetchone()[0] == 3
+    finally:
+        pinned.rollback()
+        pinned.close()
+
+
+def test_read_only_snapshot_retries_when_a_wal_appears_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute("CREATE TABLE read_only_probe(value INTEGER NOT NULL)")
+        connection.execute("INSERT INTO read_only_probe(value) VALUES (1)")
+    assert not Path(f"{database.path}-wal").exists()
+
+    real_copy = db_module._copy_descriptor_to_private_file
+    writer: Any | None = None
+
+    def copy(descriptor: int, destination: Path) -> str:
+        nonlocal writer
+        if destination.name == database.path.name and writer is None:
+            writer = database.connect()
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE read_only_probe SET value = 2")
+            writer.commit()
+        return real_copy(descriptor, destination)
+
+    monkeypatch.setattr(db_module, "_copy_descriptor_to_private_file", copy)
+    try:
+        with database.read_only() as connection:
+            assert connection.execute("SELECT value FROM read_only_probe").fetchone()[0] == 2
+        assert writer is not None
+    finally:
+        if writer is not None:
+            writer.close()
+
+
+def test_read_only_snapshot_copies_from_the_verified_database_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "approvals.sqlite3")
+    database.initialize()
+    saved = database.path.with_name("saved.sqlite3")
+    foreign = database.path.with_name("foreign.sqlite3")
+    foreign.write_bytes(b"foreign database")
+    foreign.chmod(0o600)
+    destination = tmp_path / "snapshot"
+    destination.mkdir(mode=0o700)
+
+    real_copy = db_module._copy_descriptor_to_private_file
+    raced = False
+
+    def copy(descriptor: int, path: Path) -> str:
+        nonlocal raced
+        if path.name == database.path.name and not raced:
+            raced = True
+            database.path.rename(saved)
+            foreign.rename(database.path)
+            try:
+                return real_copy(descriptor, path)
+            finally:
+                database.path.rename(foreign)
+                saved.rename(database.path)
+        return real_copy(descriptor, path)
+
+    monkeypatch.setattr(db_module, "_copy_descriptor_to_private_file", copy)
+    snapshot = db_module._copy_stable_database_snapshot(database.path, destination)
+
+    assert raced is True
+    assert foreign.read_bytes() == b"foreign database"
+    with db_module.sqlite3.connect(snapshot) as connection:
+        assert connection.execute("SELECT count(*) FROM schema_meta").fetchone()[0] > 0
 
 
 def test_newer_schema_is_refused_before_application_work(tmp_path: Path) -> None:
