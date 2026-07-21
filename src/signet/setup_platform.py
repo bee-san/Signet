@@ -563,9 +563,7 @@ class ProductionSetupPlatform:
                 if target_path.exists() or target_path.is_symlink():
                     _verify_exact_owned_file(target_path, encoded)
                 _verify_exact_owned_file(spec.root / "services" / name, encoded)
-            self._stop_systemd_units(
-                ["systemctl", "--user", "disable", "--now", *rendered_text]
-            )
+            self._stop_systemd_units(["systemctl", "--user", "disable", "--now", *rendered_text])
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
                 target_path = target / name
@@ -628,8 +626,7 @@ class ProductionSetupPlatform:
             if (
                 isinstance(recorded_after, dict)
                 and set(recorded_after) == {"serve", "funnel"}
-                and recorded_after
-                != {"serve": current_serve, "funnel": current_funnel}
+                and recorded_after != {"serve": current_serve, "funnel": current_funnel}
             ):
                 raise SetupError("the managed Tailscale snapshot changed after setup")
             if _document_mentions_port(current_funnel, port):
@@ -693,10 +690,10 @@ class ProductionSetupPlatform:
             ["tailscale", "funnel", "status", "--json"],
             "Tailscale Funnel status is unavailable",
         )
-        exact_after = (
-            isinstance(recorded_after, dict)
-            and set(recorded_after) == {"serve", "funnel"}
-        )
+        exact_after = isinstance(recorded_after, dict) and set(recorded_after) == {
+            "serve",
+            "funnel",
+        }
         if exact_after and recorded_after != {
             "serve": current_serve,
             "funnel": current_funnel,
@@ -1318,17 +1315,25 @@ def _restore_hermes_profile_snapshot(
     current_environment = _read_optional_private_file(env_path)
     expected_config = original_config or b""
     expected_environment = original_environment or b""
-    if current_config != expected_config and _remove_hermes_config(
-        current_config,
-        token_name=token_name,
-        setup_id=setup_id,
-    ) != expected_config:
+    if (
+        current_config != expected_config
+        and _remove_hermes_config(
+            current_config,
+            token_name=token_name,
+            setup_id=setup_id,
+        )
+        != expected_config
+    ):
         raise SetupError("Hermes profile config changed after its setup snapshot")
-    if current_environment != expected_environment and _remove_profile_environment(
-        current_environment,
-        token_name=token_name,
-        setup_id=setup_id,
-    ) != expected_environment:
+    if (
+        current_environment != expected_environment
+        and _remove_profile_environment(
+            current_environment,
+            token_name=token_name,
+            setup_id=setup_id,
+        )
+        != expected_environment
+    ):
         raise SetupError("Hermes profile environment changed after its setup snapshot")
 
     def restore_file(path: Path, current: bytes, original: bytes | None) -> None:
@@ -1575,8 +1580,7 @@ def _validate_owned_marker_metadata(text: str, *, label: str, setup_id: str) -> 
         return
     accepted_labels = {label, f"{label} no-final-newline"}
     if any(
-        marker.group("setup") != setup_id
-        or marker.group("label") not in accepted_labels
+        marker.group("setup") != setup_id or marker.group("label") not in accepted_labels
         for marker in markers
     ):
         raise SetupError("owned Hermes integration marker metadata is invalid")

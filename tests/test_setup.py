@@ -1330,9 +1330,7 @@ def test_tailnet_rollback_verifies_the_exact_pre_setup_snapshot(tmp_path: Path) 
         executable=Path("/bin/echo"),
     )
     ensure_private_directory(selected.root / "services")
-    before_serve: dict[str, Any] = {
-        "Web": {":9443": {"Proxy": "http://127.0.0.1:9444"}}
-    }
+    before_serve: dict[str, Any] = {"Web": {":9443": {"Proxy": "http://127.0.0.1:9444"}}}
     state: dict[str, Any] = {"serve": before_serve, "funnel": {}}
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:

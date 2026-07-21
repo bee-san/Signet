@@ -274,9 +274,7 @@ class SetupOperations:
     def _verified_backup_receipt(self, bundle: Path) -> dict[str, Any]:
         manager = self._backup_manager(self.store.load())
         with manager.database.read_only() as connection:
-            source_schema_version = int(
-                connection.execute("PRAGMA user_version").fetchone()[0]
-            )
+            source_schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         restored: RestoredBundle | None = None
         try:
             restored = manager.restore(
@@ -360,11 +358,7 @@ def _write_private_json(path: Path, document: dict[str, Any]) -> None:
     try:
         descriptor = os.open(
             path,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
             0o600,
         )
         with os.fdopen(descriptor, "wb") as destination:

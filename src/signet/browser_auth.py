@@ -647,9 +647,7 @@ class BootstrapService:
                         "SELECT user_id, status FROM browser_bootstrap_state WHERE state_id = 1"
                     ).fetchone()
                     if current is None or str(current["user_id"]) != self.owner_user_id:
-                        raise BootstrapOwnerMismatch(
-                            "browser bootstrap is bound to another owner"
-                        )
+                        raise BootstrapOwnerMismatch("browser bootstrap is bound to another owner")
                     if str(current["status"]) != "complete":
                         raise BootstrapError("browser bootstrap reconciliation lost its CAS")
             elif str(row["status"]) == "pending":

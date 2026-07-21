@@ -1732,9 +1732,7 @@ def _record_matches_manifest(record: StagedFile, item: dict[str, Any]) -> bool:
 def _table_has_column(connection: Any, table: str, column: str) -> bool:
     if table not in {"payload_versions", "staged_objects"}:
         raise ValueError("unsupported backup catalog table")
-    return any(
-        str(row[1]) == column for row in connection.execute(f"PRAGMA table_info({table})")
-    )
+    return any(str(row[1]) == column for row in connection.execute(f"PRAGMA table_info({table})"))
 
 
 def _active_staged_rows(connection: Any) -> list[Any]:
@@ -1768,8 +1766,7 @@ def _key_references(connection: Any) -> list[str]:
         references.update(
             str(row[0])
             for row in connection.execute(
-                f"SELECT encryption_key_ref FROM {table} "
-                "WHERE encryption_key_ref IS NOT NULL"
+                f"SELECT encryption_key_ref FROM {table} WHERE encryption_key_ref IS NOT NULL"
             )
         )
     return sorted(references)
