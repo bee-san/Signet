@@ -1760,15 +1760,20 @@ def _active_staged_rows(connection: Any) -> list[Any]:
 
 def _key_references(connection: Any) -> list[str]:
     references: set[str] = set()
-    for table in ("payload_versions", "staged_objects"):
+    queries = (
+        (
+            "payload_versions",
+            "SELECT encryption_key_ref FROM payload_versions WHERE encryption_key_ref IS NOT NULL",
+        ),
+        (
+            "staged_objects",
+            "SELECT encryption_key_ref FROM staged_objects WHERE encryption_key_ref IS NOT NULL",
+        ),
+    )
+    for table, query in queries:
         if not _table_has_column(connection, table, "encryption_key_ref"):
             continue
-        references.update(
-            str(row[0])
-            for row in connection.execute(
-                f"SELECT encryption_key_ref FROM {table} WHERE encryption_key_ref IS NOT NULL"
-            )
-        )
+        references.update(str(row[0]) for row in connection.execute(query))
     return sorted(references)
 
 
