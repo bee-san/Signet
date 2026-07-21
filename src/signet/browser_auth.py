@@ -166,10 +166,20 @@ class BootstrapService:
             existing = connection.execute(
                 "SELECT * FROM browser_bootstrap_state WHERE state_id = 1"
             ).fetchone()
+            existing_snapshot = dict(existing) if existing is not None else None
             if existing is not None and str(existing["user_id"]) != self.owner_user_id:
                 raise BootstrapOwnerMismatch("browser bootstrap is bound to another owner")
             if existing is not None and str(existing["status"]) == "complete":
                 raise BootstrapAlreadyComplete("initial owner setup is already complete")
+            if (
+                existing is not None
+                and existing["claimed_at"] is not None
+                and (
+                    existing["capability_expires_at"] is None
+                    or now < int(existing["capability_expires_at"])
+                )
+            ):
+                raise BootstrapClaimRequired("an unexpired claimed bootstrap ceremony exists")
             if (
                 existing is not None
                 and not replace_existing
@@ -211,6 +221,18 @@ class BootstrapService:
                 raise BootstrapOwnerMismatch("browser bootstrap is bound to another owner")
             if row is not None and str(row["status"]) == "complete":
                 raise BootstrapAlreadyComplete("initial owner setup is already complete")
+            if (
+                row is not None
+                and row["claimed_at"] is not None
+                and (
+                    row["capability_expires_at"] is None or now < int(row["capability_expires_at"])
+                )
+            ):
+                raise BootstrapClaimRequired("an unexpired claimed bootstrap ceremony exists")
+            if (dict(row) if row is not None else None) != existing_snapshot:
+                raise BootstrapClaimRequired(
+                    "browser bootstrap changed while capability replacement was prepared"
+                )
             if (
                 row is not None
                 and not replace_existing

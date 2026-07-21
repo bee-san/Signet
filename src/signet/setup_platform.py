@@ -23,7 +23,12 @@ from urllib.parse import quote, urlsplit
 import keyring
 import yaml
 
-from signet.browser_auth import BootstrapAlreadyComplete, BootstrapService
+from signet.authenticator_management import KeychainTotpSecretProvisioner
+from signet.browser_auth import (
+    BootstrapAlreadyComplete,
+    BootstrapClaimRequired,
+    BootstrapService,
+)
 from signet.config import production_instance_identity
 from signet.credential_broker import CredentialError, KeychainSecretStore
 from signet.db import Database
@@ -34,6 +39,7 @@ from signet.private_paths import (
 )
 from signet.production import create_production_assembly, load_production_config
 from signet.setup_state import SetupError, SetupSpec
+from signet.totp_enrollment import TotpEnrollmentService
 
 _CONFIG_NAME = "production.json"
 _POLICY_NAME = "policy.yaml"
@@ -900,12 +906,21 @@ class ProductionSetupPlatform:
                         assembly.token_registry.revoke(metadata.token_id)
 
     def _apply_owner_bootstrap(self, spec: SetupSpec, setup_id: str) -> None:
+        secret_store = KeychainSecretStore()
         assembly = create_production_assembly(
             spec.root / _CONFIG_NAME,
-            secret_store=KeychainSecretStore(),
+            secret_store=secret_store,
             components=frozenset(),
         )
-        bootstrap = BootstrapService(assembly.database, owner_user_id=spec.owner_user_id)
+        bootstrap = BootstrapService(
+            assembly.database,
+            owner_user_id=spec.owner_user_id,
+            totp_enrollments=TotpEnrollmentService(
+                assembly.database,
+                provisioner=KeychainTotpSecretProvisioner(),
+                secret_store=secret_store,
+            ),
+        )
         account = _secret_account(setup_id, "browser-bootstrap")
         try:
             stored = keyring.get_password(_SERVICE_NAME, account)
@@ -932,12 +947,8 @@ class ProductionSetupPlatform:
         ):
             raise SetupError("the private owner setup handoff changed or is ambiguous")
         status = bootstrap.status(now=now)
-        with assembly.database.read() as connection:
-            state = connection.execute(
-                "SELECT claimed_at FROM browser_bootstrap_state WHERE state_id = 1"
-            ).fetchone()
-        already_claimed = state is not None and state["claimed_at"] is not None
-        if status.complete or already_claimed:
+        claim_is_current = _bootstrap_claim_is_current(assembly.database, now=now)
+        if status.complete or claim_is_current:
             capability: str | None = None
         elif handoff_is_current:
             capability = handoff_capability
@@ -950,6 +961,10 @@ class ProductionSetupPlatform:
                     replace_existing=True,
                 )
             except BootstrapAlreadyComplete:
+                capability = None
+            except BootstrapClaimRequired:
+                if not _bootstrap_claim_is_current(assembly.database, now=now):
+                    raise
                 capability = None
         if capability is not None and not spec.open_browser:
             _replace_private_file(
@@ -1048,6 +1063,22 @@ class ProductionSetupPlatform:
 
 def _secret_account(setup_id: str, purpose: str) -> str:
     return f"{setup_id}-{purpose}"
+
+
+def _bootstrap_claim_is_current(database: Database, *, now: int) -> bool:
+    with database.read() as connection:
+        state = connection.execute(
+            """
+            SELECT claimed_at, capability_expires_at
+            FROM browser_bootstrap_state WHERE state_id = 1
+            """
+        ).fetchone()
+    return bool(
+        state is not None
+        and state["claimed_at"] is not None
+        and state["capability_expires_at"] is not None
+        and now < int(state["capability_expires_at"])
+    )
 
 
 def _decode_owner_handoff(encoded: bytes) -> str:

@@ -5,12 +5,13 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Any
 
 import pyotp
 import pytest
 
+import signet.browser_auth as browser_auth_module
 import signet.db as db_module
 from signet.auth import (
     SQLitePasswordCredentialRepository,
@@ -112,6 +113,84 @@ def test_operator_can_rotate_an_abandoned_bootstrap_capability(database: Databas
         service.claim(abandoned, CLAIMANT_TOKEN, now=702)
     status = service.claim(replacement, CLAIMANT_TOKEN, now=702)
     assert status.claimed is True
+
+
+def test_operator_cannot_replace_an_unexpired_claimed_capability(database: Database) -> None:
+    service = bootstrap(database)
+    capability = service.issue_capability(now=100, lifetime=600)
+    service.claim(capability, CLAIMANT_TOKEN, now=101)
+
+    with pytest.raises(BootstrapClaimRequired, match="claimed"):
+        service.issue_capability(now=102, lifetime=600, replace_existing=True)
+
+    assert service.status(now=102, claimant_token=CLAIMANT_TOKEN).claimed is True
+
+
+def test_concurrent_capability_replacements_use_compare_and_swap(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap(database).issue_capability(now=100, lifetime=600)
+    barrier = Barrier(2)
+    token_urlsafe = browser_auth_module.secrets.token_urlsafe
+
+    def synchronized_token_urlsafe(length: int) -> str:
+        if length == 18:
+            barrier.wait()
+        return token_urlsafe(length)
+
+    monkeypatch.setattr(browser_auth_module.secrets, "token_urlsafe", synchronized_token_urlsafe)
+
+    def replace_capability(_: int) -> str:
+        try:
+            return bootstrap(database).issue_capability(
+                now=700,
+                lifetime=600,
+                replace_existing=True,
+            )
+        except BootstrapClaimRequired:
+            return "rejected"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(replace_capability, range(2)))
+
+    assert sum(outcome != "rejected" for outcome in outcomes) == 1
+    winner = next(outcome for outcome in outcomes if outcome != "rejected")
+    assert bootstrap(database).capability_is_current(winner, now=701) is True
+
+
+def test_capability_replacement_rejects_a_concurrent_claim(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = bootstrap(database)
+    capability = service.issue_capability(now=100, lifetime=600)
+    replacement_prepared = Event()
+    claim_completed = Event()
+    token_urlsafe = browser_auth_module.secrets.token_urlsafe
+
+    def synchronized_token_urlsafe(length: int) -> str:
+        if length == 18:
+            replacement_prepared.set()
+            assert claim_completed.wait(timeout=5)
+        return token_urlsafe(length)
+
+    monkeypatch.setattr(browser_auth_module.secrets, "token_urlsafe", synchronized_token_urlsafe)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        replacement = executor.submit(
+            service.issue_capability,
+            now=700,
+            lifetime=600,
+            replace_existing=True,
+        )
+        assert replacement_prepared.wait(timeout=5)
+        service.claim(capability, CLAIMANT_TOKEN, now=699)
+        claim_completed.set()
+        with pytest.raises(BootstrapClaimRequired):
+            replacement.result(timeout=5)
+
+    assert service.status(now=699, claimant_token=CLAIMANT_TOKEN).claimed is True
 
 
 def encoded_credential_id(identifier: str) -> str:

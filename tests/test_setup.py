@@ -12,8 +12,10 @@ from typing import Any
 import pytest
 
 import signet.setup_platform as setup_platform
+from signet.browser_auth import BootstrapService
 from signet.config import ProductionConfig, production_instance_identity
 from signet.credential_broker import KeychainSecretStore
+from signet.db import Database
 from signet.private_paths import ensure_private_directory
 from signet.production import create_production_assembly, load_production_config
 from signet.setup_operations import SetupOperations
@@ -807,7 +809,14 @@ def test_owner_bootstrap_publishes_and_safely_rotates_a_private_claim_handoff(
     assert second != first
     assert second not in "\n".join(output)
 
-    stored.pop(account)
+    BootstrapService(
+        Database(selected.root / "data" / "signet.db"),
+        owner_user_id=selected.owner_user_id,
+    ).claim(
+        second,
+        "claimed-owner-browser-token-long-enough",
+        now=now + 1,
+    )
     now += 601
     platform._apply_owner_bootstrap(selected, setup_id)
     third = handoff.read_text(encoding="utf-8").rstrip("\n")
@@ -815,8 +824,86 @@ def test_owner_bootstrap_publishes_and_safely_rotates_a_private_claim_handoff(
     assert third != second
 
     stored.pop(account)
+    now += 601
+    platform._apply_owner_bootstrap(selected, setup_id)
+    fourth = handoff.read_text(encoding="utf-8").rstrip("\n")
+    assert fourth == stored[account]
+    assert fourth != third
+
+    stored.pop(account)
     platform._rollback_owner_bootstrap(selected, setup_id)
     assert not handoff.exists()
+
+
+def test_owner_bootstrap_accepts_a_claim_racing_capability_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "racing-owner-claim")
+    setup_id = "setup_0123456789abcdef"
+    stored: dict[tuple[str, str], str] = {}
+    now = 1_000
+    opened: list[str] = []
+    monkeypatch.setattr(
+        setup_platform.keyring,
+        "get_password",
+        lambda service, account: stored.get((service, account)),
+    )
+    monkeypatch.setattr(
+        setup_platform.keyring,
+        "set_password",
+        lambda service, account, value: stored.__setitem__((service, account), value),
+    )
+    monkeypatch.setattr(setup_platform, "_now", lambda: now)
+    platform = ProductionSetupPlatform(
+        output=lambda value: None,
+        opener=lambda value: not opened.append(value),
+    )
+    platform._apply_private_paths(selected, setup_id)
+    platform._apply_secrets(selected, setup_id)
+    platform._apply_configuration(selected, setup_id)
+    platform._apply_database(selected, setup_id)
+    database = Database(selected.root / "data" / "signet.db")
+    capability = BootstrapService(
+        database,
+        owner_user_id=selected.owner_user_id,
+    ).issue_capability(now=900, lifetime=600)
+    issue_capability = BootstrapService.issue_capability
+    raced = False
+
+    def issue_after_claim(self: BootstrapService, **kwargs: Any) -> str:
+        nonlocal raced
+        if not raced:
+            raced = True
+            BootstrapService(
+                database,
+                owner_user_id=selected.owner_user_id,
+            ).claim(
+                capability,
+                "racing-owner-browser-token-long-enough",
+                now=now,
+            )
+        return issue_capability(self, **kwargs)
+
+    monkeypatch.setattr(BootstrapService, "issue_capability", issue_after_claim)
+
+    platform._apply_owner_bootstrap(selected, setup_id)
+
+    assert raced is True
+    assert (
+        BootstrapService(
+            database,
+            owner_user_id=selected.owner_user_id,
+        )
+        .status(
+            now=now,
+            claimant_token="racing-owner-browser-token-long-enough",
+        )
+        .claimed
+        is True
+    )
+    assert opened == ["https://signet.tailnet.example/setup"]
+    assert ("Signet-Setup", f"{setup_id}-browser-bootstrap") not in stored
 
 
 def test_browser_assisted_setup_prints_exact_url_before_opening_without_printing_secret() -> None:
