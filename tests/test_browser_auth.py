@@ -182,6 +182,43 @@ def test_bootstrap_resumes_after_restart_and_finalizes_only_once(database: Datab
     assert len(SQLiteWebAuthnRepository(database).credentials_for_user(USER_ID)) == 1
 
 
+def test_bootstrap_reconciles_a_missing_complete_state_for_the_configured_owner(
+    database: Database,
+) -> None:
+    service = claimed_bootstrap(database)
+    service.enroll_password(
+        "a sufficiently long password",
+        claimant_token=CLAIMANT_TOKEN,
+        now=100,
+    )
+    service.enroll_passkey(
+        "Primary passkey",
+        credential(),
+        claimant_token=CLAIMANT_TOKEN,
+        now=101,
+    )
+    service.complete(claimant_token=CLAIMANT_TOKEN, now=102)
+    with database.transaction() as connection:
+        owner_created_at = int(
+            connection.execute(
+                "SELECT created_at FROM auth_users WHERE user_id = ?",
+                (USER_ID,),
+            ).fetchone()[0]
+        )
+        connection.execute("DELETE FROM browser_bootstrap_state")
+
+    assert bootstrap(database).status(now=103).complete is True
+    with database.read() as connection:
+        row = connection.execute(
+            "SELECT user_id, status, created_at FROM browser_bootstrap_state WHERE state_id = 1"
+        ).fetchone()
+    assert dict(row) == {
+        "user_id": USER_ID,
+        "status": "complete",
+        "created_at": owner_created_at,
+    }
+
+
 def test_bootstrap_requires_password_and_non_password_authenticator(database: Database) -> None:
     service = claimed_bootstrap(database)
     service.enroll_password("a sufficiently long password", claimant_token=CLAIMANT_TOKEN, now=100)

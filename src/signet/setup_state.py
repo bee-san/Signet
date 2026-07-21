@@ -410,6 +410,10 @@ class SetupEngine:
         )
         self._require_spec(journal, spec)
         if journal.status == "completed":
+            try:
+                self.platform.apply("owner_bootstrap", spec, journal.setup_id)
+            except Exception as exc:
+                raise SetupError("completed setup owner reconciliation failed") from exc
             return journal
         integration_names = {"services", "hermes_profiles", "owner_bootstrap"}
         reinstalling_integrations = journal.status == "uninstalled" or (

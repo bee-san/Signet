@@ -625,26 +625,46 @@ class BootstrapService:
             kinds = {str(item["kind"]) for item in self._active_factor_rows(connection)}
             if "password" not in kinds or not kinds.intersection({"totp", "webauthn"}):
                 return
-            created_at = int(row["created_at"]) if row is not None else 0
+            owner = connection.execute(
+                "SELECT created_at FROM auth_users WHERE user_id = ?",
+                (self.owner_user_id,),
+            ).fetchone()
+            if owner is None:
+                raise BootstrapError("completed bootstrap owner identity is missing")
+            created_at = int(row["created_at"]) if row is not None else int(owner["created_at"])
             if row is None:
-                connection.execute(
+                inserted = connection.execute(
                     """
                     INSERT INTO browser_bootstrap_state(
                         state_id, user_id, status, created_at, updated_at, completed_at
                     ) VALUES (1, ?, 'complete', ?, ?, ?)
+                    ON CONFLICT(state_id) DO NOTHING
                     """,
                     (self.owner_user_id, created_at, created_at, created_at),
-                )
+                ).rowcount
+                if int(inserted) != 1:
+                    current = connection.execute(
+                        "SELECT user_id, status FROM browser_bootstrap_state WHERE state_id = 1"
+                    ).fetchone()
+                    if current is None or str(current["user_id"]) != self.owner_user_id:
+                        raise BootstrapOwnerMismatch(
+                            "browser bootstrap is bound to another owner"
+                        )
+                    if str(current["status"]) != "complete":
+                        raise BootstrapError("browser bootstrap reconciliation lost its CAS")
             elif str(row["status"]) == "pending":
-                connection.execute(
+                updated = connection.execute(
                     """
                     UPDATE browser_bootstrap_state
                     SET status = 'complete', completed_at = max(updated_at, created_at),
                         capability_id = NULL, capability_verifier = NULL,
                         capability_expires_at = NULL, claimant_verifier = NULL, claimed_at = NULL
-                    WHERE state_id = 1
-                    """
-                )
+                    WHERE state_id = 1 AND user_id = ? AND status = 'pending'
+                    """,
+                    (self.owner_user_id,),
+                ).rowcount
+                if int(updated) != 1:
+                    raise BootstrapError("browser bootstrap reconciliation lost its CAS")
 
     def _active_factor_rows(self, connection: object) -> list[Any]:
         return list(

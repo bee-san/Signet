@@ -200,6 +200,36 @@ def test_setup_and_production_reject_the_same_invalid_origins(
         ProductionConfig.model_validate(rendered)
 
 
+def test_completed_setup_reconciles_only_the_owner_bootstrap_step(tmp_path: Path) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    engine = SetupEngine(SetupJournalStore(selected.root), platform)
+    engine.apply(selected)
+    platform.applied.clear()
+
+    engine.apply(selected)
+
+    assert platform.applied == ["owner_bootstrap"]
+
+
+def test_completed_setup_surfaces_owner_reconciliation_failure_without_reopening_steps(
+    tmp_path: Path,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    store = SetupJournalStore(selected.root)
+    engine = SetupEngine(store, platform)
+    engine.apply(selected)
+    platform.fail_once = "owner_bootstrap"
+
+    with pytest.raises(SetupError, match="owner reconciliation failed"):
+        engine.apply(selected)
+
+    journal = store.load()
+    assert journal.status == "completed"
+    assert all(step.status == "completed" for step in journal.steps)
+
+
 def test_apply_records_failure_and_resumes_without_repeating_completed_steps(
     tmp_path: Path,
 ) -> None:
