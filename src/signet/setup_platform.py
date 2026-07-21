@@ -33,12 +33,17 @@ from signet.config import production_instance_identity
 from signet.credential_broker import CredentialError, KeychainSecretStore
 from signet.db import Database
 from signet.private_paths import (
+    DirectoryIdentity,
     PrivatePathError,
     ensure_owned_directory,
     ensure_private_directory,
+    require_no_acl_grants,
+    require_owned_directory_identity,
+    require_private_directory_identity,
+    revalidate_directory_identity,
 )
 from signet.production import create_production_assembly, load_production_config
-from signet.setup_state import SetupError, SetupSpec
+from signet.setup_state import SetupError, SetupJournalStore, SetupSpec
 from signet.totp_enrollment import TotpEnrollmentService
 
 _CONFIG_NAME = "production.json"
@@ -437,8 +442,13 @@ class ProductionSetupPlatform:
 
     def _rollback_secrets(self, spec: SetupSpec, setup_id: str) -> None:
         backup_root = spec.root / "backups"
-        preserve_backup = backup_root.is_dir() and any(
-            path.is_file() and not path.is_symlink() for path in backup_root.glob("*.signet-backup")
+        journal = SetupJournalStore(spec.root).load()
+        preserve_backup = journal.purge_backup is not None or (
+            backup_root.is_dir()
+            and any(
+                path.is_file() and not path.is_symlink()
+                for path in backup_root.glob("*.signet-backup")
+            )
         )
         self.remove_setup_secrets(setup_id, preserve_backup=preserve_backup)
 
@@ -757,6 +767,10 @@ class ProductionSetupPlatform:
         try:
             for profile in spec.hermes_profiles:
                 profile_dir = self._hermes_profile_directory(profile)
+                try:
+                    profile_identity = require_private_directory_identity(profile_dir)
+                except PrivatePathError as exc:
+                    raise SetupError("Hermes profile directory is unavailable or unsafe") from exc
                 token_name = _profile_token_name(profile)
                 config_path = profile_dir / "config.yaml"
                 env_path = profile_dir / ".env"
@@ -767,6 +781,7 @@ class ProductionSetupPlatform:
                 _capture_hermes_profile_snapshot(
                     spec,
                     profile,
+                    profile_identity=profile_identity,
                     config=existing_config,
                     environment=existing_env,
                     config_exists=config_exists,
@@ -803,12 +818,18 @@ class ProductionSetupPlatform:
                 _replace_private_file(
                     config_path,
                     merged,
-                    expected_content=existing_config,
+                    require_absent=not config_exists,
+                    expected_content=existing_config if config_exists else None,
+                    expected_parent_identity=profile_identity,
+                    require_present=config_exists,
                 )
                 _replace_private_file(
                     env_path,
                     updated_env,
-                    expected_content=existing_env,
+                    require_absent=not environment_exists,
+                    expected_content=existing_env if environment_exists else None,
+                    expected_parent_identity=profile_identity,
+                    require_present=environment_exists,
                 )
         except Exception:
             cleanup_failure: Exception | None = None
@@ -851,10 +872,14 @@ class ProductionSetupPlatform:
             current_config = _read_optional_private_file(config_path)
             current_env = _read_optional_private_file(env_path)
             token = _existing_profile_token(current_env, token_name=token_name)
-            snapshot = _read_hermes_profile_snapshot(spec, profile)
+            snapshot = _read_hermes_profile_snapshot(
+                spec,
+                profile,
+                profile_directory=profile_dir,
+            )
             if snapshot is not None:
                 original_token = _existing_profile_token(
-                    snapshot[1] or b"",
+                    snapshot[2] or b"",
                     token_name=token_name,
                 )
                 _restore_hermes_profile_snapshot(
@@ -1149,29 +1174,64 @@ def _replace_private_file(
     require_absent: bool = False,
     parent_private: bool = True,
     expected_content: bytes | None = None,
+    expected_parent_identity: DirectoryIdentity | None = None,
+    require_present: bool = False,
 ) -> None:
+    if require_absent and require_present:
+        raise ValueError("private resource cannot be both required absent and present")
     try:
-        prepare_parent = ensure_private_directory if parent_private else ensure_owned_directory
-        parent = prepare_parent(path.parent)
+        if expected_parent_identity is not None:
+            parent = revalidate_directory_identity(
+                expected_parent_identity,
+                private=parent_private,
+            )
+        else:
+            prepare_parent = ensure_private_directory if parent_private else ensure_owned_directory
+            parent = prepare_parent(path.parent)
+            identity_reader = (
+                require_private_directory_identity
+                if parent_private
+                else require_owned_directory_identity
+            )
+            expected_parent_identity = identity_reader(parent)
     except PrivatePathError as exc:
         raise SetupError(f"private resource parent is unsafe: {path.parent}") from exc
     if parent != path.parent:
         raise SetupError(f"private resource parent is not canonical: {path.parent}")
-    if path.is_symlink():
-        raise SetupError(f"refusing symbolic-link resource: {path}")
-    if require_absent and path.exists():
-        raise SetupError(f"resource already exists: {path}")
-    temporary = path.with_name(f".{path.name}.{secrets.token_urlsafe(8)}.tmp")
+    temporary_name = f".{path.name}.{secrets.token_urlsafe(16)}.tmp"
+    parent_descriptor = -1
     descriptor: int | None = None
     try:
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_parent = os.fstat(parent_descriptor)
+        assert expected_parent_identity is not None
+        if (opened_parent.st_dev, opened_parent.st_ino) != (
+            expected_parent_identity.device,
+            expected_parent_identity.inode,
+        ):
+            raise SetupError(f"private resource parent changed: {path.parent}")
+        _require_publish_target(
+            parent_descriptor,
+            path,
+            require_absent=require_absent,
+            require_present=require_present,
+            expected_content=expected_content,
+        )
         descriptor = os.open(
-            temporary,
+            temporary_name,
             os.O_WRONLY
             | os.O_CREAT
             | os.O_EXCL
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0),
             0o600,
+            dir_fd=parent_descriptor,
         )
         os.fchmod(descriptor, 0o600)
         view = memoryview(content)
@@ -1183,53 +1243,280 @@ def _replace_private_file(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
+        _require_publish_target(
+            parent_descriptor,
+            path,
+            require_absent=require_absent,
+            require_present=require_present,
+            expected_content=expected_content,
+        )
         if require_absent:
             try:
-                os.link(temporary, path, follow_symlinks=False)
+                os.link(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
             except FileExistsError as exc:
                 raise SetupError(f"resource already exists: {path}") from exc
-            temporary.unlink()
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
         else:
-            if expected_content is not None:
-                if path.exists() or path.is_symlink():
-                    _require_exact_owned_file(path, expected_content)
-                elif expected_content != b"":
-                    raise SetupError(f"owned resource changed or is ambiguous: {path}")
-            os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            os.rename(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+        os.fsync(parent_descriptor)
         try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            assert expected_parent_identity is not None
+            revalidate_directory_identity(expected_parent_identity, private=parent_private)
+        except PrivatePathError as exc:
+            raise SetupError(f"private resource parent changed: {path.parent}") from exc
     except OSError as exc:
         raise SetupError(f"private resource could not be published: {path}") from exc
     finally:
         if descriptor is not None:
             with suppress(OSError):
                 os.close(descriptor)
-        with suppress(FileNotFoundError):
-            temporary.unlink()
+        if parent_descriptor >= 0:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            os.close(parent_descriptor)
+
+
+def _require_publish_target(
+    parent_descriptor: int,
+    path: Path,
+    *,
+    require_absent: bool,
+    require_present: bool,
+    expected_content: bytes | None,
+) -> None:
+    target_descriptor = -1
+    try:
+        target_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+    except FileNotFoundError:
+        if require_present or (expected_content is not None and expected_content != b""):
+            raise SetupError(f"owned resource changed or is ambiguous: {path}") from None
+        return
+    except OSError as exc:
+        raise SetupError(f"owned resource changed or is ambiguous: {path}") from exc
+    try:
+        if require_absent:
+            raise SetupError(f"resource already exists: {path}")
+        metadata = os.fstat(target_descriptor)
+        require_no_acl_grants(target_descriptor)
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != current_uid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise SetupError(f"owned resource changed or is ambiguous: {path}")
+        if expected_content is not None:
+            actual = _read_owned_descriptor(target_descriptor, len(expected_content) + 1)
+            if actual != expected_content:
+                raise SetupError(f"owned resource changed or is ambiguous: {path}")
+    except PrivatePathError as exc:
+        raise SetupError(f"owned resource changed or is ambiguous: {path}") from exc
+    finally:
+        os.close(target_descriptor)
 
 
 def _verify_exact_owned_file(path: Path, expected: bytes) -> None:
-    if not path.exists() and not path.is_symlink():
+    _inspect_exact_owned_file(path, expected)
+
+
+def _remove_exact_owned_file(
+    path: Path,
+    expected: bytes,
+    *,
+    expected_parent_identity: DirectoryIdentity | None = None,
+    parent_private: bool = False,
+) -> None:
+    inspected = _inspect_exact_owned_file(
+        path,
+        expected,
+        expected_parent_identity=expected_parent_identity,
+        parent_private=parent_private,
+    )
+    if inspected is None:
         return
-    if path.is_symlink():
-        raise SetupError(f"refusing to remove symbolic-link resource: {path}")
+    metadata, parent_identity = inspected
+    _quarantine_and_remove_owned_file(
+        path,
+        expected,
+        metadata=metadata,
+        parent_identity=parent_identity,
+    )
+
+
+def _quarantine_and_remove_owned_file(
+    path: Path,
+    expected: bytes,
+    *,
+    metadata: os.stat_result,
+    parent_identity: DirectoryIdentity,
+) -> None:
+    quarantine_name = f".signet-remove-{secrets.token_urlsafe(32)}"
+    parent_descriptor = -1
+    quarantine_descriptor = -1
+    owned_descriptor = -1
     try:
-        metadata = path.stat()
-        actual = path.read_bytes()
-    except OSError as exc:
-        raise SetupError(f"owned resource could not be inspected: {path}") from exc
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or actual != expected:
-        raise SetupError(f"refusing to remove changed or foreign resource: {path}")
+        revalidate_directory_identity(parent_identity, private=False)
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_parent = os.fstat(parent_descriptor)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (
+            parent_identity.device,
+            parent_identity.inode,
+        ):
+            raise SetupError(f"owned resource parent changed: {path.parent}")
+        os.mkdir(quarantine_name, mode=0o700, dir_fd=parent_descriptor)
+        quarantine_descriptor = os.open(
+            quarantine_name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+        os.fchmod(quarantine_descriptor, 0o700)
+        require_no_acl_grants(quarantine_descriptor)
+        current = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise SetupError(f"refusing to remove changed or foreign resource: {path}")
+        os.rename(
+            path.name,
+            "owned",
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=quarantine_descriptor,
+        )
+        try:
+            owned_descriptor = os.open(
+                "owned",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=quarantine_descriptor,
+            )
+            moved = os.fstat(owned_descriptor)
+            require_no_acl_grants(owned_descriptor)
+            actual = _read_owned_descriptor(owned_descriptor, len(expected) + 1)
+            named = os.stat("owned", dir_fd=quarantine_descriptor, follow_symlinks=False)
+        except (OSError, PrivatePathError):
+            _restore_quarantined_file(path, parent_descriptor, quarantine_descriptor)
+            raise
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if (
+            (moved.st_dev, moved.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or (named.st_dev, named.st_ino) != (moved.st_dev, moved.st_ino)
+            or not stat.S_ISREG(moved.st_mode)
+            or moved.st_nlink != 1
+            or moved.st_uid != current_uid
+            or stat.S_IMODE(moved.st_mode) != 0o600
+            or actual != expected
+        ):
+            os.close(owned_descriptor)
+            owned_descriptor = -1
+            _restore_quarantined_file(path, parent_descriptor, quarantine_descriptor)
+            raise SetupError(f"refusing to remove changed or foreign resource: {path}")
+        os.unlink("owned", dir_fd=quarantine_descriptor)
+        if os.fstat(owned_descriptor).st_nlink != 0:
+            raise SetupError(f"owned resource deletion lost its verified inode: {path}")
+        os.close(owned_descriptor)
+        owned_descriptor = -1
+        os.fsync(parent_descriptor)
+    except SetupError:
+        raise
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError(f"owned resource could not be removed safely: {path}") from exc
+    finally:
+        if owned_descriptor >= 0:
+            os.close(owned_descriptor)
+        if quarantine_descriptor >= 0:
+            os.close(quarantine_descriptor)
+        if parent_descriptor >= 0:
+            with suppress(OSError):
+                os.rmdir(quarantine_name, dir_fd=parent_descriptor)
+            os.close(parent_descriptor)
 
 
-def _remove_exact_owned_file(path: Path, expected: bytes) -> None:
-    _verify_exact_owned_file(path, expected)
+def _restore_quarantined_file(
+    path: Path,
+    parent_descriptor: int,
+    quarantine_descriptor: int,
+) -> None:
+    try:
+        os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        os.rename(
+            "owned",
+            path.name,
+            src_dir_fd=quarantine_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+
+
+def _inspect_exact_owned_file(
+    path: Path,
+    expected: bytes,
+    *,
+    expected_parent_identity: DirectoryIdentity | None = None,
+    parent_private: bool = False,
+) -> tuple[os.stat_result, DirectoryIdentity] | None:
     if not path.exists() and not path.is_symlink():
-        return
-    path.unlink()
+        return None
+    descriptor = -1
+    parent_identity = expected_parent_identity or require_owned_directory_identity(path.parent)
+    if expected_parent_identity is not None:
+        try:
+            revalidate_directory_identity(parent_identity, private=parent_private)
+        except PrivatePathError as exc:
+            raise SetupError(f"owned resource parent changed: {path.parent}") from exc
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        metadata = os.fstat(descriptor)
+        require_no_acl_grants(descriptor)
+        actual = _read_owned_descriptor(descriptor, len(expected) + 1)
+        current = path.lstat()
+        revalidate_directory_identity(parent_identity, private=parent_private)
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError(f"owned resource could not be inspected: {path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != current_uid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or actual != expected
+        or (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
+    ):
+        raise SetupError(f"refusing to remove changed or foreign resource: {path}")
+    return metadata, parent_identity
+
+
+def _read_owned_descriptor(descriptor: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _read_optional_private_file(path: Path) -> bytes:
@@ -1255,6 +1542,7 @@ def _capture_hermes_profile_snapshot(
     spec: SetupSpec,
     profile: str,
     *,
+    profile_identity: DirectoryIdentity,
     config: bytes,
     environment: bytes,
     config_exists: bool,
@@ -1264,12 +1552,22 @@ def _capture_hermes_profile_snapshot(
     directory = ensure_private_directory(_hermes_snapshot_directory(spec, profile))
     metadata_path = directory / "metadata.json"
     if metadata_path.exists() or metadata_path.is_symlink():
-        if _read_hermes_profile_snapshot(spec, profile) is None:  # pragma: no cover
+        snapshot = _read_hermes_profile_snapshot(
+            spec,
+            profile,
+            profile_directory=profile_identity.path,
+        )
+        if snapshot is None:  # pragma: no cover
             raise SetupError("Hermes profile snapshot disappeared during validation")
+        if not snapshot[0].same_object(profile_identity):
+            raise SetupError("Hermes profile directory changed after its setup snapshot")
         return
     metadata = {
-        "format": 1,
+        "format": 2,
         "profile": profile,
+        "profile_device": profile_identity.device,
+        "profile_inode": profile_identity.inode,
+        "profile_owner_uid": profile_identity.owner_uid,
         "config_present": config_exists,
         "config_sha256": hashlib.sha256(config).hexdigest() if config_exists else None,
         "environment_present": environment_exists,
@@ -1289,23 +1587,44 @@ def _capture_hermes_profile_snapshot(
 def _read_hermes_profile_snapshot(
     spec: SetupSpec,
     profile: str,
-) -> tuple[bytes | None, bytes | None] | None:
+    *,
+    profile_directory: Path,
+) -> tuple[DirectoryIdentity, bytes | None, bytes | None] | None:
     directory = _hermes_snapshot_directory(spec, profile)
     metadata_path = directory / "metadata.json"
     if not metadata_path.exists() and not metadata_path.is_symlink():
         return None
     metadata = _read_owned_json(metadata_path)
-    if not isinstance(metadata, dict) or set(metadata) != {
+    common_keys = {
         "format",
         "profile",
         "config_present",
         "config_sha256",
         "environment_present",
         "environment_sha256",
-    }:
+    }
+    format_two_keys = common_keys | {
+        "profile_device",
+        "profile_inode",
+        "profile_owner_uid",
+    }
+    if not isinstance(metadata, dict) or metadata.get("profile") != profile:
         raise SetupError("Hermes profile snapshot metadata is invalid")
-    if metadata["format"] != 1 or metadata["profile"] != profile:
-        raise SetupError("Hermes profile snapshot metadata is invalid")
+    try:
+        if metadata.get("format") == 1 and set(metadata) == common_keys:
+            profile_identity = require_private_directory_identity(profile_directory)
+        elif metadata.get("format") == 2 and set(metadata) == format_two_keys:
+            profile_identity = DirectoryIdentity(
+                path=profile_directory,
+                device=int(metadata["profile_device"]),
+                inode=int(metadata["profile_inode"]),
+                owner_uid=int(metadata["profile_owner_uid"]),
+            )
+            revalidate_directory_identity(profile_identity, private=True)
+        else:
+            raise SetupError("Hermes profile snapshot metadata is invalid")
+    except (TypeError, ValueError, PrivatePathError) as exc:
+        raise SetupError("Hermes profile directory changed after its setup snapshot") from exc
 
     def snapshot_file(name: str, present_key: str, digest_key: str) -> bytes | None:
         path = directory / name
@@ -1323,6 +1642,7 @@ def _read_hermes_profile_snapshot(
         return encoded
 
     return (
+        profile_identity,
         snapshot_file("config.yaml", "config_present", "config_sha256"),
         snapshot_file("environment", "environment_present", "environment_sha256"),
     )
@@ -1336,10 +1656,14 @@ def _restore_hermes_profile_snapshot(
     token_name: str,
     setup_id: str,
 ) -> bool:
-    snapshot = _read_hermes_profile_snapshot(spec, profile)
+    snapshot = _read_hermes_profile_snapshot(
+        spec,
+        profile,
+        profile_directory=profile_directory,
+    )
     if snapshot is None:
         return False
-    original_config, original_environment = snapshot
+    profile_identity, original_config, original_environment = snapshot
     config_path = profile_directory / "config.yaml"
     env_path = profile_directory / ".env"
     current_config = _read_optional_private_file(config_path)
@@ -1370,9 +1694,20 @@ def _restore_hermes_profile_snapshot(
     def restore_file(path: Path, current: bytes, original: bytes | None) -> None:
         if original is None:
             if path.exists() or path.is_symlink():
-                _remove_exact_owned_file(path, current)
+                _remove_exact_owned_file(
+                    path,
+                    current,
+                    expected_parent_identity=profile_identity,
+                    parent_private=True,
+                )
             return
-        _replace_private_file(path, original, expected_content=current)
+        _replace_private_file(
+            path,
+            original,
+            expected_content=current,
+            expected_parent_identity=profile_identity,
+            require_present=True,
+        )
 
     restore_file(config_path, current_config, original_config)
     restore_file(env_path, current_environment, original_environment)
@@ -1563,6 +1898,21 @@ def _remove_hermes_config(
         token_name=token_name,
     ):
         raise SetupError("Hermes profile has a changed or foreign Signet MCP server")
+    owned_block = _owned_hermes_block_document(text, setup_id=setup_id)
+    if owned_block is not None:
+        indent, block_payload = owned_block
+        expected_document = (
+            {"mcp_servers": {_HERMES_SERVER_NAME: existing}}
+            if indent == ""
+            else {_HERMES_SERVER_NAME: existing}
+        )
+        expected_payload = yaml.safe_dump(
+            expected_document,
+            sort_keys=False,
+            allow_unicode=False,
+        )
+        if existing is None or block_payload != expected_payload:
+            raise SetupError("Hermes profile has changed or foreign content inside its marker")
     restored, removed = _remove_owned_block(
         text,
         label="hermes config",
@@ -1575,6 +1925,33 @@ def _remove_hermes_config(
     if isinstance(restored_servers, dict) and _HERMES_SERVER_NAME in restored_servers:
         raise SetupError("Hermes profile integration rollback was incomplete")
     return restored.encode("utf-8")
+
+
+def _owned_hermes_block_document(
+    text: str,
+    *,
+    setup_id: str,
+) -> tuple[str, str] | None:
+    _validate_owned_marker_metadata(text, label="hermes config", setup_id=setup_id)
+    for label in ("hermes config no-final-newline", "hermes config"):
+        pattern = re.compile(
+            rf"(?m)^(?P<indent> *)# signet setup {re.escape(setup_id)}: "
+            rf"{re.escape(label)} begin\n"
+        )
+        match = pattern.search(text)
+        if match is None:
+            continue
+        indent = match.group("indent")
+        end_marker = f"{indent}# signet setup {setup_id}: {label} end\n"
+        end = text.find(end_marker, match.end())
+        if end < 0:
+            raise SetupError("owned Hermes integration marker is incomplete")
+        lines = text[match.end() : end].splitlines(keepends=True)
+        if indent and any(line.strip() and not line.startswith(indent) for line in lines):
+            raise SetupError("Hermes profile has changed or foreign content inside its marker")
+        payload = "".join(line[len(indent) :] if line.strip() else line for line in lines)
+        return indent, payload
+    return None
 
 
 def _mapping_block_end(text: str, key_end: int) -> int:

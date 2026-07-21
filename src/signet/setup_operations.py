@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -19,7 +20,11 @@ from signet.backup import (
 )
 from signet.credential_broker import KeychainSecretStore, SecretReference
 from signet.db import Database
-from signet.private_paths import PrivatePathError, ensure_private_directory
+from signet.private_paths import (
+    PrivatePathError,
+    ensure_private_directory,
+    require_no_acl_grants,
+)
 from signet.production import create_production_assembly, load_production_config
 from signet.production_state import ProductionStateStore
 from signet.setup_platform import ProductionSetupPlatform
@@ -209,11 +214,29 @@ class SetupOperations:
             try:
                 recovery_directory.mkdir(mode=0o700, exist_ok=True)
                 ensure_private_directory(recovery_directory)
+                _fsync_directory(recovery_directory.parent)
             except (OSError, PrivatePathError) as exc:
                 raise SetupError("purge recovery directory is unavailable or unsafe") from exc
 
+            if journal.purge_backup is not None:
+                _require_purge_checkpoint_epoch(journal)
+                backup, recovery_receipt, backup_receipt = _verify_purge_checkpoint(
+                    journal.purge_backup,
+                    recovery_directory,
+                    setup_id=journal.setup_id,
+                )
+                resumed = engine.rollback(spec)
+                return {
+                    "purged": True,
+                    "removed": [record.name for record in reversed(resumed.steps)],
+                    "backup": str(backup),
+                    "backup_key_preserved": True,
+                    "backup_receipt": backup_receipt,
+                    "recovery_receipt": str(recovery_receipt),
+                }
+
             resume_quiesced_services = journal.status != "uninstalled"
-            engine.quiesce_services_for_purge(spec)
+            journal = engine.quiesce_services_for_purge(spec)
             try:
                 backup = self.backup(
                     recovery_directory
@@ -244,6 +267,14 @@ class SetupOperations:
                         ],
                     },
                 )
+                journal.purge_backup = _build_purge_checkpoint(
+                    recovery_directory,
+                    backup,
+                    recovery_receipt,
+                    backup_receipt,
+                    setup_id=journal.setup_id,
+                )
+                self.store.save(journal)
             except Exception as backup_exc:
                 if not resume_quiesced_services:
                     raise
@@ -283,6 +314,11 @@ class SetupOperations:
     def manage(self, action: str) -> dict[str, str]:
         if action not in {"start", "stop", "restart"}:
             raise SetupError("service action must be start, stop, or restart")
+        if action != "stop" and self.store.load().purge_backup is not None:
+            raise SetupError(
+                "a durable purge checkpoint exists; finish purge or rerun setup "
+                "before starting services"
+            )
         self.platform.manage_services(self.spec(), action)
         return self.platform.service_status(self.spec())
 
@@ -383,19 +419,172 @@ class SetupOperations:
         )
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
+def _fsync_directory(path: Path) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise SetupError(f"recovery directory parent could not be made durable: {path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _require_purge_checkpoint_epoch(journal: SetupJournal) -> None:
+    if (
+        journal.status not in {"failed", "rolling_back", "rollback_failed", "rolled_back"}
+        or journal.step("services").status != "rolled_back"
+    ):
+        raise SetupError("purge checkpoint is stale because managed writers are not quiesced")
+
+
+def _private_file_checkpoint(path: Path) -> dict[str, Any]:
+    descriptor = -1
     try:
         descriptor = os.open(
             path,
             os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         )
-        with os.fdopen(descriptor, "rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError as exc:
-        raise SetupError("backup artifact is unavailable for receipt verification") from exc
-    return digest.hexdigest()
+        before = os.fstat(descriptor)
+        require_no_acl_grants(descriptor)
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError("purge recovery checkpoint file is unavailable or unsafe") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != current_uid
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+    ):
+        raise SetupError("purge recovery checkpoint file changed during inspection")
+    return {
+        "path": str(path),
+        "sha256": digest.hexdigest(),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "owner_uid": before.st_uid,
+        "mode": stat.S_IMODE(before.st_mode),
+        "nlink": before.st_nlink,
+        "size": before.st_size,
+        "mtime_ns": before.st_mtime_ns,
+    }
+
+
+def _verify_private_file_checkpoint(document: Any, recovery_directory: Path) -> Path:
+    keys = {
+        "path",
+        "sha256",
+        "device",
+        "inode",
+        "owner_uid",
+        "mode",
+        "nlink",
+        "size",
+        "mtime_ns",
+    }
+    if not isinstance(document, dict) or set(document) != keys:
+        raise SetupError("purge recovery checkpoint is invalid")
+    path = Path(document["path"])
+    if not path.is_absolute() or path.parent != recovery_directory:
+        raise SetupError("purge recovery checkpoint path is invalid")
+    actual = _private_file_checkpoint(path)
+    if actual != document:
+        raise SetupError("purge recovery checkpoint file identity or digest changed")
+    return path
+
+
+def _file_sha256(path: Path) -> str:
+    return str(_private_file_checkpoint(path)["sha256"])
+
+
+def _build_purge_checkpoint(
+    recovery_directory: Path,
+    backup: Path,
+    recovery_receipt: Path,
+    backup_receipt: dict[str, Any],
+    *,
+    setup_id: str,
+) -> dict[str, Any]:
+    backup_file = _private_file_checkpoint(backup)
+    receipt_file = _private_file_checkpoint(recovery_receipt)
+    if (
+        backup_receipt.get("artifact_path") != str(backup)
+        or backup_receipt.get("artifact_sha256") != backup_file["sha256"]
+    ):
+        raise SetupError("purge recovery checkpoint does not match the verified backup")
+    return {
+        "version": 1,
+        "setup_id": setup_id,
+        "recovery_directory": str(recovery_directory),
+        "backup": backup_file,
+        "recovery_receipt": receipt_file,
+        "backup_receipt": dict(backup_receipt),
+    }
+
+
+def _verify_purge_checkpoint(
+    checkpoint: Any,
+    recovery_directory: Path,
+    *,
+    setup_id: str,
+) -> tuple[Path, Path, dict[str, Any]]:
+    if not isinstance(checkpoint, dict) or set(checkpoint) != {
+        "version",
+        "setup_id",
+        "recovery_directory",
+        "backup",
+        "recovery_receipt",
+        "backup_receipt",
+    }:
+        raise SetupError("purge recovery checkpoint is invalid")
+    if (
+        checkpoint["version"] != 1
+        or checkpoint["setup_id"] != setup_id
+        or checkpoint["recovery_directory"] != str(recovery_directory)
+    ):
+        raise SetupError("purge recovery checkpoint is invalid")
+    backup = _verify_private_file_checkpoint(checkpoint["backup"], recovery_directory)
+    receipt = _verify_private_file_checkpoint(checkpoint["recovery_receipt"], recovery_directory)
+    backup_receipt = checkpoint["backup_receipt"]
+    if not isinstance(backup_receipt, dict) or (
+        backup_receipt.get("artifact_path") != str(backup)
+        or backup_receipt.get("artifact_sha256") != checkpoint["backup"]["sha256"]
+    ):
+        raise SetupError("purge recovery checkpoint receipt is invalid")
+    try:
+        receipt_document = json.loads(receipt.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SetupError("purge recovery checkpoint receipt is invalid") from exc
+    expected_key_accounts = [
+        f"{setup_id}-{purpose}" for purpose in ("capability", "payload", "attachment", "backup")
+    ]
+    if (
+        not isinstance(receipt_document, dict)
+        or receipt_document.get("setup_id") != setup_id
+        or receipt_document.get("backup_path") != str(backup)
+        or receipt_document.get("backup_sha256") != checkpoint["backup"]["sha256"]
+        or receipt_document.get("required_key_accounts") != expected_key_accounts
+    ):
+        raise SetupError("purge recovery checkpoint receipt is invalid")
+    return backup, receipt, dict(backup_receipt)
 
 
 def _write_private_json(path: Path, document: dict[str, Any]) -> None:

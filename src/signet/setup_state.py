@@ -165,6 +165,7 @@ class SetupJournal:
     spec_digest: str
     status: JournalStatus
     steps: list[SetupStepRecord]
+    purge_backup: dict[str, Any] | None = None
 
     def step(self, name: str) -> SetupStepRecord:
         for step in self.steps:
@@ -180,6 +181,7 @@ class SetupJournal:
             "spec_digest": self.spec_digest,
             "status": self.status,
             "steps": [step.document() for step in self.steps],
+            "purge_backup": self.purge_backup,
         }
 
 
@@ -275,6 +277,11 @@ class SetupJournalStore:
                 spec_digest=str(document["spec_digest"]),
                 status=cast(JournalStatus, document["status"]),
                 steps=steps,
+                purge_backup=(
+                    dict(document["purge_backup"])
+                    if document.get("purge_backup") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError):
             raise SetupError("setup journal is invalid") from None
@@ -409,6 +416,9 @@ class SetupEngine:
             steps=[SetupStepRecord(name=name) for name in SETUP_STEPS],
         )
         self._require_spec(journal, spec)
+        if journal.purge_backup is not None:
+            journal.purge_backup = None
+            self.store.save(journal)
         if journal.status == "completed":
             try:
                 self.platform.apply("owner_bootstrap", spec, journal.setup_id)

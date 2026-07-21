@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -11,18 +12,20 @@ from typing import Any
 
 import pytest
 
+import signet.setup_operations as setup_operations
 import signet.setup_platform as setup_platform
 from signet.browser_auth import BootstrapService
 from signet.config import ProductionConfig, production_instance_identity
 from signet.credential_broker import KeychainSecretStore
 from signet.db import Database
-from signet.private_paths import ensure_private_directory
+from signet.private_paths import ensure_private_directory, require_private_directory_identity
 from signet.production import create_production_assembly, load_production_config
 from signet.setup_operations import SetupOperations
 from signet.setup_platform import (
     ProductionSetupPlatform,
     _merge_hermes_config,
     _merge_profile_environment,
+    _remove_exact_owned_file,
     _remove_hermes_config,
     _remove_profile_environment,
     _replace_private_file,
@@ -518,6 +521,61 @@ def test_purge_preserves_every_key_needed_to_recover_an_encrypted_backup(
     }
 
 
+def test_setup_resume_durably_invalidates_a_prior_purge_checkpoint(tmp_path: Path) -> None:
+    selected = spec(tmp_path / "signet")
+    store = SetupJournalStore(selected.root)
+    engine = SetupEngine(store, FakePlatform())
+    journal = engine.apply(selected)
+    journal.purge_backup = {"stale": True}
+    store.save(journal)
+
+    resumed = engine.apply(selected)
+
+    assert resumed.purge_backup is None
+    assert store.load().purge_backup is None
+
+
+def test_service_start_refuses_to_cross_a_purge_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    store = SetupJournalStore(selected.root)
+    journal = SetupEngine(store, FakePlatform()).apply(selected)
+    journal.purge_backup = {"version": 1}
+    store.save(journal)
+    operations = SetupOperations(selected.root, platform=FakePlatform())
+    monkeypatch.setattr(operations, "spec", lambda: selected)
+
+    with pytest.raises(SetupError, match="purge checkpoint"):
+        operations.manage("start")
+
+
+def test_purge_durably_publishes_the_recovery_directory_before_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    SetupEngine(SetupJournalStore(selected.root), platform).apply(selected)
+    operations = SetupOperations(selected.root, platform=platform)
+    events: list[str] = []
+    monkeypatch.setattr(operations, "spec", lambda: selected)
+    monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
+    monkeypatch.setattr(setup_operations, "_fsync_directory", lambda path: events.append("fsync"))
+
+    def backup(destination: Path | None = None) -> Path:
+        assert destination is not None
+        events.append("backup")
+        raise SetupError("stop after durability assertion")
+
+    monkeypatch.setattr(operations, "backup", backup)
+    with pytest.raises(SetupError, match="stop after durability assertion"):
+        operations.uninstall(purge=True)
+
+    assert events[:2] == ["fsync", "backup"]
+
+
 def test_completed_setup_rejects_changed_identity_or_origin(tmp_path: Path) -> None:
     selected = spec(tmp_path / "signet")
     engine = SetupEngine(SetupJournalStore(selected.root), FakePlatform())
@@ -684,6 +742,59 @@ def test_failed_purge_reports_backup_and_service_resume_failures(
     assert "backup publication is unknown" in message
     assert "inspect the destination before retrying" in message
     assert "managed services could not be resumed" in message
+
+
+@pytest.mark.parametrize("tamper", (False, True))
+def test_purge_retry_reuses_only_a_verified_durable_backup_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: bool,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    store = SetupJournalStore(selected.root)
+    SetupEngine(store, platform).apply(selected)
+    platform.rollback_failure = "database"
+    backup_calls = 0
+
+    def backup(destination: Path | None = None) -> Path:
+        nonlocal backup_calls
+        assert destination is not None
+        backup_calls += 1
+        destination.parent.mkdir(mode=0o700, exist_ok=True)
+        destination.write_bytes(f"backup-{backup_calls}".encode())
+        destination.chmod(0o600)
+        return destination
+
+    operations = SetupOperations(selected.root, platform=platform)
+    monkeypatch.setattr(operations, "backup", backup)
+    monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
+    monkeypatch.setattr(
+        operations,
+        "_verified_backup_receipt",
+        lambda bundle: {
+            "artifact_path": str(bundle),
+            "artifact_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "source_schema_version": 19,
+            "verified_restore_schema_version": 19,
+        },
+    )
+    with pytest.raises(SetupError, match="database"):
+        operations.uninstall(purge=True)
+
+    checkpoint = store.load().purge_backup
+    assert checkpoint is not None
+    backup_path = Path(checkpoint["backup"]["path"])
+    platform.rollback_failure = None
+    if tamper:
+        backup_path.write_bytes(b"tampered")
+        backup_path.chmod(0o600)
+        with pytest.raises(SetupError, match="purge recovery checkpoint"):
+            operations.uninstall(purge=True)
+    else:
+        result = operations.uninstall(purge=True)
+        assert result["backup"] == str(backup_path)
+    assert backup_calls == 1
 
 
 def test_preserving_uninstall_is_checkpointed_and_setup_can_reinstall_integrations(
@@ -1313,6 +1424,103 @@ def test_private_replacement_revalidates_the_caller_snapshot(
     assert path.read_bytes() == b"concurrent edit"
 
 
+def test_private_replacement_rechecks_an_expected_empty_file_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = ensure_private_directory(tmp_path / "private-empty-race")
+    path = root / "config.yaml"
+    path.write_bytes(b"")
+    path.chmod(0o600)
+    real_fsync = setup_platform.os.fsync
+    raced = False
+
+    def race_fsync(descriptor: int) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            path.unlink()
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(setup_platform.os, "fsync", race_fsync)
+    with pytest.raises(SetupError, match="changed or is ambiguous"):
+        _replace_private_file(
+            path,
+            b"replacement",
+            expected_content=b"",
+            require_present=True,
+        )
+
+    assert raced is True
+    assert not path.exists()
+
+
+def test_private_replacement_rejects_a_replaced_parent_directory(tmp_path: Path) -> None:
+    root = ensure_private_directory(tmp_path / "profile")
+    identity = require_private_directory_identity(root)
+    moved = root.with_name("original-profile")
+    root.rename(moved)
+    ensure_private_directory(root)
+
+    with pytest.raises(SetupError, match="parent"):
+        _replace_private_file(
+            root / "config.yaml",
+            b"managed",
+            require_absent=True,
+            expected_parent_identity=identity,
+        )
+    assert not (root / "config.yaml").exists()
+
+
+def test_owned_file_removal_rejects_changed_permissions(tmp_path: Path) -> None:
+    root = ensure_private_directory(tmp_path / "private-removal")
+    path = root / "owned.service"
+    path.write_bytes(b"managed unit")
+    path.chmod(0o644)
+
+    with pytest.raises(SetupError, match="changed or foreign"):
+        _remove_exact_owned_file(path, b"managed unit")
+    assert path.read_bytes() == b"managed unit"
+
+
+def test_owned_file_removal_quarantines_an_inode_swap_without_deleting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = ensure_private_directory(tmp_path / "private-removal-race")
+    path = root / "owned.service"
+    foreign = root / "foreign.service"
+    saved = root / "saved-owned.service"
+    for selected, content in ((path, b"managed unit"), (foreign, b"foreign unit")):
+        selected.write_bytes(content)
+        selected.chmod(0o600)
+    real_rename = os.rename
+    raced = False
+
+    def race_rename(src: str, dst: str, **kwargs: Any) -> None:
+        nonlocal raced
+        if src == path.name and dst == "owned" and not raced:
+            raced = True
+            parent_descriptor = kwargs["src_dir_fd"]
+            real_rename(
+                path.name, saved.name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor
+            )
+            real_rename(
+                foreign.name,
+                path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+        real_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr(setup_platform.os, "rename", race_rename)
+    with pytest.raises(SetupError, match="changed or foreign"):
+        _remove_exact_owned_file(path, b"managed unit")
+
+    assert path.read_bytes() == b"foreign unit"
+    assert saved.read_bytes() == b"managed unit"
+
+
 def test_enabled_owned_hermes_entry_remains_uninstallable() -> None:
     setup_id = "setup_0123456789abcdef"
     original = b"model: test/model\n"
@@ -1328,6 +1536,42 @@ def test_enabled_owned_hermes_entry_remains_uninstallable() -> None:
         )
         == original
     )
+
+
+def test_hermes_rollback_rejects_unrelated_entries_inside_owned_marker() -> None:
+    setup_id = "setup_0123456789abcdef"
+    token_name = "SIGNET_MCP_CALLER_TOKEN_WORK"
+    merged = _merge_hermes_config(b"", token_name=token_name, setup_id=setup_id)
+    end_marker = f"# signet setup {setup_id}: hermes config end\n".encode()
+    changed = merged.replace(
+        end_marker,
+        b"  unrelated:\n    command: unrelated-server\n" + end_marker,
+    )
+
+    with pytest.raises(SetupError, match="changed or foreign"):
+        _remove_hermes_config(
+            changed,
+            token_name=token_name,
+            setup_id=setup_id,
+        )
+
+
+def test_hermes_rollback_rejects_comments_added_inside_the_owned_marker() -> None:
+    setup_id = "setup_0123456789abcdef"
+    token_name = "SIGNET_MCP_CALLER_TOKEN_WORK"
+    merged = _merge_hermes_config(b"", token_name=token_name, setup_id=setup_id)
+    changed = merged.replace(
+        b"    timeout: 120\n",
+        b"    # keep this foreign comment\n    timeout: 120\n",
+        1,
+    )
+
+    with pytest.raises(SetupError, match="changed or foreign"):
+        _remove_hermes_config(
+            changed,
+            token_name=token_name,
+            setup_id=setup_id,
+        )
 
 
 def test_hermes_edits_are_exactly_reversible_and_reject_foreign_adoption() -> None:
@@ -1402,6 +1646,97 @@ def test_hermes_config_rejects_ambiguous_or_malformed_ownership_markers(
         )
 
 
+def test_format_one_hermes_profile_snapshots_remain_readable(tmp_path: Path) -> None:
+    selected = replace(spec(tmp_path / "legacy-profile-snapshot"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    config = profile / "config.yaml"
+    environment = profile / ".env"
+    config.write_bytes(b"model: legacy\n")
+    environment.write_bytes(b"LEGACY=kept\n")
+    config.chmod(0o600)
+    environment.chmod(0o600)
+    identity = require_private_directory_identity(profile)
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=identity,
+        config=config.read_bytes(),
+        environment=environment.read_bytes(),
+        config_exists=True,
+        environment_exists=True,
+    )
+    snapshot_directory = setup_platform._hermes_snapshot_directory(selected, "work")
+    metadata_path = snapshot_directory / "metadata.json"
+    format_two = metadata_path.read_bytes()
+    metadata = json.loads(format_two)
+    for key in ("profile_device", "profile_inode", "profile_owner_uid"):
+        metadata.pop(key)
+    metadata["format"] = 1
+    _replace_private_file(
+        metadata_path,
+        setup_platform._canonical_json_bytes(metadata),
+        expected_content=format_two,
+        require_present=True,
+    )
+
+    snapshot = setup_platform._read_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_directory=profile,
+    )
+
+    assert snapshot is not None
+    assert snapshot[0].same_object(identity)
+    assert snapshot[1:] == (b"model: legacy\n", b"LEGACY=kept\n")
+
+
+def test_absent_hermes_rollback_files_stay_bound_to_the_snapshotted_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(spec(tmp_path / "absent-profile-snapshot"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    identity = require_private_directory_identity(profile)
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=identity,
+        config=b"",
+        environment=b"",
+        config_exists=False,
+        environment_exists=False,
+    )
+    real_read = setup_platform._read_optional_private_file
+    reads = 0
+
+    def swap_after_reads(path: Path) -> bytes:
+        nonlocal reads
+        content = real_read(path)
+        if path.parent == profile:
+            reads += 1
+            if reads == 2:
+                profile.rename(profile.with_name("work-original"))
+                ensure_private_directory(profile)
+                for name in ("config.yaml", ".env"):
+                    foreign = profile / name
+                    foreign.write_bytes(b"")
+                    foreign.chmod(0o600)
+        return content
+
+    monkeypatch.setattr(setup_platform, "_read_optional_private_file", swap_after_reads)
+    with pytest.raises(SetupError, match="parent|directory changed"):
+        setup_platform._restore_hermes_profile_snapshot(
+            selected,
+            "work",
+            profile_directory=profile,
+            token_name="SIGNET_MCP_CALLER_TOKEN_WORK",
+            setup_id="setup_0123456789abcdef",
+        )
+
+    assert (profile / "config.yaml").exists()
+    assert (profile / ".env").exists()
+
+
 def test_hermes_profile_edits_are_transactional_across_profiles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1466,6 +1801,54 @@ def test_hermes_profile_edits_are_transactional_across_profiles(
 
     assert all(path.read_bytes() == content for path, content in originals.items())
     assert not (selected.root / "services" / "hermes-profile-snapshots").exists()
+
+
+def test_hermes_apply_rejects_a_profile_directory_swap_after_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_home = tmp_path / "profiles"
+    profile_dir = ensure_private_directory(profile_home / "work")
+    for name, content in (("config.yaml", b"model: test/work\n"), (".env", b"OLD=kept\n")):
+        path = profile_dir / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+
+    class Issued:
+        token = "sgt_0000000000000001." + "x" * 43
+
+    class Registry:
+        def issue(self, namespace: str, aliases: set[str]) -> Issued:
+            del namespace, aliases
+            return Issued()
+
+        def revoke(self, token_id: str) -> None:
+            del token_id
+
+    class Assembly:
+        token_registry = Registry()
+
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *a, **k: Assembly())
+    selected = replace(spec(tmp_path / "profile-swap"), hermes_profiles=("work",))
+    platform = ProductionSetupPlatform(hermes_home=profile_home)
+    platform._apply_private_paths(selected, "setup_0123456789abcdef")
+    real_capture = setup_platform._capture_hermes_profile_snapshot
+
+    def swap_after_snapshot(*args: Any, **kwargs: Any) -> None:
+        real_capture(*args, **kwargs)
+        profile_dir.rename(profile_dir.with_name("work-original"))
+        ensure_private_directory(profile_dir)
+        for name, content in (("config.yaml", b"model: foreign\n"), (".env", b"FOREIGN=kept\n")):
+            path = profile_dir / name
+            path.write_bytes(content)
+            path.chmod(0o600)
+
+    monkeypatch.setattr(setup_platform, "_capture_hermes_profile_snapshot", swap_after_snapshot)
+    with pytest.raises(SetupError, match="rollback after an edit failure failed"):
+        platform._apply_hermes_profiles(selected, "setup_0123456789abcdef")
+
+    assert (profile_dir / "config.yaml").read_bytes() == b"model: foreign\n"
+    assert (profile_dir / ".env").read_bytes() == b"FOREIGN=kept\n"
 
 
 def test_tailnet_rollback_rejects_the_right_target_on_the_wrong_port(
