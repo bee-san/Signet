@@ -171,6 +171,33 @@ def test_setup_origin_uses_the_same_canonical_ipv6_serialization_as_production(
         replace(selected, public_origin="https://bücher.example")
 
 
+@pytest.mark.parametrize(
+    ("origin", "host"),
+    (
+        ("https://example.com:0", "example.com"),
+        ("https://example.com:65536", "example.com"),
+        ("https://example.com.", "example.com."),
+    ),
+)
+def test_setup_and_production_reject_the_same_invalid_origins(
+    tmp_path: Path,
+    origin: str,
+    host: str,
+) -> None:
+    with pytest.raises(ValueError):
+        replace(spec(tmp_path / "setup"), public_origin=origin)
+
+    rendered = render_production_config(
+        spec(tmp_path / "production"),
+        setup_id="setup_0123456789abcdef",
+    )
+    rendered["public_origin"] = origin
+    rendered["rp_id"] = host
+    rendered["allowed_hosts"] = [host]
+    with pytest.raises(ValueError):
+        ProductionConfig.model_validate(rendered)
+
+
 def test_apply_records_failure_and_resumes_without_repeating_completed_steps(
     tmp_path: Path,
 ) -> None:

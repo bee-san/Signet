@@ -13,9 +13,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
-from urllib.parse import urlsplit
 
 from signet.auth import canonical_user_id
+from signet.config import validate_public_origin
 from signet.private_paths import PrivatePathError, ensure_private_directory
 
 SETUP_STEPS = (
@@ -72,34 +72,10 @@ class SetupSpec:
             raise ValueError("Signet executable must be an absolute lexical path")
         if canonical_user_id(self.owner_user_id) != self.owner_user_id:
             raise ValueError("setup owner must be a canonical user ID")
-        parsed = urlsplit(self.public_origin)
         try:
-            port = parsed.port
-        except ValueError:
-            raise ValueError("setup origin must be one canonical HTTPS origin") from None
-        try:
-            hostname = (
-                parsed.hostname.encode("idna").decode("ascii").lower()
-                if parsed.hostname is not None
-                else None
-            )
-        except UnicodeError:
-            raise ValueError("setup origin must be one canonical HTTPS origin") from None
-        authority = f"[{hostname}]" if hostname is not None and ":" in hostname else hostname
-        canonical = f"https://{authority}" if authority else ""
-        if port not in (None, 443):
-            canonical += f":{port}"
-        if (
-            parsed.scheme != "https"
-            or hostname is None
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-            or self.public_origin != canonical
-        ):
-            raise ValueError("setup origin must be one canonical HTTPS origin")
+            validate_public_origin(self.public_origin)
+        except ValueError as exc:
+            raise ValueError("setup origin must be one canonical HTTPS origin") from exc
         if (
             not self.hermes_profiles
             or len(self.hermes_profiles) != len(set(self.hermes_profiles))

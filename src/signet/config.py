@@ -50,6 +50,45 @@ def is_valid_allowed_host(host: str) -> bool:
     return True
 
 
+def validate_public_origin(value: str) -> str:
+    """Validate one canonical HTTPS origin and its allowed-host representation."""
+
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("public_origin must use canonical HTTPS serialization") from None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or value.endswith("/")
+    ):
+        raise ValueError("public_origin must be an HTTPS origin without a trailing slash")
+    try:
+        if ":" in parsed.hostname:
+            hostname = ipaddress.IPv6Address(parsed.hostname).compressed
+        else:
+            hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        raise ValueError("public_origin hostname is invalid") from None
+    if not is_valid_allowed_host(hostname):
+        raise ValueError("public_origin hostname is not a valid allowed host")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("public_origin port is invalid")
+    authority = f"[{hostname}]" if ":" in hostname else hostname
+    canonical = f"https://{authority}"
+    if port is not None and port != 443:
+        canonical = f"{canonical}:{port}"
+    if value != canonical:
+        raise ValueError("public_origin must use canonical HTTPS serialization")
+    return value
+
+
 class DownstreamConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -438,35 +477,7 @@ class ProductionConfig(BaseModel):
     @field_validator("public_origin")
     @classmethod
     def origin_requires_https(cls, value: str) -> str:
-        parsed = urlsplit(value)
-        try:
-            port = parsed.port
-        except ValueError:
-            raise ValueError("public_origin must use canonical HTTPS serialization") from None
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-            or value.endswith("/")
-        ):
-            raise ValueError("public_origin must be an HTTPS origin without a trailing slash")
-        try:
-            hostname = parsed.hostname.encode("idna").decode("ascii").lower()
-        except UnicodeError:
-            raise ValueError("public_origin hostname is invalid") from None
-        if port is not None and not 1 <= port <= 65535:
-            raise ValueError("public_origin port is invalid")
-        authority = f"[{hostname}]" if ":" in hostname else hostname
-        canonical = f"https://{authority}"
-        if port is not None and port != 443:
-            canonical = f"{canonical}:{port}"
-        if value != canonical:
-            raise ValueError("public_origin must use canonical HTTPS serialization")
-        return value
+        return validate_public_origin(value)
 
     @field_validator("mcp_host", "web_host")
     @classmethod

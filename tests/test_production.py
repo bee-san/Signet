@@ -225,6 +225,82 @@ def test_production_config_digest_migrates_only_the_empty_caller_principal_prede
         )
 
 
+def test_production_config_digest_composes_empty_callers_with_legacy_predecessor(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor.pop("caller_principals")
+    predecessor["storage"].pop("attachment_staging_dir")
+    predecessor["storage"].pop("attachment_source_roots")
+    predecessor["secrets"].pop("attachment_key_ref")
+    predecessor["capabilities"]["live_providers_ready"] = False
+    predecessor.pop("provider_rollout")
+    for connector in predecessor["connectors"].values():
+        connector.pop("server_identity_digest")
+        connector.pop("tls_server_certificate")
+        connector.pop("tls_server_certificate_sha256")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+
+    migrated = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+
+    with migrated.database.read() as connection:
+        assert {
+            row["config_digest"]
+            for row in connection.execute(
+                "SELECT config_digest FROM production_services"
+            ).fetchall()
+        } == {production_config_digest(config)}
+
+
+def test_config_digest_migration_never_erases_a_divergent_service_digest(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor.pop("caller_principals")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            ("0" * 64,),
+        )
+
+    with pytest.raises(ProductionAssemblyError, match="service config has diverged"):
+        build_production_runtime(
+            config,
+            secret_store=_secret_store(),
+            components=frozenset(),
+        )
+
+
 def _provider_credential_identity(
     *,
     reference: str,

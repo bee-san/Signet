@@ -127,12 +127,32 @@ class ProductionStateStore:
                                 config,
                                 rollout_state=opposite_rollout,
                             ),
+                            _legacy_production_config_digest(
+                                config,
+                                without_caller_principals=True,
+                            ),
+                            _pre_identity_hardening_production_config_digest(
+                                config,
+                                without_caller_principals=True,
+                            ),
+                            _rollout_preparation_base_digest(
+                                config,
+                                without_caller_principals=True,
+                            ),
                         }
                     )
                 if setup["config_digest"] not in compatible_digests:
                     raise ProductionStateError(
                         "staged production config differs from durable state"
                     )
+                service_digest_rows = connection.execute(
+                    "SELECT DISTINCT config_digest FROM production_services"
+                ).fetchall()
+                if (
+                    len(service_digest_rows) != 1
+                    or service_digest_rows[0]["config_digest"] != setup["config_digest"]
+                ):
+                    raise ProductionStateError("durable production service config has diverged")
                 config_changed = True
                 connection.execute(
                     """
@@ -147,8 +167,9 @@ class ProductionStateStore:
                     """
                     UPDATE production_services
                     SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                    WHERE config_digest = ?
                     """,
-                    (config_digest, now),
+                    (config_digest, now, setup["config_digest"]),
                 )
 
             owners = connection.execute("SELECT user_id FROM production_users").fetchall()
@@ -791,10 +812,16 @@ def _pre_caller_principals_production_config_digest(
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
 
-def _pre_identity_hardening_production_config_digest(config: ProductionConfig) -> str:
+def _pre_identity_hardening_production_config_digest(
+    config: ProductionConfig,
+    *,
+    without_caller_principals: bool = False,
+) -> str:
     """Reconstruct the immediately preceding provider-config document shape."""
 
     document = config.model_dump(mode="json")
+    if without_caller_principals:
+        document.pop("caller_principals")
     for connector in document["connectors"].values():
         connector.pop("tls_server_certificate", None)
         connector.pop("tls_server_certificate_sha256", None)
@@ -811,10 +838,16 @@ def _pre_identity_hardening_connector_config_digest(document: dict[str, Any]) ->
     return hashlib.sha256(canonical_json(predecessor)).hexdigest()
 
 
-def _legacy_production_config_digest(config: ProductionConfig) -> str:
+def _legacy_production_config_digest(
+    config: ProductionConfig,
+    *,
+    without_caller_principals: bool = False,
+) -> str:
     """Reconstruct the pre-SP17 digest while allowing only new rollout fields to change."""
 
     document = config.model_dump(mode="json")
+    if without_caller_principals:
+        document.pop("caller_principals")
     document["storage"].pop("attachment_staging_dir", None)
     document["storage"].pop("attachment_source_roots", None)
     document["secrets"].pop("attachment_key_ref", None)
@@ -835,10 +868,16 @@ def _legacy_connector_config_digest(document: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(legacy)).hexdigest()
 
 
-def _rollout_preparation_base_digest(config: ProductionConfig) -> str:
+def _rollout_preparation_base_digest(
+    config: ProductionConfig,
+    *,
+    without_caller_principals: bool = False,
+) -> str:
     """Reconstruct the disabled digest emitted before rollout prerequisites were staged."""
 
     document = config.model_dump(mode="json")
+    if without_caller_principals:
+        document.pop("caller_principals")
     document["storage"]["attachment_staging_dir"] = None
     document["storage"]["attachment_source_roots"] = []
     document["secrets"]["attachment_key_ref"] = None
