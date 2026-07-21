@@ -457,6 +457,62 @@ class SetupEngine:
         self.store.save(journal)
         return journal
 
+    def quiesce_services_for_purge(self, spec: SetupSpec) -> SetupJournal:
+        """Durably stop managed writers while keeping ordinary setup resume possible."""
+
+        journal = self.store.load()
+        self._require_spec(journal, spec)
+        record = journal.step("services")
+        if journal.status == "uninstalled" and record.status == "rolled_back":
+            return journal
+        other_steps_completed = all(
+            candidate.status == "completed"
+            for candidate in journal.steps
+            if candidate.name != "services"
+        )
+        starting = (
+            journal.status == "completed" and record.status == "completed" and other_steps_completed
+        )
+        retrying = (
+            journal.status == "failed"
+            and record.status
+            in {"applying", "failed", "rolling_back", "rollback_failed", "rolled_back"}
+            and other_steps_completed
+        )
+        if not starting and not retrying:
+            raise SetupError("purge quiesce requires one completed service setup")
+        if record.status == "rolled_back":
+            return journal
+
+        previous_status = journal.status
+        previous_record_status = record.status
+        previous_error_kind = record.error_kind
+        record.status = "rolling_back"
+        record.attempts += 1
+        record.error_kind = None
+        journal.status = "failed"
+        try:
+            self.store.save(journal)
+        except Exception as exc:
+            journal.status = previous_status
+            record.status = previous_record_status
+            record.error_kind = previous_error_kind
+            record.attempts -= 1
+            raise SetupError("could not durably begin purge quiesce") from exc
+
+        try:
+            self.platform.rollback("services", spec, journal.setup_id)
+        except Exception as exc:
+            record.status = "rollback_failed"
+            record.error_kind = type(exc).__name__
+            self.store.save(journal)
+            raise SetupError("managed services could not be quiesced for purge") from exc
+
+        record.status = "rolled_back"
+        record.error_kind = None
+        self.store.save(journal)
+        return journal
+
     def rollback(self, spec: SetupSpec) -> SetupJournal:
         return self.rollback_steps(
             spec,

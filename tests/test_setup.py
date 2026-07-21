@@ -230,6 +230,52 @@ def test_completed_setup_surfaces_owner_reconciliation_failure_without_reopening
     assert all(step.status == "completed" for step in journal.steps)
 
 
+def test_purge_quiesce_is_durable_and_normal_apply_restarts_only_services(
+    tmp_path: Path,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    store = SetupJournalStore(selected.root)
+    engine = SetupEngine(store, platform)
+    engine.apply(selected)
+    platform.applied.clear()
+
+    quiesced = engine.quiesce_services_for_purge(selected)
+    assert quiesced.status == "failed"
+    assert quiesced.step("services").status == "rolled_back"
+    assert platform.rolled_back == ["services"]
+
+    resumed = engine.apply(selected)
+    assert resumed.status == "completed"
+    assert platform.applied == ["services"]
+
+
+@pytest.mark.parametrize(
+    "interrupted_status",
+    ("rolling_back", "rollback_failed", "applying", "failed"),
+)
+def test_interrupted_purge_quiesce_retries_the_service_rollback(
+    tmp_path: Path,
+    interrupted_status: str,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    store = SetupJournalStore(selected.root)
+    engine = SetupEngine(store, platform)
+    engine.apply(selected)
+    journal = store.load()
+    journal.status = "failed"
+    journal.step("services").status = interrupted_status  # type: ignore[assignment]
+    store.save(journal)
+    platform.rolled_back.clear()
+
+    quiesced = engine.quiesce_services_for_purge(selected)
+
+    assert quiesced.status == "failed"
+    assert quiesced.step("services").status == "rolled_back"
+    assert platform.rolled_back == ["services"]
+
+
 def test_apply_records_failure_and_resumes_without_repeating_completed_steps(
     tmp_path: Path,
 ) -> None:
@@ -487,7 +533,7 @@ def test_completed_setup_rejects_changed_identity_or_origin(tmp_path: Path) -> N
         engine.apply(changed)
 
 
-def test_purge_uninstall_creates_backup_before_removing_any_resource(
+def test_purge_uninstall_quiesces_services_before_the_external_backup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -518,6 +564,7 @@ def test_purge_uninstall_creates_backup_before_removing_any_resource(
         return destination
 
     monkeypatch.setattr(operations, "backup", backup)
+    monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
     monkeypatch.setattr(
         operations,
         "_verified_backup_receipt",
@@ -541,7 +588,100 @@ def test_purge_uninstall_creates_backup_before_removing_any_resource(
         f"{setup_journal.setup_id}-{purpose}"
         for purpose in ("capability", "payload", "attachment", "backup")
     }
-    assert events[0] == "backup"
+    assert events.index("rollback:services") < events.index("backup")
+    assert events.count("rollback:services") == 1
+
+
+def test_purge_rejects_missing_recovery_secret_before_quiescing_services(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    SetupEngine(SetupJournalStore(selected.root), platform).apply(selected)
+    monkeypatch.setattr(setup_platform.keyring, "get_password", lambda service, account: None)
+
+    with pytest.raises(SetupError, match="recovery secret"):
+        SetupOperations(selected.root, platform=platform).uninstall(purge=True)
+
+    assert platform.rolled_back == []
+
+
+def test_failed_purge_backup_resumes_quiesced_services(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    store = SetupJournalStore(selected.root)
+    SetupEngine(store, platform).apply(selected)
+    operations = SetupOperations(selected.root, platform=platform)
+    monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
+    monkeypatch.setattr(
+        operations,
+        "backup",
+        lambda destination=None: (_ for _ in ()).throw(SetupError("backup failed")),
+    )
+
+    with pytest.raises(SetupError, match="backup failed"):
+        operations.uninstall(purge=True)
+
+    assert store.load().status == "completed"
+    assert store.load().step("services").status == "completed"
+    assert platform.rolled_back == ["services"]
+    assert platform.applied.count("services") == 2
+
+
+def test_failed_purge_after_preserving_uninstall_does_not_reinstall_integrations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    store = SetupJournalStore(selected.root)
+    SetupEngine(store, platform).apply(selected)
+    operations = SetupOperations(selected.root, platform=platform)
+    operations.uninstall()
+    applied_before_purge = list(platform.applied)
+    monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
+    monkeypatch.setattr(
+        operations,
+        "backup",
+        lambda destination=None: (_ for _ in ()).throw(SetupError("backup failed")),
+    )
+
+    with pytest.raises(SetupError, match="backup failed"):
+        operations.uninstall(purge=True)
+
+    assert store.load().status == "uninstalled"
+    assert platform.applied == applied_before_purge
+
+
+def test_failed_purge_reports_backup_and_service_resume_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet")
+    platform = FakePlatform()
+    SetupEngine(SetupJournalStore(selected.root), platform).apply(selected)
+    platform.fail_once = "services"
+    operations = SetupOperations(selected.root, platform=platform)
+    monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
+    monkeypatch.setattr(
+        operations,
+        "backup",
+        lambda destination=None: (_ for _ in ()).throw(
+            SetupError("backup publication is unknown; inspect the destination before retrying")
+        ),
+    )
+
+    with pytest.raises(SetupError) as caught:
+        operations.uninstall(purge=True)
+
+    message = str(caught.value)
+    assert "backup publication is unknown" in message
+    assert "inspect the destination before retrying" in message
+    assert "managed services could not be resumed" in message
 
 
 def test_preserving_uninstall_is_checkpointed_and_setup_can_reinstall_integrations(

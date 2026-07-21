@@ -198,48 +198,63 @@ class SetupOperations:
 
     def uninstall(self, *, purge: bool = False) -> dict[str, Any]:
         spec = self.spec()
+        engine = SetupEngine(self.store, self.platform)
         backup: Path | None = None
         backup_receipt: dict[str, Any] | None = None
         recovery_receipt: Path | None = None
         if purge:
             journal = self.store.load()
+            self._require_recovery_secrets(journal)
             recovery_directory = self.root.parent / f"{self.root.name}-recovery"
             try:
                 recovery_directory.mkdir(mode=0o700, exist_ok=True)
                 ensure_private_directory(recovery_directory)
             except (OSError, PrivatePathError) as exc:
                 raise SetupError("purge recovery directory is unavailable or unsafe") from exc
-            backup = self.backup(
-                recovery_directory
-                / (
-                    time.strftime("purge-%Y%m%dT%H%M%SZ-", time.gmtime())
-                    + secrets.token_hex(4)
-                    + ".signet-backup"
+
+            resume_quiesced_services = journal.status != "uninstalled"
+            engine.quiesce_services_for_purge(spec)
+            try:
+                backup = self.backup(
+                    recovery_directory
+                    / (
+                        time.strftime("purge-%Y%m%dT%H%M%SZ-", time.gmtime())
+                        + secrets.token_hex(4)
+                        + ".signet-backup"
+                    )
                 )
-            )
-            backup_receipt = self._verified_backup_receipt(backup)
-            recovery_receipt = recovery_directory / (
-                f"recovery-{journal.setup_id}-{secrets.token_hex(4)}.json"
-            )
-            _write_private_json(
-                recovery_receipt,
-                {
-                    "format": 1,
-                    "setup_id": journal.setup_id,
-                    "backup_path": str(backup),
-                    "backup_sha256": backup_receipt["artifact_sha256"],
-                    "source_schema_version": backup_receipt["source_schema_version"],
-                    "verified_restore_schema_version": backup_receipt[
-                        "verified_restore_schema_version"
-                    ],
-                    "required_key_accounts": [
-                        f"{journal.setup_id}-{purpose}"
-                        for purpose in ("capability", "payload", "attachment", "backup")
-                    ],
-                },
-            )
-        engine = SetupEngine(self.store, self.platform)
-        if purge:
+                backup_receipt = self._verified_backup_receipt(backup)
+                recovery_receipt = recovery_directory / (
+                    f"recovery-{journal.setup_id}-{secrets.token_hex(4)}.json"
+                )
+                _write_private_json(
+                    recovery_receipt,
+                    {
+                        "format": 1,
+                        "setup_id": journal.setup_id,
+                        "backup_path": str(backup),
+                        "backup_sha256": backup_receipt["artifact_sha256"],
+                        "source_schema_version": backup_receipt["source_schema_version"],
+                        "verified_restore_schema_version": backup_receipt[
+                            "verified_restore_schema_version"
+                        ],
+                        "required_key_accounts": [
+                            f"{journal.setup_id}-{purpose}"
+                            for purpose in ("capability", "payload", "attachment", "backup")
+                        ],
+                    },
+                )
+            except Exception as backup_exc:
+                if not resume_quiesced_services:
+                    raise
+                try:
+                    engine.apply(spec)
+                except Exception as resume_exc:
+                    raise SetupError(
+                        f"{backup_exc}; managed services could not be resumed"
+                    ) from resume_exc
+                raise
+
             assert backup is not None
             assert recovery_receipt is not None
             journal = engine.rollback(spec)
@@ -271,6 +286,27 @@ class SetupOperations:
         self.platform.manage_services(self.spec(), action)
         return self.platform.service_status(self.spec())
 
+    def _require_recovery_secrets(self, journal: SetupJournal) -> None:
+        references = [
+            SecretReference(
+                service="Signet-Setup",
+                account=f"{journal.setup_id}-{purpose}",
+            )
+            for purpose in ("capability", "payload", "attachment", "backup")
+        ]
+        self._require_secret_references(references)
+
+    @staticmethod
+    def _require_secret_references(references: list[SecretReference]) -> None:
+        store = KeychainSecretStore()
+        for reference in references:
+            try:
+                secret = store.get(reference)
+            except Exception as exc:
+                raise SetupError("a required purge recovery secret is unavailable") from exc
+            if not secret.reveal():
+                raise SetupError("a required purge recovery secret is empty")
+
     def _verified_backup_receipt(self, bundle: Path) -> dict[str, Any]:
         manager = self._backup_manager(self.store.load())
         with manager.database.read_only() as connection:
@@ -281,6 +317,16 @@ class SetupOperations:
                 bundle,
                 self.root / "restore" / f"verify-{secrets.token_hex(8)}",
             )
+            raw_references = restored.manifest.get("key_references")
+            if not isinstance(raw_references, list) or not all(
+                isinstance(reference, str) for reference in raw_references
+            ):
+                raise SetupError("backup recovery key inventory is invalid")
+            try:
+                references = [SecretReference.parse(reference) for reference in raw_references]
+            except Exception as exc:
+                raise SetupError("backup recovery key inventory is invalid") from exc
+            self._require_secret_references(references)
             with Database(restored.database_path).read_only() as connection:
                 restored_schema_version = int(
                     connection.execute("PRAGMA user_version").fetchone()[0]
