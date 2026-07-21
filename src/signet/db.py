@@ -451,16 +451,15 @@ class Database:
 
         if not self.path.is_absolute():
             raise DatabaseError("read-only database path must be absolute")
-        snapshot_directory = tempfile.TemporaryDirectory(prefix="signet-read-only-")
+        snapshot_directory = Path(tempfile.mkdtemp(prefix="signet-read-only-"))
         try:
-            snapshot_root = Path(snapshot_directory.name)
-            snapshot_root.chmod(0o700)
+            snapshot_directory.chmod(0o700)
             database_path = _copy_stable_database_snapshot(
                 self.path,
-                snapshot_root,
+                snapshot_directory,
             )
         except BaseException:
-            snapshot_directory.cleanup()
+            _remove_read_only_snapshot(snapshot_directory)
             raise
         try:
             connection = sqlite3.connect(
@@ -471,7 +470,7 @@ class Database:
                 check_same_thread=False,
             )
         except sqlite3.Error as exc:
-            snapshot_directory.cleanup()
+            _remove_read_only_snapshot(snapshot_directory)
             raise DatabaseError("database is unavailable for read-only inspection") from exc
         try:
             connection.row_factory = sqlite3.Row
@@ -484,7 +483,7 @@ class Database:
             if connection.in_transaction:
                 connection.rollback()
             connection.close()
-            snapshot_directory.cleanup()
+            _remove_read_only_snapshot(snapshot_directory)
 
     @contextmanager
     def transaction(self, *, mode: str = "IMMEDIATE") -> Iterator[Any]:
@@ -824,6 +823,49 @@ def _require_private_file(path: Path, *, label: str) -> None:
             raise DatabaseError(f"the {label} must be an owned mode-0600 regular file")
     finally:
         os.close(descriptor)
+
+
+def _remove_read_only_snapshot(directory: Path) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        metadata = os.fstat(descriptor)
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != current_uid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise DatabaseError("read-only database snapshot directory changed during cleanup")
+        for name in os.listdir(descriptor):
+            entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or entry.st_uid != current_uid
+                or entry.st_nlink != 1
+                or stat.S_IMODE(entry.st_mode) != 0o600
+            ):
+                raise DatabaseError("read-only database snapshot contains an unsafe artifact")
+            os.unlink(name, dir_fd=descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise DatabaseError("read-only database snapshot could not be removed safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        directory.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise DatabaseError("read-only database snapshot directory could not be removed") from exc
 
 
 def _copy_stable_database_snapshot(source: Path, destination: Path) -> Path:
