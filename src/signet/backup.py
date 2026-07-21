@@ -210,20 +210,7 @@ class BackupBundleManager:
                 attachment_manifest = self._copy_attachments(snapshot, attachments_dir)
                 with _snapshot_connection(snapshot) as connection:
                     schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-                    key_references = sorted(
-                        {
-                            row[0]
-                            for row in connection.execute(
-                                """
-                                SELECT encryption_key_ref FROM payload_versions
-                                WHERE encryption_key_ref IS NOT NULL
-                                UNION
-                                SELECT encryption_key_ref FROM staged_objects
-                                WHERE encryption_key_ref IS NOT NULL
-                                """
-                            )
-                        }
-                    )
+                    key_references = _key_references(connection)
                 manifest = {
                     "format": 2,
                     "schema_version": schema_version,
@@ -480,6 +467,12 @@ class BackupBundleManager:
             if _file_hash(database_path) != manifest.get("database_sha256"):
                 raise BackupError("backup database hash does not match the manifest")
             Database.verify_snapshot(database_path)
+            with Database(database_path).read_only() as connection:
+                snapshot_schema_version = int(
+                    connection.execute("PRAGMA user_version").fetchone()[0]
+                )
+            if manifest.get("schema_version") != snapshot_schema_version:
+                raise BackupError("backup manifest schema version differs from the snapshot")
             self._relocate_restored_attachments(destination_root, database_path, manifest)
             Database.verify_snapshot(database_path)
             self._verify_restored_attachments(destination_root, database_path, manifest)
@@ -587,35 +580,50 @@ class BackupBundleManager:
         destination: Path,
     ) -> list[dict[str, Any]]:
         with _snapshot_connection(snapshot) as connection:
-            mismatches = int(
-                connection.execute(
+            if not _table_has_column(connection, "staged_objects", "attachment_id"):
+                legacy_attachments = int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM attachments
+                        WHERE storage_path IS NOT NULL AND purged_at IS NULL
+                        """
+                    ).fetchone()[0]
+                )
+                if legacy_attachments:
+                    raise BackupError(
+                        "legacy unencrypted attachments must be migrated before backup"
+                    )
+                rows = []
+            else:
+                mismatches = int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM attachments AS attachment
+                        LEFT JOIN staged_objects AS staged
+                          ON staged.attachment_id = attachment.attachment_id
+                        WHERE attachment.storage_path IS NOT NULL
+                          AND attachment.purged_at IS NULL
+                          AND (
+                              staged.attachment_id IS NULL OR staged.storage_path IS NULL OR
+                              staged.purged_at IS NOT NULL OR
+                              staged.filename != attachment.filename OR
+                              staged.declared_mime != attachment.mime_type OR
+                              staged.size_bytes != attachment.size_bytes OR
+                              staged.sha256 != attachment.sha256 OR
+                              staged.storage_path != attachment.storage_path
+                          )
+                        """
+                    ).fetchone()[0]
+                )
+                if mismatches:
+                    raise BackupError("attachment catalog is incomplete or inconsistent")
+                rows = connection.execute(
                     """
-                    SELECT count(*) FROM attachments AS attachment
-                    LEFT JOIN staged_objects AS staged
-                      ON staged.attachment_id = attachment.attachment_id
-                    WHERE attachment.storage_path IS NOT NULL
-                      AND attachment.purged_at IS NULL
-                      AND (
-                          staged.attachment_id IS NULL OR staged.storage_path IS NULL OR
-                          staged.purged_at IS NOT NULL OR
-                          staged.filename != attachment.filename OR
-                          staged.declared_mime != attachment.mime_type OR
-                          staged.size_bytes != attachment.size_bytes OR
-                          staged.sha256 != attachment.sha256 OR
-                          staged.storage_path != attachment.storage_path
-                      )
+                    SELECT staged.* FROM staged_objects AS staged
+                    WHERE staged.storage_path IS NOT NULL AND staged.purged_at IS NULL
+                    ORDER BY staged.attachment_id
                     """
-                ).fetchone()[0]
-            )
-            if mismatches:
-                raise BackupError("attachment catalog is incomplete or inconsistent")
-            rows = connection.execute(
-                """
-                SELECT staged.* FROM staged_objects AS staged
-                WHERE staged.storage_path IS NOT NULL AND staged.purged_at IS NULL
-                ORDER BY staged.attachment_id
-                """
-            ).fetchall()
+                ).fetchall()
         metadata_destination = destination / ".metadata"
         metadata_destination.mkdir(mode=0o700)
         _harden_private_directory(metadata_destination)
@@ -703,12 +711,7 @@ class BackupBundleManager:
         try:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA synchronous=FULL")
-            rows = connection.execute(
-                """
-                SELECT staged.* FROM staged_objects AS staged
-                WHERE staged.storage_path IS NOT NULL AND staged.purged_at IS NULL
-                """
-            ).fetchall()
+            rows = _active_staged_rows(connection)
             _require_consistent_attachment_references(connection)
             key_refs = _key_references(connection)
             if key_refs != manifest.get("key_references"):
@@ -817,12 +820,7 @@ class BackupBundleManager:
         connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         try:
-            rows = connection.execute(
-                """
-                SELECT staged.* FROM staged_objects AS staged
-                WHERE staged.storage_path IS NOT NULL AND staged.purged_at IS NULL
-                """
-            ).fetchall()
+            rows = _active_staged_rows(connection)
             _require_consistent_attachment_references(connection)
             key_refs = _key_references(connection)
         finally:
@@ -1731,24 +1729,55 @@ def _record_matches_manifest(record: StagedFile, item: dict[str, Any]) -> bool:
     )
 
 
-def _key_references(connection: Any) -> list[str]:
-    return sorted(
-        {
-            str(row[0])
-            for row in connection.execute(
-                """
-                SELECT encryption_key_ref FROM payload_versions
-                WHERE encryption_key_ref IS NOT NULL
-                UNION
-                SELECT encryption_key_ref FROM staged_objects
-                WHERE encryption_key_ref IS NOT NULL
-                """
-            )
-        }
+def _table_has_column(connection: Any, table: str, column: str) -> bool:
+    if table not in {"payload_versions", "staged_objects"}:
+        raise ValueError("unsupported backup catalog table")
+    return any(
+        str(row[1]) == column for row in connection.execute(f"PRAGMA table_info({table})")
     )
 
 
+def _active_staged_rows(connection: Any) -> list[Any]:
+    if not _table_has_column(connection, "staged_objects", "attachment_id"):
+        active_legacy_attachments = int(
+            connection.execute(
+                """
+                SELECT count(*) FROM attachments
+                WHERE storage_path IS NOT NULL AND purged_at IS NULL
+                """
+            ).fetchone()[0]
+        )
+        if active_legacy_attachments:
+            raise BackupError("legacy unencrypted attachments must be migrated before backup")
+        return []
+    return list(
+        connection.execute(
+            """
+            SELECT staged.* FROM staged_objects AS staged
+            WHERE staged.storage_path IS NOT NULL AND staged.purged_at IS NULL
+            """
+        ).fetchall()
+    )
+
+
+def _key_references(connection: Any) -> list[str]:
+    references: set[str] = set()
+    for table in ("payload_versions", "staged_objects"):
+        if not _table_has_column(connection, table, "encryption_key_ref"):
+            continue
+        references.update(
+            str(row[0])
+            for row in connection.execute(
+                f"SELECT encryption_key_ref FROM {table} "
+                "WHERE encryption_key_ref IS NOT NULL"
+            )
+        )
+    return sorted(references)
+
+
 def _require_consistent_attachment_references(connection: Any) -> None:
+    if not _table_has_column(connection, "staged_objects", "attachment_id"):
+        return
     mismatch = connection.execute(
         """
         SELECT 1 FROM attachments AS attachment

@@ -170,6 +170,29 @@ def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Pat
     assert all(len(migration["checksum"]) == 64 for migration in migrations)
 
 
+def test_read_only_database_connections_use_immutable_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "data" / "approvals.sqlite3"
+    database = Database(path)
+    database.initialize()
+    real_connect = db_module.sqlite3.connect
+    opened: list[str] = []
+
+    def connect(target: object, *args: object, **kwargs: object) -> Any:
+        opened.append(str(target))
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", connect)
+
+    with database.read_only() as connection:
+        assert connection.execute("SELECT count(*) FROM schema_meta").fetchone()[0] > 0
+
+    assert opened == [f"{path.as_uri()}?mode=ro&immutable=1"]
+    assert not Path(f"{path}-shm").exists()
+
+
 def test_database_refuses_unsafe_existing_parent_without_changing_mode(
     tmp_path: Path,
 ) -> None:

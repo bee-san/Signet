@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -431,19 +432,42 @@ def test_purge_uninstall_creates_backup_before_removing_any_resource(
             events.append("remove_setup_secrets")
 
     platform = LifecyclePlatform()
-    SetupEngine(SetupJournalStore(selected.root), platform).apply(selected)
+    setup_journal = SetupEngine(SetupJournalStore(selected.root), platform).apply(selected)
     operations = SetupOperations(selected.root, platform=platform)
 
     def backup(destination: Path | None = None) -> Path:
-        assert destination is None
+        assert destination is not None
+        assert selected.root not in destination.parents
+        destination.parent.mkdir(mode=0o700, exist_ok=True)
+        destination.write_bytes(b"verified encrypted backup")
+        destination.chmod(0o600)
         events.append("backup")
-        return selected.root / "backups" / "before-purge.signet-backup"
+        return destination
 
     monkeypatch.setattr(operations, "backup", backup)
+    monkeypatch.setattr(
+        operations,
+        "_verified_backup_receipt",
+        lambda bundle: {
+            "artifact_path": str(bundle),
+            "artifact_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "source_schema_version": 19,
+            "verified_restore_schema_version": 19,
+        },
+    )
 
     result = operations.uninstall(purge=True)
 
-    assert result["backup"].endswith("before-purge.signet-backup")
+    assert not Path(result["backup"]).is_relative_to(selected.root)
+    receipt_path = Path(result["recovery_receipt"])
+    assert receipt_path.is_file()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["backup_path"] == result["backup"]
+    assert receipt["backup_sha256"] == hashlib.sha256(b"verified encrypted backup").hexdigest()
+    assert set(receipt["required_key_accounts"]) == {
+        f"{setup_journal.setup_id}-{purpose}"
+        for purpose in ("capability", "payload", "attachment", "backup")
+    }
     assert events[0] == "backup"
 
 
@@ -1207,6 +1231,12 @@ def test_real_platform_builds_a_provider_disabled_production_assembly(
     assert before_inspection == after_inspection
     upgrade = operations.upgrade()
     assert Path(upgrade["backup"]).is_file()
+    assert upgrade["backup_receipt"] == {
+        "artifact_path": upgrade["backup"],
+        "artifact_sha256": hashlib.sha256(Path(upgrade["backup"]).read_bytes()).hexdigest(),
+        "source_schema_version": upgrade["schema_version"],
+        "verified_restore_schema_version": upgrade["schema_version"],
+    }
     assert upgrade["provider_rollout"] == "disabled"
     backup_path = operations.backup()
     assert backup_path.is_file()

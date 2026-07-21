@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import secrets
 import time
 from pathlib import Path
 from typing import Any, cast
 
 from signet.attachment_crypto import AttachmentCipher
-from signet.backup import BackupBundleManager, BackupError, RestoredBundle
+from signet.backup import (
+    BackupBundleManager,
+    BackupError,
+    RestoredBundle,
+    remove_private_tree_checked,
+)
 from signet.credential_broker import KeychainSecretStore, SecretReference
 from signet.db import Database
+from signet.private_paths import PrivatePathError, ensure_private_directory
 from signet.production import create_production_assembly, load_production_config
 from signet.production_state import ProductionStateStore
 from signet.setup_platform import ProductionSetupPlatform
@@ -174,6 +182,7 @@ class SetupOperations:
 
     def upgrade(self) -> dict[str, Any]:
         backup = self.backup()
+        backup_receipt = self._verified_backup_receipt(backup)
         # Reassembly performs locked schema migrations only after the verified backup above.
         assembly = create_production_assembly(
             self.root / "production.json",
@@ -182,16 +191,57 @@ class SetupOperations:
         )
         return {
             "backup": str(backup),
+            "backup_receipt": backup_receipt,
             "schema_version": assembly.status().schema_version,
             "provider_rollout": assembly.config.provider_rollout.state,
         }
 
     def uninstall(self, *, purge: bool = False) -> dict[str, Any]:
         spec = self.spec()
-        backup = self.backup() if purge else None
+        backup: Path | None = None
+        backup_receipt: dict[str, Any] | None = None
+        recovery_receipt: Path | None = None
+        if purge:
+            journal = self.store.load()
+            recovery_directory = self.root.parent / f"{self.root.name}-recovery"
+            try:
+                recovery_directory.mkdir(mode=0o700, exist_ok=True)
+                ensure_private_directory(recovery_directory)
+            except (OSError, PrivatePathError) as exc:
+                raise SetupError("purge recovery directory is unavailable or unsafe") from exc
+            backup = self.backup(
+                recovery_directory
+                / (
+                    time.strftime("purge-%Y%m%dT%H%M%SZ-", time.gmtime())
+                    + secrets.token_hex(4)
+                    + ".signet-backup"
+                )
+            )
+            backup_receipt = self._verified_backup_receipt(backup)
+            recovery_receipt = recovery_directory / (
+                f"recovery-{journal.setup_id}-{secrets.token_hex(4)}.json"
+            )
+            _write_private_json(
+                recovery_receipt,
+                {
+                    "format": 1,
+                    "setup_id": journal.setup_id,
+                    "backup_path": str(backup),
+                    "backup_sha256": backup_receipt["artifact_sha256"],
+                    "source_schema_version": backup_receipt["source_schema_version"],
+                    "verified_restore_schema_version": backup_receipt[
+                        "verified_restore_schema_version"
+                    ],
+                    "required_key_accounts": [
+                        f"{journal.setup_id}-{purpose}"
+                        for purpose in ("capability", "payload", "attachment", "backup")
+                    ],
+                },
+            )
         engine = SetupEngine(self.store, self.platform)
         if purge:
             assert backup is not None
+            assert recovery_receipt is not None
             journal = engine.rollback(spec)
             removed = [record.name for record in reversed(journal.steps)]
         else:
@@ -207,6 +257,8 @@ class SetupOperations:
                 {
                     "backup": str(backup),
                     "backup_key_preserved": True,
+                    "backup_receipt": backup_receipt,
+                    "recovery_receipt": str(recovery_receipt),
                 }
             )
         else:
@@ -218,6 +270,48 @@ class SetupOperations:
             raise SetupError("service action must be start, stop, or restart")
         self.platform.manage_services(self.spec(), action)
         return self.platform.service_status(self.spec())
+
+    def _verified_backup_receipt(self, bundle: Path) -> dict[str, Any]:
+        manager = self._backup_manager(self.store.load())
+        with manager.database.read_only() as connection:
+            source_schema_version = int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+        restored: RestoredBundle | None = None
+        try:
+            restored = manager.restore(
+                bundle,
+                self.root / "restore" / f"verify-{secrets.token_hex(8)}",
+            )
+            with Database(restored.database_path).read_only() as connection:
+                restored_schema_version = int(
+                    connection.execute("PRAGMA user_version").fetchone()[0]
+                )
+            if (
+                restored.manifest.get("schema_version") != source_schema_version
+                or restored_schema_version != source_schema_version
+            ):
+                raise SetupError("backup verification schema version is inconsistent")
+        except BackupError as exc:
+            raise SetupError("backup verification restore did not complete") from exc
+        finally:
+            if restored is not None:
+                try:
+                    remove_private_tree_checked(
+                        restored.root,
+                        parent_identity=restored.parent_identity,
+                        tree_identity=restored.root_identity,
+                    )
+                except Exception as exc:
+                    raise SetupError(
+                        "backup verification completed, but cleanup could not be confirmed"
+                    ) from exc
+        return {
+            "artifact_path": str(bundle),
+            "artifact_sha256": _file_sha256(bundle),
+            "source_schema_version": source_schema_version,
+            "verified_restore_schema_version": source_schema_version,
+        }
 
     def _backup_manager(self, journal: SetupJournal) -> BackupBundleManager:
         secret_store = KeychainSecretStore()
@@ -243,6 +337,53 @@ class SetupOperations:
             staging=staging,
             encryption_key=encryption_key,
         )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        with os.fdopen(descriptor, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise SetupError("backup artifact is unavailable for receipt verification") from exc
+    return digest.hexdigest()
+
+
+def _write_private_json(path: Path, document: dict[str, Any]) -> None:
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as destination:
+            descriptor = None
+            destination.write(encoded)
+            destination.flush()
+            os.fsync(destination.fileno())
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise SetupError("purge recovery receipt could not be written durably") from exc
 
 
 def _failed_check(exc: Exception) -> dict[str, Any]:
