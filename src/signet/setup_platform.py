@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
@@ -558,20 +559,27 @@ class ProductionSetupPlatform:
             target = Path.home() / ".config" / "systemd" / "user"
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
-                _verify_exact_owned_file(target / name, encoded)
+                target_path = target / name
+                if target_path.exists() or target_path.is_symlink():
+                    _verify_exact_owned_file(target_path, encoded)
                 _verify_exact_owned_file(spec.root / "services" / name, encoded)
-            self._run_checked(
-                ["systemctl", "--user", "disable", "--now", *rendered_text],
-                "systemd could not stop Signet",
+            self._stop_systemd_units(
+                ["systemctl", "--user", "disable", "--now", *rendered_text]
             )
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
-                _remove_exact_owned_file(target / name, encoded)
-                _remove_exact_owned_file(spec.root / "services" / name, encoded)
+                target_path = target / name
+                if target_path.exists() or target_path.is_symlink():
+                    _remove_exact_owned_file(target_path, encoded)
             self._run_checked(
                 ["systemctl", "--user", "daemon-reload"],
                 "systemd reload after rollback failed",
             )
+            for name, content in rendered_text.items():
+                _remove_exact_owned_file(
+                    spec.root / "services" / name,
+                    content.encode("utf-8"),
+                )
 
     def _wait_for_local_services(self, spec: SetupSpec) -> None:
         pending = {8789, 8790}
@@ -615,6 +623,15 @@ class ProductionSetupPlatform:
         target = "http://127.0.0.1:8790"
         if record_path.exists():
             _read_owned_json(record_path)
+            after_path = spec.root / "services" / "tailscale-serve-after.json"
+            recorded_after = _read_owned_json(after_path) if after_path.exists() else None
+            if (
+                isinstance(recorded_after, dict)
+                and set(recorded_after) == {"serve", "funnel"}
+                and recorded_after
+                != {"serve": current_serve, "funnel": current_funnel}
+            ):
+                raise SetupError("the managed Tailscale snapshot changed after setup")
             if _document_mentions_port(current_funnel, port):
                 raise SetupError("the managed Tailscale listener is now exposed by Funnel")
             if _document_mentions_port(current_serve, port):
@@ -645,9 +662,13 @@ class ProductionSetupPlatform:
         )
         if not _document_has_managed_route(after, port, target):
             raise SetupError("Tailscale Serve listener did not match the requested private route")
+        after_funnel = self._tailscale_json(
+            ["tailscale", "funnel", "status", "--json"],
+            "Tailscale Funnel verification failed",
+        )
         _create_or_verify_private_file(
             spec.root / "services" / "tailscale-serve-after.json",
-            _canonical_json_bytes(after),
+            _canonical_json_bytes({"serve": after, "funnel": after_funnel}),
         )
 
     def _rollback_tailnet_route(self, spec: SetupSpec) -> None:
@@ -672,6 +693,15 @@ class ProductionSetupPlatform:
             ["tailscale", "funnel", "status", "--json"],
             "Tailscale Funnel status is unavailable",
         )
+        exact_after = (
+            isinstance(recorded_after, dict)
+            and set(recorded_after) == {"serve", "funnel"}
+        )
+        if exact_after and recorded_after != {
+            "serve": current_serve,
+            "funnel": current_funnel,
+        }:
+            raise SetupError("refusing to overwrite a changed Tailscale snapshot")
         if _document_mentions_port(current_funnel, port):
             raise SetupError("refusing to remove a listener now exposed by Funnel")
         target = "http://127.0.0.1:8790"
@@ -688,6 +718,12 @@ class ProductionSetupPlatform:
             )
         if _document_mentions_port(current_serve, port):
             raise SetupError("Tailscale Serve listener remains after rollback")
+        restored_funnel = self._tailscale_json(
+            ["tailscale", "funnel", "status", "--json"],
+            "Tailscale Funnel rollback verification failed",
+        )
+        if current_serve != before["serve"] or restored_funnel != before["funnel"]:
+            raise SetupError("Tailscale did not return to the exact pre-setup snapshot")
         if recorded_after is not None:
             _remove_exact_owned_file(after_path, _canonical_json_bytes(recorded_after))
         _remove_exact_owned_file(record_path, _canonical_json_bytes(before))
@@ -713,46 +749,86 @@ class ProductionSetupPlatform:
             secret_store=KeychainSecretStore(),
             components=frozenset(),
         )
-        for profile in spec.hermes_profiles:
-            profile_dir = self._hermes_profile_directory(profile)
-            token_name = _profile_token_name(profile)
-            config_path = profile_dir / "config.yaml"
-            env_path = profile_dir / ".env"
-            existing_config = _read_optional_private_file(config_path)
-            existing_env = _read_optional_private_file(env_path)
-            merged = _merge_hermes_config(
-                existing_config,
-                token_name=token_name,
-                setup_id=setup_id,
-            )
-            token = _existing_profile_token(existing_env, token_name=token_name)
-            if token is not None:
+        attempted_profiles: list[str] = []
+        issued_token_ids: list[str] = []
+        try:
+            for profile in spec.hermes_profiles:
+                profile_dir = self._hermes_profile_directory(profile)
+                token_name = _profile_token_name(profile)
+                config_path = profile_dir / "config.yaml"
+                env_path = profile_dir / ".env"
+                config_exists = config_path.exists() or config_path.is_symlink()
+                environment_exists = env_path.exists() or env_path.is_symlink()
+                existing_config = _read_optional_private_file(config_path)
+                existing_env = _read_optional_private_file(env_path)
+                _capture_hermes_profile_snapshot(
+                    spec,
+                    profile,
+                    config=existing_config,
+                    environment=existing_env,
+                    config_exists=config_exists,
+                    environment_exists=environment_exists,
+                )
+                attempted_profiles.append(profile)
+                merged = _merge_hermes_config(
+                    existing_config,
+                    token_name=token_name,
+                    setup_id=setup_id,
+                )
+                token = _existing_profile_token(existing_env, token_name=token_name)
+                if token is not None:
+                    try:
+                        assembly.token_registry.authenticate(f"Bearer {token}", alias="approvals")
+                    except CredentialError:
+                        token = None
+                if token is None:
+                    for metadata in assembly.token_registry.list_metadata():
+                        if (
+                            metadata.namespace == f"profile:{profile}"
+                            and metadata.revoked_at is None
+                        ):
+                            assembly.token_registry.revoke(metadata.token_id)
+                    issued = assembly.token_registry.issue(f"profile:{profile}", {"approvals"})
+                    token = issued.token
+                    issued_token_ids.append(token.removeprefix("sgt_").split(".", 1)[0])
+                updated_env = _merge_profile_environment(
+                    existing_env,
+                    token_name=token_name,
+                    token=token,
+                    setup_id=setup_id,
+                )
+                _replace_private_file(
+                    config_path,
+                    merged,
+                    expected_content=existing_config,
+                )
+                _replace_private_file(
+                    env_path,
+                    updated_env,
+                    expected_content=existing_env,
+                )
+        except Exception:
+            cleanup_failure: Exception | None = None
+            for profile in reversed(attempted_profiles):
                 try:
-                    assembly.token_registry.authenticate(f"Bearer {token}", alias="approvals")
-                except CredentialError:
-                    token = None
-            if token is None:
-                for metadata in assembly.token_registry.list_metadata():
-                    if metadata.namespace == f"profile:{profile}" and metadata.revoked_at is None:
-                        assembly.token_registry.revoke(metadata.token_id)
-                issued = assembly.token_registry.issue(f"profile:{profile}", {"approvals"})
-                token = issued.token
-            updated_env = _merge_profile_environment(
-                existing_env,
-                token_name=token_name,
-                token=token,
-                setup_id=setup_id,
-            )
-            _replace_private_file(
-                config_path,
-                merged,
-                expected_content=existing_config,
-            )
-            _replace_private_file(
-                env_path,
-                updated_env,
-                expected_content=existing_env,
-            )
+                    _restore_hermes_profile_snapshot(
+                        spec,
+                        profile,
+                        profile_directory=self._hermes_profile_directory(profile),
+                        token_name=_profile_token_name(profile),
+                        setup_id=setup_id,
+                    )
+                except Exception as cleanup_exc:  # pragma: no cover - exercised by fault injection
+                    cleanup_failure = cleanup_exc
+                    break
+            for token_id in issued_token_ids:
+                with suppress(Exception):
+                    assembly.token_registry.revoke(token_id)
+            if cleanup_failure is not None:
+                raise SetupError(
+                    "Hermes profile rollback after an edit failure failed"
+                ) from cleanup_failure
+            raise
         self.output(
             "Hermes profiles staged with disabled Signet MCP entries. Signet did not restart "
             "the gateway; review and enable each entry, then run /reload-mcp in that profile."
@@ -772,6 +848,30 @@ class ProductionSetupPlatform:
             current_config = _read_optional_private_file(config_path)
             current_env = _read_optional_private_file(env_path)
             token = _existing_profile_token(current_env, token_name=token_name)
+            snapshot = _read_hermes_profile_snapshot(spec, profile)
+            if snapshot is not None:
+                original_token = _existing_profile_token(
+                    snapshot[1] or b"",
+                    token_name=token_name,
+                )
+                _restore_hermes_profile_snapshot(
+                    spec,
+                    profile,
+                    profile_directory=profile_dir,
+                    token_name=token_name,
+                    setup_id=setup_id,
+                )
+                if token is not None and token != original_token:
+                    token_id = token.removeprefix("sgt_").split(".", 1)[0]
+                    assembly.token_registry.revoke(token_id)
+                elif original_token is None:
+                    for metadata in assembly.token_registry.list_metadata():
+                        if (
+                            metadata.namespace == f"profile:{profile}"
+                            and metadata.revoked_at is None
+                        ):
+                            assembly.token_registry.revoke(metadata.token_id)
+                continue
             if _has_profile_token_assignment(current_env, token_name=token_name) and token is None:
                 raise SetupError("Hermes profile has a foreign Signet token assignment")
             if config_path.exists() or config_path.is_symlink():
@@ -914,6 +1014,27 @@ class ProductionSetupPlatform:
         )
         if result.returncode != 0:
             raise SetupError(message)
+
+    def _stop_systemd_units(self, command: list[str]) -> None:
+        result = self.command_runner(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+        already_stopped = any(
+            marker in detail
+            for marker in (
+                "is not loaded",
+                "not loaded",
+                "does not exist",
+                "not-found",
+                "no files found",
+            )
+        )
+        if result.returncode != 0 and not already_stopped:
+            raise SetupError("systemd could not stop Signet")
 
     def _stop_launchd_unit(self, command: list[str]) -> None:
         result = self.command_runner(
@@ -1095,6 +1216,144 @@ def _read_optional_private_file(path: Path) -> bytes:
     if len(encoded) > 1_048_576 or b"\x00" in encoded:
         raise SetupError(f"profile resource is invalid or too large: {path}")
     return encoded
+
+
+def _hermes_snapshot_directory(spec: SetupSpec, profile: str) -> Path:
+    profile_id = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:24]
+    return spec.root / "services" / "hermes-profile-snapshots" / profile_id
+
+
+def _capture_hermes_profile_snapshot(
+    spec: SetupSpec,
+    profile: str,
+    *,
+    config: bytes,
+    environment: bytes,
+    config_exists: bool,
+    environment_exists: bool,
+) -> None:
+    base = ensure_private_directory(spec.root / "services" / "hermes-profile-snapshots")
+    directory = ensure_private_directory(_hermes_snapshot_directory(spec, profile))
+    metadata_path = directory / "metadata.json"
+    if metadata_path.exists() or metadata_path.is_symlink():
+        if _read_hermes_profile_snapshot(spec, profile) is None:  # pragma: no cover
+            raise SetupError("Hermes profile snapshot disappeared during validation")
+        return
+    metadata = {
+        "format": 1,
+        "profile": profile,
+        "config_present": config_exists,
+        "config_sha256": hashlib.sha256(config).hexdigest() if config_exists else None,
+        "environment_present": environment_exists,
+        "environment_sha256": (
+            hashlib.sha256(environment).hexdigest() if environment_exists else None
+        ),
+    }
+    if config_exists:
+        _create_or_verify_private_file(directory / "config.yaml", config)
+    if environment_exists:
+        _create_or_verify_private_file(directory / "environment", environment)
+    _create_or_verify_private_file(metadata_path, _canonical_json_bytes(metadata))
+    if base != directory.parent:  # pragma: no cover - defensive path invariant
+        raise SetupError("Hermes snapshot path escaped its private root")
+
+
+def _read_hermes_profile_snapshot(
+    spec: SetupSpec,
+    profile: str,
+) -> tuple[bytes | None, bytes | None] | None:
+    directory = _hermes_snapshot_directory(spec, profile)
+    metadata_path = directory / "metadata.json"
+    if not metadata_path.exists() and not metadata_path.is_symlink():
+        return None
+    metadata = _read_owned_json(metadata_path)
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "format",
+        "profile",
+        "config_present",
+        "config_sha256",
+        "environment_present",
+        "environment_sha256",
+    }:
+        raise SetupError("Hermes profile snapshot metadata is invalid")
+    if metadata["format"] != 1 or metadata["profile"] != profile:
+        raise SetupError("Hermes profile snapshot metadata is invalid")
+
+    def snapshot_file(name: str, present_key: str, digest_key: str) -> bytes | None:
+        path = directory / name
+        present = metadata[present_key]
+        digest = metadata[digest_key]
+        if not isinstance(present, bool):
+            raise SetupError("Hermes profile snapshot metadata is invalid")
+        if not present:
+            if digest is not None or path.exists() or path.is_symlink():
+                raise SetupError("Hermes profile snapshot metadata is inconsistent")
+            return None
+        encoded = _read_optional_private_file(path)
+        if not isinstance(digest, str) or hashlib.sha256(encoded).hexdigest() != digest:
+            raise SetupError("Hermes profile snapshot content changed")
+        return encoded
+
+    return (
+        snapshot_file("config.yaml", "config_present", "config_sha256"),
+        snapshot_file("environment", "environment_present", "environment_sha256"),
+    )
+
+
+def _restore_hermes_profile_snapshot(
+    spec: SetupSpec,
+    profile: str,
+    *,
+    profile_directory: Path,
+    token_name: str,
+    setup_id: str,
+) -> bool:
+    snapshot = _read_hermes_profile_snapshot(spec, profile)
+    if snapshot is None:
+        return False
+    original_config, original_environment = snapshot
+    config_path = profile_directory / "config.yaml"
+    env_path = profile_directory / ".env"
+    current_config = _read_optional_private_file(config_path)
+    current_environment = _read_optional_private_file(env_path)
+    expected_config = original_config or b""
+    expected_environment = original_environment or b""
+    if current_config != expected_config and _remove_hermes_config(
+        current_config,
+        token_name=token_name,
+        setup_id=setup_id,
+    ) != expected_config:
+        raise SetupError("Hermes profile config changed after its setup snapshot")
+    if current_environment != expected_environment and _remove_profile_environment(
+        current_environment,
+        token_name=token_name,
+        setup_id=setup_id,
+    ) != expected_environment:
+        raise SetupError("Hermes profile environment changed after its setup snapshot")
+
+    def restore_file(path: Path, current: bytes, original: bytes | None) -> None:
+        if original is None:
+            if path.exists() or path.is_symlink():
+                _remove_exact_owned_file(path, current)
+            return
+        _replace_private_file(path, original, expected_content=current)
+
+    restore_file(config_path, current_config, original_config)
+    restore_file(env_path, current_environment, original_environment)
+    directory = _hermes_snapshot_directory(spec, profile)
+    metadata = _read_owned_json(directory / "metadata.json")
+    for path, content in (
+        (directory / "config.yaml", original_config),
+        (directory / "environment", original_environment),
+    ):
+        if content is not None:
+            _remove_exact_owned_file(path, content)
+    _remove_exact_owned_file(directory / "metadata.json", _canonical_json_bytes(metadata))
+    directory.rmdir()
+    base = directory.parent
+    if base.exists() and not any(base.iterdir()):
+        base.rmdir()
+    return True
 
 
 def _managed_tailnet_port(spec: SetupSpec) -> int | None:
@@ -1306,7 +1565,27 @@ def _append_owned_block(text: str, content: str, *, label: str, setup_id: str) -
     )
 
 
+def _validate_owned_marker_metadata(text: str, *, label: str, setup_id: str) -> None:
+    marker_pattern = re.compile(
+        r"(?m)^ *# signet setup (?P<setup>[^:\s]+): "
+        r"(?P<label>[^\n]+?) (?P<boundary>begin|end)$"
+    )
+    markers = list(marker_pattern.finditer(text))
+    if not markers:
+        return
+    accepted_labels = {label, f"{label} no-final-newline"}
+    if any(
+        marker.group("setup") != setup_id
+        or marker.group("label") not in accepted_labels
+        for marker in markers
+    ):
+        raise SetupError("owned Hermes integration marker metadata is invalid")
+    if len(markers) != 2:
+        raise SetupError("owned Hermes integration marker is ambiguous")
+
+
 def _remove_owned_block(text: str, *, label: str, setup_id: str) -> tuple[str, bool]:
+    _validate_owned_marker_metadata(text, label=label, setup_id=setup_id)
     for candidate, remove_separator in (
         (f"{label} no-final-newline", True),
         (label, False),

@@ -33,6 +33,7 @@ from signet.setup_state import (
     SETUP_STEPS,
     SetupEngine,
     SetupError,
+    SetupJournal,
     SetupJournalStore,
     SetupSpec,
 )
@@ -258,7 +259,7 @@ def test_rollback_cleans_partially_applied_failed_step(tmp_path: Path) -> None:
     ]
 
 
-def test_rollback_is_reverse_order_and_records_partial_rollback_failure(tmp_path: Path) -> None:
+def test_rollback_stops_at_the_first_failed_dependency_barrier(tmp_path: Path) -> None:
     selected = spec(tmp_path / "signet")
     platform = FakePlatform(rollback_failure="configuration")
     store = SetupJournalStore(selected.root)
@@ -271,7 +272,15 @@ def test_rollback_is_reverse_order_and_records_partial_rollback_failure(tmp_path
     journal = store.load()
     assert journal.status == "rollback_failed"
     assert journal.step("configuration").status == "rollback_failed"
-    assert platform.rolled_back == list(reversed(SETUP_STEPS))
+    assert platform.rolled_back == [
+        "owner_bootstrap",
+        "hermes_profiles",
+        "services",
+        "database",
+        "configuration",
+    ]
+    assert journal.step("secrets").status == "completed"
+    assert journal.step("private_paths").status == "completed"
 
 
 def test_service_rollback_failure_is_a_barrier_for_durable_state(tmp_path: Path) -> None:
@@ -289,6 +298,40 @@ def test_service_rollback_failure_is_a_barrier_for_durable_state(tmp_path: Path)
     assert journal.step("database").status == "completed"
     assert journal.step("configuration").status == "completed"
     assert journal.step("secrets").status == "completed"
+
+
+def test_failed_rollback_transition_restores_the_loaded_journal_status(tmp_path: Path) -> None:
+    selected = spec(tmp_path / "signet")
+
+    class TransitionFailingStore(SetupJournalStore):
+        loaded_journals: list[SetupJournal]
+        reject_transition: bool
+
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.loaded_journals = []
+            self.reject_transition = True
+
+        def load(self) -> SetupJournal:
+            journal = super().load()
+            self.loaded_journals.append(journal)
+            return journal
+
+        def save(self, journal: SetupJournal) -> None:
+            if self.reject_transition and journal.status == "rolling_back":
+                self.reject_transition = False
+                raise OSError("injected durable transition failure")
+            super().save(journal)
+
+    store = TransitionFailingStore(selected.root)
+    engine = SetupEngine(store, FakePlatform())
+    engine.apply(selected)
+
+    with pytest.raises(SetupError, match="begin rollback"):
+        engine.rollback(selected)
+
+    assert store.loaded_journals[-1].status == "completed"
+    assert store.load().status == "completed"
 
 
 def test_interrupted_rolling_back_step_is_retried(tmp_path: Path) -> None:
@@ -812,6 +855,53 @@ def test_service_install_management_status_and_rollback_are_platform_native(
         assert any("restart" in command for command in commands)
 
 
+def test_systemd_rollback_retries_after_reload_failure_and_tolerates_unloaded_units(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / ".config" / "systemd" / "user"
+    target.mkdir(parents=True)
+    target.chmod(0o700)
+    selected = replace(spec(tmp_path / "root-systemd-retry"), public_origin="https://example.com")
+    ensure_private_directory(selected.root / "services")
+    rendered = render_systemd_services(selected, active=True)
+    for name, content in rendered.items():
+        encoded = content.encode("utf-8")
+        for path in (target / name, selected.root / "services" / name):
+            path.write_bytes(encoded)
+            path.chmod(0o600)
+    reloads = 0
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal reloads
+        del kwargs
+        if "disable" in command:
+            return subprocess.CompletedProcess(command, 1, "", "Unit is not loaded")
+        if command[-1] == "daemon-reload":
+            reloads += 1
+            return subprocess.CompletedProcess(
+                command,
+                1 if reloads == 1 else 0,
+                "",
+                "reload failed" if reloads == 1 else "",
+            )
+        raise AssertionError(command)
+
+    monkeypatch.setattr(setup_platform.sys, "platform", "linux")
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    platform = ProductionSetupPlatform(command_runner=run)
+
+    with pytest.raises(SetupError, match="reload after rollback"):
+        platform._rollback_services(selected, "setup-service-test")
+
+    assert all(not (target / name).exists() for name in rendered)
+    assert all((selected.root / "services" / name).is_file() for name in rendered)
+
+    platform._rollback_services(selected, "setup-service-test")
+    assert all(not (selected.root / "services" / name).exists() for name in rendered)
+
+
 def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1018,7 +1108,7 @@ def test_hermes_edits_are_exactly_reversible_and_reject_foreign_adoption() -> No
         )
         == original_env
     )
-    with pytest.raises(SetupError, match="unowned"):
+    with pytest.raises(SetupError, match="marker"):
         _merge_hermes_config(
             merged_config,
             token_name=token_name,
@@ -1030,6 +1120,95 @@ def test_hermes_edits_are_exactly_reversible_and_reject_foreign_adoption() -> No
             token_name=token_name,
             setup_id=setup_id,
         )
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "malformed"))
+def test_hermes_config_rejects_ambiguous_or_malformed_ownership_markers(
+    mutation: str,
+) -> None:
+    setup_id = "setup_0123456789abcdef"
+    token_name = "SIGNET_MCP_CALLER_TOKEN_WORK"
+    existing = _merge_hermes_config(b"", token_name=token_name, setup_id=setup_id)
+    if mutation == "duplicate":
+        existing += b"# signet setup setup_fedcba9876543210: hermes config begin\n"
+    else:
+        existing = existing.replace(
+            f"# signet setup {setup_id}: hermes config begin".encode(),
+            b"# signet setup malformed: hermes config begin",
+        )
+
+    with pytest.raises(SetupError, match="marker"):
+        _merge_hermes_config(
+            existing,
+            token_name=token_name,
+            setup_id=setup_id,
+        )
+
+
+def test_hermes_profile_edits_are_transactional_across_profiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_home = tmp_path / "profiles"
+    originals: dict[Path, bytes] = {}
+    for profile in ("personal", "work"):
+        directory = profile_home / profile
+        directory.mkdir(parents=True)
+        directory.chmod(0o700)
+        for name, content in (
+            ("config.yaml", f"model: test/{profile}\n".encode()),
+            (".env", f"EXISTING_{profile.upper()}=kept\n".encode()),
+        ):
+            path = directory / name
+            path.write_bytes(content)
+            path.chmod(0o600)
+            originals[path] = content
+
+    class Issued:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+    class Registry:
+        issued = 0
+
+        def authenticate(self, authorization: str, *, alias: str) -> None:
+            del authorization, alias
+
+        def list_metadata(self) -> list[Any]:
+            return []
+
+        def issue(self, namespace: str, aliases: set[str]) -> Issued:
+            del namespace, aliases
+            self.issued += 1
+            return Issued(f"sgt_{self.issued:016x}." + "x" * 43)
+
+        def revoke(self, token_id: str) -> None:
+            del token_id
+
+    class Assembly:
+        token_registry = Registry()
+
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *a, **k: Assembly())
+    selected = spec(tmp_path / "transactional-hermes")
+    platform = ProductionSetupPlatform(hermes_home=profile_home)
+    platform._apply_private_paths(selected, "setup_0123456789abcdef")
+    real_replace = setup_platform._replace_private_file
+    failed = False
+
+    def fail_on_work_config(path: Path, content: bytes, **kwargs: Any) -> None:
+        nonlocal failed
+        if path == profile_home / "work" / "config.yaml" and not failed:
+            failed = True
+            raise SetupError("injected second-profile write failure")
+        real_replace(path, content, **kwargs)
+
+    monkeypatch.setattr(setup_platform, "_replace_private_file", fail_on_work_config)
+
+    with pytest.raises(SetupError, match="second-profile"):
+        platform._apply_hermes_profiles(selected, "setup_0123456789abcdef")
+
+    assert all(path.read_bytes() == content for path, content in originals.items())
+    assert not (selected.root / "services" / "hermes-profile-snapshots").exists()
 
 
 def test_tailnet_rollback_rejects_the_right_target_on_the_wrong_port(
@@ -1110,6 +1289,49 @@ def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
     assert state["serve"] == {}
     assert not (selected.root / "services" / "tailscale-serve-before.json").exists()
     assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
+
+
+def test_tailnet_rollback_verifies_the_exact_pre_setup_snapshot(tmp_path: Path) -> None:
+    selected = SetupSpec(
+        root=tmp_path / "owned-exact-tailnet",
+        public_origin="https://signet.example.ts.net:8443",
+        owner_user_id="user:owner",
+        hermes_profiles=("work",),
+        executable=Path("/bin/echo"),
+    )
+    ensure_private_directory(selected.root / "services")
+    before_serve: dict[str, Any] = {
+        "Web": {":9443": {"Proxy": "http://127.0.0.1:9444"}}
+    }
+    state: dict[str, Any] = {"serve": before_serve, "funnel": {}}
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        if command[:3] == ["tailscale", "serve", "status"]:
+            payload = state["serve"]
+        elif command[:3] == ["tailscale", "funnel", "status"]:
+            payload = state["funnel"]
+        elif "--bg" in command:
+            state["serve"] = {
+                "Web": {
+                    ":9443": {"Proxy": "http://127.0.0.1:9444"},
+                    ":8443": {"Proxy": "http://127.0.0.1:8790"},
+                }
+            }
+            payload = {}
+        elif command[-1] == "off":
+            state["serve"] = {}
+            payload = {}
+        else:
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    platform = ProductionSetupPlatform(command_runner=run)
+    platform._apply_tailnet_route(selected)
+
+    with pytest.raises(SetupError, match="exact pre-setup snapshot"):
+        platform._rollback_tailnet_route(selected)
+    assert (selected.root / "services" / "tailscale-serve-before.json").is_file()
 
 
 def test_real_platform_builds_a_provider_disabled_production_assembly(

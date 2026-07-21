@@ -473,8 +473,13 @@ class SetupEngine:
             raise SetupError(f"unsupported setup step: {unsupported[0]}")
         journal = self.store.load()
         self._require_spec(journal, spec)
+        previous_status = journal.status
         journal.status = "rolling_back"
-        self.store.save(journal)
+        try:
+            self.store.save(journal)
+        except Exception as exc:
+            journal.status = previous_status
+            raise SetupError("could not durably begin rollback") from exc
         failures: list[str] = []
         for name in step_names:
             record = journal.step(name)
@@ -497,8 +502,7 @@ class SetupEngine:
                 record.error_kind = type(exc).__name__
                 failures.append(record.name)
                 self.store.save(journal)
-                if record.name == "services":
-                    break
+                break
             else:
                 record.status = "rolled_back"
                 record.error_kind = None
