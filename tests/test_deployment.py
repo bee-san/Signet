@@ -26,6 +26,7 @@ from signet.deployment import (
     DISABLED_CONFIG_ENV,
     DeploymentError,
     DisabledDeploymentConfig,
+    HumanAuthContext,
     create_mcp_app,
     create_mcp_runtime,
     create_web_app,
@@ -35,6 +36,30 @@ from signet.deployment import (
 from signet.gateway_tools import GATEWAY_TOOL_DEFINITIONS
 
 TOKEN_PATTERN = re.compile(r"^sgt_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}$")
+
+
+@pytest.mark.parametrize(
+    ("public_origin", "rp_id", "accepted"),
+    [
+        ("https://signet.example.test:8443", "signet.example.test", True),
+        ("https://127.0.0.1", "127.0.0.1", False),
+        ("https://[::1]", "::1", False),
+    ],
+)
+def test_human_auth_context_requires_dns_rp_id(
+    public_origin: str,
+    rp_id: str,
+    accepted: bool,
+) -> None:
+    if accepted:
+        assert (
+            HumanAuthContext(user_id="owner", public_origin=public_origin, rp_id=rp_id).rp_id
+            == rp_id
+        )
+        return
+
+    with pytest.raises(ValueError, match="matching RP ID"):
+        HumanAuthContext(user_id="owner", public_origin=public_origin, rp_id=rp_id)
 
 
 def initialized_config(tmp_path: Path) -> tuple[Path, DisabledDeploymentConfig]:

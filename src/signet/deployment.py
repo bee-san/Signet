@@ -575,12 +575,15 @@ def _migrate_command(config: DisabledDeploymentConfig, destination: Path) -> Non
     def backup(selected: Database, prior_version: int) -> MigrationBackupReceipt:
         snapshot = selected.create_snapshot(destination)
         Database.verify_snapshot(snapshot)
+        source_device, source_inode = selected.migration_source_identity()
         return MigrationBackupReceipt(
             database_path=selected.path,
             source_schema_version=prior_version,
             artifact_path=snapshot.absolute(),
             artifact_sha256=_file_sha256(snapshot),
             verified_restore_schema_version=prior_version,
+            source_database_device=source_device,
+            source_database_inode=source_inode,
         )
 
     try:
@@ -994,7 +997,7 @@ def _valid_namespace(value: str) -> bool:
 def _valid_host(host: str) -> bool:
     try:
         ipaddress.ip_address(host)
-        return True
+        return False
     except ValueError:
         labels = host.split(".")
         return bool(labels) and all(

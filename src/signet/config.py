@@ -91,12 +91,15 @@ def validate_public_origin(value: str) -> str:
         or value.endswith("/")
     ):
         raise ValueError("public_origin must be an HTTPS origin without a trailing slash")
+    if ":" in parsed.hostname:
+        try:
+            ipaddress.IPv6Address(parsed.hostname)
+        except ValueError:
+            raise ValueError("public_origin hostname is invalid") from None
+        raise ValueError("numeric IPv6 public origins are not supported")
     try:
-        if ":" in parsed.hostname:
-            hostname = ipaddress.IPv6Address(parsed.hostname).compressed
-        else:
-            hostname = parsed.hostname.encode("idna").decode("ascii").lower()
-    except (UnicodeError, ValueError):
+        hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
         raise ValueError("public_origin hostname is invalid") from None
     if not is_valid_allowed_host(hostname):
         raise ValueError("public_origin hostname is not a valid allowed host")

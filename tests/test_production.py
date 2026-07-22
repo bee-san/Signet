@@ -163,6 +163,7 @@ def _secret_store(
             ("signet", "capability"): "capability-secret-" * 3,
             ("signet", "payload"): "payload-secret-" * 3,
             ("signet", "totp"): totp_secret,
+            ("signet", "attachment"): "attachment-key-material-" * 3,
             ("signet", "mail"): "mail-secret-value",
         }
     )
@@ -179,6 +180,44 @@ def test_missing_durable_service_inventory_fails_closed(tmp_path: Path) -> None:
         connection.execute("DELETE FROM production_services WHERE service_name = 'web'")
 
     with pytest.raises(ProductionAssemblyError, match="service inventory has diverged"):
+        build_production_runtime(
+            config,
+            secret_store=_secret_store(),
+            components=frozenset(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("table", "where_clause", "message"),
+    (
+        (
+            "production_secret_references",
+            "purpose = 'session_secret_ref'",
+            "secret reference inventory has diverged",
+        ),
+        (
+            "production_connectors",
+            "connector_alias = 'mail'",
+            "connector inventory has diverged",
+        ),
+    ),
+)
+def test_missing_durable_production_inventory_fails_closed(
+    tmp_path: Path,
+    table: str,
+    where_clause: str,
+    message: str,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    with assembly.database.transaction() as connection:
+        connection.execute(f"DELETE FROM {table} WHERE {where_clause}")
+
+    with pytest.raises(ProductionAssemblyError, match=message):
         build_production_runtime(
             config,
             secret_store=_secret_store(),
@@ -1680,6 +1719,131 @@ def test_production_http_surfaces_reject_non_loopback_transport_peers(tmp_path: 
         )
 
 
+def test_production_runtime_refuses_to_rebind_a_historical_auth_owner(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    database = Database(config.storage.database_path)
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO auth_users(user_id, created_at) VALUES (?, ?)",
+            ("user:historical-owner", 100),
+        )
+
+    with pytest.raises(ProductionAssemblyError, match="authenticator owner differs"):
+        build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+
+
+def test_production_config_digest_composes_rollout_and_identity_predecessors(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor["provider_rollout"]["state"] = "enabled"
+    predecessor["capabilities"]["live_providers_ready"] = True
+    for connector in predecessor["connectors"].values():
+        connector.pop("tls_server_certificate")
+        connector.pop("tls_server_certificate_sha256")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+
+    migrated = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+
+    with migrated.database.read() as connection:
+        assert connection.execute(
+            "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+        ).fetchone()["config_digest"] == production_config_digest(config)
+
+
+def test_legacy_config_digest_adds_only_the_new_attachment_secret_inventory(
+    tmp_path: Path,
+) -> None:
+    payload = _production_payload(tmp_path)
+    source_root = tmp_path / "attachment-source"
+    source_root.mkdir(mode=0o700)
+    payload["storage"].update(
+        attachment_staging_dir=str(tmp_path / "attachment-staging"),
+        attachment_source_roots=[str(source_root)],
+    )
+    payload["secrets"]["attachment_key_ref"] = "keychain://signet/attachment"
+    config = ProductionConfig.model_validate(payload)
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor["storage"].pop("attachment_staging_dir")
+    predecessor["storage"].pop("attachment_source_roots")
+    predecessor["secrets"].pop("attachment_key_ref")
+    predecessor["capabilities"]["live_providers_ready"] = False
+    predecessor.pop("provider_rollout")
+    for connector in predecessor["connectors"].values():
+        connector.pop("server_identity_digest")
+        connector.pop("tls_server_certificate")
+        connector.pop("tls_server_certificate_sha256")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "DELETE FROM production_secret_references WHERE purpose = 'attachment_key_ref'"
+        )
+
+    migrated = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+
+    with migrated.database.read() as connection:
+        purposes = {
+            str(row["purpose"])
+            for row in connection.execute(
+                "SELECT purpose FROM production_secret_references"
+            ).fetchall()
+        }
+    assert "attachment_key_ref" in purposes
+
+
+@pytest.mark.parametrize("deleted_table", ["production_setup_state", "production_users"])
+def test_production_runtime_refuses_deleted_durable_identity_rows(
+    tmp_path: Path,
+    deleted_table: str,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    with assembly.database.transaction() as connection:
+        connection.execute(f"DELETE FROM {deleted_table}")
+
+    with pytest.raises(ProductionAssemblyError, match="durable production"):
+        build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 124)
+
+
 @pytest.mark.asyncio
 async def test_production_maintenance_worker_has_explicit_lifecycle(tmp_path: Path) -> None:
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
@@ -1833,6 +1997,11 @@ def test_environment_asgi_factories_use_only_the_private_config_path(
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     config_path.chmod(0o600)
     monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", str(config_path))
+    monkeypatch.setattr(
+        production_module,
+        "_owned_runtime_database",
+        lambda path: Database(Path(payload["storage"]["data_dir"]) / "signet.db"),
+    )
 
     mcp_app = create_production_mcp_app_from_environment(secret_store=_secret_store())
     web_app = create_production_web_app_from_environment(secret_store=_secret_store())
