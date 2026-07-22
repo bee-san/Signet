@@ -2850,6 +2850,7 @@ def _replace_private_file(
     temporary_name = f".{path.name}.{secrets.token_urlsafe(16)}.tmp"
     parent_descriptor = -1
     descriptor: int | None = None
+    target_descriptor: int | None = None
     temporary_identity: tuple[int, int] | None = None
     try:
         parent_descriptor = os.open(
@@ -2896,7 +2897,7 @@ def _replace_private_file(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-        target_identity = _require_publish_target(
+        opened_target = _open_publish_target(
             parent_descriptor,
             path,
             require_absent=require_absent,
@@ -2904,6 +2905,10 @@ def _replace_private_file(
             expected_content=expected_content,
             expected_identity=expected_identity,
         )
+        if opened_target is None:
+            target_identity = None
+        else:
+            target_descriptor, target_identity = opened_target
         if target_identity != observed_target_identity:
             raise SetupError(f"owned resource changed or is ambiguous: {path}")
         if target_identity is None:
@@ -2935,7 +2940,24 @@ def _replace_private_file(
             published = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
             displaced_identity = (displaced.st_dev, displaced.st_ino)
             published_identity = (published.st_dev, published.st_ino)
-            if displaced_identity != target_identity or published_identity != temporary_identity:
+            assert target_descriptor is not None
+            guarded = os.fstat(target_descriptor)
+            guarded_identity = (guarded.st_dev, guarded.st_ino)
+            guarded_content_matches = True
+            if expected_content is not None:
+                os.lseek(target_descriptor, 0, os.SEEK_SET)
+                guarded_content_matches = (
+                    _read_owned_descriptor(target_descriptor, len(expected_content) + 1)
+                    == expected_content
+                )
+            if (
+                displaced_identity != target_identity
+                or published_identity != temporary_identity
+                or guarded_identity != target_identity
+                or not stat.S_ISREG(guarded.st_mode)
+                or guarded.st_nlink != 1
+                or not guarded_content_matches
+            ):
                 if published_identity == temporary_identity:
                     try:
                         exchange_entries(
@@ -2968,6 +2990,9 @@ def _replace_private_file(
         if descriptor is not None:
             with suppress(OSError):
                 os.close(descriptor)
+        if target_descriptor is not None:
+            with suppress(OSError):
+                os.close(target_descriptor)
         if parent_descriptor >= 0:
             primary = sys.exception()
             cleanup_failure: SetupError | None = None
@@ -2997,7 +3022,34 @@ def _require_publish_target(
     expected_content: bytes | None,
     expected_identity: tuple[int, int] | None,
 ) -> tuple[int, int] | None:
+    opened = _open_publish_target(
+        parent_descriptor,
+        path,
+        require_absent=require_absent,
+        require_present=require_present,
+        expected_content=expected_content,
+        expected_identity=expected_identity,
+    )
+    if opened is None:
+        return None
+    descriptor, identity = opened
+    try:
+        return identity
+    finally:
+        os.close(descriptor)
+
+
+def _open_publish_target(
+    parent_descriptor: int,
+    path: Path,
+    *,
+    require_absent: bool,
+    require_present: bool,
+    expected_content: bytes | None,
+    expected_identity: tuple[int, int] | None,
+) -> tuple[int, tuple[int, int]] | None:
     target_descriptor = -1
+    retain_descriptor = False
     try:
         target_descriptor = os.open(
             path.name,
@@ -3035,11 +3087,14 @@ def _require_publish_target(
             actual = _read_owned_descriptor(target_descriptor, len(expected_content) + 1)
             if actual != expected_content:
                 raise SetupError(f"owned resource changed or is ambiguous: {path}")
-        return metadata.st_dev, metadata.st_ino
+        identity = (metadata.st_dev, metadata.st_ino)
+        retain_descriptor = True
+        return target_descriptor, identity
     except PrivatePathError as exc:
         raise SetupError(f"owned resource changed or is ambiguous: {path}") from exc
     finally:
-        os.close(target_descriptor)
+        if target_descriptor >= 0 and not retain_descriptor:
+            os.close(target_descriptor)
 
 
 def _remove_owned_private_entry(

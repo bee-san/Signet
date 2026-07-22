@@ -1000,7 +1000,7 @@ def test_upgrade_recovery_receipt_update_avoids_overwriting_rename(
     foreign = recovery_directory / "foreign-receipt.json"
     foreign.write_bytes(b"same-user foreign receipt")
     foreign.chmod(0o600)
-    real_require = setup_platform._require_publish_target
+    real_open: Any = setup_platform._open_publish_target
     checks = 0
 
     def swap_after_identity_check(
@@ -1010,7 +1010,7 @@ def test_upgrade_recovery_receipt_update_avoids_overwriting_rename(
         **kwargs: object,
     ) -> Any:
         nonlocal checks
-        result = real_require(parent_descriptor, path, *args, **kwargs)
+        result = real_open(parent_descriptor, path, *args, **kwargs)
         if path == receipt_path:
             checks += 1
         if checks == 2:
@@ -1018,7 +1018,7 @@ def test_upgrade_recovery_receipt_update_avoids_overwriting_rename(
             foreign.rename(receipt_path)
         return result
 
-    monkeypatch.setattr(setup_platform, "_require_publish_target", swap_after_identity_check)
+    monkeypatch.setattr(setup_platform, "_open_publish_target", swap_after_identity_check)
     with pytest.raises(SetupError, match="changed|ambiguous|publication"):
         setup_operations._write_upgrade_recovery_receipt(
             recovery_directory,
@@ -3486,13 +3486,13 @@ def test_private_new_file_publication_does_not_overwrite_a_racing_file(
     root = ensure_private_directory(tmp_path / "private-new-publication-race")
     path = root / "config.yaml"
     foreign_content = b""
-    real_require = setup_platform._require_publish_target
+    real_open: Any = setup_platform._open_publish_target
     checks = 0
     foreign_identity: tuple[int, int] | None = None
 
     def insert_after_absence_check(*args: object, **kwargs: object) -> Any:
         nonlocal checks, foreign_identity
-        result = real_require(*args, **kwargs)
+        result = real_open(*args, **kwargs)
         checks += 1
         if checks == 2:
             path.write_bytes(foreign_content)
@@ -3501,7 +3501,7 @@ def test_private_new_file_publication_does_not_overwrite_a_racing_file(
             foreign_identity = (metadata.st_dev, metadata.st_ino)
         return result
 
-    monkeypatch.setattr(setup_platform, "_require_publish_target", insert_after_absence_check)
+    monkeypatch.setattr(setup_platform, "_open_publish_target", insert_after_absence_check)
     with pytest.raises(SetupError, match="already exists|changed|published"):
         _replace_private_file(path, b"managed file", expected_content=b"")
 
@@ -3524,19 +3524,19 @@ def test_private_file_update_restores_a_racing_replacement(
     foreign.chmod(0o600)
     foreign_metadata = foreign.stat()
     foreign_identity = (foreign_metadata.st_dev, foreign_metadata.st_ino)
-    real_require = setup_platform._require_publish_target
+    real_open: Any = setup_platform._open_publish_target
     checks = 0
 
     def swap_after_identity_check(*args: object, **kwargs: object) -> Any:
         nonlocal checks
-        result = real_require(*args, **kwargs)
+        result = real_open(*args, **kwargs)
         checks += 1
         if checks == 1:
             path.rename(saved)
             foreign.rename(path)
         return result
 
-    monkeypatch.setattr(setup_platform, "_require_publish_target", swap_after_identity_check)
+    monkeypatch.setattr(setup_platform, "_open_publish_target", swap_after_identity_check)
     with pytest.raises(SetupError, match="changed|ambiguous|publication"):
         _replace_private_file(
             path,
