@@ -495,6 +495,40 @@ def rename_entry_no_replace(
         raise OSError(error_number, os.strerror(error_number), source_name)
 
 
+def exchange_entries(
+    first_directory_descriptor: int,
+    first_name: str,
+    second_directory_descriptor: int,
+    second_name: str,
+) -> None:
+    """Atomically exchange two descriptor-relative entries."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    first = os.fsencode(first_name)
+    second = os.fsencode(second_name)
+    rename = getattr(libc, "renameat2", None)
+    flag = 2  # RENAME_EXCHANGE
+    if rename is None:
+        rename = getattr(libc, "renameatx_np", None)
+        flag = 0x00000002  # RENAME_SWAP
+    if rename is None:
+        raise PrivatePathError("atomic entry exchange is unavailable")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if (
+        rename(
+            first_directory_descriptor,
+            first,
+            second_directory_descriptor,
+            second,
+            flag,
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), first_name)
+
+
 def _normal_directory_open_flags() -> int:
     return (
         os.O_RDONLY
