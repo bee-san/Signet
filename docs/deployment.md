@@ -48,6 +48,9 @@ mode reads only the absolute non-secret config path from `SIGNET_DISABLED_CONFIG
 The dedicated commands are preferred because they take their bind address and port
 from the verified config instead of duplicating them on the command line.
 
+For the target production runtime and lifecycle contract that future packaging must
+satisfy, see `docs/production-runtime.md`.
+
 Everything under `deploy/` is an inert, secret-free template. The launchd examples
 contain nonexistent absolute-path placeholders and cannot start until the disabled
 state and templates are reviewed. The packaged setup command is separate: it changes
