@@ -24,6 +24,7 @@ import keyring
 import yaml
 
 from signet.authenticator_management import KeychainTotpSecretProvisioner
+from signet.backup import BackupError, remove_private_tree_checked
 from signet.browser_auth import (
     BootstrapAlreadyComplete,
     BootstrapClaimRequired,
@@ -2000,6 +2001,119 @@ def _read_hermes_profile_snapshot(
     )
 
 
+def _hermes_snapshot_cleanup_paths(spec: SetupSpec, profile: str) -> tuple[Path, Path]:
+    directory = _hermes_snapshot_directory(spec, profile)
+    return (
+        directory.parent / f".{directory.name}.cleanup",
+        directory.parent / f".{directory.name}.cleanup.json",
+    )
+
+
+def _finish_hermes_snapshot_cleanup(spec: SetupSpec, profile: str, *, setup_id: str) -> bool:
+    directory = _hermes_snapshot_directory(spec, profile)
+    tombstone, receipt_path = _hermes_snapshot_cleanup_paths(spec, profile)
+    if not receipt_path.exists() and not receipt_path.is_symlink():
+        if tombstone.exists() or tombstone.is_symlink():
+            raise SetupError("Hermes snapshot cleanup has an unreceipted tombstone")
+        return False
+    receipt = _read_owned_json(receipt_path)
+    fields = (
+        "parent_device",
+        "parent_inode",
+        "parent_owner_uid",
+        "tree_device",
+        "tree_inode",
+        "tree_owner_uid",
+    )
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"format", "profile", "setup_id", *fields}
+        or receipt.get("format") != 1
+        or receipt.get("profile") != profile
+        or receipt.get("setup_id") != setup_id
+        or any(type(receipt.get(field)) is not int for field in fields)
+    ):
+        raise SetupError("Hermes snapshot cleanup receipt is invalid")
+    parent_identity = DirectoryIdentity(
+        path=directory.parent,
+        device=receipt["parent_device"],
+        inode=receipt["parent_inode"],
+        owner_uid=receipt["parent_owner_uid"],
+    )
+    tree_identity = DirectoryIdentity(
+        path=tombstone,
+        device=receipt["tree_device"],
+        inode=receipt["tree_inode"],
+        owner_uid=receipt["tree_owner_uid"],
+    )
+    try:
+        revalidate_directory_identity(parent_identity, private=True)
+        directory_present = directory.exists() or directory.is_symlink()
+        tombstone_present = tombstone.exists() or tombstone.is_symlink()
+        if directory_present and tombstone_present:
+            raise SetupError("Hermes snapshot cleanup has ambiguous directory state")
+        if directory_present:
+            active_identity = DirectoryIdentity(
+                path=directory,
+                device=tree_identity.device,
+                inode=tree_identity.inode,
+                owner_uid=tree_identity.owner_uid,
+            )
+            revalidate_directory_identity(active_identity, private=True)
+            parent_descriptor = os.open(
+                directory.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.rename(
+                    directory.name,
+                    tombstone.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+                os.fsync(parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
+        remove_private_tree_checked(
+            tombstone,
+            parent_identity=parent_identity,
+            tree_identity=tree_identity,
+        )
+    except (OSError, PrivatePathError, BackupError) as exc:
+        raise SetupError("Hermes snapshot cleanup could not be completed safely") from exc
+    _remove_exact_owned_file(
+        receipt_path,
+        _canonical_json_bytes(receipt),
+        expected_parent_identity=parent_identity,
+        parent_private=True,
+    )
+    return True
+
+
+def _begin_hermes_snapshot_cleanup(spec: SetupSpec, profile: str, *, setup_id: str) -> None:
+    directory = _hermes_snapshot_directory(spec, profile)
+    parent_identity = require_private_directory_identity(directory.parent)
+    tree_identity = require_private_directory_identity(directory)
+    receipt = {
+        "format": 1,
+        "profile": profile,
+        "setup_id": setup_id,
+        "parent_device": parent_identity.device,
+        "parent_inode": parent_identity.inode,
+        "parent_owner_uid": parent_identity.owner_uid,
+        "tree_device": tree_identity.device,
+        "tree_inode": tree_identity.inode,
+        "tree_owner_uid": tree_identity.owner_uid,
+    }
+    _, receipt_path = _hermes_snapshot_cleanup_paths(spec, profile)
+    _create_or_verify_private_file(receipt_path, _canonical_json_bytes(receipt))
+    if not _finish_hermes_snapshot_cleanup(spec, profile, setup_id=setup_id):
+        raise SetupError("Hermes snapshot cleanup receipt was not honored")
+
+
 def _restore_hermes_profile_snapshot(
     spec: SetupSpec,
     profile: str,
@@ -2008,6 +2122,11 @@ def _restore_hermes_profile_snapshot(
     token_name: str,
     setup_id: str,
 ) -> bool:
+    if _finish_hermes_snapshot_cleanup(spec, profile, setup_id=setup_id):
+        base = _hermes_snapshot_directory(spec, profile).parent
+        if base.exists() and not any(base.iterdir()):
+            base.rmdir()
+        return True
     snapshot = _read_hermes_profile_snapshot(
         spec,
         profile,
@@ -2064,15 +2183,7 @@ def _restore_hermes_profile_snapshot(
     restore_file(config_path, current_config, original_config)
     restore_file(env_path, current_environment, original_environment)
     directory = _hermes_snapshot_directory(spec, profile)
-    metadata = _read_owned_json(directory / "metadata.json")
-    for path, content in (
-        (directory / "config.yaml", original_config),
-        (directory / "environment", original_environment),
-    ):
-        if content is not None:
-            _remove_exact_owned_file(path, content)
-    _remove_exact_owned_file(directory / "metadata.json", _canonical_json_bytes(metadata))
-    directory.rmdir()
+    _begin_hermes_snapshot_cleanup(spec, profile, setup_id=setup_id)
     base = directory.parent
     if base.exists() and not any(base.iterdir()):
         base.rmdir()

@@ -15,6 +15,7 @@ import pytest
 import signet.setup_operations as setup_operations
 import signet.setup_platform as setup_platform
 import signet.setup_state as setup_state
+from signet.backup import BackupError
 from signet.browser_auth import BootstrapService
 from signet.config import ProductionConfig, production_instance_identity
 from signet.credential_broker import KeychainSecretStore
@@ -2191,6 +2192,90 @@ def test_format_one_hermes_profile_snapshots_fail_closed_without_directory_ident
             "work",
             profile_directory=profile,
         )
+
+
+def test_hermes_snapshot_cleanup_resumes_after_snapshot_removal_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(spec(tmp_path / "profile-cleanup-resume"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    config = profile / "config.yaml"
+    environment = profile / ".env"
+    original_config = b"model: original\n"
+    original_environment = b"EXISTING=kept\n"
+    config.write_bytes(original_config)
+    environment.write_bytes(original_environment)
+    config.chmod(0o600)
+    environment.chmod(0o600)
+    profile_identity = require_private_directory_identity(profile)
+    setup_id = "setup_0123456789abcdef"
+    token_name = "SIGNET_MCP_CALLER_TOKEN_WORK"
+    token = "sgt_0123456789abcdef." + "x" * 43
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=profile_identity,
+        config=original_config,
+        environment=original_environment,
+        config_exists=True,
+        environment_exists=True,
+    )
+    managed_config = _merge_hermes_config(
+        original_config,
+        token_name=token_name,
+        setup_id=setup_id,
+    )
+    managed_environment = _merge_profile_environment(
+        original_environment,
+        token_name=token_name,
+        token=token,
+        setup_id=setup_id,
+    )
+    _replace_private_file(
+        config,
+        managed_config,
+        expected_content=original_config,
+        require_present=True,
+        expected_parent_identity=profile_identity,
+    )
+    _replace_private_file(
+        environment,
+        managed_environment,
+        expected_content=original_environment,
+        require_present=True,
+        expected_parent_identity=profile_identity,
+    )
+    real_remove_tree = setup_platform.remove_private_tree_checked
+    interrupted = False
+
+    def interrupt_after_removal(*args: Any, **kwargs: Any) -> None:
+        nonlocal interrupted
+        real_remove_tree(*args, **kwargs)
+        if not interrupted:
+            interrupted = True
+            raise BackupError("simulated cleanup interruption")
+
+    monkeypatch.setattr(setup_platform, "remove_private_tree_checked", interrupt_after_removal)
+    with pytest.raises(SetupError, match="could not be completed safely"):
+        setup_platform._restore_hermes_profile_snapshot(
+            selected,
+            "work",
+            profile_directory=profile,
+            token_name=token_name,
+            setup_id=setup_id,
+        )
+    monkeypatch.setattr(setup_platform, "remove_private_tree_checked", real_remove_tree)
+
+    assert setup_platform._restore_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_directory=profile,
+        token_name=token_name,
+        setup_id=setup_id,
+    )
+    assert config.read_bytes() == original_config
+    assert environment.read_bytes() == original_environment
 
 
 def test_private_profile_file_read_refuses_a_path_replacement_race(
