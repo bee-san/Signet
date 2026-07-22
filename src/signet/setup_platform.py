@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -17,7 +18,7 @@ import webbrowser
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 
 import keyring
@@ -30,8 +31,8 @@ from signet.browser_auth import (
     BootstrapClaimRequired,
     BootstrapService,
 )
-from signet.config import production_instance_identity
-from signet.credential_broker import CredentialError, KeychainSecretStore
+from signet.config import production_health_proof, production_instance_identity
+from signet.credential_broker import CredentialError, KeychainSecretStore, SecretReference
 from signet.db import Database
 from signet.private_paths import (
     DirectoryIdentity,
@@ -43,7 +44,11 @@ from signet.private_paths import (
     require_private_directory_identity,
     revalidate_directory_identity,
 )
-from signet.production import create_production_assembly, load_production_config
+from signet.production import (
+    ProductionAssemblyError,
+    create_production_assembly,
+    load_production_config,
+)
 from signet.setup_state import SetupError, SetupJournalStore, SetupSpec
 from signet.totp_enrollment import TotpEnrollmentService
 
@@ -824,22 +829,45 @@ class ProductionSetupPlatform:
 
         self._wait_for_local_services(spec)
 
+    def _health_secret(self, spec: SetupSpec) -> str:
+        try:
+            config = load_production_config(spec.root / _CONFIG_NAME)
+            reference = SecretReference.parse(config.secrets.session_secret_ref)
+            return KeychainSecretStore().get(reference).reveal()
+        except (CredentialError, OSError, ProductionAssemblyError, ValueError) as exc:
+            raise SetupError("the local service health proof secret is unavailable") from exc
+
     def _wait_for_local_services(self, spec: SetupSpec) -> None:
-        pending = {8789, 8790}
+        pending: dict[int, Literal["mcp", "web"]] = {8789: "mcp", 8790: "web"}
         expected_identity = production_instance_identity(spec.root)
+        health_secret = self._health_secret(spec)
         deadline = time.monotonic() + 20
         while pending and time.monotonic() < deadline:
-            for port in tuple(pending):
+            for port, component in tuple(pending.items()):
+                challenge = secrets.token_urlsafe(32)
+                expected_proof = production_health_proof(
+                    health_secret,
+                    identity=expected_identity,
+                    component=component,
+                    challenge=challenge,
+                )
                 connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
                 try:
-                    connection.request("GET", "/healthz")
+                    connection.request(
+                        "GET",
+                        "/healthz",
+                        headers={"X-Signet-Health-Challenge": challenge},
+                    )
                     response = connection.getresponse()
                     response.read(4097)
+                    proof = response.getheader("X-Signet-Health-Proof")
                     if (
                         response.status == 200
                         and response.getheader("X-Signet-Instance") == expected_identity
+                        and isinstance(proof, str)
+                        and hmac.compare_digest(proof, expected_proof)
                     ):
-                        pending.remove(port)
+                        del pending[port]
                 except OSError:
                     pass
                 finally:
@@ -847,8 +875,7 @@ class ProductionSetupPlatform:
             if pending:
                 time.sleep(0.2)
         if pending:
-            selected = ", ".join(str(port) for port in sorted(pending))
-            raise SetupError(f"Signet services did not become healthy on ports: {selected}")
+            raise SetupError(f"services did not become healthy: {', '.join(map(str, pending))}")
 
     def _apply_tailnet_route(self, spec: SetupSpec) -> None:
         port = _managed_tailnet_port(spec)

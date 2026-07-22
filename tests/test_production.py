@@ -34,7 +34,7 @@ from signet.app import main as run_cli
 from signet.auth import SessionManager, SQLiteSessionRepository
 from signet.browser_auth import BootstrapService
 from signet.canonical import canonical_json
-from signet.config import ProductionConfig, production_instance_identity
+from signet.config import ProductionConfig, production_health_proof, production_instance_identity
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
 from signet.db import Database
 from signet.downstream import DownstreamClient
@@ -1384,8 +1384,14 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     tmp_path: Path,
 ) -> None:
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    secret_store = _secret_store()
+    health_identity = production_instance_identity(config.storage.data_dir.parent)
+    health_secret = secret_store.get(
+        SecretReference.parse(config.secrets.session_secret_ref)
+    ).reveal()
+    health_challenge = "test-health-challenge-value-0123456789"
 
-    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    assembly = build_production_runtime(config, secret_store=secret_store, clock=lambda: 123)
     status = assembly.status()
 
     assert status.schema_version == 19
@@ -1404,18 +1410,26 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     health = TestClient(
         assembly.web,
         base_url="https://signet.example.test",
-    ).get("/healthz")
+    ).get("/healthz", headers={"X-Signet-Health-Challenge": health_challenge})
     assert health.status_code == 503
     assert health.json() == {"status": "unavailable", "service": "signet-web"}
-    assert health.headers["X-Signet-Instance"] == production_instance_identity(
-        config.storage.data_dir.parent
+    assert health.headers["X-Signet-Instance"] == health_identity
+    assert health.headers["X-Signet-Health-Proof"] == production_health_proof(
+        health_secret,
+        identity=health_identity,
+        component="web",
+        challenge=health_challenge,
     )
     mcp_client = TestClient(assembly.mcp.app, base_url="http://127.0.0.1:8789")
-    mcp_health = mcp_client.get("/healthz")
+    mcp_health = mcp_client.get("/healthz", headers={"X-Signet-Health-Challenge": health_challenge})
     assert mcp_health.status_code == 503
     assert mcp_health.json() == {"status": "unavailable"}
-    assert mcp_health.headers["X-Signet-Instance"] == production_instance_identity(
-        config.storage.data_dir.parent
+    assert mcp_health.headers["X-Signet-Instance"] == health_identity
+    assert mcp_health.headers["X-Signet-Health-Proof"] == production_health_proof(
+        health_secret,
+        identity=health_identity,
+        component="mcp",
+        challenge=health_challenge,
     )
     readiness = mcp_client.get("/readyz")
     assert readiness.status_code == 503

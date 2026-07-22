@@ -47,7 +47,7 @@ from signet.authenticator_management import (
     TotpSecretProvisioner,
 )
 from signet.browser_auth import BootstrapService, BrowserAuthController
-from signet.config import ProductionConfig, production_instance_identity
+from signet.config import ProductionConfig, production_health_proof, production_instance_identity
 from signet.credential_broker import (
     KeychainSecretStore,
     Secret,
@@ -589,6 +589,16 @@ def build_production_runtime(
         config,
         secret_store,
     )
+    health_identity = production_instance_identity(config.storage.data_dir.parent)
+    health_secret = secret_values["session_secret_ref"].reveal()
+
+    def health_prover(component: Literal["mcp", "web"]) -> Callable[[str], str]:
+        return lambda challenge: production_health_proof(
+            health_secret,
+            identity=health_identity,
+            component=component,
+            challenge=challenge,
+        )
 
     database = Database(config.storage.data_dir / "signet.db")
     verified_backup_version: int | None = None
@@ -828,7 +838,8 @@ def build_production_runtime(
             bind_port=config.mcp_port,
             health_probe=mcp_readiness,
             readiness_probe=mcp_readiness,
-            health_identity=production_instance_identity(config.storage.data_dir.parent),
+            health_identity=health_identity,
+            health_prover=health_prover("mcp"),
             lifecycle_observer=observe_mcp_lifecycle,
         )
         if "mcp" in components
@@ -952,9 +963,8 @@ def build_production_runtime(
 
     if web is not None:
         web.state.signet_health_probe = production_health_probe
-        web.state.signet_health_identity = production_instance_identity(
-            config.storage.data_dir.parent
-        )
+        web.state.signet_health_identity = health_identity
+        web.state.signet_health_prover = health_prover("web")
     return ProductionAssembly(
         config=config,
         database=database,

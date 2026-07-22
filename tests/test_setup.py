@@ -1495,15 +1495,25 @@ def test_service_health_checks_reject_a_different_signet_instance(
             return b'{"status":"ok"}'
 
         def getheader(self, name: str) -> str | None:
-            assert name == "X-Signet-Instance"
-            return "0" * len(expected)
+            if name == "X-Signet-Instance":
+                return "0" * len(expected)
+            if name == "X-Signet-Health-Proof":
+                return None
+            raise AssertionError(name)
 
     class Connection:
         def __init__(self, host: str, port: int, timeout: int) -> None:
             del host, port, timeout
 
-        def request(self, method: str, path: str) -> None:
+        def request(
+            self,
+            method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
             assert (method, path) == ("GET", "/healthz")
+            assert "X-Signet-Health-Challenge" in headers
 
         def getresponse(self) -> Response:
             return Response()
@@ -1515,9 +1525,73 @@ def test_service_health_checks_reject_a_different_signet_instance(
     monkeypatch.setattr(setup_platform.http.client, "HTTPConnection", Connection)
     monkeypatch.setattr(setup_platform.time, "monotonic", lambda: next(moments))
     monkeypatch.setattr(setup_platform.time, "sleep", lambda delay: None)
+    monkeypatch.setattr(
+        ProductionSetupPlatform,
+        "_health_secret",
+        lambda self, selected_spec: "known-only-to-the-real-services-123456",
+    )
 
     with pytest.raises(SetupError, match="did not become healthy"):
         ProductionSetupPlatform()._wait_for_local_services(selected)
+
+
+def test_service_health_checks_reject_a_predictable_identity_without_a_valid_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "predictable-health")
+    expected = production_instance_identity(selected.root)
+    challenges: list[str] = []
+
+    class Response:
+        status = 200
+
+        def read(self, limit: int) -> bytes:
+            del limit
+            return b'{"status":"ok"}'
+
+        def getheader(self, name: str) -> str | None:
+            if name == "X-Signet-Instance":
+                return expected
+            if name == "X-Signet-Health-Proof":
+                return "0" * 64
+            raise AssertionError(name)
+
+    class Connection:
+        def __init__(self, host: str, port: int, timeout: int) -> None:
+            del host, port, timeout
+
+        def request(
+            self,
+            method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
+            assert (method, path) == ("GET", "/healthz")
+            challenges.append(headers["X-Signet-Health-Challenge"])
+
+        def getresponse(self) -> Response:
+            return Response()
+
+        def close(self) -> None:
+            pass
+
+    moments = iter((0.0, 1.0, 21.0))
+    monkeypatch.setattr(setup_platform.http.client, "HTTPConnection", Connection)
+    monkeypatch.setattr(setup_platform.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(setup_platform.time, "sleep", lambda delay: None)
+    monkeypatch.setattr(
+        ProductionSetupPlatform,
+        "_health_secret",
+        lambda self, selected_spec: "known-only-to-the-real-services-123456",
+        raising=False,
+    )
+
+    with pytest.raises(SetupError, match="did not become healthy"):
+        ProductionSetupPlatform()._wait_for_local_services(selected)
+
+    assert challenges
 
 
 def test_service_plans_use_installed_executable_and_remain_inert(tmp_path: Path) -> None:

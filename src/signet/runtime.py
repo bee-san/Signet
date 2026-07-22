@@ -10,7 +10,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from functools import partial
@@ -378,6 +378,7 @@ def assemble_mcp_runtime(
     health_probe: Callable[[], bool] | None = None,
     readiness_probe: Callable[[], bool] | None = None,
     health_identity: str | None = None,
+    health_prover: Callable[[str], str] | None = None,
     lifecycle_observer: Callable[[str], None] | None = None,
 ) -> MCPRuntime:
     """Assemble a local MCP ASGI app without contacting downstream providers."""
@@ -391,6 +392,8 @@ def assemble_mcp_runtime(
         raise RuntimeAssemblyError("request concurrency limit must be 1 to 256")
     if health_identity is not None and re.fullmatch(r"[0-9a-f]{64}", health_identity) is None:
         raise RuntimeAssemblyError("health identity must be one lowercase SHA-256 digest")
+    if health_prover is not None and health_identity is None:
+        raise RuntimeAssemblyError("health proof requires an instance identity")
     if APPROVALS_ALIAS in aliases:
         raise RuntimeAssemblyError("the approvals alias is reserved for gateway-owned tools")
 
@@ -461,7 +464,6 @@ def assemble_mcp_runtime(
         )
 
     async def health(request: Any) -> JSONResponse:
-        del request
         try:
             healthy = health_probe is None or health_probe()
         except Exception:
@@ -469,6 +471,10 @@ def assemble_mcp_runtime(
         headers = {"Cache-Control": "no-store"}
         if health_identity is not None:
             headers["X-Signet-Instance"] = health_identity
+        challenge = request.headers.get("X-Signet-Health-Challenge")
+        if challenge is not None and health_prover is not None:
+            with suppress(TypeError, ValueError):
+                headers["X-Signet-Health-Proof"] = health_prover(challenge)
         return JSONResponse(
             {"status": "ok" if healthy else "unavailable"},
             status_code=200 if healthy else 503,

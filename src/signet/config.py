@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
 import re
 from pathlib import Path
@@ -24,6 +25,27 @@ def production_instance_identity(root: Path) -> str:
         raise ValueError("production root must be an absolute lexical path")
     material = b"signet-health-instance-v1\0" + str(root).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
+
+
+def production_health_proof(
+    secret: str,
+    *,
+    identity: str,
+    component: Literal["mcp", "web"],
+    challenge: str,
+) -> str:
+    """Authenticate one fresh component-specific local health challenge."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+        raise ValueError("health identity must be one lowercase SHA-256 digest")
+    if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", challenge) is None:
+        raise ValueError("health challenge must be one URL-safe random value")
+    key = secret.encode("utf-8")
+    if not 32 <= len(key) <= 4_096:
+        raise ValueError("health proof secret must be 32 to 4096 UTF-8 bytes")
+    material = b"signet-health-proof-v1\0" + identity.encode("ascii")
+    material += b"\0" + component.encode("ascii") + b"\0" + challenge.encode("ascii")
+    return hmac.new(key, material, hashlib.sha256).hexdigest()
 
 
 def is_valid_allowed_host(host: str) -> bool:
