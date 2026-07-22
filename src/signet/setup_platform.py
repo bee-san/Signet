@@ -1073,6 +1073,14 @@ class ProductionSetupPlatform:
         for profile in spec.hermes_profiles:
             profile_dir = self._hermes_profile_directory(profile)
             token_name = _profile_token_name(profile)
+            if _finish_hermes_snapshot_cleanup(spec, profile, setup_id=setup_id):
+                snapshot_base = _hermes_snapshot_directory(spec, profile).parent
+                if snapshot_base.exists() and not any(snapshot_base.iterdir()):
+                    snapshot_base.rmdir()
+                for metadata in assembly.token_registry.list_metadata():
+                    if metadata.namespace == f"profile:{profile}" and metadata.revoked_at is None:
+                        assembly.token_registry.revoke(metadata.token_id)
+                continue
             config_path = profile_dir / "config.yaml"
             env_path = profile_dir / ".env"
             current_config = _read_optional_private_file(config_path)
@@ -1108,33 +1116,23 @@ class ProductionSetupPlatform:
                 continue
             if _has_profile_token_assignment(current_env, token_name=token_name) and token is None:
                 raise SetupError("Hermes profile has a foreign Signet token assignment")
-            if config_path.exists() or config_path.is_symlink():
-                _replace_private_file(
-                    config_path,
-                    _remove_hermes_config(
-                        current_config,
-                        token_name=token_name,
-                        setup_id=setup_id,
-                    ),
-                    expected_content=current_config,
-                )
-            if env_path.exists() or env_path.is_symlink():
-                _replace_private_file(
-                    env_path,
-                    _remove_profile_environment(
-                        current_env,
-                        token_name=token_name,
-                        setup_id=setup_id,
-                    ),
-                    expected_content=current_env,
-                )
+            desired_config = _remove_hermes_config(
+                current_config,
+                token_name=token_name,
+                setup_id=setup_id,
+            )
+            desired_environment = _remove_profile_environment(
+                current_env,
+                token_name=token_name,
+                setup_id=setup_id,
+            )
+            if desired_config != current_config or desired_environment != current_env:
+                raise SetupError("refusing Hermes rollback without a bound profile snapshot")
             if token is not None:
-                token_id = token.removeprefix("sgt_").split(".", 1)[0]
-                assembly.token_registry.revoke(token_id)
-            else:
-                for metadata in assembly.token_registry.list_metadata():
-                    if metadata.namespace == f"profile:{profile}" and metadata.revoked_at is None:
-                        assembly.token_registry.revoke(metadata.token_id)
+                raise SetupError("refusing Hermes token rollback without a bound profile snapshot")
+            for metadata in assembly.token_registry.list_metadata():
+                if metadata.namespace == f"profile:{profile}" and metadata.revoked_at is None:
+                    assembly.token_registry.revoke(metadata.token_id)
 
     def _apply_owner_bootstrap(self, spec: SetupSpec, setup_id: str) -> None:
         secret_store = KeychainSecretStore()

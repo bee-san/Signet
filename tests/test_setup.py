@@ -2278,6 +2278,43 @@ def test_hermes_snapshot_cleanup_resumes_after_snapshot_removal_interruption(
     assert environment.read_bytes() == original_environment
 
 
+def test_hermes_rollback_refuses_managed_markers_without_a_bound_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_home = tmp_path / "profiles"
+    profile = ensure_private_directory(profile_home / "work")
+    selected = replace(spec(tmp_path / "missing-profile-snapshot"), hermes_profiles=("work",))
+    setup_id = "setup_0123456789abcdef"
+    token_name = "SIGNET_MCP_CALLER_TOKEN_WORK"
+    config = _merge_hermes_config(b"model: original\n", token_name=token_name, setup_id=setup_id)
+    environment = _merge_profile_environment(
+        b"EXISTING=kept\n",
+        token_name=token_name,
+        token="sgt_0123456789abcdef." + "x" * 43,
+        setup_id=setup_id,
+    )
+    (profile / "config.yaml").write_bytes(config)
+    (profile / ".env").write_bytes(environment)
+    (profile / "config.yaml").chmod(0o600)
+    (profile / ".env").chmod(0o600)
+
+    class Registry:
+        def list_metadata(self) -> list[Any]:
+            return []
+
+    class Assembly:
+        token_registry = Registry()
+
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *a, **k: Assembly())
+    platform = ProductionSetupPlatform(hermes_home=profile_home)
+
+    with pytest.raises(SetupError, match="without a bound profile snapshot"):
+        platform._rollback_hermes_profiles(selected, setup_id)
+    assert (profile / "config.yaml").read_bytes() == config
+    assert (profile / ".env").read_bytes() == environment
+
+
 def test_private_profile_file_read_refuses_a_path_replacement_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
