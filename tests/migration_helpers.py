@@ -38,12 +38,15 @@ def verified_backup_callback(
         snapshot = database.create_snapshot(destination)
         Database.verify_snapshot(snapshot)
         versions.append(current_version)
+        source_device, source_inode = database.migration_source_identity()
         return MigrationBackupReceipt(
             database_path=database.path,
             source_schema_version=current_version,
             artifact_path=snapshot.absolute(),
             artifact_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
             verified_restore_schema_version=current_version,
+            source_database_device=source_device,
+            source_database_inode=source_inode,
         )
 
     return backup

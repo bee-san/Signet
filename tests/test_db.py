@@ -170,6 +170,34 @@ def test_database_uses_wal_full_sync_foreign_keys_and_private_mode(tmp_path: Pat
     assert all(len(migration["checksum"]) == 64 for migration in migrations)
 
 
+def test_write_fence_blocks_other_writers_and_rolls_back_nested_bookkeeping(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "fenced" / "approvals.sqlite3")
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute("CREATE TABLE write_fence_probe (value INTEGER NOT NULL)")
+
+    def competing_writer() -> str:
+        competing = Database(database.path, timeout=0.1)
+        try:
+            with competing.transaction() as connection:
+                connection.execute("INSERT INTO write_fence_probe (value) VALUES (2)")
+        except db_module.sqlite3.OperationalError as exc:
+            return str(exc)
+        return "writer unexpectedly succeeded"
+
+    with database.write_fence():
+        with database.transaction() as connection:
+            connection.execute("INSERT INTO write_fence_probe (value) VALUES (1)")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            outcome = executor.submit(competing_writer).result(timeout=5)
+        assert "locked" in outcome
+
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM write_fence_probe").fetchone()[0] == 0
+
+
 def test_read_only_snapshot_hardens_its_directory_under_a_restrictive_umask(
     tmp_path: Path,
 ) -> None:
@@ -279,6 +307,303 @@ def test_concurrent_initializers_share_a_single_maintenance_lock(tmp_path: Path)
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: initialize(), range(2)))
     assert results == [("ok", ()), ("ok", ())]
+
+
+def test_backup_snapshot_uses_the_write_fence_connection_after_path_replacement(
+    tmp_path: Path,
+) -> None:
+    live = Database(tmp_path / "live" / "approvals.sqlite3")
+    live.initialize()
+    with live.transaction() as connection:
+        connection.execute("CREATE TABLE snapshot_identity (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO snapshot_identity (value) VALUES ('owned')")
+    replacement = Database(tmp_path / "foreign" / "approvals.sqlite3")
+    replacement.initialize()
+    with replacement.transaction() as connection:
+        connection.execute("CREATE TABLE snapshot_identity (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO snapshot_identity (value) VALUES ('foreign')")
+
+    snapshot = tmp_path / "snapshot" / "bound.sqlite3"
+    held: dict[str, Path] = {}
+    with live.write_fence():
+        for suffix in ("", "-wal", "-shm"):
+            source = Path(f"{live.path}{suffix}")
+            if source.exists():
+                destination = live.path.with_name(f"held{suffix or '.db'}")
+                source.replace(destination)
+                held[suffix] = destination
+        replacement.path.replace(live.path)
+        try:
+            live.create_snapshot(snapshot)
+        finally:
+            live.path.unlink(missing_ok=True)
+            for suffix, source in held.items():
+                source.replace(Path(f"{live.path}{suffix}"))
+
+    with db_module.sqlite3.connect(snapshot) as connection:
+        assert connection.execute("SELECT value FROM snapshot_identity").fetchone() == ("owned",)
+
+
+def test_bound_snapshot_includes_committed_wal_frames_with_a_pinned_reader(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "wal-snapshot" / "approvals.sqlite3")
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute("CREATE TABLE wal_snapshot_probe (value TEXT NOT NULL)")
+
+    reader = db_module.sqlite3.connect(str(database.path), isolation_level=None)
+    try:
+        reader.execute("BEGIN")
+        assert reader.execute("SELECT count(*) FROM wal_snapshot_probe").fetchone() == (0,)
+        with database.transaction() as connection:
+            connection.execute("INSERT INTO wal_snapshot_probe (value) VALUES ('committed-in-wal')")
+
+        snapshot = tmp_path / "snapshot" / "wal-aware.sqlite3"
+        with database.write_fence():
+            database.create_snapshot(snapshot)
+
+        with db_module.sqlite3.connect(snapshot) as connection:
+            assert connection.execute("SELECT value FROM wal_snapshot_probe").fetchone() == (
+                "committed-in-wal",
+            )
+    finally:
+        reader.close()
+
+
+def test_snapshot_cleans_its_temporary_after_bound_serialization_failure(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "serialization-failure" / "approvals.sqlite3")
+    database.initialize()
+    snapshot = tmp_path / "snapshot" / "serialization-failure.sqlite3"
+    temporary = snapshot.with_name(f".{snapshot.name}.partial")
+
+    class SerializationFailingConnection:
+        @staticmethod
+        def serialize() -> bytes:
+            raise OSError("injected serialization failure")
+
+    metadata = database.path.stat()
+    with (
+        database._bound_migration_backup_source(
+            SerializationFailingConnection(),
+            (metadata.st_dev, metadata.st_ino),
+        ),
+        pytest.raises(OSError, match="injected serialization failure"),
+    ):
+        database.create_snapshot(snapshot)
+
+    assert not snapshot.exists()
+    assert not temporary.exists()
+
+
+def test_snapshot_cleans_its_temporary_after_bound_target_open_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "target-open-failure" / "approvals.sqlite3")
+    database.initialize()
+    snapshot = tmp_path / "snapshot" / "target-open-failure.sqlite3"
+    temporary = snapshot.with_name(f".{snapshot.name}.partial")
+
+    class SerializedConnection:
+        @staticmethod
+        def serialize() -> bytes:
+            return b"serialized database bytes"
+
+    def fail_target_open(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise db_module.sqlite3.OperationalError("injected target open failure")
+
+    metadata = database.path.stat()
+    with database._bound_migration_backup_source(
+        SerializedConnection(),
+        (metadata.st_dev, metadata.st_ino),
+    ):
+        monkeypatch.setattr(db_module.sqlite3, "connect", fail_target_open)
+        with pytest.raises(
+            db_module.sqlite3.OperationalError,
+            match="injected target open failure",
+        ):
+            database.create_snapshot(snapshot)
+
+    assert not snapshot.exists()
+    assert not temporary.exists()
+
+
+def test_snapshot_cleans_its_temporary_after_unbound_copy_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "copy-failure" / "approvals.sqlite3")
+    database.initialize()
+    snapshot = tmp_path / "snapshot" / "copy-failure.sqlite3"
+    temporary = snapshot.with_name(f".{snapshot.name}.partial")
+    close_calls: list[None] = []
+
+    class CopyFailingConnection:
+        @staticmethod
+        def backup(target: object) -> None:
+            del target
+            raise db_module.sqlite3.OperationalError("injected copy failure")
+
+        @staticmethod
+        def close() -> None:
+            close_calls.append(None)
+
+    monkeypatch.setattr(database, "_connect", lambda: CopyFailingConnection())
+
+    with pytest.raises(db_module.sqlite3.OperationalError, match="injected copy failure"):
+        database.create_snapshot(snapshot)
+
+    assert close_calls == [None]
+    assert not snapshot.exists()
+    assert not temporary.exists()
+
+
+def test_snapshot_cleanup_does_not_delete_a_foreign_temporary_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "foreign-replacement" / "approvals.sqlite3")
+    database.initialize()
+    snapshot = tmp_path / "snapshot" / "foreign-replacement.sqlite3"
+    temporary = snapshot.with_name(f".{snapshot.name}.partial")
+    foreign_content = b"same-user foreign replacement"
+
+    class ReplacingCopyFailureConnection:
+        @staticmethod
+        def backup(target: object) -> None:
+            del target
+            temporary.unlink()
+            temporary.write_bytes(foreign_content)
+            temporary.chmod(0o600)
+            raise db_module.sqlite3.OperationalError("injected copy failure after replacement")
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    monkeypatch.setattr(
+        database,
+        "_connect",
+        lambda: ReplacingCopyFailureConnection(),
+    )
+
+    with pytest.raises(
+        db_module.sqlite3.OperationalError,
+        match="injected copy failure after replacement",
+    ):
+        database.create_snapshot(snapshot)
+
+    assert not snapshot.exists()
+    assert temporary.read_bytes() == foreign_content
+
+
+def test_migration_backup_boundary_blocks_competing_writers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    shutil.copy2(
+        Database(tmp_path / "probe.sqlite3").migrations_path / "0001_initial.sql",
+        migrations / "0001_initial.sql",
+    )
+    (migrations / "0002_upgrade_marker.sql").write_text(
+        "CREATE TABLE upgrade_marker (id INTEGER PRIMARY KEY) STRICT;\n",
+        encoding="utf-8",
+    )
+
+    class UpgradeDatabase(Database):
+        @property
+        def migrations_path(self) -> Path:
+            return migrations
+
+    path = tmp_path / "migration-fence" / "approvals.sqlite3"
+    monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 1)
+    UpgradeDatabase(path).initialize()
+    database = UpgradeDatabase(path)
+    with database.transaction() as connection:
+        connection.execute("CREATE TABLE migration_fence_probe (value INTEGER NOT NULL)")
+    monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 2)
+
+    writer_outcomes: list[str] = []
+
+    def backup(candidate: Database, version: int) -> MigrationBackupReceipt:
+        assert version == 1
+        competing = Database(candidate.path, timeout=0.1)
+        try:
+            with competing.transaction() as connection:
+                connection.execute("INSERT INTO migration_fence_probe (value) VALUES (1)")
+        except db_module.sqlite3.OperationalError as exc:
+            writer_outcomes.append(str(exc))
+        else:
+            writer_outcomes.append("writer unexpectedly succeeded")
+        artifact = candidate.create_snapshot(tmp_path / "migration-fence-backup.sqlite3")
+        Database.verify_snapshot(artifact)
+        source_device, source_inode = candidate.migration_source_identity()
+        return MigrationBackupReceipt(
+            database_path=candidate.path,
+            source_schema_version=version,
+            artifact_path=artifact,
+            artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            verified_restore_schema_version=version,
+            source_database_device=source_device,
+            source_database_inode=source_inode,
+        )
+
+    database.initialize(pre_migration_backup=backup)
+
+    assert writer_outcomes and "locked" in writer_outcomes[0]
+    with database.read() as connection:
+        assert connection.execute("SELECT count(*) FROM migration_fence_probe").fetchone()[0] == 0
+
+
+def test_migration_refuses_path_replacement_during_the_backup_callback(tmp_path: Path) -> None:
+    live = Database(tmp_path / "live" / "approvals.sqlite3")
+    replacement = Database(tmp_path / "replacement" / "approvals.sqlite3")
+    live.initialize()
+    replacement.initialize()
+    prior_version = LATEST_SCHEMA_VERSION - 1
+    for database in (live, replacement):
+        with database.transaction(mode="EXCLUSIVE") as connection:
+            connection.execute(f"PRAGMA user_version={prior_version}")
+            connection.execute(
+                "DELETE FROM schema_meta WHERE migration_id = ?",
+                (LATEST_SCHEMA_VERSION,),
+            )
+    held = live.path.with_name("held.sqlite3")
+    snapshot = tmp_path / "backup" / "pre-migration.sqlite3"
+
+    def replace_path_and_backup(candidate: Database, version: int) -> MigrationBackupReceipt:
+        assert version == prior_version
+        for suffix in ("", "-wal", "-shm"):
+            source = Path(f"{live.path}{suffix}")
+            if source.exists():
+                source.replace(Path(f"{held}{suffix}"))
+        replacement.path.replace(live.path)
+        artifact = candidate.create_snapshot(snapshot)
+        Database.verify_snapshot(artifact)
+        source_device, source_inode = candidate.migration_source_identity()
+        return MigrationBackupReceipt(
+            database_path=candidate.path,
+            source_schema_version=version,
+            artifact_path=artifact,
+            artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            verified_restore_schema_version=version,
+            source_database_device=source_device,
+            source_database_inode=source_inode,
+        )
+
+    with pytest.raises(MigrationIntegrityError, match="changed during the pre-migration backup"):
+        live.initialize(pre_migration_backup=replace_path_and_backup)
+
+    with db_module.sqlite3.connect(held) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == prior_version
+    with db_module.sqlite3.connect(live.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == prior_version
 
 
 def test_backup_snapshot_restores_into_a_separate_verified_path(tmp_path: Path) -> None:
@@ -780,12 +1105,15 @@ def test_migration_backup_receipt_digest_is_verified_without_read_bytes(
     content = b"x" * (2 * 1024 * 1024 + 1)
     artifact.write_bytes(content)
     artifact.chmod(0o600)
+    source_metadata = database.path.stat()
     receipt = MigrationBackupReceipt(
         database_path=database.path,
         source_schema_version=LATEST_SCHEMA_VERSION,
         artifact_path=artifact,
         artifact_sha256=hashlib.sha256(content).hexdigest(),
         verified_restore_schema_version=LATEST_SCHEMA_VERSION,
+        source_database_device=source_metadata.st_dev,
+        source_database_inode=source_metadata.st_ino,
     )
     original_read_bytes = Path.read_bytes
 
@@ -801,12 +1129,15 @@ def test_migration_backup_receipt_digest_is_verified_without_read_bytes(
 def test_migration_backup_receipt_rejects_the_live_database_artifact(tmp_path: Path) -> None:
     database = Database(tmp_path / "approvals.sqlite3")
     database.initialize()
+    source_metadata = database.path.stat()
     receipt = MigrationBackupReceipt(
         database_path=database.path,
         source_schema_version=LATEST_SCHEMA_VERSION,
         artifact_path=database.path.absolute(),
         artifact_sha256=hashlib.sha256(database.path.read_bytes()).hexdigest(),
         verified_restore_schema_version=LATEST_SCHEMA_VERSION,
+        source_database_device=source_metadata.st_dev,
+        source_database_inode=source_metadata.st_ino,
     )
 
     with pytest.raises(MigrationIntegrityError, match="inconsistent"):
