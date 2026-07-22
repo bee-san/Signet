@@ -10,7 +10,7 @@ import secrets
 import stat
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -37,7 +37,8 @@ from signet.production import (
 from signet.production_state import ProductionStateStore
 from signet.setup_platform import (
     ProductionSetupPlatform,
-    validate_active_database_ownership,
+    _replace_private_file,
+    validate_active_database_runtime_ownership,
 )
 from signet.setup_state import (
     PolicyMode,
@@ -135,8 +136,16 @@ class SetupOperations:
             database_path = config.storage.database_path
             if database_path.is_symlink() or not database_path.is_file():
                 raise SetupError("production database is unavailable for read-only inspection")
+            expected_identity, expected_lock_identity = validate_active_database_runtime_ownership(
+                database_path.parent,
+                setup_id=journal.setup_id,
+            )
             production = ProductionStateStore(
-                Database(database_path),
+                Database(
+                    database_path,
+                    expected_identity=expected_identity,
+                    expected_lock_identity=expected_lock_identity,
+                ),
                 provider_rollout_enabled=config.provider_rollout.state == "enabled",
             ).status(read_only=True)
             result["provider_rollout"] = config.provider_rollout.state
@@ -632,15 +641,6 @@ class SetupOperations:
             try:
                 manager = self._backup_manager(journal)
                 manager.require_live_key_references(self._production_key_references())
-                try:
-                    revocation_started = self._revoke_hermes_tokens_for_rollback(
-                        spec, journal.setup_id
-                    )
-                except Exception:
-                    resume_quiesced_services = False
-                    raise
-                if revocation_started:
-                    resume_quiesced_services = False
                 with manager.database.write_fence():
                     backup = self._backup(
                         recovery_directory
@@ -709,17 +709,26 @@ class SetupOperations:
                             "purge backup checkpoint no longer verifies cryptographically"
                         )
                     backup_receipt = verified_receipt
-                    with self._use_database(manager.database):
-                        journal = engine.rollback_steps(
-                            spec,
-                            (
-                                "owner_bootstrap",
-                                "hermes_profiles",
-                                "services",
-                                "database",
-                            ),
-                            final_status="rolling_back",
-                        )
+                try:
+                    revocation_started = self._revoke_hermes_tokens_for_rollback(
+                        spec, journal.setup_id
+                    )
+                except Exception:
+                    resume_quiesced_services = False
+                    raise
+                if revocation_started:
+                    resume_quiesced_services = False
+                with manager.database.write_fence(), self._use_database(manager.database):
+                    journal = engine.rollback_steps(
+                        spec,
+                        (
+                            "owner_bootstrap",
+                            "hermes_profiles",
+                            "services",
+                            "database",
+                        ),
+                        final_status="rolling_back",
+                    )
                 journal = engine.rollback_steps(
                     spec,
                     ("configuration", "secrets", "private_paths", "preflight"),
@@ -1013,17 +1022,25 @@ class SetupOperations:
         database_path = self.root / "data" / "signet.db"
         ownership_marker = database_path.parent / ".signet-database-ownership.json"
         expected_identity = None
+        expected_lock_identity = None
         if (
             database_path.exists()
             or database_path.is_symlink()
             or ownership_marker.exists()
             or ownership_marker.is_symlink()
         ):
-            expected_identity = validate_active_database_ownership(
+            (
+                expected_identity,
+                expected_lock_identity,
+            ) = validate_active_database_runtime_ownership(
                 database_path.parent,
                 setup_id=journal.setup_id,
             )
-        database = Database(database_path, expected_identity=expected_identity)
+        database = Database(
+            database_path,
+            expected_identity=expected_identity,
+            expected_lock_identity=expected_lock_identity,
+        )
         staging = StagingStore(
             staging_root or (self.root / "staging"),
             database=database,
@@ -1374,86 +1391,22 @@ def _replace_upgrade_recovery_receipt(path: Path, document: dict[str, Any]) -> N
     }:
         raise SetupError("upgrade recovery receipt state transition is invalid")
     encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.partial")
-    temporary_descriptor: int | None = None
-    try:
-        temporary_descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
-        os.fchmod(temporary_descriptor, 0o600)
-        require_no_acl_grants(temporary_descriptor)
-        temporary_metadata = os.fstat(temporary_descriptor)
-        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
-        if (
-            not stat.S_ISREG(temporary_metadata.st_mode)
-            or temporary_metadata.st_uid != current_uid
-            or temporary_metadata.st_nlink != 1
-            or stat.S_IMODE(temporary_metadata.st_mode) != 0o600
-        ):
-            raise SetupError("upgrade recovery receipt permissions could not be enforced")
-        with os.fdopen(temporary_descriptor, "wb") as destination:
-            temporary_descriptor = None
-            destination.write(encoded)
-            destination.flush()
-            os.fsync(destination.fileno())
-        if path.read_bytes() != current_bytes:
-            raise SetupError("upgrade recovery receipt changed during its state transition")
-        os.replace(temporary, path)
-        _private_file_checkpoint(path)
-        _fsync_directory(path.parent)
-    except OSError as exc:
-        raise SetupError("upgrade recovery receipt could not be updated durably") from exc
-    finally:
-        if temporary_descriptor is not None:
-            os.close(temporary_descriptor)
-        if temporary.exists():
-            temporary.unlink()
+    _replace_private_file(
+        path,
+        encoded,
+        expected_content=current_bytes,
+        expected_identity=(before.st_dev, before.st_ino),
+        require_present=True,
+    )
+    _private_file_checkpoint(path)
+    _fsync_directory(path.parent)
 
 
 def _write_private_json(path: Path, document: dict[str, Any]) -> None:
     encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    descriptor = -1
-    created = False
-    try:
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
-        created = True
-        os.fchmod(descriptor, 0o600)
-        require_no_acl_grants(descriptor)
-        metadata = os.fstat(descriptor)
-        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != current_uid
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-        ):
-            raise SetupError("private recovery receipt permissions could not be enforced")
-        view = memoryview(encoded)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("private recovery receipt write made no progress")
-            view = view[written:]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        _private_file_checkpoint(path)
-        _fsync_directory(path.parent)
-    except BaseException as exc:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if created:
-            with suppress(OSError):
-                path.unlink(missing_ok=True)
-        if isinstance(exc, SetupError):
-            raise
-        raise SetupError("private recovery receipt could not be written durably") from exc
+    _replace_private_file(path, encoded, require_absent=True)
+    _private_file_checkpoint(path)
+    _fsync_directory(path.parent)
 
 
 def _failed_check(exc: Exception) -> dict[str, Any]:

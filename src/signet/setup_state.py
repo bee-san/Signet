@@ -19,6 +19,7 @@ from signet.config import validate_public_origin
 from signet.private_paths import (
     PrivatePathError,
     ensure_private_directory,
+    rename_entry_no_replace,
     require_no_acl_grants,
     require_private_directory_identity,
     revalidate_directory_identity,
@@ -205,6 +206,7 @@ class SetupJournalStore:
     """Own one private setup root and atomically publish its non-secret journal."""
 
     OWNER_NAME = ".setup-owner.json"
+    OWNER_INTENT_NAME = ".setup-owner.intent.json"
     JOURNAL_NAME = ".setup-journal.json"
 
     def __init__(self, root: Path) -> None:
@@ -216,7 +218,9 @@ class SetupJournalStore:
         if spec.root != self.root:
             raise SetupError("setup journal root does not match the setup specification")
         self._prepare_root()
-        self._recover_owner_publication()
+        recovered_setup_id = self._recover_owner_publication(spec=spec)
+        if recovered_setup_id is not None and recovered_setup_id != setup_id:
+            raise SetupError("setup root is owned by a different setup specification")
         if self.owner_path.exists():
             owner = self._read_document(self.owner_path, label="setup owner marker")
             accepted_digests = {spec.digest}
@@ -236,16 +240,12 @@ class SetupJournalStore:
         ]
         if foreign or self.journal_path.exists():
             raise SetupError("setup root is not owned by Signet setup")
-        self._write_document(
-            self.owner_path,
-            {"version": 1, "setup_id": setup_id, "spec_digest": spec.digest},
-            replace=False,
-        )
+        self._write_owner_document(spec, setup_id)
 
     def owned_setup_id(self, spec: SetupSpec) -> str | None:
         """Recover the durable setup ID without creating or replacing state."""
 
-        self._recover_owner_publication()
+        self._recover_owner_publication(spec=spec)
         if not self.owner_path.exists():
             return None
         owner = self._read_document(self.owner_path, label="setup owner marker")
@@ -315,7 +315,13 @@ class SetupJournalStore:
             raise SetupError("setup root must not be a symbolic link")
         if self.root.exists() and not self.root.is_dir():
             raise SetupError("setup root must be a directory")
-        if self.root.exists() and not self.owner_path.exists() and any(self.root.iterdir()):
+        intent_path = self.root / self.OWNER_INTENT_NAME
+        if (
+            self.root.exists()
+            and not self.owner_path.exists()
+            and any(self.root.iterdir())
+            and not (intent_path.exists() or intent_path.is_symlink())
+        ):
             raise SetupError("setup root is not owned by Signet setup")
         try:
             resolved = ensure_private_directory(self.root)
@@ -324,16 +330,336 @@ class SetupJournalStore:
         if resolved != self.root:
             raise SetupError("setup root must be canonical and contain no symbolic links")
 
-    def _recover_owner_publication(self) -> None:
+    @classmethod
+    def _owner_temporary_name(cls, setup_id: str, spec_digest: str) -> str:
+        token = hashlib.sha256(f"{setup_id}\0{spec_digest}".encode()).hexdigest()[:24]
+        return f".{cls.OWNER_NAME}.{token}.tmp"
+
+    @classmethod
+    def _owner_intent_document(cls, spec: SetupSpec, setup_id: str) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "setup_id": setup_id,
+            "spec_digest": spec.digest,
+        }
+
+    def _write_owner_document(self, spec: SetupSpec, setup_id: str) -> None:
+        intent = self._owner_intent_document(spec, setup_id)
+        self._create_owner_intent(intent)
+        recovered = self._recover_owner_publication(spec=spec)
+        if recovered != setup_id:
+            raise SetupError("setup owner marker publication did not complete")
+
+    def _create_owner_intent(self, intent: dict[str, Any]) -> None:
+        encoded = self._encoded_document(intent)
+        parent_identity = require_private_directory_identity(self.root)
+        parent_descriptor = -1
+        descriptor = -1
+        created = False
+        try:
+            parent_descriptor = os.open(
+                self.root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            parent = os.fstat(parent_descriptor)
+            if (parent.st_dev, parent.st_ino) != (
+                parent_identity.device,
+                parent_identity.inode,
+            ):
+                raise SetupError("setup state directory changed before owner intent")
+            try:
+                descriptor = os.open(
+                    self.OWNER_INTENT_NAME,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                created = True
+            except FileExistsError as exc:
+                raise SetupError("setup owner creation intent already exists") from exc
+            os.fchmod(descriptor, 0o600)
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short setup owner intent write")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.fsync(parent_descriptor)
+            revalidate_directory_identity(parent_identity, private=True)
+        except SetupError:
+            raise
+        except (OSError, PrivatePathError) as exc:
+            if created:
+                raise SetupError(
+                    "setup owner creation intent could not be finalized; retry with the same setup"
+                ) from exc
+            raise SetupError("setup owner creation intent could not be persisted") from exc
+        finally:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
+            if parent_descriptor >= 0:
+                with suppress(OSError):
+                    os.close(parent_descriptor)
+
+    def _recover_owner_creation_intent(self, spec: SetupSpec) -> str | None:
+        intent_path = self.root / self.OWNER_INTENT_NAME
+        if not intent_path.exists() and not intent_path.is_symlink():
+            return None
+        intent = self._read_document(
+            intent_path,
+            label="setup owner creation intent",
+            allowed_links=frozenset({1, 2, 3}),
+        )
+        setup_id = intent.get("setup_id")
+        spec_digest = intent.get("spec_digest")
+        if (
+            set(intent) != {"version", "setup_id", "spec_digest"}
+            or intent.get("version") != 1
+            or not isinstance(setup_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", setup_id) is None
+            or spec_digest != spec.digest
+        ):
+            raise SetupError("setup owner creation intent is invalid")
+        temporary_name = self._owner_temporary_name(setup_id, spec.digest)
+        encoded_owner = self._encoded_document(intent)
+        root_identity = require_private_directory_identity(self.root)
+        parent_descriptor = -1
+        try:
+            parent_descriptor = os.open(
+                self.root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened_root = os.fstat(parent_descriptor)
+            if (opened_root.st_dev, opened_root.st_ino) != (
+                root_identity.device,
+                root_identity.inode,
+            ):
+                raise SetupError("setup state directory changed during owner recovery")
+            intent_metadata = self._inspect_owner_candidate(
+                parent_descriptor,
+                self.OWNER_INTENT_NAME,
+                encoded_owner,
+            )
+            assert intent_metadata is not None
+            temporary = self._inspect_owner_candidate(
+                parent_descriptor,
+                temporary_name,
+                encoded_owner,
+                optional=True,
+            )
+            owner = self._inspect_owner_candidate(
+                parent_descriptor,
+                self.OWNER_NAME,
+                encoded_owner,
+                optional=True,
+            )
+            intent_identity = (intent_metadata.st_dev, intent_metadata.st_ino)
+            if (
+                temporary is not None
+                and (
+                    temporary.st_dev,
+                    temporary.st_ino,
+                )
+                != intent_identity
+            ):
+                raise SetupError("setup owner marker publication state is ambiguous")
+            if owner is not None and (owner.st_dev, owner.st_ino) != intent_identity:
+                raise SetupError("setup owner marker publication state is ambiguous")
+            if owner is None and temporary is None:
+                os.link(
+                    self.OWNER_INTENT_NAME,
+                    temporary_name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                temporary = self._inspect_owner_candidate(
+                    parent_descriptor,
+                    temporary_name,
+                    encoded_owner,
+                )
+            if owner is None:
+                assert temporary is not None
+                try:
+                    os.link(
+                        temporary_name,
+                        self.OWNER_NAME,
+                        src_dir_fd=parent_descriptor,
+                        dst_dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise SetupError("setup ownership marker already exists") from exc
+                owner = self._inspect_owner_candidate(
+                    parent_descriptor,
+                    self.OWNER_NAME,
+                    encoded_owner,
+                )
+                temporary = self._inspect_owner_candidate(
+                    parent_descriptor,
+                    temporary_name,
+                    encoded_owner,
+                )
+            if temporary is not None:
+                if owner is None or (owner.st_dev, owner.st_ino) != (
+                    temporary.st_dev,
+                    temporary.st_ino,
+                ):
+                    raise SetupError("setup owner marker publication state is ambiguous")
+                self._remove_owner_link(
+                    parent_descriptor,
+                    temporary_name,
+                    expected_identity=intent_identity,
+                )
+                os.fsync(parent_descriptor)
+            self._remove_owner_intent(
+                parent_descriptor,
+                intent_path,
+                expected_identity=intent_identity,
+            )
+            os.fsync(parent_descriptor)
+            published = self._inspect_owner_candidate(
+                parent_descriptor,
+                self.OWNER_NAME,
+                encoded_owner,
+            )
+            if published is None or published.st_nlink != 1:
+                raise SetupError("setup owner marker recovery did not complete")
+            revalidate_directory_identity(root_identity, private=True)
+        except SetupError:
+            raise
+        except (OSError, PrivatePathError) as exc:
+            raise SetupError("setup owner marker publication could not be recovered") from exc
+        finally:
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+        return setup_id
+
+    @staticmethod
+    def _inspect_owner_candidate(
+        parent_descriptor: int,
+        name: str,
+        expected: bytes,
+        *,
+        optional: bool = False,
+    ) -> os.stat_result | None:
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            if optional:
+                return None
+            raise SetupError("setup owner marker publication artifact is unavailable") from None
+        try:
+            before = os.fstat(descriptor)
+            require_no_acl_grants(descriptor)
+            chunks: list[bytes] = []
+            remaining = len(expected) + 1
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        finally:
+            os.close(descriptor)
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != current_uid
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink not in {1, 2, 3}
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)
+            or b"".join(chunks) != expected
+        ):
+            raise SetupError("setup owner marker publication artifact is ambiguous")
+        return before
+
+    def _remove_owner_intent(
+        self,
+        parent_descriptor: int,
+        intent_path: Path,
+        *,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        named = intent_path.lstat()
+        if (named.st_dev, named.st_ino) != expected_identity:
+            raise SetupError("setup owner creation intent changed during recovery")
+        self._remove_owner_link(
+            parent_descriptor,
+            self.OWNER_INTENT_NAME,
+            expected_identity=expected_identity,
+        )
+
+    def _remove_owner_link(
+        self,
+        parent_descriptor: int,
+        name: str,
+        *,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        removal_name = f".{self.OWNER_NAME}.{secrets.token_urlsafe(24)}.tmp"
+        try:
+            rename_entry_no_replace(
+                parent_descriptor,
+                name,
+                parent_descriptor,
+                removal_name,
+            )
+            moved = os.stat(removal_name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (moved.st_dev, moved.st_ino) != expected_identity:
+                with suppress(OSError, PrivatePathError):
+                    rename_entry_no_replace(
+                        parent_descriptor,
+                        removal_name,
+                        parent_descriptor,
+                        name,
+                    )
+                raise SetupError("setup owner publication artifact changed during cleanup")
+            os.unlink(removal_name, dir_fd=parent_descriptor)
+        except FileNotFoundError as exc:
+            raise SetupError("setup owner publication cleanup state is uncertain") from exc
+        except (OSError, PrivatePathError) as exc:
+            raise SetupError(
+                "setup owner publication artifact could not be removed safely"
+            ) from exc
+
+    def _recover_owner_publication(self, *, spec: SetupSpec) -> str | None:
         """Finish the recoverable hard-link publication boundary for the owner marker."""
+
+        recovered = self._recover_owner_creation_intent(spec)
+        if recovered is not None:
+            return recovered
 
         try:
             owner = self.owner_path.lstat()
         except FileNotFoundError:
-            return
+            return None
         current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
         if owner.st_nlink == 1:
-            return
+            return None
         if (
             not stat.S_ISREG(owner.st_mode)
             or owner.st_uid != current_uid
@@ -374,17 +700,21 @@ class SetupJournalStore:
                 owner.st_ino,
             ) or current.st_nlink != 2:
                 raise SetupError("setup owner marker changed during publication recovery")
-            os.unlink(candidates[0], dir_fd=parent_descriptor)
+            self._remove_owner_link(
+                parent_descriptor,
+                candidates[0],
+                expected_identity=(owner.st_dev, owner.st_ino),
+            )
             os.fsync(parent_descriptor)
-            recovered = os.stat(
+            published_owner = os.stat(
                 self.OWNER_NAME,
                 dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
-            if (recovered.st_dev, recovered.st_ino) != (
+            if (published_owner.st_dev, published_owner.st_ino) != (
                 owner.st_dev,
                 owner.st_ino,
-            ) or recovered.st_nlink != 1:
+            ) or published_owner.st_nlink != 1:
                 raise SetupError("setup owner marker recovery did not complete")
             revalidate_directory_identity(parent_identity, private=True)
         except SetupError:
@@ -394,9 +724,21 @@ class SetupJournalStore:
         finally:
             if parent_descriptor >= 0:
                 os.close(parent_descriptor)
+        return None
 
     @staticmethod
-    def _read_document(path: Path, *, label: str) -> dict[str, Any]:
+    def _encoded_document(document: dict[str, Any]) -> bytes:
+        return (json.dumps(document, sort_keys=True, indent=2, ensure_ascii=True) + "\n").encode(
+            "utf-8"
+        )
+
+    @staticmethod
+    def _read_document(
+        path: Path,
+        *,
+        label: str,
+        allowed_links: frozenset[int] = frozenset({1}),
+    ) -> dict[str, Any]:
         descriptor = -1
         try:
             descriptor = os.open(
@@ -437,7 +779,7 @@ class SetupJournalStore:
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != current_uid
             or stat.S_IMODE(before.st_mode) != 0o600
-            or before.st_nlink != 1
+            or before.st_nlink not in allowed_links
         ):
             raise SetupError(f"{label} is not a private owned file")
         if stable_identity != (
@@ -468,9 +810,7 @@ class SetupJournalStore:
 
     @staticmethod
     def _write_document(path: Path, document: dict[str, Any], *, replace: bool) -> None:
-        encoded = (json.dumps(document, sort_keys=True, indent=2, ensure_ascii=True) + "\n").encode(
-            "utf-8"
-        )
+        encoded = SetupJournalStore._encoded_document(document)
         temporary_name = f".{path.name}.{secrets.token_urlsafe(8)}.tmp"
         descriptor = -1
         parent_descriptor = -1

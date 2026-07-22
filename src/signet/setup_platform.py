@@ -39,6 +39,7 @@ from signet.private_paths import (
     PrivatePathError,
     ensure_owned_directory,
     ensure_private_directory,
+    exchange_entries,
     rename_entry_no_replace,
     require_no_acl_grants,
     require_owned_directory_identity,
@@ -252,6 +253,25 @@ class ProductionSetupPlatform:
             yield
         finally:
             self._database_override = None
+
+    def _owned_database(self, spec: SetupSpec, setup_id: str) -> Database | None:
+        if self._database_override is not None:
+            return self._database_override
+        database_path = spec.root / "data" / "signet.db"
+        marker = database_path.parent / _DATABASE_OWNERSHIP_MARKER
+        if not (marker.exists() or marker.is_symlink()):
+            if database_path.exists() or database_path.is_symlink():
+                raise SetupError("database exists without an active ownership receipt")
+            return None
+        database_identity, lock_identity = validate_active_database_runtime_ownership(
+            database_path.parent,
+            setup_id=setup_id,
+        )
+        return Database(
+            database_path,
+            expected_identity=database_identity,
+            expected_lock_identity=lock_identity,
+        )
 
     def _hermes_profile_directory(self, profile: str) -> Path:
         if profile == "default":
@@ -468,6 +488,24 @@ class ProductionSetupPlatform:
                 receipt_path = _private_path_receipt_path(spec.root, name)
                 receipt_exists = receipt_path.exists() or receipt_path.is_symlink()
                 if receipt_exists and not path_exists and not pending_exists:
+                    recorded = _read_owned_json(receipt_path)
+                    intent = _private_path_creation_intent(name, setup_id)
+                    if isinstance(recorded, dict) and recorded.get("format") == 3:
+                        if recorded != intent:
+                            raise SetupError(
+                                f"private setup path {name!r} creation intent is invalid"
+                            )
+                        staging_name = intent["staging_name"]
+                        assert isinstance(staging_name, str)
+                        _remove_unbound_private_path_staging(spec.root, staging_name)
+                        _remove_exact_owned_file(
+                            receipt_path,
+                            _json_bytes(intent),
+                            expected_parent_identity=root_identity,
+                            parent_private=True,
+                        )
+                        continue
+                if receipt_exists and not path_exists and not pending_exists:
                     pending_exists = _resume_receipted_private_path_staging(
                         spec.root,
                         name,
@@ -587,6 +625,7 @@ class ProductionSetupPlatform:
 
     def _apply_database(self, spec: SetupSpec, setup_id: str) -> None:
         database_path = spec.root / "data" / "signet.db"
+        maintenance_lock_path = database_path.with_name(f".{database_path.name}.maintenance.lock")
         marker = database_path.parent / _DATABASE_OWNERSHIP_MARKER
         if database_path.exists() and database_path.is_symlink():
             raise SetupError("the Signet database must not be a symbolic link")
@@ -608,6 +647,7 @@ class ProductionSetupPlatform:
         recorded = _read_owned_json(marker)
         bound_initializing: dict[str, Any] | None = None
         expected_database_identity: tuple[int, int] | None = None
+        expected_lock_identity: tuple[int, int] | None = None
         if recorded == unbound_initializing:
             existing = {
                 child.name
@@ -616,29 +656,37 @@ class ProductionSetupPlatform:
             }
             if existing:
                 raise SetupError("refusing database adoption after unbound initialization")
-            descriptor = -1
-            try:
-                descriptor = os.open(
-                    database_path,
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_NOFOLLOW", 0)
-                    | getattr(os, "O_CLOEXEC", 0),
-                    0o600,
-                )
-                os.fchmod(descriptor, 0o600)
-                require_no_acl_grants(descriptor)
-                os.fsync(descriptor)
-            except (OSError, PrivatePathError) as exc:
-                raise SetupError("database initialization ownership could not be bound") from exc
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
+            for runtime_path in (database_path, maintenance_lock_path):
+                descriptor = -1
+                try:
+                    descriptor = os.open(
+                        runtime_path,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                    )
+                    os.fchmod(descriptor, 0o600)
+                    require_no_acl_grants(descriptor)
+                    os.fsync(descriptor)
+                except (OSError, PrivatePathError) as exc:
+                    raise SetupError(
+                        "database initialization ownership could not be bound"
+                    ) from exc
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
             created_database_identity = _owned_runtime_file_identity(database_path)
+            created_lock_identity = _owned_runtime_file_identity(maintenance_lock_path)
             expected_database_identity = (
                 created_database_identity["device"],
                 created_database_identity["inode"],
+            )
+            expected_lock_identity = (
+                created_lock_identity["device"],
+                created_lock_identity["inode"],
             )
             bound_initializing = {
                 "format": 5,
@@ -648,6 +696,8 @@ class ProductionSetupPlatform:
                 "data_owner_uid": data_identity.owner_uid,
                 "database_device": created_database_identity["device"],
                 "database_inode": created_database_identity["inode"],
+                "maintenance_lock_device": created_lock_identity["device"],
+                "maintenance_lock_inode": created_lock_identity["inode"],
                 "removal_phase": "initializing",
             }
             _replace_private_file(
@@ -667,6 +717,8 @@ class ProductionSetupPlatform:
                 "data_owner_uid",
                 "database_device",
                 "database_inode",
+                "maintenance_lock_device",
+                "maintenance_lock_inode",
                 "removal_phase",
             }
             if (
@@ -695,12 +747,24 @@ class ProductionSetupPlatform:
                 recorded["database_device"],
                 recorded["database_inode"],
             )
+            bound_lock_identity = _owned_runtime_file_identity(maintenance_lock_path)
+            if bound_lock_identity != {
+                "device": recorded["maintenance_lock_device"],
+                "inode": recorded["maintenance_lock_inode"],
+            }:
+                raise SetupError(
+                    "maintenance lock changed after initialization ownership was bound"
+                )
+            expected_lock_identity = (
+                recorded["maintenance_lock_device"],
+                recorded["maintenance_lock_inode"],
+            )
             existing = {
                 child.name
                 for child in database_path.parent.iterdir()
                 if child.name != _DATABASE_OWNERSHIP_MARKER
             }
-            if existing != {"signet.db"}:
+            if existing != {"signet.db", maintenance_lock_path.name}:
                 raise SetupError("database directory contains an unowned runtime artifact")
             bound_initializing = recorded
         elif isinstance(recorded, dict) and recorded.get("format") == 3:
@@ -715,13 +779,20 @@ class ProductionSetupPlatform:
                 database_identity["device"],
                 database_identity["inode"],
             )
+            lock_identity = recorded["runtime_files"][maintenance_lock_path.name]
+            expected_lock_identity = (
+                lock_identity["device"],
+                lock_identity["inode"],
+            )
         else:
             raise SetupError("database ownership receipt is invalid")
 
         assert expected_database_identity is not None
+        assert expected_lock_identity is not None
         owned_database = Database(
             database_path,
             expected_identity=expected_database_identity,
+            expected_lock_identity=expected_lock_identity,
         )
         owned_database.initialize(
             post_initialize=lambda: _publish_database_ownership(
@@ -763,7 +834,12 @@ class ProductionSetupPlatform:
                 "removal_phase",
             }
             if bound:
-                initializing_fields |= {"database_device", "database_inode"}
+                initializing_fields |= {
+                    "database_device",
+                    "database_inode",
+                    "maintenance_lock_device",
+                    "maintenance_lock_inode",
+                }
             if (
                 set(ownership) != initializing_fields
                 or ownership.get("setup_id") != setup_id
@@ -802,7 +878,15 @@ class ProductionSetupPlatform:
                 "inode": ownership["database_inode"],
             }:
                 raise SetupError("database changed after initialization ownership was bound")
-            if set(discovered_runtime_files) != {"signet.db"}:
+            lock_name = ".signet.db.maintenance.lock"
+            if discovered_runtime_files.get(lock_name) != {
+                "device": ownership["maintenance_lock_device"],
+                "inode": ownership["maintenance_lock_inode"],
+            }:
+                raise SetupError(
+                    "maintenance lock changed after initialization ownership was bound"
+                )
+            if set(discovered_runtime_files) != {"signet.db", lock_name}:
                 raise SetupError("database directory contains an unowned runtime artifact")
             upgraded = {
                 "format": 3,
@@ -925,43 +1009,59 @@ class ProductionSetupPlatform:
             }
             unreceipted = present - allowed
             active_fence = self._database_override
-            if unreceipted:
-                transient_fence_files = {"signet.db-wal", "signet.db-shm"}
-                if (
-                    phase != "active"
-                    or active_fence is None
-                    or active_fence.path != (data_directory / "signet.db").absolute()
-                    or not active_fence.has_active_write_fence()
-                    or not unreceipted <= transient_fence_files
-                ):
-                    raise SetupError(
-                        "database directory contains an unreceipted database runtime artifact"
-                    )
-                expanded_runtime_files = dict(runtime_files)
-                for name in sorted(unreceipted):
-                    expanded_runtime_files[name] = _owned_runtime_file_identity(
-                        data_directory / name
-                    )
-                expanded_quarantine = {
-                    name: _database_runtime_quarantine_name(setup_id, name, identity)
-                    for name, identity in expanded_runtime_files.items()
-                }
-                expanded_ownership = {
-                    **ownership,
-                    "runtime_files": expanded_runtime_files,
-                    "quarantine": expanded_quarantine,
-                }
-                _replace_private_file(
-                    marker,
-                    _json_bytes(expanded_ownership),
-                    expected_content=_json_bytes(ownership),
-                    expected_parent_identity=data_identity,
-                    require_present=True,
+            transient_fence_files = {"signet.db-wal", "signet.db-shm"}
+            fence_is_active = (
+                phase == "active"
+                and active_fence is not None
+                and active_fence.path == (data_directory / "signet.db").absolute()
+                and active_fence.has_active_write_fence()
+            )
+            if unreceipted and (not fence_is_active or not unreceipted <= transient_fence_files):
+                raise SetupError(
+                    "database directory contains an unreceipted database runtime artifact"
                 )
-                os.fsync(descriptor)
-                ownership = expanded_ownership
-                runtime_files = expanded_runtime_files
-                expected_quarantine = expanded_quarantine
+            if fence_is_active:
+                refreshed_runtime_files = dict(runtime_files)
+                for name in transient_fence_files:
+                    recorded_identity = runtime_files.get(name)
+                    recorded_quarantine = (
+                        expected_quarantine.get(name) if recorded_identity is not None else None
+                    )
+                    source_present = name in present
+                    quarantine_present = (
+                        recorded_quarantine is not None and recorded_quarantine in present
+                    )
+                    if source_present and quarantine_present:
+                        raise SetupError(
+                            "database runtime removal state is incomplete or ambiguous"
+                        )
+                    if source_present:
+                        refreshed_runtime_files[name] = _owned_runtime_file_identity(
+                            data_directory / name
+                        )
+                    elif not quarantine_present:
+                        refreshed_runtime_files.pop(name, None)
+                refreshed_quarantine = {
+                    name: _database_runtime_quarantine_name(setup_id, name, identity)
+                    for name, identity in refreshed_runtime_files.items()
+                }
+                refreshed_ownership = {
+                    **ownership,
+                    "runtime_files": refreshed_runtime_files,
+                    "quarantine": refreshed_quarantine,
+                }
+                if refreshed_ownership != ownership:
+                    _replace_private_file(
+                        marker,
+                        _json_bytes(refreshed_ownership),
+                        expected_content=_json_bytes(ownership),
+                        expected_parent_identity=data_identity,
+                        require_present=True,
+                    )
+                    os.fsync(descriptor)
+                ownership = refreshed_ownership
+                runtime_files = refreshed_runtime_files
+                expected_quarantine = refreshed_quarantine
             removal_order = sorted(runtime_files, key=lambda name: name == "signet.db")
             if phase == "active":
                 for name in removal_order:
@@ -1429,10 +1529,11 @@ class ProductionSetupPlatform:
             spec.root / _CONFIG_NAME,
             secret_store=KeychainSecretStore(),
             components=frozenset(),
-            database_override=self._database_override,
+            database_override=self._owned_database(spec, setup_id),
         )
         attempted_profiles: list[str] = []
         issued_token_ids: list[str] = []
+        prior_revocations_unconfirmed: set[str] = set()
         try:
             for profile in spec.hermes_profiles:
                 profile_dir = self._hermes_profile_directory(profile)
@@ -1484,6 +1585,7 @@ class ProductionSetupPlatform:
                     raise SetupError("Hermes profile snapshot disappeared during setup")
                 snapshot_token_id = snapshot[3]
                 if snapshot_token_id is not None:
+                    prior_revocations_unconfirmed.add(profile)
                     assembly.token_registry.revoke(snapshot_token_id)
                     metadata = assembly.token_registry.metadata(snapshot_token_id)
                     if metadata is None or metadata.revoked_at is None:
@@ -1494,6 +1596,7 @@ class ProductionSetupPlatform:
                         profile_directory=profile_dir,
                         token_id=snapshot_token_id,
                     )
+                    prior_revocations_unconfirmed.remove(profile)
                 merged = _merge_hermes_config(
                     existing_config,
                     token_name=token_name,
@@ -1552,6 +1655,8 @@ class ProductionSetupPlatform:
                     if metadata is None or metadata.revoked_at is None:
                         raise SetupError("issued Hermes caller token revocation was not durable")
                 for profile in reversed(attempted_profiles):
+                    if profile in prior_revocations_unconfirmed:
+                        continue
                     _restore_hermes_profile_snapshot(
                         spec,
                         profile,
@@ -1577,7 +1682,7 @@ class ProductionSetupPlatform:
             spec.root / _CONFIG_NAME,
             secret_store=KeychainSecretStore(),
             components=frozenset(),
-            database_override=self._database_override,
+            database_override=self._owned_database(spec, setup_id),
         )
         for profile in spec.hermes_profiles:
             profile_dir = self._hermes_profile_directory(profile)
@@ -1599,7 +1704,7 @@ class ProductionSetupPlatform:
             spec.root / _CONFIG_NAME,
             secret_store=KeychainSecretStore(),
             components=frozenset(),
-            database_override=self._database_override,
+            database_override=self._owned_database(spec, setup_id),
         )
         for profile in spec.hermes_profiles:
             profile_dir = self._hermes_profile_directory(profile)
@@ -1682,7 +1787,7 @@ class ProductionSetupPlatform:
             spec.root / _CONFIG_NAME,
             secret_store=secret_store,
             components=frozenset(),
-            database_override=self._database_override,
+            database_override=self._owned_database(spec, setup_id),
         )
         bootstrap = BootstrapService(
             assembly.database,
@@ -1858,6 +1963,21 @@ def _private_path_pending_path(root: Path, name: str, setup_id: str) -> Path:
     return root / f"{_PRIVATE_PATH_RECEIPT_PREFIX}{name}.{digest}.pending"
 
 
+def _private_path_staging_name(name: str, setup_id: str) -> str:
+    digest = hashlib.sha256(f"{setup_id}:{name}:staging".encode()).hexdigest()[:24]
+    return f"{_PRIVATE_PATH_RECEIPT_PREFIX}{name}.{digest}.staging"
+
+
+def _private_path_creation_intent(name: str, setup_id: str) -> dict[str, Any]:
+    return {
+        "format": 3,
+        "setup_id": setup_id,
+        "name": name,
+        "staging_name": _private_path_staging_name(name, setup_id),
+        "creation_state": "planned",
+    }
+
+
 def _read_private_path_receipt(
     path: Path,
     *,
@@ -2009,6 +2129,144 @@ def _resume_receipted_private_path_staging(
     return True
 
 
+def _remove_unbound_private_path_staging(root: Path, staging_name: str) -> None:
+    staging = root.parent / staging_name
+    if not staging.exists() and not staging.is_symlink():
+        return
+    parent_identity = require_owned_directory_identity(root.parent)
+    parent_descriptor = -1
+    staging_descriptor = -1
+    quarantine_name = f".signet-private-staging-remove-{secrets.token_urlsafe(24)}"
+    try:
+        parent_descriptor = os.open(
+            root.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_parent = os.fstat(parent_descriptor)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (
+            parent_identity.device,
+            parent_identity.inode,
+        ):
+            raise SetupError("private path staging parent changed during recovery")
+        before = os.stat(staging_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        staging_descriptor = os.open(
+            staging_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(staging_descriptor)
+        require_no_acl_grants(staging_descriptor)
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != current_uid
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or os.listdir(staging_descriptor)
+        ):
+            raise SetupError("private path staging intent names an ambiguous object")
+        rename_entry_no_replace(
+            parent_descriptor,
+            staging_name,
+            parent_descriptor,
+            quarantine_name,
+        )
+        moved = os.stat(quarantine_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (moved.st_dev, moved.st_ino) != (opened.st_dev, opened.st_ino):
+            raise SetupError("private path staging changed during recovery")
+        os.rmdir(quarantine_name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+        for removed_name in (staging_name, quarantine_name):
+            try:
+                os.stat(removed_name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise SetupError("private path staging removal could not be confirmed")
+        revalidate_directory_identity(parent_identity, private=False)
+    except SetupError:
+        raise
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError("private path staging could not be recovered safely") from exc
+    finally:
+        if staging_descriptor >= 0:
+            os.close(staging_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _bind_private_path_creation_intent(
+    root: Path,
+    name: str,
+    *,
+    setup_id: str,
+    intent: Mapping[str, Any],
+    recover_existing: bool,
+) -> None:
+    expected_intent = _private_path_creation_intent(name, setup_id)
+    if intent != expected_intent:
+        raise SetupError(f"private setup path {name!r} creation intent is invalid")
+    staging_name = expected_intent["staging_name"]
+    assert isinstance(staging_name, str)
+    staging = root.parent / staging_name
+    if staging.exists() or staging.is_symlink():
+        if not recover_existing:
+            _remove_exact_owned_file(
+                _private_path_receipt_path(root, name),
+                _json_bytes(expected_intent),
+                expected_parent_identity=require_private_directory_identity(root),
+                parent_private=True,
+            )
+            raise SetupError(f"private setup path {name!r} staging appeared before creation")
+        _remove_unbound_private_path_staging(root, staging_name)
+    try:
+        os.mkdir(staging, 0o700)
+        identity = require_private_directory_identity(staging)
+        _fsync_owned_directory(staging)
+        parent_descriptor = os.open(
+            root.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    except FileExistsError as exc:
+        _remove_exact_owned_file(
+            _private_path_receipt_path(root, name),
+            _json_bytes(expected_intent),
+            expected_parent_identity=require_private_directory_identity(root),
+            parent_private=True,
+        )
+        raise SetupError(f"private setup path {name!r} staging appeared before creation") from exc
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError(f"private setup path {name!r} could not be created safely") from exc
+    receipt = {
+        "format": 2,
+        "setup_id": setup_id,
+        "name": name,
+        "tree_device": identity.device,
+        "tree_inode": identity.inode,
+        "tree_owner_uid": identity.owner_uid,
+        "staging_name": staging_name,
+    }
+    _replace_private_file(
+        _private_path_receipt_path(root, name),
+        _json_bytes(receipt),
+        expected_content=_json_bytes(expected_intent),
+        expected_parent_identity=require_private_directory_identity(root),
+        require_present=True,
+    )
+
+
 def _create_or_verify_receipted_private_directory(
     root: Path,
     path: Path,
@@ -2020,8 +2278,37 @@ def _create_or_verify_receipted_private_directory(
     receipt_path = _private_path_receipt_path(root, path.name)
     pending = _private_path_pending_path(root, path.name, setup_id)
     receipt_exists = receipt_path.exists() or receipt_path.is_symlink()
+    created_intent = False
     path_exists = path.exists() or path.is_symlink()
     pending_exists = pending.exists() or pending.is_symlink()
+    if not receipt_exists:
+        if path_exists or pending_exists:
+            raise SetupError(f"private setup path {path.name!r} has no ownership receipt")
+        intent = _private_path_creation_intent(path.name, setup_id)
+        staging_name = intent["staging_name"]
+        assert isinstance(staging_name, str)
+        staging = root.parent / staging_name
+        if staging.exists() or staging.is_symlink():
+            raise SetupError(f"private setup path {path.name!r} has no creation intent")
+        _replace_private_file(
+            receipt_path,
+            _json_bytes(intent),
+            require_absent=True,
+            expected_parent_identity=require_private_directory_identity(root),
+        )
+        receipt_exists = True
+        created_intent = True
+    recorded = _read_owned_json(receipt_path)
+    if isinstance(recorded, dict) and recorded.get("format") == 3:
+        if path_exists or pending_exists:
+            raise SetupError(f"private setup path {path.name!r} has ambiguous publication state")
+        _bind_private_path_creation_intent(
+            root,
+            path.name,
+            setup_id=setup_id,
+            intent=recorded,
+            recover_existing=not created_intent,
+        )
     if receipt_exists:
         if path_exists and pending_exists:
             raise SetupError(f"private setup path {path.name!r} has ambiguous publication state")
@@ -2039,44 +2326,6 @@ def _create_or_verify_receipted_private_directory(
                 f"private setup path {path.name!r} disappeared while its ownership receipt remains"
             )
         _read_private_path_receipt(pending, setup_id=setup_id, expected_name=path.name)
-    else:
-        if path_exists or pending_exists:
-            raise SetupError(f"private setup path {path.name!r} has no ownership receipt")
-        staging_name = (
-            f"{_PRIVATE_PATH_RECEIPT_PREFIX}{path.name}.{secrets.token_urlsafe(12)}.staging"
-        )
-        staging = root.parent / staging_name
-        try:
-            os.mkdir(staging, 0o700)
-            identity = require_private_directory_identity(staging)
-            _fsync_owned_directory(staging)
-            parent_descriptor = os.open(
-                root.parent,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
-            )
-            try:
-                os.fsync(parent_descriptor)
-            finally:
-                os.close(parent_descriptor)
-        except (OSError, PrivatePathError) as exc:
-            raise SetupError(
-                f"private setup path {path.name!r} could not be created safely"
-            ) from exc
-        receipt = {
-            "format": 2,
-            "setup_id": setup_id,
-            "name": path.name,
-            "tree_device": identity.device,
-            "tree_inode": identity.inode,
-            "tree_owner_uid": identity.owner_uid,
-            "staging_name": staging_name,
-        }
-        _create_or_verify_private_file(receipt_path, _json_bytes(receipt))
-        if not _resume_receipted_private_path_staging(root, path.name, setup_id=setup_id):
-            raise SetupError(f"private setup path {path.name!r} staging disappeared")
     parent_descriptor = -1
     try:
         root_identity = require_private_directory_identity(root)
@@ -2317,12 +2566,12 @@ def _validate_active_database_ownership(
         _owned_runtime_file_identity(data_directory / name)
 
 
-def validate_active_database_ownership(
+def validate_active_database_runtime_ownership(
     data_directory: Path,
     *,
     setup_id: str,
-) -> tuple[int, int]:
-    """Validate the setup receipt and return the bound main-database identity."""
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Validate the setup receipt and return the bound database and lock identities."""
 
     try:
         data_identity = require_private_directory_identity(data_directory)
@@ -2337,7 +2586,26 @@ def validate_active_database_ownership(
         setup_id=setup_id,
         data_identity=data_identity,
     )
-    return int(ownership["database_device"]), int(ownership["database_inode"])
+    database_identity = ownership["runtime_files"]["signet.db"]
+    lock_identity = ownership["runtime_files"][".signet.db.maintenance.lock"]
+    return (
+        (int(database_identity["device"]), int(database_identity["inode"])),
+        (int(lock_identity["device"]), int(lock_identity["inode"])),
+    )
+
+
+def validate_active_database_ownership(
+    data_directory: Path,
+    *,
+    setup_id: str,
+) -> tuple[int, int]:
+    """Validate the setup receipt and return the bound main-database identity."""
+
+    database_identity, _lock_identity = validate_active_database_runtime_ownership(
+        data_directory,
+        setup_id=setup_id,
+    )
+    return database_identity
 
 
 def _runtime_identity_error(logical_name: str) -> str:
@@ -2437,10 +2705,31 @@ def _remove_quarantined_runtime_file(
         )
     except FileNotFoundError:
         return
+    removal_name = f".signet-runtime-delete-{secrets.token_urlsafe(24)}"
     try:
-        os.unlink(quarantine, dir_fd=parent_descriptor)
+        rename_entry_no_replace(
+            parent_descriptor,
+            quarantine,
+            parent_descriptor,
+            removal_name,
+        )
+        moved = os.stat(removal_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (moved.st_dev, moved.st_ino) != expected_identity:
+            with suppress(OSError, PrivatePathError):
+                rename_entry_no_replace(
+                    parent_descriptor,
+                    removal_name,
+                    parent_descriptor,
+                    quarantine,
+                )
+            raise SetupError("database runtime file changed during final removal")
+        os.unlink(removal_name, dir_fd=parent_descriptor)
         if os.fstat(descriptor).st_nlink != 0:
             raise SetupError("database runtime file deletion could not be confirmed")
+    except FileNotFoundError as exc:
+        raise SetupError("database runtime file cleanup state is uncertain") from exc
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError("database runtime file could not be removed safely") from exc
     finally:
         os.close(descriptor)
 
@@ -2561,6 +2850,7 @@ def _replace_private_file(
     temporary_name = f".{path.name}.{secrets.token_urlsafe(16)}.tmp"
     parent_descriptor = -1
     descriptor: int | None = None
+    temporary_identity: tuple[int, int] | None = None
     try:
         parent_descriptor = os.open(
             parent,
@@ -2576,7 +2866,7 @@ def _replace_private_file(
             expected_parent_identity.inode,
         ):
             raise SetupError(f"private resource parent changed: {path.parent}")
-        _require_publish_target(
+        observed_target_identity = _require_publish_target(
             parent_descriptor,
             path,
             require_absent=require_absent,
@@ -2595,6 +2885,8 @@ def _replace_private_file(
             dir_fd=parent_descriptor,
         )
         os.fchmod(descriptor, 0o600)
+        created = os.fstat(descriptor)
+        temporary_identity = (created.st_dev, created.st_ino)
         view = memoryview(content)
         while view:
             written = os.write(descriptor, view)
@@ -2604,7 +2896,7 @@ def _replace_private_file(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-        _require_publish_target(
+        target_identity = _require_publish_target(
             parent_descriptor,
             path,
             require_absent=require_absent,
@@ -2612,41 +2904,88 @@ def _replace_private_file(
             expected_content=expected_content,
             expected_identity=expected_identity,
         )
-        if require_absent:
+        if target_identity != observed_target_identity:
+            raise SetupError(f"owned resource changed or is ambiguous: {path}")
+        if target_identity is None:
             try:
-                os.link(
+                rename_entry_no_replace(
+                    parent_descriptor,
                     temporary_name,
+                    parent_descriptor,
                     path.name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                    follow_symlinks=False,
                 )
             except FileExistsError as exc:
                 raise SetupError(f"resource already exists: {path}") from exc
-            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            published = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (published.st_dev, published.st_ino) != temporary_identity:
+                raise SetupError(f"private resource publication changed: {path}")
+            temporary_identity = None
         else:
-            os.rename(
+            exchange_entries(
+                parent_descriptor,
                 temporary_name,
+                parent_descriptor,
                 path.name,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
             )
+            displaced = os.stat(
+                temporary_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            published = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            displaced_identity = (displaced.st_dev, displaced.st_ino)
+            published_identity = (published.st_dev, published.st_ino)
+            if displaced_identity != target_identity or published_identity != temporary_identity:
+                if published_identity == temporary_identity:
+                    try:
+                        exchange_entries(
+                            parent_descriptor,
+                            temporary_name,
+                            parent_descriptor,
+                            path.name,
+                        )
+                    except (OSError, PrivatePathError) as exc:
+                        raise SetupError(
+                            f"private resource publication rollback is uncertain: {path}"
+                        ) from exc
+                raise SetupError(f"owned resource changed or is ambiguous: {path}")
+            _remove_owned_private_entry(
+                parent_descriptor,
+                temporary_name,
+                expected_identity=target_identity,
+                label=str(path),
+            )
+            temporary_identity = None
         os.fsync(parent_descriptor)
         try:
             assert expected_parent_identity is not None
             revalidate_directory_identity(expected_parent_identity, private=parent_private)
         except PrivatePathError as exc:
             raise SetupError(f"private resource parent changed: {path.parent}") from exc
-    except OSError as exc:
+    except (OSError, PrivatePathError) as exc:
         raise SetupError(f"private resource could not be published: {path}") from exc
     finally:
         if descriptor is not None:
             with suppress(OSError):
                 os.close(descriptor)
         if parent_descriptor >= 0:
-            with suppress(FileNotFoundError):
-                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            primary = sys.exception()
+            cleanup_failure: SetupError | None = None
+            if temporary_identity is not None:
+                try:
+                    _remove_owned_private_entry(
+                        parent_descriptor,
+                        temporary_name,
+                        expected_identity=temporary_identity,
+                        label=str(path),
+                    )
+                except SetupError as cleanup_error:
+                    cleanup_failure = cleanup_error
             os.close(parent_descriptor)
+            if cleanup_failure is not None:
+                if primary is None:
+                    raise cleanup_failure
+                primary.add_note(f"private publication cleanup is uncertain: {cleanup_failure}")
 
 
 def _require_publish_target(
@@ -2657,7 +2996,7 @@ def _require_publish_target(
     require_present: bool,
     expected_content: bytes | None,
     expected_identity: tuple[int, int] | None,
-) -> None:
+) -> tuple[int, int] | None:
     target_descriptor = -1
     try:
         target_descriptor = os.open(
@@ -2666,9 +3005,13 @@ def _require_publish_target(
             dir_fd=parent_descriptor,
         )
     except FileNotFoundError:
-        if require_present or (expected_content is not None and expected_content != b""):
+        if (
+            require_present
+            or expected_identity is not None
+            or (expected_content is not None and expected_content != b"")
+        ):
             raise SetupError(f"owned resource changed or is ambiguous: {path}") from None
-        return
+        return None
     except OSError as exc:
         raise SetupError(f"owned resource changed or is ambiguous: {path}") from exc
     try:
@@ -2676,12 +3019,14 @@ def _require_publish_target(
             raise SetupError(f"resource already exists: {path}")
         metadata = os.fstat(target_descriptor)
         require_no_acl_grants(target_descriptor)
+        named = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
         current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
             or metadata.st_uid != current_uid
             or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (named.st_dev, named.st_ino) != (metadata.st_dev, metadata.st_ino)
             or expected_identity is not None
             and (metadata.st_dev, metadata.st_ino) != expected_identity
         ):
@@ -2690,10 +3035,61 @@ def _require_publish_target(
             actual = _read_owned_descriptor(target_descriptor, len(expected_content) + 1)
             if actual != expected_content:
                 raise SetupError(f"owned resource changed or is ambiguous: {path}")
+        return metadata.st_dev, metadata.st_ino
     except PrivatePathError as exc:
         raise SetupError(f"owned resource changed or is ambiguous: {path}") from exc
     finally:
         os.close(target_descriptor)
+
+
+def _remove_owned_private_entry(
+    parent_descriptor: int,
+    name: str,
+    *,
+    expected_identity: tuple[int, int],
+    label: str,
+) -> None:
+    descriptor = -1
+    removal_name = f".signet-private-remove-{secrets.token_urlsafe(24)}"
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) != expected_identity or (
+            current.st_dev,
+            current.st_ino,
+        ) != expected_identity:
+            raise SetupError(f"refusing to remove changed private resource: {label}")
+        rename_entry_no_replace(
+            parent_descriptor,
+            name,
+            parent_descriptor,
+            removal_name,
+        )
+        moved = os.stat(removal_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (moved.st_dev, moved.st_ino) != expected_identity:
+            with suppress(OSError, PrivatePathError):
+                rename_entry_no_replace(
+                    parent_descriptor,
+                    removal_name,
+                    parent_descriptor,
+                    name,
+                )
+            raise SetupError(f"refusing to remove changed private resource: {label}")
+        os.unlink(removal_name, dir_fd=parent_descriptor)
+        if os.fstat(descriptor).st_nlink != 0:
+            raise SetupError(f"private resource deletion could not be confirmed: {label}")
+    except FileNotFoundError as exc:
+        raise SetupError(f"private resource cleanup is uncertain: {label}") from exc
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError(f"private resource could not be removed safely: {label}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _verify_exact_owned_file(path: Path, expected: bytes) -> None:

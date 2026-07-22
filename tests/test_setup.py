@@ -578,6 +578,48 @@ def test_apply_recovers_owner_marker_link_publication_crash(tmp_path: Path) -> N
     assert not interrupted_temporary.exists()
 
 
+def test_apply_recovers_owner_marker_temporary_before_its_final_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet-owner-pre-link-crash")
+    store = SetupJournalStore(selected.root)
+    setup_id = "setup_0123456789abcdef"
+    real_link = setup_state.os.link
+    real_unlink = setup_state.os.unlink
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_before_link(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if destination == store.OWNER_NAME:
+            raise SimulatedCrash
+        real_link(source, destination, *args, **kwargs)
+
+    def preserve_temporary(path: object, *args: object, **kwargs: object) -> None:
+        if str(path).endswith(".tmp"):
+            return
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(setup_state.os, "link", crash_before_link)
+    monkeypatch.setattr(setup_state.os, "unlink", preserve_temporary)
+    with pytest.raises(SimulatedCrash):
+        store.prepare(selected, setup_id)
+
+    monkeypatch.setattr(setup_state.os, "link", real_link)
+    monkeypatch.setattr(setup_state.os, "unlink", real_unlink)
+    journal = SetupEngine(store, FakePlatform()).apply(selected)
+
+    assert journal.setup_id == setup_id
+    assert store.owner_path.stat().st_nlink == 1
+    assert not any(path.name.endswith(".tmp") for path in selected.root.iterdir())
+
+
 def test_apply_refuses_nonempty_foreign_root(tmp_path: Path) -> None:
     root = tmp_path / "signet"
     root.mkdir()
@@ -922,6 +964,75 @@ def test_upgrade_recovery_receipt_enforces_private_mode_under_restrictive_umask(
         os.umask(previous_umask)
 
     assert receipt_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_upgrade_recovery_receipt_update_avoids_overwriting_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "upgrade-receipt-publication")
+    journal = SetupEngine(SetupJournalStore(selected.root), FakePlatform()).apply(selected)
+    recovery_directory = ensure_private_directory(tmp_path / "recovery-publication")
+    database_path = tmp_path / "source-publication.sqlite3"
+    database_path.write_bytes(b"database source")
+    database_path.chmod(0o600)
+    artifact = tmp_path / "publication-backup.signet-backup"
+    artifact.write_bytes(b"verified backup")
+    artifact.chmod(0o600)
+    source_metadata = database_path.stat()
+    receipt = MigrationBackupReceipt(
+        database_path=database_path,
+        source_schema_version=1,
+        artifact_path=artifact,
+        artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        verified_restore_schema_version=1,
+        source_database_device=source_metadata.st_dev,
+        source_database_inode=source_metadata.st_ino,
+    )
+    receipt_path = setup_operations._write_upgrade_recovery_receipt(
+        recovery_directory,
+        journal=journal,
+        migration_receipt=receipt,
+        observed_schema_version=1,
+        state="backup_verified_migration_pending",
+    )
+    saved = recovery_directory / "saved-owned-receipt.json"
+    foreign = recovery_directory / "foreign-receipt.json"
+    foreign.write_bytes(b"same-user foreign receipt")
+    foreign.chmod(0o600)
+    real_require = setup_platform._require_publish_target
+    checks = 0
+
+    def swap_after_identity_check(
+        parent_descriptor: int,
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> Any:
+        nonlocal checks
+        result = real_require(parent_descriptor, path, *args, **kwargs)
+        if path == receipt_path:
+            checks += 1
+        if checks == 2:
+            receipt_path.rename(saved)
+            foreign.rename(receipt_path)
+        return result
+
+    monkeypatch.setattr(setup_platform, "_require_publish_target", swap_after_identity_check)
+    with pytest.raises(SetupError, match="changed|ambiguous|publication"):
+        setup_operations._write_upgrade_recovery_receipt(
+            recovery_directory,
+            journal=journal,
+            migration_receipt=receipt,
+            observed_schema_version=LATEST_SCHEMA_VERSION,
+            state="migration_applied",
+        )
+
+    assert checks == 2
+    assert receipt_path.read_bytes() == b"same-user foreign receipt"
+    assert json.loads(saved.read_text(encoding="utf-8"))["state"] == (
+        "backup_verified_migration_pending"
+    )
 
 
 def test_upgrade_records_live_schema_when_assembly_fails_after_migration(
@@ -1321,6 +1432,37 @@ def test_verified_purge_receipt_read_refuses_a_path_replacement_race(
         )
 
     assert receipt.read_bytes() == b'{"setup_id":"foreign"}'
+
+
+def test_failed_purge_backup_does_not_revoke_hermes_tokens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "backup-before-revocation")
+    platform = FakePlatform()
+    SetupEngine(SetupJournalStore(selected.root), platform).apply(selected)
+    operations = SetupOperations(selected.root, platform=platform)
+    events: list[str] = []
+    monkeypatch.setattr(operations, "spec", lambda: selected)
+    monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
+    _mock_purge_backup_manager(monkeypatch, operations)
+    monkeypatch.setattr(
+        operations,
+        "_revoke_hermes_tokens_for_rollback",
+        lambda *args, **kwargs: events.append("revoke") or True,
+    )
+
+    def fail_backup(*args: Any, **kwargs: Any) -> Path:
+        del args, kwargs
+        events.append("backup")
+        raise SetupError("injected backup failure")
+
+    monkeypatch.setattr(operations, "_backup", fail_backup)
+
+    with pytest.raises(SetupError, match="injected backup failure"):
+        operations.uninstall(purge=True)
+
+    assert events == ["backup"]
 
 
 def test_purge_durably_publishes_the_recovery_directory_before_backup(
@@ -2459,6 +2601,25 @@ def test_private_path_apply_refuses_an_unreceipted_same_user_tree(tmp_path: Path
     assert foreign.read_text(encoding="utf-8") == "preserve me"
 
 
+def test_private_path_apply_does_not_adopt_a_preexisting_staging_tree(tmp_path: Path) -> None:
+    selected = replace(
+        spec(tmp_path / "private-path-staging-injection"),
+        public_origin="https://example.com",
+    )
+    setup_id = "setup-private-path-staging"
+    ensure_private_directory(selected.root)
+    staging_name = setup_platform._private_path_staging_name("data", setup_id)
+    staging = ensure_private_directory(selected.root.parent / staging_name)
+    foreign = staging / "foreign.txt"
+    foreign.write_text("preserve me", encoding="utf-8")
+    foreign.chmod(0o600)
+
+    with pytest.raises(SetupError, match="no creation intent"):
+        ProductionSetupPlatform()._apply_private_paths(selected, setup_id)
+
+    assert foreign.read_text(encoding="utf-8") == "preserve me"
+
+
 def test_private_path_apply_resumes_a_receipted_pending_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2531,6 +2692,41 @@ def test_private_path_apply_recovers_when_creation_precedes_ownership_receipt(
         (selected.root / name).is_dir()
         for name in ("data", "backups", "restore", "logs", "services", "staging", "attachments")
     )
+    platform._rollback_private_paths(selected, "setup_pre_receipt_crash")
+    assert not list(selected.root.parent.glob(".signet-private-path-*.staging"))
+
+
+def test_private_path_rollback_cleans_creation_intent_after_pre_receipt_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "private-path-pre-receipt-purge")
+    ensure_private_directory(selected.root)
+    platform = ProductionSetupPlatform()
+    real_require = setup_platform.require_private_directory_identity
+    interrupted = False
+
+    def interrupt_after_creation(path: Path) -> Any:
+        nonlocal interrupted
+        identity = real_require(path)
+        if not interrupted and path.name.startswith(".signet-private-path-"):
+            interrupted = True
+            raise RuntimeError("injected crash before ownership receipt")
+        return identity
+
+    monkeypatch.setattr(
+        setup_platform,
+        "require_private_directory_identity",
+        interrupt_after_creation,
+    )
+    with pytest.raises(RuntimeError, match="before ownership receipt"):
+        platform._apply_private_paths(selected, "setup_pre_receipt_purge")
+    monkeypatch.setattr(setup_platform, "require_private_directory_identity", real_require)
+
+    platform._rollback_private_paths(selected, "setup_pre_receipt_purge")
+
+    assert not list(selected.root.parent.glob(".signet-private-path-*.staging"))
+    assert not list(selected.root.glob(".signet-private-path-*"))
 
 
 def test_private_path_rollback_removes_a_receipted_pending_publication(
@@ -2695,6 +2891,140 @@ def test_database_apply_resumes_after_initialization_precedes_runtime_inventory(
     assert marker["removal_phase"] == "active"
 
 
+def test_database_apply_resumes_after_maintenance_lock_creation_precedes_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(
+        spec(tmp_path / "database-maintenance-lock-crash"),
+        public_origin="https://example.com",
+    )
+    setup_id = "setup-database-maintenance-lock-crash"
+    platform = ProductionSetupPlatform()
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *args, **kwargs: None)
+    platform._apply_private_paths(selected, setup_id)
+    database_path = selected.root / "data" / "signet.db"
+    maintenance_lock = database_path.with_name(f".{database_path.name}.maintenance.lock")
+    real_initialize = Database.initialize
+
+    def interrupt_after_lock_creation(database: Database, **kwargs: Any) -> None:
+        del database, kwargs
+        if not maintenance_lock.exists():
+            maintenance_lock.write_bytes(b"")
+            maintenance_lock.chmod(0o600)
+        raise RuntimeError("simulated death after maintenance-lock creation")
+
+    monkeypatch.setattr(Database, "initialize", interrupt_after_lock_creation)
+    with pytest.raises(RuntimeError, match="maintenance-lock creation"):
+        platform._apply_database(selected, setup_id)
+
+    monkeypatch.setattr(Database, "initialize", real_initialize)
+    platform._apply_database(selected, setup_id)
+
+    marker = json.loads(
+        (selected.root / "data" / ".signet-database-ownership.json").read_text(encoding="utf-8")
+    )
+    assert marker["format"] == 3
+    assert marker["runtime_files"][maintenance_lock.name] == {
+        "device": maintenance_lock.stat().st_dev,
+        "inode": maintenance_lock.stat().st_ino,
+    }
+
+
+def test_later_setup_steps_reject_a_database_replaced_after_database_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(
+        spec(tmp_path / "database-later-step-replacement"),
+        public_origin="https://example.com",
+    )
+    setup_id = "setup-database-later-step-replacement"
+    platform = ProductionSetupPlatform()
+    store = SetupJournalStore(selected.root)
+    store.prepare(selected, setup_id)
+    store.save(
+        SetupJournal(
+            version=1,
+            setup_id=setup_id,
+            spec=selected.document(),
+            spec_digest=selected.digest,
+            status="completed",
+            steps=[
+                setup_state.SetupStepRecord(name=name, status="completed", attempts=1)
+                for name in SETUP_STEPS
+            ],
+        )
+    )
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *args, **kwargs: None)
+    platform._apply_private_paths(selected, setup_id)
+    platform._apply_configuration(selected, setup_id)
+    platform._apply_database(selected, setup_id)
+
+    database_path = selected.root / "data" / "signet.db"
+    replacement = selected.root / "data" / "replacement.db"
+    replacement.write_bytes(database_path.read_bytes())
+    replacement.chmod(0o600)
+    replacement.replace(database_path)
+
+    def reject_unpinned_assembly(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("production assembly must not open a replaced database")
+
+    monkeypatch.setattr(setup_platform, "create_production_assembly", reject_unpinned_assembly)
+
+    class StatusPlatform(ProductionSetupPlatform):
+        def service_status(self, selected_spec: SetupSpec) -> dict[str, str]:
+            del selected_spec
+            return {"signet-mcp": "inactive", "signet-web": "inactive"}
+
+    status = SetupOperations(selected.root, platform=StatusPlatform()).status()
+    assert status["production"] == {"available": False, "error_kind": "SetupError"}
+
+    with pytest.raises(SetupError, match="database changed after setup ownership"):
+        platform._apply_owner_bootstrap(selected, setup_id)
+
+
+def test_private_file_replacement_preserves_a_racing_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "private-replacement"
+    parent.mkdir(mode=0o700)
+    target = parent / "receipt.json"
+    target.write_bytes(b"owned-old")
+    target.chmod(0o600)
+    foreign = b"same-user foreign replacement"
+    real_exchange = setup_platform.exchange_entries
+    raced = False
+
+    def race_then_exchange(
+        first_directory: int,
+        first_name: str,
+        second_directory: int,
+        second_name: str,
+    ) -> None:
+        nonlocal raced
+        if not raced:
+            target.unlink()
+            target.write_bytes(foreign)
+            target.chmod(0o600)
+            raced = True
+        real_exchange(first_directory, first_name, second_directory, second_name)
+
+    monkeypatch.setattr(setup_platform, "exchange_entries", race_then_exchange)
+    with pytest.raises(SetupError, match="changed or is ambiguous"):
+        setup_platform._replace_private_file(
+            target,
+            b"owned-new",
+            expected_content=b"owned-old",
+            require_present=True,
+        )
+
+    assert raced is True
+    assert target.read_bytes() == foreign
+
+
 def test_database_rollback_refuses_a_same_user_replacement_inode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2779,6 +3109,50 @@ def test_database_rollback_receipts_active_fence_sidecars_before_mutation(
         assert receipt["removal_phase"] == "active"
 
 
+def test_database_rollback_refreshes_transient_sidecar_epoch_on_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(
+        spec(tmp_path / "database-sidecar-epoch-refresh"),
+        public_origin="https://example.com",
+    )
+    setup_id = "setup-database-sidecar-epoch"
+    platform = ProductionSetupPlatform()
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *args, **kwargs: None)
+    platform._apply_private_paths(selected, setup_id)
+    platform._apply_database(selected, setup_id)
+    database = Database(selected.root / "data" / "signet.db")
+    marker = database.path.parent / ".signet-database-ownership.json"
+
+    def interrupt(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("simulated crash before quarantine")
+
+    monkeypatch.setattr(setup_platform, "_quarantine_owned_runtime_file", interrupt)
+    with platform.use_database(database), database.write_fence() as connection:
+        connection.execute("CREATE TABLE sidecar_epoch_test (value INTEGER NOT NULL)")
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            platform._rollback_database(selected, setup_id)
+        first = json.loads(marker.read_text(encoding="utf-8"))
+
+        refreshed: dict[str, dict[str, int]] = {}
+        for name in ("signet.db-wal", "signet.db-shm"):
+            path = database.path.parent / name
+            path.unlink()
+            path.write_bytes(b"recreated sidecar epoch")
+            path.chmod(0o600)
+            metadata = path.stat()
+            refreshed[name] = {"device": metadata.st_dev, "inode": metadata.st_ino}
+            assert refreshed[name] != first["runtime_files"][name]
+
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            platform._rollback_database(selected, setup_id)
+        second = json.loads(marker.read_text(encoding="utf-8"))
+
+    assert {name: second["runtime_files"][name] for name in refreshed} == refreshed
+
+
 def test_database_rollback_removes_every_receipted_runtime_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2825,6 +3199,48 @@ def test_database_rollback_resumes_after_runtime_files_were_quarantined(
 
     assert not marker.exists()
     assert list(data_directory.iterdir()) == []
+
+
+def test_database_quarantine_cleanup_does_not_unlink_a_racing_foreign_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = ensure_private_directory(tmp_path / "database-quarantine-cleanup")
+    quarantine_name = ".signet-runtime-remove-owned"
+    quarantine = directory / quarantine_name
+    saved = directory / "saved-owned"
+    foreign = directory / "foreign"
+    quarantine.write_bytes(b"owned runtime")
+    quarantine.chmod(0o600)
+    foreign.write_bytes(b"same-user foreign runtime")
+    foreign.chmod(0o600)
+    metadata = quarantine.stat()
+    parent_descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    real_unlink = setup_platform.os.unlink
+    raced = False
+
+    def race_pathname_unlink(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal raced
+        if path == quarantine_name and not raced:
+            quarantine.rename(saved)
+            foreign.rename(quarantine)
+            raced = True
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(setup_platform.os, "unlink", race_pathname_unlink)
+    try:
+        setup_platform._remove_quarantined_runtime_file(
+            parent_descriptor,
+            quarantine_name,
+            expected_identity=(metadata.st_dev, metadata.st_ino),
+            logical_name="signet.db-wal",
+        )
+    finally:
+        os.close(parent_descriptor)
+
+    assert raced is False
+    assert foreign.read_bytes() == b"same-user foreign runtime"
+    assert not saved.exists()
 
 
 def test_systemd_rollback_retries_after_reload_failure_and_tolerates_unloaded_units(
@@ -3061,6 +3477,78 @@ def test_private_replacement_rechecks_an_expected_empty_file_before_publish(
 
     assert raced is True
     assert not path.exists()
+
+
+def test_private_new_file_publication_does_not_overwrite_a_racing_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = ensure_private_directory(tmp_path / "private-new-publication-race")
+    path = root / "config.yaml"
+    foreign_content = b""
+    real_require = setup_platform._require_publish_target
+    checks = 0
+    foreign_identity: tuple[int, int] | None = None
+
+    def insert_after_absence_check(*args: object, **kwargs: object) -> Any:
+        nonlocal checks, foreign_identity
+        result = real_require(*args, **kwargs)
+        checks += 1
+        if checks == 2:
+            path.write_bytes(foreign_content)
+            path.chmod(0o600)
+            metadata = path.stat()
+            foreign_identity = (metadata.st_dev, metadata.st_ino)
+        return result
+
+    monkeypatch.setattr(setup_platform, "_require_publish_target", insert_after_absence_check)
+    with pytest.raises(SetupError, match="already exists|changed|published"):
+        _replace_private_file(path, b"managed file", expected_content=b"")
+
+    assert path.read_bytes() == foreign_content
+    metadata = path.stat()
+    assert (metadata.st_dev, metadata.st_ino) == foreign_identity
+
+
+def test_private_file_update_restores_a_racing_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = ensure_private_directory(tmp_path / "private-update-publication-race")
+    path = root / "config.yaml"
+    saved = root / "saved-owned.yaml"
+    foreign = root / "foreign.yaml"
+    path.write_bytes(b"owned content")
+    path.chmod(0o600)
+    foreign.write_bytes(b"owned content")
+    foreign.chmod(0o600)
+    foreign_metadata = foreign.stat()
+    foreign_identity = (foreign_metadata.st_dev, foreign_metadata.st_ino)
+    real_require = setup_platform._require_publish_target
+    checks = 0
+
+    def swap_after_identity_check(*args: object, **kwargs: object) -> Any:
+        nonlocal checks
+        result = real_require(*args, **kwargs)
+        checks += 1
+        if checks == 1:
+            path.rename(saved)
+            foreign.rename(path)
+        return result
+
+    monkeypatch.setattr(setup_platform, "_require_publish_target", swap_after_identity_check)
+    with pytest.raises(SetupError, match="changed|ambiguous|publication"):
+        _replace_private_file(
+            path,
+            b"updated content",
+            expected_content=b"owned content",
+            require_present=True,
+        )
+
+    assert path.read_bytes() == b"owned content"
+    path_metadata = path.stat()
+    assert (path_metadata.st_dev, path_metadata.st_ino) == foreign_identity
+    assert saved.read_bytes() == b"owned content"
 
 
 def test_private_replacement_rejects_a_replaced_parent_directory(tmp_path: Path) -> None:
@@ -3910,6 +4398,65 @@ def test_hermes_profile_edits_are_transactional_across_profiles(
 
     assert all(path.read_bytes() == content for path, content in originals.items())
     assert not (selected.root / "services" / "hermes-profile-snapshots").exists()
+
+
+def test_hermes_apply_preserves_snapshot_when_prior_token_revocation_is_unconfirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_home = tmp_path / "profiles"
+    profile = ensure_private_directory(profile_home / "work")
+    original_config = b"model: test/work\n"
+    original_environment = b"ORIGINAL=kept\n"
+    for name, content in (("config.yaml", original_config), (".env", original_environment)):
+        path = profile / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+
+    selected = replace(spec(tmp_path / "prior-revocation-failure"), hermes_profiles=("work",))
+    setup_id = "setup_0123456789abcdef"
+    platform = ProductionSetupPlatform(hermes_home=profile_home)
+    platform._apply_private_paths(selected, setup_id)
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=require_private_directory_identity(profile),
+        config=original_config,
+        environment=original_environment,
+        config_exists=True,
+        environment_exists=True,
+        setup_id=setup_id,
+    )
+    setup_platform._bind_hermes_snapshot_token(
+        selected,
+        "work",
+        profile_directory=profile,
+        token_id="00000000000000aa",
+    )
+
+    class Registry:
+        @staticmethod
+        def revoke(token_id: str) -> None:
+            assert token_id == "00000000000000aa"
+            raise RuntimeError("injected prior-token revocation failure")
+
+    class Assembly:
+        token_registry = Registry()
+
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *a, **k: Assembly())
+
+    with pytest.raises(RuntimeError, match="prior-token revocation"):
+        platform._apply_hermes_profiles(selected, setup_id)
+
+    snapshot = setup_platform._read_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_directory=profile,
+    )
+    assert snapshot is not None
+    assert snapshot[3] == "00000000000000aa"
+    assert (profile / "config.yaml").read_bytes() == original_config
+    assert (profile / ".env").read_bytes() == original_environment
 
 
 def test_hermes_apply_preserves_snapshot_and_edits_when_token_revocation_fails(
