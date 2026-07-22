@@ -2582,6 +2582,39 @@ def test_tailnet_apply_rejects_a_foreground_listener_before_mutation(
     assert not any("--bg" in command for command in commands)
 
 
+def test_tailnet_apply_resume_rejects_unreceipted_configuration_drift(
+    tmp_path: Path,
+) -> None:
+    selected = SetupSpec(
+        root=tmp_path / "tailnet-resume-drift",
+        public_origin="https://signet.example.ts.net:8443",
+        owner_user_id="user:owner",
+        hermes_profiles=("work",),
+        executable=Path("/bin/echo"),
+    )
+    ensure_private_directory(selected.root / "services")
+    before_path = selected.root / "services" / "tailscale-serve-before.json"
+    before_path.write_text('{"format":2,"serve":{}}\n', encoding="utf-8")
+    before_path.chmod(0o600)
+    drifted = {
+        "TCP": {"9443": {"HTTPS": True}},
+        "Web": {
+            "signet.example.ts.net:9443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9444"}}}
+        },
+    }
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(drifted), "")
+
+    platform = ProductionSetupPlatform(command_runner=run)
+    with pytest.raises(SetupError, match="snapshot changed before apply completed"):
+        platform._apply_tailnet_route(selected)
+    assert not any("--bg" in command for command in commands)
+
+
 def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
     tmp_path: Path,
 ) -> None:

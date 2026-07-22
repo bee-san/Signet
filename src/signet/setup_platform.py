@@ -837,17 +837,36 @@ class ProductionSetupPlatform:
         target = "http://127.0.0.1:8790"
         if record_path.exists():
             before = _read_owned_json(record_path)
-            if not isinstance(before, dict) or set(before) != {"format", "serve"}:
+            if (
+                not isinstance(before, dict)
+                or set(before) != {"format", "serve"}
+                or before.get("format") != 2
+            ):
                 raise SetupError("Tailscale rollback record is invalid")
             recorded_after = _read_owned_json(after_path) if after_path.exists() else None
-            if recorded_after is not None and (
-                not isinstance(recorded_after, dict)
-                or set(recorded_after) != {"format", "serve"}
-                or recorded_after.get("format") != 2
-                or recorded_after.get("serve") != current
-            ):
-                raise SetupError("the managed Tailscale snapshot changed after setup")
-            if _serve_config_mentions_listener(current, host_port=host_port, port=port):
+            if recorded_after is not None:
+                if (
+                    not isinstance(recorded_after, dict)
+                    or set(recorded_after) != {"format", "serve"}
+                    or recorded_after.get("format") != 2
+                    or recorded_after.get("serve") != current
+                    or not _serve_config_has_private_route(
+                        current,
+                        host_port=host_port,
+                        port=port,
+                        target=target,
+                    )
+                ):
+                    raise SetupError("the managed Tailscale snapshot changed after setup")
+                return
+            listener_present = _serve_config_mentions_listener(
+                current,
+                host_port=host_port,
+                port=port,
+            )
+            if current != before.get("serve") and not listener_present:
+                raise SetupError("the pre-setup Tailscale snapshot changed before apply completed")
+            if listener_present:
                 if not _serve_config_has_private_route(
                     current,
                     host_port=host_port,
