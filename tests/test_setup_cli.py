@@ -27,6 +27,9 @@ class FakePlatform:
         del spec, setup_id
         self.rolled_back.append(step)
 
+    def validate_private_paths(self, spec: object, setup_id: str) -> None:
+        del spec, setup_id
+
 
 def test_profile_discovery_includes_the_hermes_default_profile(
     tmp_path: Path,

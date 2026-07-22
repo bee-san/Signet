@@ -194,6 +194,8 @@ class SetupJournal:
 class SetupPlatform(Protocol):
     def preflight(self, spec: SetupSpec) -> None: ...
 
+    def validate_private_paths(self, spec: SetupSpec, setup_id: str) -> None: ...
+
     def apply(self, step: str, spec: SetupSpec, setup_id: str) -> None: ...
 
     def rollback(self, step: str, spec: SetupSpec, setup_id: str) -> None: ...
@@ -214,6 +216,7 @@ class SetupJournalStore:
         if spec.root != self.root:
             raise SetupError("setup journal root does not match the setup specification")
         self._prepare_root()
+        self._recover_owner_publication()
         if self.owner_path.exists():
             owner = self._read_document(self.owner_path, label="setup owner marker")
             accepted_digests = {spec.digest}
@@ -242,6 +245,7 @@ class SetupJournalStore:
     def owned_setup_id(self, spec: SetupSpec) -> str | None:
         """Recover the durable setup ID without creating or replacing state."""
 
+        self._recover_owner_publication()
         if not self.owner_path.exists():
             return None
         owner = self._read_document(self.owner_path, label="setup owner marker")
@@ -319,6 +323,77 @@ class SetupJournalStore:
             raise SetupError("setup root must be an owned mode-0700 directory") from exc
         if resolved != self.root:
             raise SetupError("setup root must be canonical and contain no symbolic links")
+
+    def _recover_owner_publication(self) -> None:
+        """Finish the recoverable hard-link publication boundary for the owner marker."""
+
+        try:
+            owner = self.owner_path.lstat()
+        except FileNotFoundError:
+            return
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if owner.st_nlink == 1:
+            return
+        if (
+            not stat.S_ISREG(owner.st_mode)
+            or owner.st_uid != current_uid
+            or stat.S_IMODE(owner.st_mode) != 0o600
+            or owner.st_nlink != 2
+        ):
+            raise SetupError("setup owner marker is not a private owned file")
+        parent_identity = require_private_directory_identity(self.root)
+        parent_descriptor = -1
+        try:
+            parent_descriptor = os.open(
+                self.root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            prefix = f".{self.OWNER_NAME}."
+            candidates: list[str] = []
+            for name in os.listdir(parent_descriptor):
+                if not name.startswith(prefix) or not name.endswith(".tmp"):
+                    continue
+                token = name[len(prefix) : -4]
+                if not token or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None:
+                    continue
+                candidate = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                if (candidate.st_dev, candidate.st_ino) == (owner.st_dev, owner.st_ino):
+                    candidates.append(name)
+            if len(candidates) != 1:
+                raise SetupError("setup owner marker publication state is ambiguous")
+            current = os.stat(
+                self.OWNER_NAME,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (current.st_dev, current.st_ino) != (
+                owner.st_dev,
+                owner.st_ino,
+            ) or current.st_nlink != 2:
+                raise SetupError("setup owner marker changed during publication recovery")
+            os.unlink(candidates[0], dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+            recovered = os.stat(
+                self.OWNER_NAME,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (recovered.st_dev, recovered.st_ino) != (
+                owner.st_dev,
+                owner.st_ino,
+            ) or recovered.st_nlink != 1:
+                raise SetupError("setup owner marker recovery did not complete")
+            revalidate_directory_identity(parent_identity, private=True)
+        except SetupError:
+            raise
+        except (OSError, PrivatePathError) as exc:
+            raise SetupError("setup owner marker publication could not be recovered") from exc
+        finally:
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
 
     @staticmethod
     def _read_document(path: Path, *, label: str) -> dict[str, Any]:
@@ -534,6 +609,7 @@ class SetupEngine:
         if journal.purge_backup is not None:
             journal.purge_backup = None
             self.store.save(journal)
+        self.validate_private_paths(spec, journal=journal)
         if journal.status == "completed":
             try:
                 self.platform.apply("owner_bootstrap", spec, journal.setup_id)
@@ -580,11 +656,45 @@ class SetupEngine:
         self.store.save(journal)
         return journal
 
+    def validate_private_paths(
+        self,
+        spec: SetupSpec,
+        *,
+        journal: SetupJournal | None = None,
+    ) -> SetupJournal:
+        selected = self.store.load() if journal is None else journal
+        self._require_spec(selected, spec)
+        if selected.step("private_paths").status == "completed":
+            self.platform.validate_private_paths(spec, selected.setup_id)
+        return selected
+
+    def mark_pending_services_rolled_back_for_purge(self, spec: SetupSpec) -> SetupJournal:
+        """Durably record that a never-applied service step needs no rollback."""
+
+        journal = self.store.load()
+        self._require_spec(journal, spec)
+        self.validate_private_paths(spec, journal=journal)
+        record = journal.step("services")
+        if record.status == "rolled_back":
+            return journal
+        if record.status != "pending":
+            raise SetupError("pending-service purge transition is no longer applicable")
+        record.status = "rolled_back"
+        record.error_kind = None
+        journal.status = "rolling_back"
+        try:
+            self.store.save(journal)
+        except Exception as exc:
+            record.status = "pending"
+            raise SetupError("could not durably quiesce a pending service step") from exc
+        return journal
+
     def quiesce_services_for_purge(self, spec: SetupSpec) -> SetupJournal:
         """Durably stop managed writers while keeping ordinary setup resume possible."""
 
         journal = self.store.load()
         self._require_spec(journal, spec)
+        self.validate_private_paths(spec, journal=journal)
         record = journal.step("services")
         if journal.status == "uninstalled" and record.status == "rolled_back":
             return journal
@@ -656,6 +766,7 @@ class SetupEngine:
             raise SetupError(f"unsupported setup step: {unsupported[0]}")
         journal = self.store.load()
         self._require_spec(journal, spec)
+        self.validate_private_paths(spec, journal=journal)
         previous_status = journal.status
         journal.status = "rolling_back"
         try:
