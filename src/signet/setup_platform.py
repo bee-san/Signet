@@ -942,8 +942,13 @@ class ProductionSetupPlatform:
             not isinstance(recorded_after, dict)
             or set(recorded_after) != {"format", "serve"}
             or recorded_after.get("format") != 2
-            or recorded_after.get("serve") != current
         ):
+            raise SetupError("Tailscale apply receipt is invalid")
+        if current == before_serve:
+            _remove_exact_owned_file(after_path, _canonical_json_bytes(recorded_after))
+            _remove_exact_owned_file(record_path, _canonical_json_bytes(before))
+            return
+        if recorded_after.get("serve") != current:
             raise SetupError("refusing to overwrite a changed Tailscale snapshot")
         target = "http://127.0.0.1:8790"
         if not _serve_config_has_private_route(

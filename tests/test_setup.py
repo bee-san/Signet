@@ -2662,6 +2662,62 @@ def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
     assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
 
 
+def test_tailnet_rollback_resumes_after_restoring_the_pre_setup_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = SetupSpec(
+        root=tmp_path / "resumable-tailnet-rollback",
+        public_origin="https://signet.example.ts.net:8443",
+        owner_user_id="user:owner",
+        hermes_profiles=("work",),
+        executable=Path("/bin/echo"),
+    )
+    ensure_private_directory(selected.root / "services")
+    host_port = "signet.example.ts.net:8443"
+    state: dict[str, Any] = {"serve": {}}
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        commands.append(command)
+        if command[:3] == ["tailscale", "serve", "status"]:
+            payload = state["serve"]
+        elif "--bg" in command:
+            state["serve"] = {
+                "TCP": {"8443": {"HTTPS": True}},
+                "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+                "AllowFunnel": {host_port: False},
+            }
+            payload = {}
+        elif command[-1] == "off":
+            state["serve"] = {}
+            payload = {}
+        else:  # pragma: no cover - protects the fake boundary
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    platform = ProductionSetupPlatform(command_runner=run)
+    platform._apply_tailnet_route(selected)
+    real_remove = setup_platform._remove_exact_owned_file
+
+    def interrupt_cleanup(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise SetupError("fault after Tailscale restore")
+
+    monkeypatch.setattr(setup_platform, "_remove_exact_owned_file", interrupt_cleanup)
+    with pytest.raises(SetupError, match="fault after Tailscale restore"):
+        platform._rollback_tailnet_route(selected)
+
+    monkeypatch.setattr(setup_platform, "_remove_exact_owned_file", real_remove)
+    platform._rollback_tailnet_route(selected)
+
+    assert state["serve"] == {}
+    assert sum(command[-1] == "off" for command in commands) == 1
+    assert not (selected.root / "services" / "tailscale-serve-before.json").exists()
+    assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
+
+
 def test_tailnet_rollback_verifies_the_exact_pre_setup_snapshot(tmp_path: Path) -> None:
     selected = SetupSpec(
         root=tmp_path / "owned-exact-tailnet",
