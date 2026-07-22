@@ -138,9 +138,10 @@ Notes:
 
 - Each factor has its own rate-limit scope, and each caller/source also has its own
   rate-limit scope.
-- TOTP replay prevention is per factor and per timestep. A timestep can be
-  consumed once for a given purpose and cannot be reused by the same factor, a
-  different factor, or a different user.
+- TOTP replay prevention is scoped by `(factor_id, timestep)`. That pair can be
+  consumed once for a given purpose and cannot be reused by the same factor.
+  The same numeric timestep for a different factor, including one owned by a
+  different user, is an independent proof.
 - WebAuthn challenges are bound to the exact origin, RP ID, host, session ID,
   method, action, request ID, version, and payload hashes needed for the
   operation.
@@ -215,7 +216,7 @@ must remain unchanged except for the relevant audit/event record.
 | E-4 | The same TOTP seed is cloned to another label/device and presented as a new factor | Reject; it is not an independent enrollment. |
 | A-1 | Login proof is submitted to a mutation endpoint | Reject; no commit and no session upgrade. |
 | A-2 | Mutation proof is replayed against a second request or version | Reject; the proof is already consumed. |
-| A-3 | One TOTP timestep is reused for the same factor, another factor, or another user | Reject; the step ledger blocks replay. |
+| A-3 | One `(factor_id, timestep)` pair is reused; another factor independently uses the same numeric timestep | Reject the reused pair; allow the independent factor after its own proof succeeds. |
 | A-4 | WebAuthn assertion uses the wrong origin, RP ID, host, session, action, or request hash | Reject; the challenge is invalid or unconsumed. |
 | A-5 | A browser or agent session lacking a fresh selected factor attempts approve, edit, deny, cancel, enroll, revoke, recover, or weaken policy | Reject all of them; no state change. |
 | F-1 | Rename, revoke, or disable is attempted without a fresh selected factor | Reject; the label/state remains unchanged. |

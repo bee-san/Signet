@@ -75,7 +75,7 @@ The user-facing production verbs are intentionally narrow and idempotent:
 | `signet install` | Apply one desired runtime state | Treat already-installed managed objects as a no-op when hashes match | Render or update managed config, unit files, and route fragments | Never restart by default |
 | `signet status` | Read-only inventory snapshot | Purely observational | Show paths, owners, units, ports, routes, schema, health, and budgets | Never mutates |
 | `signet doctor` | Read-only verification of the installed runtime | Purely observational | Run integrity, capacity, and backend checks | Never mutates |
-| `signet upgrade` | Move to a newer release and schema | Must checkpoint and back up before any schema boundary | Stage new artifacts, migrate schema, and reload routes | Prefer `/reload-mcp`; hard restart is a separate approval gate |
+| `signet upgrade` | Move to a newer release and schema | Must checkpoint and back up before any schema boundary | Stage new artifacts, migrate schema, restart Signet services, and reload routes | Supervised Signet restart is required; a Hermes gateway restart is a separate approval gate |
 | `signet backup` | Create an encrypted bundle from a consistent snapshot | Re-running with the same output path must refuse to overwrite | Write one encrypted bundle to the backup root | No restart |
 | `signet restore` | Restore a bundle into a new destination root | Never overwrite existing live state | Produce a new restored tree only | No restart |
 | `signet uninstall` | Remove live service objects and routes | Re-running on an already-removed install is a no-op | Disable units, remove managed route fragments, keep backups by default | No restart |
@@ -272,13 +272,18 @@ Upgrade proceeds in this order:
 2. create a backup;
 3. stage the new release artifacts and service definitions;
 4. run schema migrations if needed;
-5. refresh Hermes routes with `/reload-mcp` if the route surface changed;
-6. re-run doctor;
-7. only then ask for the separate approval if a hard restart is unavoidable.
+5. use the service manager to restart the Signet API and workers onto the staged
+   release;
+6. require every managed unit to be active and pass authenticated post-restart
+   health checks, then re-run doctor;
+7. refresh Hermes routes with `/reload-mcp` if the route surface changed;
+8. only then ask for separate approval if a Hermes gateway restart is unavoidable.
 
-If a schema boundary or release bug makes rollback unsafe, the system must stop in
-`rollback_pending` and require an operator decision to either repair forward or
-restore from the just-taken backup.
+If a Signet unit or post-restart check fails, the upgrade must not report success.
+It must restore the prior artifacts and service definitions when that rollback is
+provably safe. If a schema boundary or release bug makes rollback unsafe, the system
+must stop in `rollback_pending` and require an operator decision to either repair
+forward or restore from the just-taken backup.
 
 ### Rollback
 
