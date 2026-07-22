@@ -171,9 +171,9 @@ def run_setup_command(
                 input_fn,
                 "Back up and roll back all setup-owned Signet resources?",
             )
-            rollback_document = operations_factory(
-                root, platform=selected_platform
-            ).uninstall(purge=True)
+            rollback_document = operations_factory(root, platform=selected_platform).uninstall(
+                purge=True
+            )
             _emit(rollback_document, output)
             return 0
         _require_confirmation(args.yes, input_fn, "Apply this setup plan?")
