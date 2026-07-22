@@ -119,10 +119,40 @@ class ProductionStateStore:
                     _pre_identity_hardening_production_config_digest(config),
                     _rollout_preparation_base_digest(config),
                 }
+                if not config.caller_principals:
+                    compatible_digests.update(
+                        {
+                            _pre_caller_principals_production_config_digest(config),
+                            _pre_caller_principals_production_config_digest(
+                                config,
+                                rollout_state=opposite_rollout,
+                            ),
+                            _legacy_production_config_digest(
+                                config,
+                                without_caller_principals=True,
+                            ),
+                            _pre_identity_hardening_production_config_digest(
+                                config,
+                                without_caller_principals=True,
+                            ),
+                            _rollout_preparation_base_digest(
+                                config,
+                                without_caller_principals=True,
+                            ),
+                        }
+                    )
                 if setup["config_digest"] not in compatible_digests:
                     raise ProductionStateError(
                         "staged production config differs from durable state"
                     )
+                service_digest_rows = connection.execute(
+                    "SELECT DISTINCT config_digest FROM production_services"
+                ).fetchall()
+                if (
+                    len(service_digest_rows) != 1
+                    or service_digest_rows[0]["config_digest"] != setup["config_digest"]
+                ):
+                    raise ProductionStateError("durable production service config has diverged")
                 config_changed = True
                 connection.execute(
                     """
@@ -137,8 +167,9 @@ class ProductionStateStore:
                     """
                     UPDATE production_services
                     SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                    WHERE config_digest = ?
                     """,
-                    (config_digest, now),
+                    (config_digest, now, setup["config_digest"]),
                 )
 
             owners = connection.execute("SELECT user_id FROM production_users").fetchall()
@@ -170,6 +201,7 @@ class ProductionStateStore:
                 services,
                 config_digest=config_digest,
                 now=now,
+                require_complete_inventory=setup is not None,
             )
             connection.execute(
                 """
@@ -462,8 +494,9 @@ class ProductionStateStore:
                 (next_config_digest, now, current_config_digest),
             )
 
-    def status(self) -> ProductionStatus:
-        with self.database.read() as connection:
+    def status(self, *, read_only: bool = False) -> ProductionStatus:
+        reader = self.database.read_only if read_only else self.database.read
+        with reader() as connection:
             schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             setup = connection.execute(
                 """
@@ -706,13 +739,16 @@ class ProductionStateStore:
         *,
         config_digest: str,
         now: int,
+        require_complete_inventory: bool,
     ) -> None:
         configured_names = {service.name for service in services}
         stored_names = {
             str(row["service_name"])
             for row in connection.execute("SELECT service_name FROM production_services").fetchall()
         }
-        if stored_names - configured_names:
+        if stored_names - configured_names or (
+            require_complete_inventory and stored_names != configured_names
+        ):
             raise ProductionStateError("durable production service inventory has diverged")
         for service in services:
             connection.execute(
@@ -765,10 +801,31 @@ def _connector_config_digest(document: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
 
-def _pre_identity_hardening_production_config_digest(config: ProductionConfig) -> str:
+def _pre_caller_principals_production_config_digest(
+    config: ProductionConfig,
+    *,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
+) -> str:
+    """Reconstruct the digest emitted before caller authorization joined the config."""
+
+    document = config.model_dump(mode="json")
+    document.pop("caller_principals")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _pre_identity_hardening_production_config_digest(
+    config: ProductionConfig,
+    *,
+    without_caller_principals: bool = False,
+) -> str:
     """Reconstruct the immediately preceding provider-config document shape."""
 
     document = config.model_dump(mode="json")
+    if without_caller_principals:
+        document.pop("caller_principals")
     for connector in document["connectors"].values():
         connector.pop("tls_server_certificate", None)
         connector.pop("tls_server_certificate_sha256", None)
@@ -785,10 +842,16 @@ def _pre_identity_hardening_connector_config_digest(document: dict[str, Any]) ->
     return hashlib.sha256(canonical_json(predecessor)).hexdigest()
 
 
-def _legacy_production_config_digest(config: ProductionConfig) -> str:
+def _legacy_production_config_digest(
+    config: ProductionConfig,
+    *,
+    without_caller_principals: bool = False,
+) -> str:
     """Reconstruct the pre-SP17 digest while allowing only new rollout fields to change."""
 
     document = config.model_dump(mode="json")
+    if without_caller_principals:
+        document.pop("caller_principals")
     document["storage"].pop("attachment_staging_dir", None)
     document["storage"].pop("attachment_source_roots", None)
     document["secrets"].pop("attachment_key_ref", None)
@@ -809,10 +872,16 @@ def _legacy_connector_config_digest(document: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(legacy)).hexdigest()
 
 
-def _rollout_preparation_base_digest(config: ProductionConfig) -> str:
+def _rollout_preparation_base_digest(
+    config: ProductionConfig,
+    *,
+    without_caller_principals: bool = False,
+) -> str:
     """Reconstruct the disabled digest emitted before rollout prerequisites were staged."""
 
     document = config.model_dump(mode="json")
+    if without_caller_principals:
+        document.pop("caller_principals")
     document["storage"]["attachment_staging_dir"] = None
     document["storage"]["attachment_source_roots"] = []
     document["secrets"]["attachment_key_ref"] = None

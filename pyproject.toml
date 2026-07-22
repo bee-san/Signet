@@ -124,6 +124,9 @@ release = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/signet"]
 
+[tool.hatch.build.targets.wheel.shared-data]
+"docs/man/signet.1" = "share/man/man1/signet.1"
+
 [tool.hatch.build.targets.wheel.hooks.custom]
 
 [tool.pytest.ini_options]

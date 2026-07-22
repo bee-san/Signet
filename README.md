@@ -17,20 +17,28 @@ the authenticated web app presents the private review queue.
 
 ## Safety status
 
-This repository is in no-live implementation mode. Tests use explicit `fake:*`
-identities and fake downstreams. No repository command enrolls a passkey or TOTP,
-reads a live provider credential, sends a real message, changes an existing Hermes
-profile, installs a launchd job, changes Tailscale Serve, or performs cutover. The
-documented helpers modify only a newly created blank fake or downstream-disabled
-profile and may ingest its Signet caller token through standard input.
+This repository now includes one explicitly confirmed production setup path. The
+packaged `signet setup` command can create a marker-owned private root, write secrets
+to the operating-system keyring, install launchd/systemd user services, claim a free
+Tailscale Serve HTTPS 8443 listener, prepare existing named Hermes profiles, and open
+a real owner authentication ceremony. It prints a read-only plan first when requested,
+refuses ambiguous or foreign resources, persists resumable rollback state, keeps every
+provider and generated Hermes entry disabled, and never restarts Hermes. Read the
+[packaged setup guide](docs/setup.md) before running it.
 
-The files under `deploy/` are inert review templates. Their placeholders prevent
-installation without review. The installed `signet deployment` commands provide a
-runnable downstream-disabled staging assembly: it has no provider transport,
+No provider becomes live through setup. Fastmail and `wacli` still require separate
+schema, policy, account, credential-identity, attachment, host-readiness, and cutover
+review. Automated tests use explicit `fake:*` identities, fake downstreams, isolated
+profile trees, and injected operating-system boundaries; CI does not enroll a passkey
+or TOTP, read a live credential, install a host service, alter Tailscale, or send a
+provider request.
+
+The files under `deploy/` remain inert review templates. Their placeholders prevent
+installation without review. The older installed `signet deployment` commands provide
+a runnable downstream-disabled staging assembly: it has no provider transport,
 credential resolver, dispatch worker, or downstream MCP alias. Its authenticated
-`approvals` tools all return `deployment_disabled`. This is not a live deployment
-or a substitute for deferred human setup and cutover. `signet.operations` consumes
-local, bounded fixtures only; it has no discovery network client or host scanner.
+`approvals` tools all return `deployment_disabled`. Use `signet setup`, not those
+staging helpers, for the resumable packaged owner setup path.
 
 The generic plugin surface is staged-only as well. Local, hash-pinned manifests
 can describe MCP connectors and propose effects, but installation, discovery, and
@@ -66,6 +74,25 @@ running as the same operating-system user from reading that user's files, memory
 or Keychain items, and they cannot govern direct provider scripts, native adapters,
 browser sessions, webhooks, or other paths that bypass Signet. See
 [`docs/security-model.md`](docs/security-model.md).
+
+## Packaged setup
+
+After installing a reviewed wheel, inspect the read-only plan and select every Hermes
+profile explicitly:
+
+```console
+signet setup --plan --profile personal --profile work
+signet setup --profile personal --profile work
+```
+
+The default private origin is the current Tailscale node on HTTPS 8443. Setup creates
+provider-disabled state, starts installed-package user services, stages disabled
+`signet_approvals` entries in both profiles, prints the public owner setup URL before
+browser launch, and resumes from an atomic journal after interruption. Review each
+Hermes entry, enable it deliberately, then run `/reload-mcp`; Signet does not restart
+the gateway or enable providers. See [`docs/setup.md`](docs/setup.md) for prerequisites,
+resource-adoption rules, browser ceremonies, backup/restore, upgrade, uninstall, and
+rollback.
 
 ## Development
 
@@ -271,7 +298,11 @@ The readiness report is advisory: it always keeps `ready` and
 - [Staged plugin integrations](docs/plugin-integrations.md)
 - [Plugin readiness boundary](docs/plugin-readiness.md)
 - [Deployment, backup, restore, and rollback](docs/deployment.md)
+- [Production runtime and lifecycle architecture](docs/production-runtime.md)
+- [Productionisation plan and acceptance matrix](docs/plans/2026-07-17-signet-productionization-plan.md)
 - [No-live operator and Hermes runbook](docs/operator-runbook.md)
 
-The implementation contract and deferred human-only ceremony are recorded in
+The current productionisation plan and acceptance matrix are recorded in
+[`docs/plans/2026-07-17-signet-productionization-plan.md`](docs/plans/2026-07-17-signet-productionization-plan.md).
+The earlier generic approval-gateway plan remains in
 [`2026-07-14-signet-approval-gateway-plan.md`](2026-07-14-signet-approval-gateway-plan.md).

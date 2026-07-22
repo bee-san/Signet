@@ -35,6 +35,16 @@ jobs:
         run: uv python install 3.12.13
       - name: Install locked environment
         run: uv sync --frozen
+      - name: Build and smoke-test published artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/signet-dist"
+          wheel_venv="$RUNNER_TEMP/signet-wheel-venv"
+          uv build --clear --out-dir "$artifact_dir"
+          uv venv --python 3.12.13 "$wheel_venv"
+          uv pip install --python "$wheel_venv/bin/python" "$artifact_dir"/*.whl
+          "$wheel_venv/bin/signet" --help >/dev/null
       - name: Validate locked Hermes integration runtime
         run: uv lock --check --project deploy/hermes/runtime
       - name: Exercise configured profiles with locked Hermes integration runtime

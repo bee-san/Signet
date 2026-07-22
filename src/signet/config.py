@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import ipaddress
 import re
 from pathlib import Path
@@ -14,6 +16,36 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from signet.auth import canonical_user_id
 from signet.credential_broker import CredentialError, SecretReference
 from signet.private_paths import PrivatePathError, ensure_private_directory
+
+
+def production_instance_identity(root: Path) -> str:
+    """Return the public, deterministic identity used by local health probes."""
+
+    if not root.is_absolute() or ".." in root.parts:
+        raise ValueError("production root must be an absolute lexical path")
+    material = b"signet-health-instance-v1\0" + str(root).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def production_health_proof(
+    secret: str,
+    *,
+    identity: str,
+    component: Literal["mcp", "web"],
+    challenge: str,
+) -> str:
+    """Authenticate one fresh component-specific local health challenge."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+        raise ValueError("health identity must be one lowercase SHA-256 digest")
+    if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", challenge) is None:
+        raise ValueError("health challenge must be one URL-safe random value")
+    key = secret.encode("utf-8")
+    if not 32 <= len(key) <= 4_096:
+        raise ValueError("health proof secret must be 32 to 4096 UTF-8 bytes")
+    material = b"signet-health-proof-v1\0" + identity.encode("ascii")
+    material += b"\0" + component.encode("ascii") + b"\0" + challenge.encode("ascii")
+    return hmac.new(key, material, hashlib.sha256).hexdigest()
 
 
 def is_valid_allowed_host(host: str) -> bool:
@@ -38,6 +70,45 @@ def is_valid_allowed_host(host: str) -> bool:
             for label in labels
         )
     return True
+
+
+def validate_public_origin(value: str) -> str:
+    """Validate one canonical HTTPS origin and its allowed-host representation."""
+
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("public_origin must use canonical HTTPS serialization") from None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or value.endswith("/")
+    ):
+        raise ValueError("public_origin must be an HTTPS origin without a trailing slash")
+    try:
+        if ":" in parsed.hostname:
+            hostname = ipaddress.IPv6Address(parsed.hostname).compressed
+        else:
+            hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        raise ValueError("public_origin hostname is invalid") from None
+    if not is_valid_allowed_host(hostname):
+        raise ValueError("public_origin hostname is not a valid allowed host")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("public_origin port is invalid")
+    authority = f"[{hostname}]" if ":" in hostname else hostname
+    canonical = f"https://{authority}"
+    if port is not None and port != 443:
+        canonical = f"{canonical}:{port}"
+    if value != canonical:
+        raise ValueError("public_origin must use canonical HTTPS serialization")
+    return value
 
 
 class DownstreamConfig(BaseModel):
@@ -371,6 +442,32 @@ class ProductionProviderRollout(BaseModel):
     wacli: ProductionWacliConfig | None = None
 
 
+class ProductionCallerPrincipal(BaseModel):
+    """One reviewed Hermes profile allowed to use the approvals-only MCP route."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    namespace: str
+    allowed_aliases: tuple[Literal["approvals"], ...] = ("approvals",)
+
+    @field_validator("namespace")
+    @classmethod
+    def namespace_is_profile_scoped(cls, value: str) -> str:
+        if re.fullmatch(r"profile:[a-z][a-z0-9-]{0,63}", value) is None:
+            raise ValueError("production caller namespace must identify one Hermes profile")
+        return value
+
+    @field_validator("allowed_aliases")
+    @classmethod
+    def aliases_are_approvals_only(
+        cls,
+        value: tuple[Literal["approvals"], ...],
+    ) -> tuple[Literal["approvals"], ...]:
+        if value != ("approvals",):
+            raise ValueError("production callers may use only the approvals alias")
+        return value
+
+
 class ProductionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -388,6 +485,7 @@ class ProductionConfig(BaseModel):
     storage: ProductionStorageConfig
     secrets: ProductionSecretsConfig
     capabilities: ProductionCapabilities
+    caller_principals: tuple[ProductionCallerPrincipal, ...] = ()
     connectors: dict[str, DownstreamConfig] = Field(default_factory=dict)
     provider_rollout: ProductionProviderRollout = Field(default_factory=ProductionProviderRollout)
 
@@ -401,35 +499,7 @@ class ProductionConfig(BaseModel):
     @field_validator("public_origin")
     @classmethod
     def origin_requires_https(cls, value: str) -> str:
-        parsed = urlsplit(value)
-        try:
-            port = parsed.port
-        except ValueError:
-            raise ValueError("public_origin must use canonical HTTPS serialization") from None
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-            or value.endswith("/")
-        ):
-            raise ValueError("public_origin must be an HTTPS origin without a trailing slash")
-        try:
-            hostname = parsed.hostname.encode("idna").decode("ascii").lower()
-        except UnicodeError:
-            raise ValueError("public_origin hostname is invalid") from None
-        if port is not None and not 1 <= port <= 65535:
-            raise ValueError("public_origin port is invalid")
-        authority = f"[{hostname}]" if ":" in hostname else hostname
-        canonical = f"https://{authority}"
-        if port is not None and port != 443:
-            canonical = f"{canonical}:{port}"
-        if value != canonical:
-            raise ValueError("public_origin must use canonical HTTPS serialization")
-        return value
+        return validate_public_origin(value)
 
     @field_validator("mcp_host", "web_host")
     @classmethod
@@ -535,6 +605,9 @@ class ProductionConfig(BaseModel):
             raise ValueError("rp_id must equal the public origin host")
         if origin_host not in self.allowed_hosts:
             raise ValueError("allowed_hosts must include the public origin host")
+        namespaces = tuple(principal.namespace for principal in self.caller_principals)
+        if len(namespaces) != len(set(namespaces)):
+            raise ValueError("production caller namespaces must be unique")
         references = [
             reference for reference in self.secrets.model_dump().values() if reference is not None
         ]
@@ -567,6 +640,13 @@ class ProductionConfig(BaseModel):
         ):
             raise ValueError("WhatsApp rollout requires exactly one owned wacli boundary")
         return self
+
+    @property
+    def allowed_principals(self) -> dict[str, tuple[str, ...]]:
+        return {
+            principal.namespace: tuple(principal.allowed_aliases)
+            for principal in self.caller_principals
+        }
 
     def prepare_directories(self) -> None:
         self.storage.prepare_directories()
