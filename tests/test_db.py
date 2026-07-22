@@ -238,6 +238,37 @@ def test_read_only_database_connections_use_a_private_snapshot(
     assert not Path(f"{path}-shm").exists()
 
 
+def test_read_only_cleanup_preserves_an_untracked_same_user_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "read-only-cleanup" / "approvals.sqlite3")
+    database.initialize()
+    real_mkdtemp = db_module.tempfile.mkdtemp
+    snapshot_directory: Path | None = None
+
+    def capture_snapshot_directory(*args: object, **kwargs: object) -> str:
+        nonlocal snapshot_directory
+        snapshot_directory = Path(real_mkdtemp(*args, **kwargs))
+        return str(snapshot_directory)
+
+    monkeypatch.setattr(db_module.tempfile, "mkdtemp", capture_snapshot_directory)
+    foreign_content = b"same-user untracked snapshot artifact"
+
+    with (
+        pytest.raises(DatabaseError, match="cleanup did not complete"),
+        database.read_only() as connection,
+    ):
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+        assert snapshot_directory is not None
+        foreign = snapshot_directory / "foreign.sqlite3"
+        foreign.write_bytes(foreign_content)
+        foreign.chmod(0o600)
+
+    assert snapshot_directory is not None
+    assert (snapshot_directory / "foreign.sqlite3").read_bytes() == foreign_content
+
+
 def test_database_refuses_unsafe_existing_parent_without_changing_mode(
     tmp_path: Path,
 ) -> None:
@@ -292,6 +323,27 @@ def test_runtime_refuses_an_unverified_sqlite_version(
 def test_database_rejects_unbounded_busy_timeouts(tmp_path: Path, timeout: float) -> None:
     with pytest.raises(ValueError, match="timeout"):
         Database(tmp_path / "approvals.sqlite3", timeout=timeout)
+
+
+def test_expected_maintenance_lock_identity_rejects_a_path_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "approvals.sqlite3"
+    database = Database(path)
+    database.initialize()
+    lock_path = path.with_name(f".{path.name}.maintenance.lock")
+    database_identity = path.stat()
+    lock_identity = lock_path.stat()
+    pinned = Database(
+        path,
+        expected_identity=(database_identity.st_dev, database_identity.st_ino),
+        expected_lock_identity=(lock_identity.st_dev, lock_identity.st_ino),
+    )
+    replacement = tmp_path / "replacement.lock"
+    replacement.write_bytes(b"")
+    replacement.chmod(0o600)
+    replacement.replace(lock_path)
+
+    with pytest.raises(DatabaseError, match="maintenance lock changed after setup ownership"):
+        pinned.initialize()
 
 
 def test_concurrent_initializers_share_a_single_maintenance_lock(tmp_path: Path) -> None:
@@ -369,6 +421,41 @@ def test_bound_snapshot_includes_committed_wal_frames_with_a_pinned_reader(
             )
     finally:
         reader.close()
+
+
+def test_snapshot_publication_does_not_replace_a_racing_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "snapshot-publication" / "approvals.sqlite3")
+    database.initialize()
+    snapshot = tmp_path / "backups" / "snapshot.sqlite3"
+    temporary = snapshot.with_name(f".{snapshot.name}.partial")
+    foreign_content = b"same-user foreign destination"
+    real_fsync = db_module.os.fsync
+    raced = False
+
+    def insert_destination_before_publication(descriptor: int) -> None:
+        nonlocal raced
+        if not raced and temporary.exists() and not snapshot.exists():
+            opened = os.fstat(descriptor)
+            temporary_metadata = temporary.stat(follow_symlinks=False)
+            if (opened.st_dev, opened.st_ino) == (
+                temporary_metadata.st_dev,
+                temporary_metadata.st_ino,
+            ):
+                snapshot.write_bytes(foreign_content)
+                snapshot.chmod(0o600)
+                raced = True
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(db_module.os, "fsync", insert_destination_before_publication)
+
+    with pytest.raises(DatabaseError, match="destination|publish"):
+        database.create_snapshot(snapshot)
+
+    assert raced is True
+    assert snapshot.read_bytes() == foreign_content
 
 
 def test_snapshot_cleans_its_temporary_after_bound_serialization_failure(
@@ -494,11 +581,12 @@ def test_snapshot_cleanup_does_not_delete_a_foreign_temporary_replacement(
     with pytest.raises(
         db_module.sqlite3.OperationalError,
         match="injected copy failure after replacement",
-    ):
+    ) as raised:
         database.create_snapshot(snapshot)
 
     assert not snapshot.exists()
     assert temporary.read_bytes() == foreign_content
+    assert any("cleanup" in note.lower() for note in getattr(raised.value, "__notes__", ()))
 
 
 def test_migration_backup_boundary_blocks_competing_writers(
