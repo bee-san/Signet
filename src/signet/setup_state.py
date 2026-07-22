@@ -16,7 +16,13 @@ from typing import Any, Literal, Protocol, cast
 
 from signet.auth import canonical_user_id
 from signet.config import validate_public_origin
-from signet.private_paths import PrivatePathError, ensure_private_directory
+from signet.private_paths import (
+    PrivatePathError,
+    ensure_private_directory,
+    require_no_acl_grants,
+    require_private_directory_identity,
+    revalidate_directory_identity,
+)
 
 SETUP_STEPS = (
     "preflight",
@@ -186,6 +192,8 @@ class SetupJournal:
 
 
 class SetupPlatform(Protocol):
+    def preflight(self, spec: SetupSpec) -> None: ...
+
     def apply(self, step: str, spec: SetupSpec, setup_id: str) -> None: ...
 
     def rollback(self, step: str, spec: SetupSpec, setup_id: str) -> None: ...
@@ -314,43 +322,113 @@ class SetupJournalStore:
 
     @staticmethod
     def _read_document(path: Path, *, label: str) -> dict[str, Any]:
+        descriptor = -1
         try:
-            metadata = path.lstat()
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_nlink != 1
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
-            ):
-                raise SetupError(f"{label} is not a private owned file")
-            encoded = path.read_bytes()
-            if len(encoded) > 1_048_576:
-                raise SetupError(f"{label} is too large")
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            before = os.fstat(descriptor)
+            require_no_acl_grants(descriptor)
+            chunks: list[bytes] = []
+            remaining = 1_048_577
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            encoded = b"".join(chunks)
+            after = os.fstat(descriptor)
+            current = path.lstat()
+        except (OSError, PrivatePathError) as exc:
+            raise SetupError(f"{label} is unavailable or unsafe") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if len(encoded) > 1_048_576:
+            raise SetupError(f"{label} is too large")
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        stable_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            stat.S_IMODE(before.st_mode),
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != current_uid
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+        ):
+            raise SetupError(f"{label} is not a private owned file")
+        if stable_identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            stat.S_IMODE(after.st_mode),
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or stable_identity != (
+            current.st_dev,
+            current.st_ino,
+            current.st_uid,
+            stat.S_IMODE(current.st_mode),
+            current.st_nlink,
+            current.st_size,
+            current.st_mtime_ns,
+        ):
+            raise SetupError(f"{label} changed during inspection")
+        try:
             value = json.loads(encoded)
-        except SetupError:
-            raise
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (UnicodeError, json.JSONDecodeError):
             raise SetupError(f"{label} is unavailable or invalid") from None
         if not isinstance(value, dict):
             raise SetupError(f"{label} is invalid")
-        return value
+        return cast(dict[str, Any], value)
 
     @staticmethod
     def _write_document(path: Path, document: dict[str, Any], *, replace: bool) -> None:
         encoded = (json.dumps(document, sort_keys=True, indent=2, ensure_ascii=True) + "\n").encode(
             "utf-8"
         )
-        temporary = path.with_name(f".{path.name}.{secrets.token_urlsafe(8)}.tmp")
-        descriptor: int | None = None
+        temporary_name = f".{path.name}.{secrets.token_urlsafe(8)}.tmp"
+        descriptor = -1
+        parent_descriptor = -1
         try:
+            parent_identity = require_private_directory_identity(path.parent)
+            parent_descriptor = os.open(
+                path.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            parent_metadata = os.fstat(parent_descriptor)
+            require_no_acl_grants(parent_descriptor)
+            if (
+                parent_metadata.st_dev,
+                parent_metadata.st_ino,
+                parent_metadata.st_uid,
+            ) != (
+                parent_identity.device,
+                parent_identity.inode,
+                parent_identity.owner_uid,
+            ):
+                raise SetupError("setup state directory changed before publication")
             descriptor = os.open(
-                temporary,
+                temporary_name,
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_CLOEXEC", 0),
                 0o600,
+                dir_fd=parent_descriptor,
             )
             os.fchmod(descriptor, 0o600)
             view = memoryview(encoded)
@@ -361,30 +439,41 @@ class SetupJournalStore:
                 view = view[written:]
             os.fsync(descriptor)
             os.close(descriptor)
-            descriptor = None
+            descriptor = -1
             if replace:
-                os.replace(temporary, path)
+                os.replace(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
             else:
                 try:
-                    os.link(temporary, path, follow_symlinks=False)
+                    os.link(
+                        temporary_name,
+                        path.name,
+                        src_dir_fd=parent_descriptor,
+                        dst_dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
                 except FileExistsError as exc:
                     raise SetupError("setup ownership marker already exists") from exc
-                temporary.unlink()
-            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+            revalidate_directory_identity(parent_identity, private=True)
         except SetupError:
             raise
-        except OSError as exc:
+        except (OSError, PrivatePathError) as exc:
             raise SetupError("setup state could not be published durably") from exc
         finally:
-            if descriptor is not None:
+            if descriptor >= 0:
                 with suppress(OSError):
                     os.close(descriptor)
-            with suppress(FileNotFoundError):
-                temporary.unlink()
+            if parent_descriptor >= 0:
+                with suppress(FileNotFoundError, OSError):
+                    os.unlink(temporary_name, dir_fd=parent_descriptor)
+                with suppress(OSError):
+                    os.close(parent_descriptor)
 
 
 class SetupEngine:
@@ -417,6 +506,32 @@ class SetupEngine:
         )
         self._require_spec(journal, spec)
         if journal.purge_backup is not None:
+            durable_checkpoint = (
+                isinstance(journal.purge_backup, dict)
+                and set(journal.purge_backup)
+                == {
+                    "version",
+                    "setup_id",
+                    "recovery_directory",
+                    "backup",
+                    "recovery_receipt",
+                    "backup_receipt",
+                }
+                and journal.purge_backup.get("version") == 1
+                and journal.purge_backup.get("setup_id") == journal.setup_id
+            )
+            if durable_checkpoint or journal.status in {
+                "rolling_back",
+                "rolled_back",
+                "rollback_failed",
+                "uninstalled",
+            }:
+                raise SetupError(
+                    "setup has a durable purge checkpoint; finish purge before applying again"
+                )
+        if journal.status in {"rolling_back", "rolled_back", "rollback_failed"}:
+            raise SetupError("setup is in rollback state; finish rollback before applying again")
+        if journal.purge_backup is not None:
             journal.purge_backup = None
             self.store.save(journal)
         if journal.status == "completed":
@@ -438,8 +553,6 @@ class SetupEngine:
                 if record.name not in integration_names
             )
         )
-        if journal.status in {"rolling_back", "rolled_back", "rollback_failed"}:
-            raise SetupError("setup is in rollback state; finish rollback before applying again")
         journal.status = "applying"
         self.store.save(journal)
         for record in journal.steps:

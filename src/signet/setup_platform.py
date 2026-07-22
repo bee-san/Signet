@@ -51,6 +51,16 @@ _POLICY_NAME = "policy.yaml"
 _SECRET_PURPOSES = ("session", "csrf", "capability", "payload", "attachment", "backup")
 _SERVICE_NAME = "Signet-Setup"
 _HERMES_SERVER_NAME = "signet_approvals"
+_DATABASE_OWNERSHIP_MARKER = ".signet-database-ownership.json"
+_DATABASE_RUNTIME_NAMES = frozenset(
+    {
+        "signet.db",
+        ".signet.db.maintenance.lock",
+        "signet.db-wal",
+        "signet.db-shm",
+        "signet.db-journal",
+    }
+)
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -229,6 +239,9 @@ class ProductionSetupPlatform:
             return self.hermes_home.parent
         return self.hermes_home / profile
 
+    def preflight(self, spec: SetupSpec) -> None:
+        self._apply_preflight(spec, "preflight")
+
     def apply(self, step: str, spec: SetupSpec, setup_id: str) -> None:
         operation = getattr(self, f"_apply_{step}", None)
         if operation is None:
@@ -316,16 +329,15 @@ class ProductionSetupPlatform:
                     ["tailscale", "serve", "status", "--json"],
                     "Tailscale Serve status is unavailable",
                 )
-                funnel = self._tailscale_json(
-                    ["tailscale", "funnel", "status", "--json"],
-                    "Tailscale Funnel status is unavailable",
-                )
             except SetupError:
                 result[f"tailscale:{port}"] = "unavailable"
             else:
-                private_route = _document_has_managed_route(
-                    serve, port, "http://127.0.0.1:8790"
-                ) and not _document_mentions_port(funnel, port)
+                private_route = _serve_config_has_private_route(
+                    serve,
+                    host_port=_managed_tailnet_host_port(spec, port),
+                    port=port,
+                    target="http://127.0.0.1:8790",
+                )
                 result[f"tailscale:{port}"] = "active" if private_route else "missing_or_changed"
         return result
 
@@ -487,7 +499,6 @@ class ProductionSetupPlatform:
             _remove_exact_owned_file(path, content)
 
     def _apply_database(self, spec: SetupSpec, setup_id: str) -> None:
-        del setup_id
         database_path = spec.root / "data" / "signet.db"
         if database_path.exists() and database_path.is_symlink():
             raise SetupError("the Signet database must not be a symbolic link")
@@ -498,15 +509,161 @@ class ProductionSetupPlatform:
             secret_store=KeychainSecretStore(),
             components=frozenset(),
         )
+        data_identity = require_private_directory_identity(database_path.parent)
+        database_descriptor = -1
+        try:
+            database_descriptor = os.open(
+                database_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            database_identity = os.fstat(database_descriptor)
+            require_no_acl_grants(database_descriptor)
+            named_database = database_path.stat(follow_symlinks=False)
+        except (OSError, PrivatePathError) as exc:
+            raise SetupError("database ownership could not be recorded safely") from exc
+        finally:
+            if database_descriptor >= 0:
+                os.close(database_descriptor)
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if (
+            not stat.S_ISREG(database_identity.st_mode)
+            or database_identity.st_uid != current_uid
+            or database_identity.st_nlink != 1
+            or stat.S_IMODE(database_identity.st_mode) != 0o600
+            or (named_database.st_dev, named_database.st_ino)
+            != (database_identity.st_dev, database_identity.st_ino)
+        ):
+            raise SetupError("database ownership could not be recorded safely")
+        runtime_files: dict[str, dict[str, int]] = {}
+        for child in database_path.parent.iterdir():
+            if child.name == _DATABASE_OWNERSHIP_MARKER:
+                continue
+            if child.name not in _DATABASE_RUNTIME_NAMES:
+                raise SetupError("database directory contains an unowned runtime artifact")
+            runtime_files[child.name] = _owned_runtime_file_identity(child)
+        if "signet.db" not in runtime_files:
+            raise SetupError("database ownership could not be recorded safely")
+        ownership = {
+            "format": 2,
+            "setup_id": setup_id,
+            "data_device": data_identity.device,
+            "data_inode": data_identity.inode,
+            "data_owner_uid": data_identity.owner_uid,
+            "database_device": database_identity.st_dev,
+            "database_inode": database_identity.st_ino,
+            "runtime_files": runtime_files,
+        }
+        _create_or_verify_private_file(
+            database_path.parent / _DATABASE_OWNERSHIP_MARKER,
+            _json_bytes(ownership),
+        )
 
     def _rollback_database(self, spec: SetupSpec, setup_id: str) -> None:
-        del setup_id
-        for suffix in ("-shm", "-wal", ""):
-            path = spec.root / "data" / f"signet.db{suffix}"
-            if path.is_symlink():
-                raise SetupError("database rollback refused a symbolic link")
-            with suppress(FileNotFoundError):
-                path.unlink()
+        data_directory = spec.root / "data"
+        marker = data_directory / _DATABASE_OWNERSHIP_MARKER
+        if not marker.exists() and not marker.is_symlink():
+            try:
+                leftovers = tuple(data_directory.iterdir())
+            except FileNotFoundError:
+                return
+            if leftovers:
+                raise SetupError("refusing database cleanup without an ownership receipt")
+            return
+        ownership = _read_owned_json(marker)
+        integer_fields = (
+            "data_device",
+            "data_inode",
+            "data_owner_uid",
+            "database_device",
+            "database_inode",
+        )
+        if (
+            not isinstance(ownership, dict)
+            or set(ownership) != {"format", "setup_id", "runtime_files", *integer_fields}
+            or ownership.get("format") != 2
+            or ownership.get("setup_id") != setup_id
+            or any(type(ownership.get(field)) is not int for field in integer_fields)
+        ):
+            raise SetupError("database ownership receipt is invalid")
+        runtime_files = ownership.get("runtime_files")
+        if (
+            not isinstance(runtime_files, dict)
+            or "signet.db" not in runtime_files
+            or not set(runtime_files).issubset(_DATABASE_RUNTIME_NAMES)
+            or any(
+                not isinstance(identity, dict)
+                or set(identity) != {"device", "inode"}
+                or any(type(identity.get(field)) is not int for field in ("device", "inode"))
+                for identity in runtime_files.values()
+            )
+            or runtime_files["signet.db"]
+            != {
+                "device": ownership["database_device"],
+                "inode": ownership["database_inode"],
+            }
+        ):
+            raise SetupError("database ownership receipt is invalid")
+        data_identity = DirectoryIdentity(
+            path=data_directory,
+            device=ownership["data_device"],
+            inode=ownership["data_inode"],
+            owner_uid=ownership["data_owner_uid"],
+        )
+        try:
+            revalidate_directory_identity(data_identity, private=True)
+        except PrivatePathError as exc:
+            raise SetupError("database directory changed after setup") from exc
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                data_directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (data_identity.device, data_identity.inode):
+                raise SetupError("database directory changed during rollback")
+            present = set(os.listdir(descriptor))
+            unknown = present - {_DATABASE_OWNERSHIP_MARKER} - set(runtime_files)
+            if unknown:
+                raise SetupError(
+                    "database directory contains an unreceipted database runtime artifact"
+                )
+            for name, identity in runtime_files.items():
+                if name not in present:
+                    continue
+                current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                expected = (identity["device"], identity["inode"])
+                if (current.st_dev, current.st_ino) != expected:
+                    if name == "signet.db":
+                        raise SetupError("database changed after setup ownership was recorded")
+                    raise SetupError(
+                        "database runtime artifact changed after ownership was recorded"
+                    )
+            removal_order = sorted(runtime_files, key=lambda name: name == "signet.db")
+            for name in removal_order:
+                identity = runtime_files[name]
+                _remove_owned_runtime_file(
+                    descriptor,
+                    data_directory,
+                    name,
+                    expected_identity=(identity["device"], identity["inode"]),
+                )
+            os.fsync(descriptor)
+        except OSError as exc:
+            raise SetupError("database rollback could not remove owned runtime files") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        _remove_exact_owned_file(
+            marker,
+            _json_bytes(ownership),
+            expected_parent_identity=data_identity,
+            parent_private=True,
+        )
+        _fsync_owned_directory(data_directory)
 
     def _apply_services(self, spec: SetupSpec, setup_id: str) -> None:
         del setup_id
@@ -561,25 +718,62 @@ class ProductionSetupPlatform:
             target = Path.home() / "Library" / "LaunchAgents"
             uid = os.getuid()
             for name, content in rendered.items():
-                _verify_exact_owned_file(target / name, content)
-                _verify_exact_owned_file(spec.root / "services" / name, content)
+                target_path = target / name
+                plan_path = spec.root / "services" / name
+                target_exists = target_path.exists() or target_path.is_symlink()
+                plan_exists = plan_path.exists() or plan_path.is_symlink()
+                if target_exists and not plan_exists:
+                    raise SetupError("launchd unit exists without its ownership plan")
+                if target_exists:
+                    _verify_exact_owned_file(target_path, content)
+                if plan_exists:
+                    _verify_exact_owned_file(plan_path, content)
             for name in rendered:
                 path = target / name
                 self._stop_launchd_unit(["launchctl", "bootout", f"gui/{uid}", str(path)])
+            for name in rendered:
+                label = name.removesuffix(".plist")
+                status = self.command_runner(
+                    ["launchctl", "print", f"gui/{uid}/{label}"],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if status.returncode == 0:
+                    raise SetupError("launchd did not quiesce every Signet service")
             for name, content in rendered.items():
                 path = target / name
-                _remove_exact_owned_file(path, content)
-                _remove_exact_owned_file(spec.root / "services" / name, content)
+                plan_path = spec.root / "services" / name
+                if path.exists() or path.is_symlink():
+                    _remove_exact_owned_file(path, content)
+                if plan_path.exists() or plan_path.is_symlink():
+                    _remove_exact_owned_file(plan_path, content)
         else:
             rendered_text = render_systemd_services(spec, active=True)
             target = Path.home() / ".config" / "systemd" / "user"
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
                 target_path = target / name
-                if target_path.exists() or target_path.is_symlink():
+                plan_path = spec.root / "services" / name
+                target_exists = target_path.exists() or target_path.is_symlink()
+                plan_exists = plan_path.exists() or plan_path.is_symlink()
+                if target_exists and not plan_exists:
+                    raise SetupError("systemd unit exists without its ownership plan")
+                if target_exists:
                     _verify_exact_owned_file(target_path, encoded)
-                _verify_exact_owned_file(spec.root / "services" / name, encoded)
-            self._stop_systemd_units(["systemctl", "--user", "disable", "--now", *rendered_text])
+                if plan_exists:
+                    _verify_exact_owned_file(plan_path, encoded)
+            for name in rendered_text:
+                self._stop_systemd_units(["systemctl", "--user", "disable", "--now", name])
+            for name in rendered_text:
+                status = self.command_runner(
+                    ["systemctl", "--user", "is-active", name],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if status.returncode == 0:
+                    raise SetupError("systemd did not quiesce every Signet service")
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
                 target_path = target / name
@@ -590,10 +784,17 @@ class ProductionSetupPlatform:
                 "systemd reload after rollback failed",
             )
             for name, content in rendered_text.items():
-                _remove_exact_owned_file(
-                    spec.root / "services" / name,
-                    content.encode("utf-8"),
-                )
+                plan_path = spec.root / "services" / name
+                if plan_path.exists() or plan_path.is_symlink():
+                    _remove_exact_owned_file(
+                        plan_path,
+                        content.encode("utf-8"),
+                    )
+
+    def verify_service_health(self, spec: SetupSpec) -> None:
+        """Require both local services to answer for this exact Signet instance."""
+
+        self._wait_for_local_services(spec)
 
     def _wait_for_local_services(self, spec: SetupSpec) -> None:
         pending = {8789, 8790}
@@ -626,119 +827,123 @@ class ProductionSetupPlatform:
         if port is None:
             return
         record_path = spec.root / "services" / "tailscale-serve-before.json"
-        current_serve = self._tailscale_json(
+        after_path = spec.root / "services" / "tailscale-serve-after.json"
+        current = self._tailscale_json(
             ["tailscale", "serve", "status", "--json"],
             "Tailscale Serve status is unavailable",
         )
-        current_funnel = self._tailscale_json(
-            ["tailscale", "funnel", "status", "--json"],
-            "Tailscale Funnel status is unavailable",
-        )
+        host_port = _managed_tailnet_host_port(spec, port)
         target = "http://127.0.0.1:8790"
         if record_path.exists():
-            _read_owned_json(record_path)
-            after_path = spec.root / "services" / "tailscale-serve-after.json"
+            before = _read_owned_json(record_path)
+            if not isinstance(before, dict) or set(before) != {"format", "serve"}:
+                raise SetupError("Tailscale rollback record is invalid")
             recorded_after = _read_owned_json(after_path) if after_path.exists() else None
-            if (
-                isinstance(recorded_after, dict)
-                and set(recorded_after) == {"serve", "funnel"}
-                and recorded_after != {"serve": current_serve, "funnel": current_funnel}
+            if recorded_after is not None and (
+                not isinstance(recorded_after, dict)
+                or set(recorded_after) != {"format", "serve"}
+                or recorded_after.get("format") != 2
+                or recorded_after.get("serve") != current
             ):
                 raise SetupError("the managed Tailscale snapshot changed after setup")
-            if _document_mentions_port(current_funnel, port):
-                raise SetupError("the managed Tailscale listener is now exposed by Funnel")
-            if _document_mentions_port(current_serve, port):
-                if not _document_has_managed_route(current_serve, port, target):
+            if _serve_config_mentions_listener(current, host_port=host_port, port=port):
+                if not _serve_config_has_private_route(
+                    current,
+                    host_port=host_port,
+                    port=port,
+                    target=target,
+                ):
                     raise SetupError("the managed Tailscale listener changed ownership")
+                if recorded_after is None:
+                    _create_or_verify_private_file(
+                        after_path,
+                        _canonical_json_bytes({"format": 2, "serve": current}),
+                    )
                 return
         else:
-            if _document_mentions_port(current_serve, port) or _document_mentions_port(
-                current_funnel,
-                port,
-            ):
+            if _serve_config_mentions_listener(current, host_port=host_port, port=port):
                 raise SetupError(f"Tailscale listener {port} is already in use")
-            before = _canonical_json_bytes({"serve": current_serve, "funnel": current_funnel})
-            _create_or_verify_private_file(record_path, before)
+            _create_or_verify_private_file(
+                record_path,
+                _canonical_json_bytes({"format": 2, "serve": current}),
+            )
         self._run_checked(
-            [
-                "tailscale",
-                "serve",
-                "--bg",
-                f"--https={port}",
-                target,
-            ],
+            ["tailscale", "serve", "--bg", f"--https={port}", target],
             "Tailscale Serve listener could not be installed",
         )
         after = self._tailscale_json(
             ["tailscale", "serve", "status", "--json"],
             "Tailscale Serve verification failed",
         )
-        if not _document_has_managed_route(after, port, target):
+        if not _serve_config_has_private_route(
+            after,
+            host_port=host_port,
+            port=port,
+            target=target,
+        ):
             raise SetupError("Tailscale Serve listener did not match the requested private route")
-        after_funnel = self._tailscale_json(
-            ["tailscale", "funnel", "status", "--json"],
-            "Tailscale Funnel verification failed",
-        )
         _create_or_verify_private_file(
-            spec.root / "services" / "tailscale-serve-after.json",
-            _canonical_json_bytes({"serve": after, "funnel": after_funnel}),
+            after_path,
+            _canonical_json_bytes({"format": 2, "serve": after}),
         )
 
     def _rollback_tailnet_route(self, spec: SetupSpec) -> None:
         port = _managed_tailnet_port(spec)
-        record_path = spec.root / "services" / "tailscale-serve-before.json"
-        if port is None or not record_path.exists():
+        if port is None:
             return
-        before = _read_owned_json(record_path)
-        if not isinstance(before, dict) or set(before) != {"serve", "funnel"}:
-            raise SetupError("Tailscale rollback record is invalid")
-        if _document_mentions_port(before["serve"], port) or _document_mentions_port(
-            before["funnel"], port
-        ):
-            raise SetupError("Tailscale rollback record does not describe a free listener")
-        after_path = spec.root / "services" / "tailscale-serve-after.json"
-        recorded_after = _read_owned_json(after_path) if after_path.exists() else None
-        current_serve = self._tailscale_json(
+        record_path = spec.root / "services" / "tailscale-serve-before.json"
+        current = self._tailscale_json(
             ["tailscale", "serve", "status", "--json"],
             "Tailscale Serve status is unavailable",
         )
-        current_funnel = self._tailscale_json(
-            ["tailscale", "funnel", "status", "--json"],
-            "Tailscale Funnel status is unavailable",
-        )
-        exact_after = isinstance(recorded_after, dict) and set(recorded_after) == {
-            "serve",
-            "funnel",
-        }
-        if exact_after and recorded_after != {
-            "serve": current_serve,
-            "funnel": current_funnel,
-        }:
+        host_port = _managed_tailnet_host_port(spec, port)
+        if not record_path.exists():
+            if _serve_config_mentions_listener(current, host_port=host_port, port=port):
+                raise SetupError("refusing Tailscale rollback without an ownership receipt")
+            return
+        before = _read_owned_json(record_path)
+        if (
+            not isinstance(before, dict)
+            or set(before) != {"format", "serve"}
+            or before.get("format") != 2
+        ):
+            raise SetupError("Tailscale rollback record is invalid")
+        before_serve = before["serve"]
+        if _serve_config_mentions_listener(before_serve, host_port=host_port, port=port):
+            raise SetupError("Tailscale rollback record does not describe a free listener")
+        after_path = spec.root / "services" / "tailscale-serve-after.json"
+        recorded_after = _read_owned_json(after_path) if after_path.exists() else None
+        if recorded_after is None:
+            if current != before_serve:
+                raise SetupError("Tailscale apply receipt is missing for a changed configuration")
+            _remove_exact_owned_file(record_path, _canonical_json_bytes(before))
+            return
+        if (
+            not isinstance(recorded_after, dict)
+            or set(recorded_after) != {"format", "serve"}
+            or recorded_after.get("format") != 2
+            or recorded_after.get("serve") != current
+        ):
             raise SetupError("refusing to overwrite a changed Tailscale snapshot")
-        if _document_mentions_port(current_funnel, port):
-            raise SetupError("refusing to remove a listener now exposed by Funnel")
         target = "http://127.0.0.1:8790"
-        if _document_mentions_port(current_serve, port):
-            if not _document_has_managed_route(current_serve, port, target):
-                raise SetupError("refusing to remove a changed Tailscale listener")
-            self._run_checked(
-                ["tailscale", "serve", f"--https={port}", "off"],
-                "Tailscale Serve listener rollback failed",
-            )
-            current_serve = self._tailscale_json(
-                ["tailscale", "serve", "status", "--json"],
-                "Tailscale Serve rollback verification failed",
-            )
-        if _document_mentions_port(current_serve, port):
-            raise SetupError("Tailscale Serve listener remains after rollback")
-        restored_funnel = self._tailscale_json(
-            ["tailscale", "funnel", "status", "--json"],
-            "Tailscale Funnel rollback verification failed",
+        if not _serve_config_has_private_route(
+            current,
+            host_port=host_port,
+            port=port,
+            target=target,
+        ):
+            raise SetupError("refusing to remove a changed Tailscale listener")
+        self._run_checked(
+            ["tailscale", "serve", f"--https={port}", "off"],
+            "Tailscale Serve listener rollback failed",
         )
-        if current_serve != before["serve"] or restored_funnel != before["funnel"]:
+        restored = self._tailscale_json(
+            ["tailscale", "serve", "status", "--json"],
+            "Tailscale Serve rollback verification failed",
+        )
+        if restored != before_serve:
             raise SetupError("Tailscale did not return to the exact pre-setup snapshot")
-        if recorded_after is not None:
-            _remove_exact_owned_file(after_path, _canonical_json_bytes(recorded_after))
+        _remove_exact_owned_file(after_path, _canonical_json_bytes(recorded_after))
         _remove_exact_owned_file(record_path, _canonical_json_bytes(before))
 
     def _tailscale_json(self, command: list[str], message: str) -> Any:
@@ -1084,6 +1289,112 @@ class ProductionSetupPlatform:
         already_stopped = "no such process" in detail or "could not find service" in detail
         if result.returncode != 0 and not already_stopped:
             raise SetupError("launchd could not stop Signet")
+
+
+def _json_bytes(document: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+
+
+def _fsync_owned_directory(path: Path) -> None:
+    descriptor = -1
+    try:
+        identity = require_private_directory_identity(path)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) != (identity.device, identity.inode):
+            raise SetupError("owned directory changed before durability barrier")
+        os.fsync(descriptor)
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError("owned directory could not be made durable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _owned_runtime_file_identity(path: Path) -> dict[str, int]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        metadata = os.fstat(descriptor)
+        named = path.stat(follow_symlinks=False)
+        require_no_acl_grants(descriptor)
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError("database runtime artifact ownership could not be recorded") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != current_uid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or (named.st_dev, named.st_ino) != (metadata.st_dev, metadata.st_ino)
+    ):
+        raise SetupError("database runtime artifact is not an owned private regular file")
+    return {"device": metadata.st_dev, "inode": metadata.st_ino}
+
+
+def _remove_owned_runtime_file(
+    parent_descriptor: int,
+    parent: Path,
+    name: str,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
+    descriptor = -1
+    quarantine = f".signet-runtime-remove-{secrets.token_urlsafe(32)}"
+    try:
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        metadata = os.fstat(descriptor)
+        require_no_acl_grants(descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        expected = (metadata.st_dev, metadata.st_ino)
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != current_uid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or (current.st_dev, current.st_ino) != expected
+            or (expected_identity is not None and expected != expected_identity)
+        ):
+            raise SetupError("database runtime file is not an owned private regular file")
+        os.rename(
+            name,
+            quarantine,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        moved = os.stat(quarantine, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (moved.st_dev, moved.st_ino) != expected:
+            raise SetupError("database runtime file changed during quarantine")
+        os.unlink(quarantine, dir_fd=parent_descriptor)
+        if os.fstat(descriptor).st_nlink != 0:
+            raise SetupError("database runtime file deletion could not be confirmed")
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError("database runtime file removal was unsafe") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _secret_account(setup_id: str, purpose: str) -> str:
@@ -1520,14 +1831,52 @@ def _read_owned_descriptor(descriptor: int, limit: int) -> bytes:
 
 
 def _read_optional_private_file(path: Path) -> bytes:
-    if not path.exists():
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+    except FileNotFoundError:
         return b""
-    if path.is_symlink():
-        raise SetupError(f"refusing symbolic-link profile file: {path}")
-    metadata = path.stat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise SetupError(f"profile resource is not a regular file: {path}")
-    encoded = path.read_bytes()
+    except OSError as exc:
+        raise SetupError(f"profile resource is unavailable or unsafe: {path}") from exc
+    try:
+        before = os.fstat(descriptor)
+        require_no_acl_grants(descriptor)
+        encoded = _read_owned_descriptor(descriptor, 1_048_577)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError(f"profile resource is unavailable or unsafe: {path}") from exc
+    finally:
+        os.close(descriptor)
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != current_uid
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+    ):
+        raise SetupError(f"profile resource is not an owned private regular file: {path}")
+    if identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ) or identity != (
+        current.st_dev,
+        current.st_ino,
+        current.st_size,
+        current.st_mtime_ns,
+    ):
+        raise SetupError(f"profile resource changed during inspection: {path}")
     if len(encoded) > 1_048_576 or b"\x00" in encoded:
         raise SetupError(f"profile resource is invalid or too large: {path}")
     return encoded
@@ -1611,14 +1960,17 @@ def _read_hermes_profile_snapshot(
     if not isinstance(metadata, dict) or metadata.get("profile") != profile:
         raise SetupError("Hermes profile snapshot metadata is invalid")
     try:
-        if metadata.get("format") == 1 and set(metadata) == common_keys:
-            profile_identity = require_private_directory_identity(profile_directory)
-        elif metadata.get("format") == 2 and set(metadata) == format_two_keys:
+        if metadata.get("format") == 2 and set(metadata) == format_two_keys:
+            if any(
+                type(metadata[key]) is not int
+                for key in ("profile_device", "profile_inode", "profile_owner_uid")
+            ):
+                raise SetupError("Hermes profile snapshot metadata is invalid")
             profile_identity = DirectoryIdentity(
                 path=profile_directory,
-                device=int(metadata["profile_device"]),
-                inode=int(metadata["profile_inode"]),
-                owner_uid=int(metadata["profile_owner_uid"]),
+                device=metadata["profile_device"],
+                inode=metadata["profile_inode"],
+                owner_uid=metadata["profile_owner_uid"],
             )
             revalidate_directory_identity(profile_identity, private=True)
         else:
@@ -1735,6 +2087,13 @@ def _managed_tailnet_port(spec: SetupSpec) -> int | None:
     return None
 
 
+def _managed_tailnet_host_port(spec: SetupSpec, port: int) -> str:
+    hostname = urlsplit(spec.public_origin).hostname
+    if not hostname:
+        raise SetupError("the managed tailnet hostname is invalid")
+    return f"{hostname}:{port}"
+
+
 def _canonical_json_bytes(document: Any) -> bytes:
     return (json.dumps(document, sort_keys=True, indent=2, ensure_ascii=True) + "\n").encode(
         "utf-8"
@@ -1752,52 +2111,46 @@ def _read_owned_json(path: Path) -> Any:
         raise SetupError(f"owned route record is invalid: {path}") from exc
 
 
-def _document_mentions_port(document: Any, port: int) -> bool:
-    if isinstance(document, bool):
+def _serve_config_mentions_listener(document: Any, *, host_port: str, port: int) -> bool:
+    if not isinstance(document, dict):
         return False
-    if isinstance(document, int):
-        return document == port
-    if isinstance(document, str):
-        return re.search(rf"(?<!\d){port}(?!\d)", document) is not None
-    if isinstance(document, dict):
-        return any(
-            _document_mentions_port(key, port) or _document_mentions_port(value, port)
-            for key, value in document.items()
-        )
-    if isinstance(document, list):
-        return any(_document_mentions_port(value, port) for value in document)
-    return False
+    tcp = document.get("TCP")
+    web = document.get("Web")
+    allow_funnel = document.get("AllowFunnel")
+    foreground = document.get("Foreground")
+    foreground_mentions = isinstance(foreground, dict) and any(
+        _serve_config_mentions_listener(candidate, host_port=host_port, port=port)
+        for candidate in foreground.values()
+    )
+    return (
+        isinstance(tcp, dict)
+        and str(port) in tcp
+        or isinstance(web, dict)
+        and host_port in web
+        or isinstance(allow_funnel, dict)
+        and host_port in allow_funnel
+        or foreground_mentions
+    )
 
 
-def _document_has_managed_route(document: Any, port: int, target: str) -> bool:
-    scopes: list[Any] = []
-
-    def collect(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if _document_mentions_port(key, port):
-                    scopes.append(child)
-                else:
-                    collect(child)
-        elif isinstance(value, list):
-            for child in value:
-                collect(child)
-
-    def proxy_targets(value: Any) -> set[str]:
-        found: set[str] = set()
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if isinstance(key, str) and key.casefold() == "proxy" and isinstance(child, str):
-                    found.add(child)
-                else:
-                    found.update(proxy_targets(child))
-        elif isinstance(value, list):
-            for child in value:
-                found.update(proxy_targets(child))
-        return found
-
-    collect(document)
-    return bool(scopes) and all(proxy_targets(scope) == {target} for scope in scopes)
+def _serve_config_has_private_route(
+    document: Any,
+    *,
+    host_port: str,
+    port: int,
+    target: str,
+) -> bool:
+    if not isinstance(document, dict):
+        return False
+    tcp = document.get("TCP")
+    web = document.get("Web")
+    allow_funnel = document.get("AllowFunnel")
+    if not isinstance(tcp, dict) or tcp.get(str(port)) != {"HTTPS": True}:
+        return False
+    expected_web = {"Handlers": {"/": {"Proxy": target}}}
+    if not isinstance(web, dict) or web.get(host_port) != expected_web:
+        return False
+    return not (isinstance(allow_funnel, dict) and allow_funnel.get(host_port) is True)
 
 
 def _document_contains_value(document: Any, expected: str) -> bool:
@@ -1832,7 +2185,7 @@ def _merge_hermes_config(
     if existing is not None:
         if not _is_owned_hermes_server(existing, token_name=token_name):
             raise SetupError("Hermes profile has a conflicting Signet MCP server")
-        _, owned = _remove_owned_block(
+        _, owned, _ = _remove_owned_block(
             text,
             label="hermes config",
             setup_id=setup_id,
@@ -1913,7 +2266,7 @@ def _remove_hermes_config(
         )
         if existing is None or block_payload != expected_payload:
             raise SetupError("Hermes profile has changed or foreign content inside its marker")
-    restored, removed = _remove_owned_block(
+    restored, removed, _ = _remove_owned_block(
         text,
         label="hermes config",
         setup_id=setup_id,
@@ -1996,7 +2349,7 @@ def _validate_owned_marker_metadata(text: str, *, label: str, setup_id: str) -> 
         raise SetupError("owned Hermes integration marker is ambiguous")
 
 
-def _remove_owned_block(text: str, *, label: str, setup_id: str) -> tuple[str, bool]:
+def _remove_owned_block(text: str, *, label: str, setup_id: str) -> tuple[str, bool, str]:
     _validate_owned_marker_metadata(text, label=label, setup_id=setup_id)
     for candidate, remove_separator in (
         (f"{label} no-final-newline", True),
@@ -2021,8 +2374,12 @@ def _remove_owned_block(text: str, *, label: str, setup_id: str) -> tuple[str, b
             if start == 0 or text[start - 1] != "\n":
                 raise SetupError("owned Hermes integration separator is invalid")
             start -= 1
-        return text[:start] + text[end + len(end_marker) :], True
-    return text, False
+        return (
+            text[:start] + text[end + len(end_marker) :],
+            True,
+            text[match.end() : end],
+        )
+    return text, False, ""
 
 
 def _yaml_document(encoded: bytes) -> dict[str, Any]:
@@ -2090,12 +2447,12 @@ def _merge_profile_environment(
     exact = f"{token_name}={token}"
     match = assignment.search(text)
     if match is not None:
-        _, owned = _remove_owned_block(
+        _, owned, payload = _remove_owned_block(
             text,
             label="hermes environment",
             setup_id=setup_id,
         )
-        if match.group(0) != exact or not owned:
+        if match.group(0) != exact or not owned or payload != exact + "\n":
             raise SetupError("Hermes profile has a conflicting Signet token assignment")
         return encoded
     return _append_owned_block(
@@ -2125,13 +2482,16 @@ def _remove_profile_environment(
     except UnicodeDecodeError:
         raise SetupError("Hermes profile environment is not UTF-8") from None
     has_assignment = _has_profile_token_assignment(encoded, token_name=token_name)
-    restored, removed = _remove_owned_block(
+    restored, removed, payload = _remove_owned_block(
         text,
         label="hermes environment",
         setup_id=setup_id,
     )
     if has_assignment and not removed:
         raise SetupError("Hermes profile has an unowned Signet token assignment")
+    token = _existing_profile_token(encoded, token_name=token_name)
+    if removed and (token is None or payload != f"{token_name}={token}\n"):
+        raise SetupError("Hermes profile environment marker contains foreign content")
     if _has_profile_token_assignment(restored.encode("utf-8"), token_name=token_name):
         raise SetupError("Hermes profile environment rollback was incomplete")
     return restored.encode("utf-8")

@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from signet.setup_operations import SetupOperations
+from signet.setup_operations import SetupOperations, setup_lifecycle_lock
 from signet.setup_platform import ProductionSetupPlatform
 from signet.setup_state import PolicyMode, SetupEngine, SetupError, SetupJournalStore, SetupSpec
 
@@ -169,20 +169,16 @@ def run_setup_command(
             _require_confirmation(
                 args.yes,
                 input_fn,
-                "Roll back setup-owned resources?",
+                "Back up and roll back all setup-owned Signet resources?",
             )
-            before = store.load()
-            backup_path: Path | None = None
-            if before.step("database").status == "completed":
-                backup_path = operations_factory(root, platform=selected_platform).backup()
-            journal = engine.rollback(spec)
-            rollback_output = {"setup_status": journal.status, "setup_id": journal.setup_id}
-            if backup_path is not None:
-                rollback_output["backup"] = str(backup_path)
-            _emit(rollback_output, output)
+            rollback_document = operations_factory(
+                root, platform=selected_platform
+            ).uninstall(purge=True)
+            _emit(rollback_document, output)
             return 0
         _require_confirmation(args.yes, input_fn, "Apply this setup plan?")
-        journal = engine.apply(spec)
+        with setup_lifecycle_lock(root):
+            journal = engine.apply(spec)
         output(
             "Review the generated MCP entry, then run /reload-mcp in each selected Hermes profile; "
             "Signet never restarts the Hermes gateway."

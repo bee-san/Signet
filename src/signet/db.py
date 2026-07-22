@@ -454,6 +454,7 @@ class Database:
         snapshot_directory = Path(tempfile.mkdtemp(prefix="signet-read-only-"))
         try:
             snapshot_directory.chmod(0o700)
+            _require_private_snapshot_directory(snapshot_directory)
             database_path = _copy_stable_database_snapshot(
                 self.path,
                 snapshot_directory,
@@ -480,10 +481,7 @@ class Database:
             connection.execute("BEGIN")
             yield connection
         finally:
-            if connection.in_transaction:
-                connection.rollback()
-            connection.close()
-            _remove_read_only_snapshot(snapshot_directory)
+            _finalize_read_only_connection(connection, snapshot_directory)
 
     @contextmanager
     def transaction(self, *, mode: str = "IMMEDIATE") -> Iterator[Any]:
@@ -825,6 +823,62 @@ def _require_private_file(path: Path, *, label: str) -> None:
         os.close(descriptor)
 
 
+def _require_private_snapshot_directory(directory: Path) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink < 1
+        ):
+            raise DatabaseError("read-only snapshot directory is unsafe")
+        require_no_acl_grants(descriptor)
+    except (OSError, PrivatePathError) as exc:
+        raise DatabaseError("read-only snapshot directory is unsafe") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _finalize_read_only_connection(connection: Any, snapshot_directory: Path) -> None:
+    primary = sys.exception()
+    failures: list[BaseException] = []
+    try:
+        if connection.in_transaction:
+            connection.rollback()
+    except BaseException as exc:
+        failures.append(exc)
+    try:
+        connection.close()
+    except BaseException as exc:
+        failures.append(exc)
+    try:
+        _remove_read_only_snapshot(snapshot_directory)
+    except BaseException as exc:
+        failures.append(exc)
+    if not failures:
+        return
+    note = "read-only database cleanup encountered: " + ", ".join(
+        type(failure).__name__ for failure in failures
+    )
+    if primary is not None:
+        primary.add_note(note)
+        return
+    error = DatabaseError("read-only database cleanup did not complete")
+    for failure in failures[1:]:
+        error.add_note(type(failure).__name__)
+    raise error from failures[0]
+
+
 def _remove_read_only_snapshot(directory: Path) -> None:
     descriptor = -1
     try:
@@ -914,16 +968,31 @@ def _copy_stable_database_snapshot(source: Path, destination: Path) -> Path:
         except FileNotFoundError:
             stable = False
         finally:
-            if wal_descriptor >= 0:
-                os.close(wal_descriptor)
-            if main_descriptor >= 0:
-                os.close(main_descriptor)
+            _close_snapshot_descriptors(wal_descriptor, main_descriptor)
         if stable:
             return snapshot
         else:
             snapshot.unlink(missing_ok=True)
             snapshot_wal.unlink(missing_ok=True)
     raise DatabaseError("database changed during read-only snapshot")
+
+
+def _close_snapshot_descriptors(*descriptors: int) -> None:
+    primary = sys.exception()
+    failures: list[OSError] = []
+    for descriptor in descriptors:
+        if descriptor < 0:
+            continue
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            failures.append(exc)
+    if not failures:
+        return
+    if primary is not None:
+        primary.add_note("one or more database snapshot descriptors could not be closed")
+        return
+    raise DatabaseError("database snapshot descriptor cleanup did not complete") from failures[0]
 
 
 def _open_snapshot_source(
@@ -970,6 +1039,7 @@ def _copy_descriptor_to_private_file(descriptor: int, destination: Path) -> str:
             0o600,
         )
         os.fchmod(output, 0o600)
+        require_no_acl_grants(output)
         os.lseek(descriptor, 0, os.SEEK_SET)
         while chunk := os.read(descriptor, 1024 * 1024):
             digest.update(chunk)
@@ -980,7 +1050,7 @@ def _copy_descriptor_to_private_file(descriptor: int, destination: Path) -> str:
                     raise OSError("short database snapshot write")
                 view = view[written:]
         os.fsync(output)
-    except OSError as exc:
+    except (OSError, PrivatePathError) as exc:
         destination.unlink(missing_ok=True)
         raise DatabaseError("database snapshot could not be copied safely") from exc
     finally:

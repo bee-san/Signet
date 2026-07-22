@@ -14,10 +14,11 @@ import pytest
 
 import signet.setup_operations as setup_operations
 import signet.setup_platform as setup_platform
+import signet.setup_state as setup_state
 from signet.browser_auth import BootstrapService
 from signet.config import ProductionConfig, production_instance_identity
 from signet.credential_broker import KeychainSecretStore
-from signet.db import Database
+from signet.db import Database, MigrationBackupReceipt
 from signet.private_paths import ensure_private_directory, require_private_directory_identity
 from signet.production import create_production_assembly, load_production_config
 from signet.setup_operations import SetupOperations
@@ -91,6 +92,37 @@ def test_plan_is_read_only_and_defaults_providers_to_disabled(tmp_path: Path) ->
         {"namespace": "profile:personal", "allowed_aliases": ["approvals"]},
         {"namespace": "profile:work", "allowed_aliases": ["approvals"]},
     ]
+
+
+def test_journal_read_refuses_a_path_replacement_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet-journal-race")
+    store = SetupJournalStore(selected.root)
+    expected = SetupEngine(store, FakePlatform()).apply(selected)
+    replacement_root = tmp_path / "replacement-root"
+    replacement_store = SetupJournalStore(replacement_root)
+    replacement = SetupEngine(replacement_store, FakePlatform()).apply(spec(replacement_root))
+    replacement_path = selected.root / "replacement-journal.json"
+    replacement_path.write_bytes(replacement_store.journal_path.read_bytes())
+    replacement_path.chmod(0o600)
+    real_read = setup_state.os.read
+    raced = False
+
+    def replace_before_read(descriptor: int, size: int) -> bytes:
+        nonlocal raced
+        if not raced:
+            raced = True
+            replacement_path.replace(store.journal_path)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(setup_state.os, "read", replace_before_read)
+
+    with pytest.raises(SetupError, match="changed during inspection"):
+        store.load()
+
+    assert expected.setup_id != replacement.setup_id
 
 
 def test_setup_status_and_doctor_do_not_construct_or_mutate_production_state(
@@ -484,6 +516,286 @@ def test_backup_manager_is_constructed_without_live_assembly_or_migration(
     assert not manager.database.path.exists()
 
 
+def test_public_backup_refuses_to_cross_an_active_lifecycle_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "backup-lifecycle-lock")
+    SetupEngine(SetupJournalStore(selected.root), FakePlatform()).apply(selected)
+    operations = SetupOperations(selected.root, platform=FakePlatform())
+    monkeypatch.setattr(
+        operations,
+        "_backup_manager",
+        lambda journal: pytest.fail("backup crossed an active lifecycle lock"),
+    )
+
+    with (
+        setup_operations.setup_lifecycle_lock(selected.root),
+        pytest.raises(SetupError, match="another setup lifecycle operation"),
+    ):
+        operations.backup(tmp_path / "locked.signet-backup")
+
+
+def test_upgrade_preflights_before_stopping_and_verifies_services_before_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "upgrade-offline-preflight")
+    events: list[str] = []
+
+    class UpgradePlatform(FakePlatform):
+        def preflight(self, selected_spec: SetupSpec) -> None:
+            del selected_spec
+            events.append("preflight")
+
+        def manage_services(self, selected_spec: SetupSpec, action: str) -> None:
+            del selected_spec
+            events.append(action)
+
+        def service_status(self, selected_spec: SetupSpec) -> dict[str, str]:
+            del selected_spec
+            events.append("status")
+            return {
+                "signet-mcp": "inactive",
+                "signet-web": "inactive",
+                "tailscale:8443": "active",
+            }
+
+    platform = UpgradePlatform()
+    SetupEngine(SetupJournalStore(selected.root), platform).apply(selected)
+    operations = SetupOperations(selected.root, platform=platform)
+    monkeypatch.setattr(
+        operations,
+        "_backup_manager",
+        lambda journal: (_ for _ in ()).throw(SetupError("stop after order assertion")),
+    )
+    monkeypatch.setattr(operations, "_restart_services_after_upgrade", lambda selected_spec: None)
+
+    with pytest.raises(SetupError, match="stop after order assertion"):
+        operations.upgrade()
+
+    assert events == ["preflight", "stop", "status"]
+
+
+def test_upgrade_resumes_verified_services_when_pre_migration_backup_cannot_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "upgrade-pre-migration-recovery")
+    events: list[str] = []
+    active = True
+
+    class UpgradePlatform(FakePlatform):
+        def preflight(self, selected_spec: SetupSpec) -> None:
+            del selected_spec
+            events.append("preflight")
+
+        def manage_services(self, selected_spec: SetupSpec, action: str) -> None:
+            nonlocal active
+            del selected_spec
+            events.append(action)
+            active = action == "start"
+
+        def service_status(self, selected_spec: SetupSpec) -> dict[str, str]:
+            del selected_spec
+            events.append("status")
+            state = "active" if active else "inactive"
+            return {"signet-mcp": state, "signet-web": state}
+
+        def verify_service_health(self, selected_spec: SetupSpec) -> None:
+            del selected_spec
+            events.append("health")
+            assert active
+
+    platform = UpgradePlatform()
+    SetupEngine(SetupJournalStore(selected.root), platform).apply(selected)
+    operations = SetupOperations(selected.root, platform=platform)
+    monkeypatch.setattr(
+        operations,
+        "_backup_manager",
+        lambda journal: (_ for _ in ()).throw(SetupError("backup unavailable")),
+    )
+
+    with pytest.raises(SetupError, match="backup unavailable"):
+        operations.upgrade()
+
+    assert events == ["preflight", "stop", "status", "start", "status", "health"]
+
+
+def test_upgrade_creates_the_reported_backup_inside_the_migration_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "upgrade-migration-epoch")
+
+    class UpgradePlatform(FakePlatform):
+        def preflight(self, selected_spec: SetupSpec) -> None:
+            del selected_spec
+
+        def manage_services(self, selected_spec: SetupSpec, action: str) -> None:
+            del selected_spec, action
+
+        def service_status(self, selected_spec: SetupSpec) -> dict[str, str]:
+            del selected_spec
+            return {"signet-mcp": "inactive", "signet-web": "inactive"}
+
+    platform = UpgradePlatform()
+    SetupEngine(SetupJournalStore(selected.root), platform).apply(selected)
+    ensure_private_directory(selected.root / "data")
+    database = Database(selected.root / "data" / "signet.db")
+    database.initialize()
+    with database.transaction(mode="EXCLUSIVE") as connection:
+        connection.execute("PRAGMA user_version = 1")
+    with database.read_only() as connection:
+        source_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    backup_path = tmp_path / "verified-upgrade.signet-backup"
+    assembly_active = False
+    events: list[str] = []
+
+    def callback(candidate: Database, version: int) -> MigrationBackupReceipt:
+        assert assembly_active, "backup callback ran outside the database migration epoch"
+        assert candidate.path == database.path
+        assert version == source_version
+        events.append("backup")
+        backup_path.write_bytes(b"encrypted backup")
+        backup_path.chmod(0o600)
+        return MigrationBackupReceipt(
+            database_path=candidate.path,
+            source_schema_version=version,
+            artifact_path=backup_path,
+            artifact_sha256=hashlib.sha256(backup_path.read_bytes()).hexdigest(),
+            verified_restore_schema_version=version,
+        )
+
+    class Manager:
+        def create_pre_migration_callback(self, destination: Path) -> Any:
+            assert destination.name.endswith("-recovery")
+            return callback
+
+    class Assembly:
+        config = type(
+            "Config",
+            (),
+            {"provider_rollout": type("Rollout", (), {"state": "disabled"})()},
+        )()
+
+        @staticmethod
+        def status() -> Any:
+            return type("Status", (), {"schema_version": source_version})()
+
+    def create_assembly(*args: Any, pre_migration_backup: Any, **kwargs: Any) -> Assembly:
+        nonlocal assembly_active
+        del args, kwargs
+        events.append("assembly")
+        assembly_active = True
+        try:
+            pre_migration_backup(database, source_version)
+        finally:
+            assembly_active = False
+        return Assembly()
+
+    operations = SetupOperations(selected.root, platform=platform)
+    monkeypatch.setattr(operations, "_backup_manager", lambda journal: Manager())
+    monkeypatch.setattr(operations, "_restart_services_after_upgrade", lambda selected_spec: None)
+    monkeypatch.setattr(setup_operations, "create_production_assembly", create_assembly)
+
+    result = operations.upgrade()
+
+    assert events == ["assembly", "backup"]
+    assert result["backup"] == str(backup_path)
+
+
+def test_upgrade_requiesces_a_partial_service_restart(
+    tmp_path: Path,
+) -> None:
+    selected = spec(tmp_path / "upgrade-partial-restart")
+    events: list[str] = []
+
+    class PartialRestartPlatform(FakePlatform):
+        def manage_services(self, selected_spec: SetupSpec, action: str) -> None:
+            del selected_spec
+            events.append(action)
+            if action == "start":
+                raise SetupError("second service failed to start")
+
+        def service_status(self, selected_spec: SetupSpec) -> dict[str, str]:
+            del selected_spec
+            events.append("status")
+            return {"signet-mcp": "inactive", "signet-web": "inactive"}
+
+    operations = SetupOperations(selected.root, platform=PartialRestartPlatform())
+
+    with pytest.raises(SetupError, match="services were left stopped"):
+        operations._restart_services_after_upgrade(selected)
+
+    assert events == ["start", "stop", "status"]
+
+
+def test_upgrade_restart_requires_instance_bound_health_before_returning(
+    tmp_path: Path,
+) -> None:
+    selected = spec(tmp_path / "upgrade-health-identity")
+    events: list[str] = []
+    active = False
+
+    class WrongInstancePlatform(FakePlatform):
+        def manage_services(self, selected_spec: SetupSpec, action: str) -> None:
+            nonlocal active
+            del selected_spec
+            events.append(action)
+            active = action == "start"
+
+        def service_status(self, selected_spec: SetupSpec) -> dict[str, str]:
+            del selected_spec
+            events.append("status")
+            state = "active" if active else "inactive"
+            return {"signet-mcp": state, "signet-web": state}
+
+        def verify_service_health(self, selected_spec: SetupSpec) -> None:
+            del selected_spec
+            events.append("health")
+            raise SetupError("health identity mismatch")
+
+    operations = SetupOperations(selected.root, platform=WrongInstancePlatform())
+
+    with pytest.raises(SetupError, match="services were left stopped"):
+        operations._restart_services_after_upgrade(selected)
+
+    assert events == ["start", "status", "health", "stop", "status"]
+
+
+def test_upgrade_interrupt_during_restart_requiesces_services(
+    tmp_path: Path,
+) -> None:
+    selected = spec(tmp_path / "upgrade-restart-interrupt")
+    events: list[str] = []
+    interrupted = False
+
+    class InterruptedPlatform(FakePlatform):
+        def manage_services(self, selected_spec: SetupSpec, action: str) -> None:
+            del selected_spec
+            events.append(action)
+
+        def service_status(self, selected_spec: SetupSpec) -> dict[str, str]:
+            nonlocal interrupted
+            del selected_spec
+            events.append("status")
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return {"signet-mcp": "inactive", "signet-web": "inactive"}
+
+        def verify_service_health(self, selected_spec: SetupSpec) -> None:
+            pytest.fail(f"health checked after interruption for {selected_spec.root}")
+
+    operations = SetupOperations(selected.root, platform=InterruptedPlatform())
+
+    with pytest.raises(KeyboardInterrupt):
+        operations._restart_services_after_upgrade(selected)
+
+    assert events == ["start", "status", "stop", "status"]
+
+
 def test_purge_preserves_every_key_needed_to_recover_an_encrypted_backup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -535,6 +847,28 @@ def test_setup_resume_durably_invalidates_a_prior_purge_checkpoint(tmp_path: Pat
     assert store.load().purge_backup is None
 
 
+def test_setup_resume_preserves_a_structurally_valid_purge_checkpoint(tmp_path: Path) -> None:
+    selected = spec(tmp_path / "signet-valid-purge-checkpoint")
+    store = SetupJournalStore(selected.root)
+    engine = SetupEngine(store, FakePlatform())
+    journal = engine.apply(selected)
+    checkpoint = {
+        "version": 1,
+        "setup_id": journal.setup_id,
+        "recovery_directory": str(tmp_path / "recovery"),
+        "backup": {},
+        "recovery_receipt": {},
+        "backup_receipt": {},
+    }
+    journal.purge_backup = checkpoint
+    store.save(journal)
+
+    with pytest.raises(SetupError, match="finish purge"):
+        engine.apply(selected)
+
+    assert store.load().purge_backup == checkpoint
+
+
 def test_service_start_refuses_to_cross_a_purge_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -549,6 +883,39 @@ def test_service_start_refuses_to_cross_a_purge_checkpoint(
 
     with pytest.raises(SetupError, match="purge checkpoint"):
         operations.manage("start")
+
+
+def test_verified_purge_receipt_read_refuses_a_path_replacement_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery = ensure_private_directory(tmp_path / "recovery-checkpoint")
+    receipt = recovery / "receipt.json"
+    replacement = recovery / "replacement.json"
+    receipt.write_bytes(b'{"setup_id":"expected"}')
+    receipt.chmod(0o600)
+    replacement.write_bytes(b'{"setup_id":"foreign"}')
+    replacement.chmod(0o600)
+    checkpoint = setup_operations._private_file_checkpoint(receipt)
+    real_read = setup_operations.os.read
+    raced = False
+
+    def replace_before_read(descriptor: int, size: int) -> bytes:
+        nonlocal raced
+        if not raced:
+            raced = True
+            replacement.replace(receipt)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(setup_operations.os, "read", replace_before_read)
+
+    with pytest.raises(SetupError, match="identity or digest changed"):
+        setup_operations._read_verified_private_file_checkpoint(
+            checkpoint,
+            recovery,
+        )
+
+    assert receipt.read_bytes() == b'{"setup_id":"foreign"}'
 
 
 def test_purge_durably_publishes_the_recovery_directory_before_backup(
@@ -569,7 +936,7 @@ def test_purge_durably_publishes_the_recovery_directory_before_backup(
         events.append("backup")
         raise SetupError("stop after durability assertion")
 
-    monkeypatch.setattr(operations, "backup", backup)
+    monkeypatch.setattr(operations, "_backup", backup)
     with pytest.raises(SetupError, match="stop after durability assertion"):
         operations.uninstall(purge=True)
 
@@ -623,12 +990,12 @@ def test_purge_uninstall_quiesces_services_before_the_external_backup(
         events.append("backup")
         return destination
 
-    monkeypatch.setattr(operations, "backup", backup)
+    monkeypatch.setattr(operations, "_backup", backup)
     monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
     monkeypatch.setattr(
         operations,
         "_verified_backup_receipt",
-        lambda bundle: {
+        lambda bundle, **_: {
             "artifact_path": str(bundle),
             "artifact_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
             "source_schema_version": 19,
@@ -650,6 +1017,50 @@ def test_purge_uninstall_quiesces_services_before_the_external_backup(
     }
     assert events.index("rollback:services") < events.index("backup")
     assert events.count("rollback:services") == 1
+
+
+def test_purge_verifies_the_published_checkpoint_before_destructive_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet-checkpoint-gate")
+    platform = FakePlatform()
+    store = SetupJournalStore(selected.root)
+    SetupEngine(store, platform).apply(selected)
+    operations = SetupOperations(selected.root, platform=platform)
+
+    def backup(destination: Path | None = None) -> Path:
+        assert destination is not None
+        destination.parent.mkdir(mode=0o700, exist_ok=True)
+        destination.write_bytes(b"verified encrypted backup")
+        destination.chmod(0o600)
+        return destination
+
+    monkeypatch.setattr(operations, "_backup", backup)
+    monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
+    monkeypatch.setattr(
+        operations,
+        "_verified_backup_receipt",
+        lambda bundle, **_: {
+            "artifact_path": str(bundle),
+            "artifact_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "source_schema_version": 19,
+            "verified_restore_schema_version": 19,
+        },
+    )
+    monkeypatch.setattr(
+        setup_operations,
+        "_verify_purge_checkpoint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            SetupError("published checkpoint did not verify")
+        ),
+    )
+
+    with pytest.raises(SetupError, match="published checkpoint did not verify"):
+        operations.uninstall(purge=True)
+
+    assert platform.rolled_back == ["services"]
+    assert store.load().purge_backup is not None
 
 
 def test_purge_rejects_missing_recovery_secret_before_quiescing_services(
@@ -679,7 +1090,7 @@ def test_failed_purge_backup_resumes_quiesced_services(
     monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
     monkeypatch.setattr(
         operations,
-        "backup",
+        "_backup",
         lambda destination=None: (_ for _ in ()).throw(SetupError("backup failed")),
     )
 
@@ -706,7 +1117,7 @@ def test_failed_purge_after_preserving_uninstall_does_not_reinstall_integrations
     monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
     monkeypatch.setattr(
         operations,
-        "backup",
+        "_backup",
         lambda destination=None: (_ for _ in ()).throw(SetupError("backup failed")),
     )
 
@@ -729,7 +1140,7 @@ def test_failed_purge_reports_backup_and_service_resume_failures(
     monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
     monkeypatch.setattr(
         operations,
-        "backup",
+        "_backup",
         lambda destination=None: (_ for _ in ()).throw(
             SetupError("backup publication is unknown; inspect the destination before retrying")
         ),
@@ -767,12 +1178,12 @@ def test_purge_retry_reuses_only_a_verified_durable_backup_checkpoint(
         return destination
 
     operations = SetupOperations(selected.root, platform=platform)
-    monkeypatch.setattr(operations, "backup", backup)
+    monkeypatch.setattr(operations, "_backup", backup)
     monkeypatch.setattr(operations, "_require_recovery_secrets", lambda journal: None)
     monkeypatch.setattr(
         operations,
         "_verified_backup_receipt",
-        lambda bundle: {
+        lambda bundle, **_: {
             "artifact_path": str(bundle),
             "artifact_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
             "source_schema_version": 19,
@@ -1183,11 +1594,27 @@ def test_service_install_management_status_and_rollback_are_platform_native(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     commands: list[list[str]] = []
+    services_active = False
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal services_active
         commands.append(command)
-        stdout = "active\n" if command[-1:] == ["is-active"] else ""
-        return subprocess.CompletedProcess(command, 0, stdout, "")
+        if command[:2] == ["launchctl", "bootstrap"] or "enable" in command:
+            services_active = True
+        elif command[:2] == ["launchctl", "bootout"] or "disable" in command:
+            services_active = False
+        elif command[:2] == ["launchctl", "kickstart"] or "restart" in command:
+            services_active = True
+        if command[:2] == ["launchctl", "print"]:
+            return subprocess.CompletedProcess(command, 0 if services_active else 3, "", "")
+        if "is-active" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0 if services_active else 3,
+                "active\n" if services_active else "inactive\n",
+                "",
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
     monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
@@ -1223,6 +1650,79 @@ def test_service_install_management_status_and_rollback_are_platform_native(
         assert any("restart" in command for command in commands)
 
 
+def test_database_rollback_refuses_a_same_user_replacement_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(
+        spec(tmp_path / "root-database-ownership"),
+        public_origin="https://example.com",
+    )
+    platform = ProductionSetupPlatform()
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *args, **kwargs: None)
+    platform._apply_private_paths(selected, "setup-database-test")
+    platform._apply_database(selected, "setup-database-test")
+    database = selected.root / "data" / "signet.db"
+    marker = selected.root / "data" / ".signet-database-ownership.json"
+    replacement = selected.root / "data" / "replacement.db"
+    replacement.write_bytes(b"same-user foreign database")
+    replacement.chmod(0o600)
+    replacement.replace(database)
+
+    with pytest.raises(SetupError, match="database changed after setup ownership"):
+        platform._rollback_database(selected, "setup-database-test")
+
+    assert database.read_bytes() == b"same-user foreign database"
+    assert marker.is_file()
+
+
+def test_database_rollback_rejects_unreceipted_sqlite_sidecars_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(
+        spec(tmp_path / "root-database-sidecar-ownership"),
+        public_origin="https://example.com",
+    )
+    platform = ProductionSetupPlatform()
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *args, **kwargs: None)
+    platform._apply_private_paths(selected, "setup-database-test")
+    platform._apply_database(selected, "setup-database-test")
+    database = selected.root / "data" / "signet.db"
+    marker = selected.root / "data" / ".signet-database-ownership.json"
+    sidecar = selected.root / "data" / "signet.db-wal"
+    sidecar.write_bytes(b"unreceipted same-user file")
+    sidecar.chmod(0o600)
+
+    with pytest.raises(SetupError, match="unreceipted database runtime artifact"):
+        platform._rollback_database(selected, "setup-database-test")
+
+    assert sidecar.read_bytes() == b"unreceipted same-user file"
+    assert database.is_file()
+    assert marker.is_file()
+
+
+def test_database_rollback_removes_every_receipted_runtime_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(
+        spec(tmp_path / "root-database-runtime-cleanup"),
+        public_origin="https://example.com",
+    )
+    platform = ProductionSetupPlatform()
+    monkeypatch.setattr(setup_platform, "create_production_assembly", lambda *args, **kwargs: None)
+    platform._apply_private_paths(selected, "setup-database-test")
+    platform._apply_database(selected, "setup-database-test")
+    data_directory = selected.root / "data"
+    maintenance_lock = data_directory / ".signet.db.maintenance.lock"
+    assert maintenance_lock.is_file()
+
+    platform._rollback_database(selected, "setup-database-test")
+
+    assert list(data_directory.iterdir()) == []
+
+
 def test_systemd_rollback_retries_after_reload_failure_and_tolerates_unloaded_units(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1246,6 +1746,8 @@ def test_systemd_rollback_retries_after_reload_failure_and_tolerates_unloaded_un
         del kwargs
         if "disable" in command:
             return subprocess.CompletedProcess(command, 1, "", "Unit is not loaded")
+        if "is-active" in command:
+            return subprocess.CompletedProcess(command, 3, "inactive\n", "")
         if command[-1] == "daemon-reload":
             reloads += 1
             return subprocess.CompletedProcess(
@@ -1286,6 +1788,8 @@ def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
                 return subprocess.CompletedProcess(command, 1, "", "stop failed")
             if bootouts == 3:
                 return subprocess.CompletedProcess(command, 3, "", "No such process")
+        if command[:2] == ["launchctl", "print"]:
+            return subprocess.CompletedProcess(command, 3, "", "No such process")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
@@ -1646,7 +2150,9 @@ def test_hermes_config_rejects_ambiguous_or_malformed_ownership_markers(
         )
 
 
-def test_format_one_hermes_profile_snapshots_remain_readable(tmp_path: Path) -> None:
+def test_format_one_hermes_profile_snapshots_fail_closed_without_directory_identity(
+    tmp_path: Path,
+) -> None:
     selected = replace(spec(tmp_path / "legacy-profile-snapshot"), hermes_profiles=("work",))
     profile = ensure_private_directory(tmp_path / "profiles" / "work")
     config = profile / "config.yaml"
@@ -1679,15 +2185,41 @@ def test_format_one_hermes_profile_snapshots_remain_readable(tmp_path: Path) -> 
         require_present=True,
     )
 
-    snapshot = setup_platform._read_hermes_profile_snapshot(
-        selected,
-        "work",
-        profile_directory=profile,
-    )
+    with pytest.raises(SetupError, match="metadata is invalid"):
+        setup_platform._read_hermes_profile_snapshot(
+            selected,
+            "work",
+            profile_directory=profile,
+        )
 
-    assert snapshot is not None
-    assert snapshot[0].same_object(identity)
-    assert snapshot[1:] == (b"model: legacy\n", b"LEGACY=kept\n")
+
+def test_private_profile_file_read_refuses_a_path_replacement_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = ensure_private_directory(tmp_path / "profile-read-race")
+    path = directory / "config.yaml"
+    replacement = directory / "replacement.yaml"
+    path.write_bytes(b"original\n")
+    path.chmod(0o600)
+    replacement.write_bytes(b"foreign\n")
+    replacement.chmod(0o600)
+    real_read = setup_platform.os.read
+    raced = False
+
+    def replace_before_read(descriptor: int, size: int) -> bytes:
+        nonlocal raced
+        if not raced:
+            raced = True
+            replacement.replace(path)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(setup_platform.os, "read", replace_before_read)
+
+    with pytest.raises(SetupError, match="changed during inspection"):
+        setup_platform._read_optional_private_file(path)
+
+    assert path.read_bytes() == b"foreign\n"
 
 
 def test_absent_hermes_rollback_files_stay_bound_to_the_snapshotted_profile(
@@ -1863,29 +2395,69 @@ def test_tailnet_rollback_rejects_the_right_target_on_the_wrong_port(
     )
     ensure_private_directory(selected.root / "services")
     before_path = selected.root / "services" / "tailscale-serve-before.json"
-    before_path.write_text('{"funnel":{},"serve":{}}\n', encoding="utf-8")
+    before_path.write_text('{"format":2,"serve":{}}\n', encoding="utf-8")
     before_path.chmod(0o600)
+    host_port = "signet.example.ts.net:8443"
     state = {
         "serve": {
-            "Web": {
-                ":8443": {"Proxy": "http://127.0.0.1:9999"},
-                ":443": {"Proxy": "http://127.0.0.1:8790"},
-            }
+            "TCP": {"8443": {"HTTPS": True}},
+            "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}}}},
+            "AllowFunnel": {host_port: False},
         },
-        "funnel": {},
     }
+    after_path = selected.root / "services" / "tailscale-serve-after.json"
+    after_path.write_text(
+        json.dumps({"format": 2, "serve": state["serve"]}) + "\n",
+        encoding="utf-8",
+    )
+    after_path.chmod(0o600)
     commands: list[list[str]] = []
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
         commands.append(command)
-        payload = state["funnel"] if command[1] == "funnel" else state["serve"]
+        payload = state["serve"]
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
     platform = ProductionSetupPlatform(command_runner=run)
     with pytest.raises(SetupError, match="changed Tailscale listener"):
         platform._rollback_tailnet_route(selected)
     assert not any(command[-1] == "off" for command in commands)
+
+
+def test_tailnet_apply_rejects_a_foreground_listener_before_mutation(
+    tmp_path: Path,
+) -> None:
+    selected = SetupSpec(
+        root=tmp_path / "foreground-tailnet",
+        public_origin="https://signet.example.ts.net:8443",
+        owner_user_id="user:owner",
+        hermes_profiles=("work",),
+        executable=Path("/bin/echo"),
+    )
+    ensure_private_directory(selected.root / "services")
+    host_port = "signet.example.ts.net:8443"
+    serve = {
+        "Foreground": {
+            "session-1": {
+                "TCP": {"8443": {"HTTPS": True}},
+                "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}}}},
+            }
+        }
+    }
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(serve), "")
+
+    platform = ProductionSetupPlatform(command_runner=run)
+
+    with pytest.raises(SetupError, match="listener 8443 is already in use"):
+        platform._apply_tailnet_route(selected)
+
+    assert not any("--bg" in command for command in commands)
 
 
 def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
@@ -1899,7 +2471,8 @@ def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
         executable=Path("/bin/echo"),
     )
     ensure_private_directory(selected.root / "services")
-    state: dict[str, Any] = {"serve": {}, "funnel": {}}
+    host_port = "signet.example.ts.net:8443"
+    state: dict[str, Any] = {"serve": {}}
     commands: list[list[str]] = []
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -1907,10 +2480,12 @@ def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
         commands.append(command)
         if command[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
-        elif command[:3] == ["tailscale", "funnel", "status"]:
-            payload = state["funnel"]
         elif "--bg" in command:
-            state["serve"] = {"Web": {":8443": {"Proxy": "http://127.0.0.1:8790"}}}
+            state["serve"] = {
+                "TCP": {"8443": {"HTTPS": True}},
+                "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+                "AllowFunnel": {host_port: False},
+            }
             payload = {}
         elif command[-1] == "off":
             state["serve"] = {}
@@ -1923,6 +2498,7 @@ def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
     platform._apply_tailnet_route(selected)
 
     assert any("--https=8443" in command for command in commands)
+    assert not any(command[1] == "funnel" for command in commands)
     assert (selected.root / "services" / "tailscale-serve-before.json").is_file()
     assert (selected.root / "services" / "tailscale-serve-after.json").is_file()
     platform._rollback_tailnet_route(selected)
@@ -1940,21 +2516,26 @@ def test_tailnet_rollback_verifies_the_exact_pre_setup_snapshot(tmp_path: Path) 
         executable=Path("/bin/echo"),
     )
     ensure_private_directory(selected.root / "services")
-    before_serve: dict[str, Any] = {"Web": {":9443": {"Proxy": "http://127.0.0.1:9444"}}}
-    state: dict[str, Any] = {"serve": before_serve, "funnel": {}}
+    host_port = "signet.example.ts.net:8443"
+    other_host_port = "signet.example.ts.net:9443"
+    before_serve: dict[str, Any] = {
+        "TCP": {"9443": {"HTTPS": True}},
+        "Web": {other_host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9444"}}}},
+    }
+    state: dict[str, Any] = {"serve": before_serve}
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
         if command[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
-        elif command[:3] == ["tailscale", "funnel", "status"]:
-            payload = state["funnel"]
         elif "--bg" in command:
             state["serve"] = {
+                "TCP": {"9443": {"HTTPS": True}, "8443": {"HTTPS": True}},
                 "Web": {
-                    ":9443": {"Proxy": "http://127.0.0.1:9444"},
-                    ":8443": {"Proxy": "http://127.0.0.1:8790"},
-                }
+                    other_host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9444"}}},
+                    host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}},
+                },
+                "AllowFunnel": {host_port: False},
             }
             payload = {}
         elif command[-1] == "off":
@@ -2011,12 +2592,21 @@ def test_real_platform_builds_a_provider_disabled_production_assembly(
         def _apply_services(self, selected: SetupSpec, setup_id: str) -> None:
             del selected, setup_id
 
+        def manage_services(self, selected: SetupSpec, action: str) -> None:
+            del selected
+            self.services_active = action != "stop"
+
         def _apply_owner_bootstrap(self, selected: SetupSpec, setup_id: str) -> None:
             del selected, setup_id
 
         def service_status(self, selected: SetupSpec) -> dict[str, str]:
             del selected
-            return {"signet-mcp": "active", "signet-web": "active"}
+            state = "active" if getattr(self, "services_active", True) else "inactive"
+            return {"signet-mcp": state, "signet-web": state}
+
+        def verify_service_health(self, spec: SetupSpec) -> None:
+            del spec
+            assert getattr(self, "services_active", True)
 
     selected = SetupSpec(
         root=tmp_path / "owned-root",

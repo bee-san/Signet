@@ -242,6 +242,55 @@ def test_setup_apply_is_resumable_and_prints_reload_instruction(tmp_path: Path) 
     assert json.loads(output[-1])["setup_status"] == "completed"
 
 
+def test_setup_rollback_routes_database_removal_through_verified_purge(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "signet"
+    platform = FakePlatform()
+    parser = _parser()
+    apply_args = parser.parse_args(
+        [
+            "setup",
+            "--yes",
+            "--no-open-browser",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--owner",
+            "user:owner",
+            "--executable",
+            "/opt/signet/bin/signet",
+        ]
+    )
+    assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
+    calls: list[bool] = []
+
+    class Operations:
+        def uninstall(self, *, purge: bool = False) -> dict[str, object]:
+            calls.append(purge)
+            return {
+                "setup_status": "uninstalled",
+                "purged": True,
+                "backup": str(tmp_path / "verified.signet-backup"),
+            }
+
+    output: list[str] = []
+    rollback_args = parser.parse_args(["setup", "--rollback", "--yes", "--root", str(root)])
+    assert (
+        run_setup_command(
+            rollback_args,
+            output=output.append,
+            platform=platform,
+            operations_factory=lambda root, platform: Operations(),
+        )
+        == 0
+    )
+
+    assert calls == [True]
+    assert json.loads(output[-1])["purged"] is True
+
+
 def test_lifecycle_commands_dispatch_to_operations_without_mutating_setup_state(
     tmp_path: Path,
 ) -> None:
@@ -401,22 +450,21 @@ def test_completed_setup_rollback_creates_backup_first(tmp_path: Path) -> None:
     events: list[str] = []
 
     class FakeOperations:
-        def backup(self) -> Path:
-            events.append("backup")
-            return root / "backups" / "before-rollback.signet-backup"
-
-    class RollbackPlatform(FakePlatform):
-        def rollback(self, step: str, spec: Any, setup_id: str) -> None:
-            if not events:
-                raise AssertionError("rollback ran before backup")
-            super().rollback(step, spec, setup_id)
+        def uninstall(self, *, purge: bool = False) -> dict[str, object]:
+            assert purge is True
+            events.extend(["backup", "rollback"])
+            return {
+                "setup_status": "rolled_back",
+                "purged": True,
+                "backup": str(root / "backups" / "before-rollback.signet-backup"),
+            }
 
     output: list[str] = []
     rollback_args = _parser().parse_args(["setup", "--root", str(root), "--rollback", "--yes"])
     assert (
         run_setup_command(
             rollback_args,
-            platform=RollbackPlatform(),
+            platform=FakePlatform(),
             operations_factory=lambda *_args, **_kwargs: FakeOperations(),
             output=output.append,
         )
@@ -425,4 +473,4 @@ def test_completed_setup_rollback_creates_backup_first(tmp_path: Path) -> None:
     document = json.loads(output[-1])
     assert document["setup_status"] == "rolled_back"
     assert document["backup"].endswith("before-rollback.signet-backup")
-    assert events == ["backup"]
+    assert events == ["backup", "rollback"]

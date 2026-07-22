@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import secrets
 import stat
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -19,13 +22,17 @@ from signet.backup import (
     remove_private_tree_checked,
 )
 from signet.credential_broker import KeychainSecretStore, SecretReference
-from signet.db import Database
+from signet.db import LATEST_SCHEMA_VERSION, Database
 from signet.private_paths import (
     PrivatePathError,
     ensure_private_directory,
     require_no_acl_grants,
 )
-from signet.production import create_production_assembly, load_production_config
+from signet.production import (
+    ProductionAssemblyError,
+    create_production_assembly,
+    load_production_config,
+)
 from signet.production_state import ProductionStateStore
 from signet.setup_platform import ProductionSetupPlatform
 from signet.setup_state import (
@@ -39,6 +46,36 @@ from signet.setup_state import (
 from signet.staging import StagingStore
 
 
+@contextmanager
+def setup_lifecycle_lock(root_path: Path) -> Iterator[None]:
+    descriptor = -1
+    try:
+        root = ensure_private_directory(root_path)
+        descriptor = os.open(
+            root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        require_no_acl_grants(descriptor)
+    except (OSError, PrivatePathError) as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise SetupError("setup lifecycle lock is unavailable or unsafe") from exc
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SetupError("another setup lifecycle operation is in progress") from None
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 class SetupOperations:
     def __init__(
         self,
@@ -49,6 +86,11 @@ class SetupOperations:
         self.root = root
         self.store = SetupJournalStore(root)
         self.platform = platform or ProductionSetupPlatform()
+
+    @contextmanager
+    def lifecycle_lock(self) -> Iterator[None]:
+        with setup_lifecycle_lock(self.root):
+            yield
 
     def spec(self) -> SetupSpec:
         journal = self.store.load()
@@ -157,7 +199,15 @@ class SetupOperations:
         }
 
     def backup(self, destination: Path | None = None) -> Path:
+        with self.lifecycle_lock():
+            return self._backup(destination)
+
+    def _backup(self, destination: Path | None = None) -> Path:
         journal = self.store.load()
+        if journal.purge_backup is not None:
+            raise SetupError(
+                "a durable purge checkpoint exists; finish purge before creating another backup"
+            )
         manager = self._backup_manager(journal)
         selected = destination or (
             self.root
@@ -176,6 +226,10 @@ class SetupOperations:
             raise SetupError(str(exc)) from exc
 
     def restore(self, bundle: Path) -> RestoredBundle:
+        with self.lifecycle_lock():
+            return self._restore(bundle)
+
+    def _restore(self, bundle: Path) -> RestoredBundle:
         if not bundle.is_absolute() or ".." in bundle.parts:
             raise SetupError("restore bundle must be an absolute lexical path")
         journal = self.store.load()
@@ -186,22 +240,124 @@ class SetupOperations:
             raise SetupError(str(exc)) from exc
 
     def upgrade(self) -> dict[str, Any]:
-        backup = self.backup()
-        backup_receipt = self._verified_backup_receipt(backup)
-        # Reassembly performs locked schema migrations only after the verified backup above.
-        assembly = create_production_assembly(
-            self.root / "production.json",
-            secret_store=KeychainSecretStore(),
-            components=frozenset(),
-        )
+        with self.lifecycle_lock():
+            return self._upgrade()
+
+    def _upgrade(self) -> dict[str, Any]:
+        spec = self.spec()
+        journal = self.store.load()
+        self.platform.preflight(spec)
+        self.platform.manage_services(spec, "stop")
+        stopped = self.platform.service_status(spec)
+        local_services = {
+            name: state for name, state in stopped.items() if not name.startswith("tailscale:")
+        }
+        if len(local_services) != 2 or any(
+            state != "inactive" for state in local_services.values()
+        ):
+            raise SetupError("upgrade requires every Signet service to be inactive")
+        migration_receipt: Any | None = None
+        assembly: Any | None = None
+        recovery_directory = spec.root.parent / f"{spec.root.name}-recovery"
+        try:
+            manager = self._backup_manager(journal)
+            recovery_directory.mkdir(mode=0o700, exist_ok=True)
+            ensure_private_directory(recovery_directory)
+            _fsync_directory(recovery_directory.parent)
+            database = Database(spec.root / "data" / "signet.db")
+            with database.read_only() as connection:
+                current_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if current_version <= 0 or current_version > LATEST_SCHEMA_VERSION:
+                raise SetupError("upgrade source schema version is unsupported")
+            callback = manager.create_pre_migration_callback(recovery_directory)
+
+            def capture_verified_backup(candidate: Database, version: int) -> Any:
+                nonlocal migration_receipt
+                if migration_receipt is not None:
+                    raise SetupError("upgrade migration backup callback ran more than once")
+                migration_receipt = callback(candidate, version)
+                return migration_receipt
+
+            if current_version == LATEST_SCHEMA_VERSION:
+                migration_receipt = callback(database, current_version)
+            assembly = create_production_assembly(
+                self.root / "production.json",
+                secret_store=KeychainSecretStore(),
+                pre_migration_backup=capture_verified_backup,
+                components=frozenset(),
+            )
+            if migration_receipt is None:
+                raise SetupError("upgrade did not produce a verified migration backup")
+            self._restart_services_after_upgrade(spec)
+        except BaseException as exc:
+            if migration_receipt is None:
+                try:
+                    self._restart_services_after_upgrade(spec)
+                except BaseException as recovery_exc:
+                    raise SetupError(
+                        "upgrade failed before migration, and services could not be safely resumed"
+                    ) from recovery_exc
+            if isinstance(exc, (BackupError, ProductionAssemblyError)):
+                raise SetupError(str(exc)) from exc
+            raise
+        assert migration_receipt is not None
+        assert assembly is not None
         return {
-            "backup": str(backup),
-            "backup_receipt": backup_receipt,
+            "backup": str(migration_receipt.artifact_path),
+            "backup_receipt": {
+                "artifact_path": str(migration_receipt.artifact_path),
+                "artifact_sha256": migration_receipt.artifact_sha256,
+                "source_schema_version": migration_receipt.source_schema_version,
+                "verified_restore_schema_version": (
+                    migration_receipt.verified_restore_schema_version
+                ),
+            },
             "schema_version": assembly.status().schema_version,
             "provider_rollout": assembly.config.provider_rollout.state,
         }
 
+    def _restart_services_after_upgrade(self, spec: SetupSpec) -> None:
+        try:
+            self.platform.manage_services(spec, "start")
+            started = self.platform.service_status(spec)
+            local_services = {
+                name: state for name, state in started.items() if not name.startswith("tailscale:")
+            }
+            if (
+                len(local_services) != 2
+                or any(state != "active" for state in local_services.values())
+                or any(state != "active" for state in started.values())
+            ):
+                raise SetupError("upgrade completed but Signet services did not all restart")
+            self.platform.verify_service_health(spec)
+        except BaseException as start_exc:
+            try:
+                self.platform.manage_services(spec, "stop")
+                stopped = self.platform.service_status(spec)
+                local_services = {
+                    name: state
+                    for name, state in stopped.items()
+                    if not name.startswith("tailscale:")
+                }
+                if len(local_services) != 2 or any(
+                    state != "inactive" for state in local_services.values()
+                ):
+                    raise SetupError("not every local Signet service is inactive")
+            except BaseException as stop_exc:
+                raise SetupError(
+                    "upgrade service restart failed and quiescence could not be confirmed"
+                ) from stop_exc
+            if not isinstance(start_exc, Exception):
+                raise
+            raise SetupError(
+                "upgrade completed, but Signet services were left stopped after restart failed"
+            ) from start_exc
+
     def uninstall(self, *, purge: bool = False) -> dict[str, Any]:
+        with self.lifecycle_lock():
+            return self._uninstall(purge=purge)
+
+    def _uninstall(self, *, purge: bool = False) -> dict[str, Any]:
         spec = self.spec()
         engine = SetupEngine(self.store, self.platform)
         backup: Path | None = None
@@ -225,6 +381,12 @@ class SetupOperations:
                     recovery_directory,
                     setup_id=journal.setup_id,
                 )
+                cryptographic_receipt = self._verified_backup_receipt(
+                    backup,
+                    expected_source_schema_version=int(backup_receipt["source_schema_version"]),
+                )
+                if cryptographic_receipt != backup_receipt:
+                    raise SetupError("purge backup checkpoint no longer verifies cryptographically")
                 resumed = engine.rollback(spec)
                 return {
                     "purged": True,
@@ -238,7 +400,7 @@ class SetupOperations:
             resume_quiesced_services = journal.status != "uninstalled"
             journal = engine.quiesce_services_for_purge(spec)
             try:
-                backup = self.backup(
+                backup = self._backup(
                     recovery_directory
                     / (
                         time.strftime("purge-%Y%m%dT%H%M%SZ-", time.gmtime())
@@ -288,6 +450,18 @@ class SetupOperations:
 
             assert backup is not None
             assert recovery_receipt is not None
+            backup, recovery_receipt, verified_receipt = _verify_purge_checkpoint(
+                journal.purge_backup,
+                recovery_directory,
+                setup_id=journal.setup_id,
+            )
+            cryptographic_receipt = self._verified_backup_receipt(
+                backup,
+                expected_source_schema_version=int(verified_receipt["source_schema_version"]),
+            )
+            if cryptographic_receipt != verified_receipt:
+                raise SetupError("purge backup checkpoint no longer verifies cryptographically")
+            backup_receipt = verified_receipt
             journal = engine.rollback(spec)
             removed = [record.name for record in reversed(journal.steps)]
         else:
@@ -312,6 +486,10 @@ class SetupOperations:
         return result
 
     def manage(self, action: str) -> dict[str, str]:
+        with self.lifecycle_lock():
+            return self._manage(action)
+
+    def _manage(self, action: str) -> dict[str, str]:
         if action not in {"start", "stop", "restart"}:
             raise SetupError("service action must be start, stop, or restart")
         if action != "stop" and self.store.load().purge_backup is not None:
@@ -343,10 +521,18 @@ class SetupOperations:
             if not secret.reveal():
                 raise SetupError("a required purge recovery secret is empty")
 
-    def _verified_backup_receipt(self, bundle: Path) -> dict[str, Any]:
+    def _verified_backup_receipt(
+        self,
+        bundle: Path,
+        *,
+        expected_source_schema_version: int | None = None,
+    ) -> dict[str, Any]:
         manager = self._backup_manager(self.store.load())
-        with manager.database.read_only() as connection:
-            source_schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if expected_source_schema_version is None:
+            with manager.database.read_only() as connection:
+                source_schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        else:
+            source_schema_version = expected_source_schema_version
         restored: RestoredBundle | None = None
         try:
             restored = manager.restore(
@@ -439,7 +625,8 @@ def _fsync_directory(path: Path) -> None:
 
 def _require_purge_checkpoint_epoch(journal: SetupJournal) -> None:
     if (
-        journal.status not in {"failed", "rolling_back", "rollback_failed", "rolled_back"}
+        journal.status
+        not in {"failed", "rolling_back", "rollback_failed", "rolled_back", "uninstalled"}
         or journal.step("services").status != "rolled_back"
     ):
         raise SetupError("purge checkpoint is stale because managed writers are not quiesced")
@@ -511,6 +698,76 @@ def _verify_private_file_checkpoint(document: Any, recovery_directory: Path) -> 
     return path
 
 
+def _read_verified_private_file_checkpoint(
+    document: Any,
+    recovery_directory: Path,
+) -> tuple[Path, bytes]:
+    keys = {
+        "path",
+        "sha256",
+        "device",
+        "inode",
+        "owner_uid",
+        "mode",
+        "nlink",
+        "size",
+        "mtime_ns",
+    }
+    if not isinstance(document, dict) or set(document) != keys:
+        raise SetupError("purge recovery checkpoint is invalid")
+    try:
+        path = Path(document["path"])
+    except TypeError as exc:
+        raise SetupError("purge recovery checkpoint path is invalid") from exc
+    if not path.is_absolute() or path.parent != recovery_directory:
+        raise SetupError("purge recovery checkpoint path is invalid")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        before = os.fstat(descriptor)
+        require_no_acl_grants(descriptor)
+        chunks: list[bytes] = []
+        remaining = 1_048_577
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+    except (OSError, PrivatePathError) as exc:
+        raise SetupError("purge recovery checkpoint file is unavailable or unsafe") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(encoded) > 1_048_576:
+        raise SetupError("purge recovery checkpoint file is too large")
+    actual = {
+        "path": str(path),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "owner_uid": before.st_uid,
+        "mode": stat.S_IMODE(before.st_mode),
+        "nlink": before.st_nlink,
+        "size": before.st_size,
+        "mtime_ns": before.st_mtime_ns,
+    }
+    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    if (
+        actual != document
+        or identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+    ):
+        raise SetupError("purge recovery checkpoint file identity or digest changed")
+    return path, encoded
+
+
 def _file_sha256(path: Path) -> str:
     return str(_private_file_checkpoint(path)["sha256"])
 
@@ -562,7 +819,10 @@ def _verify_purge_checkpoint(
     ):
         raise SetupError("purge recovery checkpoint is invalid")
     backup = _verify_private_file_checkpoint(checkpoint["backup"], recovery_directory)
-    receipt = _verify_private_file_checkpoint(checkpoint["recovery_receipt"], recovery_directory)
+    receipt, receipt_encoded = _read_verified_private_file_checkpoint(
+        checkpoint["recovery_receipt"],
+        recovery_directory,
+    )
     backup_receipt = checkpoint["backup_receipt"]
     if not isinstance(backup_receipt, dict) or (
         backup_receipt.get("artifact_path") != str(backup)
@@ -570,8 +830,8 @@ def _verify_purge_checkpoint(
     ):
         raise SetupError("purge recovery checkpoint receipt is invalid")
     try:
-        receipt_document = json.loads(receipt.read_bytes())
-    except (OSError, json.JSONDecodeError) as exc:
+        receipt_document = json.loads(receipt_encoded)
+    except json.JSONDecodeError as exc:
         raise SetupError("purge recovery checkpoint receipt is invalid") from exc
     expected_key_accounts = [
         f"{setup_id}-{purpose}" for purpose in ("capability", "payload", "attachment", "backup")
