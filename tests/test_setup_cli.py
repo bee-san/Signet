@@ -259,6 +259,8 @@ def test_setup_rollback_routes_database_removal_through_verified_purge(
             "https://signet.example",
             "--owner",
             "user:owner",
+            "--profile",
+            "work",
             "--executable",
             "/opt/signet/bin/signet",
         ]
