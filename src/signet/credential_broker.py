@@ -275,10 +275,23 @@ class SQLiteTokenRegistry(TokenRegistry):
             if configured != record.allowed_aliases:
                 record = None
         registry = TokenRegistry(() if record is None else (record,))
-        return registry.authenticate(
+        principal = registry.authenticate(
             None if raw_token is None else f"Bearer {raw_token}",
             alias=alias,
         )
+        with self._database.read() as connection:
+            current_row = connection.execute(
+                """
+                SELECT token_id, origin_namespace, verifier, allowed_aliases_json,
+                       revoked_at
+                FROM mcp_caller_tokens
+                WHERE token_id = ?
+                """,
+                (principal.token_id,),
+            ).fetchone()
+        if _stored_token_record(current_row) != record:
+            raise CredentialError("invalid bearer token")
+        return principal
 
     def export_records(self) -> tuple[TokenRecord, ...]:
         raise CredentialError("durable caller token verifiers are not exportable")

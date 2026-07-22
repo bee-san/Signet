@@ -1108,18 +1108,39 @@ def create_web_app(
         app.add_exception_handler(browser_error, browser_auth_error_handler)
 
     @app.get("/healthz")
-    async def healthz() -> Response:
+    async def healthz(request: Request) -> Response:
         probe = getattr(app.state, "signet_health_probe", None)
+        identity = getattr(app.state, "signet_health_identity", None)
+        prover = getattr(app.state, "signet_health_prover", None)
         try:
             healthy = probe is None or (callable(probe) and probe() is True)
         except Exception:
             healthy = False
+        headers = {"Cache-Control": "no-store"}
+        if identity is not None:
+            if not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+                healthy = False
+            else:
+                headers["X-Signet-Instance"] = identity
+        challenge = request.headers.get("X-Signet-Health-Challenge")
+        if challenge is not None and callable(prover):
+            try:
+                proof = prover(challenge)
+                if not isinstance(proof, str) or re.fullmatch(r"[0-9a-f]{64}", proof) is None:
+                    raise ValueError("health proof is invalid")
+                headers["X-Signet-Health-Proof"] = proof
+            except (TypeError, ValueError):
+                pass
         if not healthy:
             return JSONResponse(
                 {"status": "unavailable", "service": "signet-web"},
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                headers=headers,
             )
-        return JSONResponse({"status": "ok", "service": "signet-web"})
+        return JSONResponse(
+            {"status": "ok", "service": "signet-web"},
+            headers=headers,
+        )
 
     @app.get("/manifest.webmanifest", include_in_schema=False)
     def manifest() -> Response:

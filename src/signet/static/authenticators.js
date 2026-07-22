@@ -55,6 +55,22 @@
   });
 
   const csrf = () => document.querySelector('meta[name="csrf-token"]')?.content || "";
+
+  const claimForm = document.querySelector('form[action="/setup/claim"]');
+  if (claimForm && window.location.hash.startsWith("#bootstrap=")) {
+    const encoded = window.location.hash.slice("#bootstrap=".length);
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    try {
+      const field = claimForm.querySelector('input[name="capability"]');
+      if (field) {
+        field.value = decodeURIComponent(encoded);
+        claimForm.requestSubmit();
+      }
+    } catch (_error) {
+      // Leave the ordinary attended claim form available for a malformed handoff URL.
+    }
+  }
+
   const announce = (message, failed = false) => {
     const region = document.querySelector("[data-auth-status]");
     if (!region) return;

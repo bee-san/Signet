@@ -649,6 +649,22 @@ def _remove_with_passkey(page: Page, target: str, credential_id: str) -> None:
     card.get_by_role("button", name="Confirm removal with passkey").click()
 
 
+def test_setup_private_url_claims_and_removes_bootstrap_fragment(tmp_path: Path) -> None:
+    with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
+        try:
+            page.goto(f"{live.origin}/setup#bootstrap={live.bootstrap_capability}")
+
+            expect(page.get_by_role("heading", name="1. Create your password")).to_be_visible()
+            assert page.url == f"{live.origin}/setup"
+            assert live.bootstrap_capability not in page.url
+        finally:
+            context.close()
+            browser.close()
+
+
 def test_setup_totp_ceremony_resumes_after_reload_without_browser_secret_storage(
     tmp_path: Path,
 ) -> None:

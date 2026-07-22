@@ -120,6 +120,50 @@ def _manager(
     return BackupBundleManager(database, staging=staging, encryption_key=key)
 
 
+def test_backup_refuses_a_source_database_replacement_during_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, staging, _staged = _fixture(tmp_path)
+    replacement = Database(tmp_path / "replacement" / "approvals.sqlite3")
+    replacement.initialize()
+    manager = _manager(database, staging)
+    create_snapshot = database.create_snapshot
+
+    def replace_source(destination: Path) -> Path:
+        snapshot = create_snapshot(destination)
+        replacement.path.replace(database.path)
+        return snapshot
+
+    monkeypatch.setattr(database, "create_snapshot", replace_source)
+
+    destination = tmp_path / "backups" / "race.signet-backup"
+    with pytest.raises(BackupRetentionStateUnknown, match="could not be confirmed"):
+        manager.create(destination, created_at=10)
+    assert not destination.exists()
+
+
+def test_key_reference_inventory_includes_encrypted_edit_drafts() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("CREATE TABLE payload_versions(encryption_key_ref TEXT)")
+        connection.execute("CREATE TABLE staged_objects(attachment_id TEXT PRIMARY KEY)")
+        connection.execute("CREATE TABLE web_action_drafts(edit_encryption_key_ref TEXT)")
+        connection.execute(
+            "INSERT INTO payload_versions(encryption_key_ref) VALUES (?)",
+            (PAYLOAD_KEY_REF,),
+        )
+        draft_ref = "keychain://Signet/edit-draft-backupfixture"
+        connection.execute(
+            "INSERT INTO web_action_drafts(edit_encryption_key_ref) VALUES (?)",
+            (draft_ref,),
+        )
+
+        assert backup_module._key_references(connection) == [draft_ref, PAYLOAD_KEY_REF]
+    finally:
+        connection.close()
+
+
 def _restored_store(restored: RestoredBundle) -> StagingStore:
     database = Database(restored.database_path)
     database.initialize()
@@ -290,6 +334,33 @@ def test_encrypted_bundle_restores_catalogued_envelopes_and_key_manifest(
     assert len(live_pins) == 1
     assert live_pins[0]["started_at"] is not None
     assert live_pins[0]["completed_at"] is not None
+
+
+def test_restore_rejects_manifest_schema_that_differs_from_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    database, staging, _ = _fixture(tmp_path)
+    manager = _manager(database, staging)
+    current = manager.create(tmp_path / "current.signet")
+
+    def change_schema_version(members: dict[str, bytes]) -> None:
+        manifest = json.loads(members["manifest.json"])
+        manifest["schema_version"] += 1
+        members["manifest.json"] = json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    mismatched = _rewrite_encrypted_archive(
+        current,
+        tmp_path / "schema-mismatch.signet",
+        change_schema_version,
+    )
+
+    with pytest.raises(BackupError, match="schema version"):
+        manager.restore(mismatched, tmp_path / "schema-mismatch-restore")
+    assert not (tmp_path / "schema-mismatch-restore").exists()
 
 
 def test_backup_publication_never_replaces_a_destination_created_during_race(

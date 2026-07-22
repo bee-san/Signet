@@ -34,7 +34,7 @@ from signet.app import main as run_cli
 from signet.auth import SessionManager, SQLiteSessionRepository
 from signet.browser_auth import BootstrapService
 from signet.canonical import canonical_json
-from signet.config import ProductionConfig
+from signet.config import ProductionConfig, production_health_proof, production_instance_identity
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
 from signet.db import Database
 from signet.downstream import DownstreamClient
@@ -56,7 +56,7 @@ from signet.production_connectors import (
     ProviderSessionPool,
     provider_execution_identity_digest,
 )
-from signet.production_state import ProductionStateError
+from signet.production_state import ProductionStateError, production_config_digest
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
@@ -166,6 +166,157 @@ def _secret_store(
             ("signet", "mail"): "mail-secret-value",
         }
     )
+
+
+def test_missing_durable_service_inventory_fails_closed(tmp_path: Path) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    with assembly.database.transaction() as connection:
+        connection.execute("DELETE FROM production_services WHERE service_name = 'web'")
+
+    with pytest.raises(ProductionAssemblyError, match="service inventory has diverged"):
+        build_production_runtime(
+            config,
+            secret_store=_secret_store(),
+            components=frozenset(),
+        )
+
+
+def test_production_config_digest_migrates_only_the_empty_caller_principal_predecessor(
+    tmp_path: Path,
+) -> None:
+    payload = _production_payload(tmp_path)
+    without_principal = ProductionConfig.model_validate(payload)
+    predecessor_document = without_principal.model_dump(mode="json")
+    predecessor_document.pop("caller_principals")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor_document)).hexdigest()
+    expected_digest = production_config_digest(without_principal)
+    assembly = build_production_runtime(
+        without_principal,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+
+    migrated = build_production_runtime(
+        without_principal,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    with migrated.database.read() as connection:
+        assert (
+            connection.execute(
+                "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()["config_digest"]
+            == expected_digest
+        )
+
+    payload["caller_principals"] = [{"namespace": "profile:work", "allowed_aliases": ["approvals"]}]
+    with_principal = ProductionConfig.model_validate(payload)
+    assert expected_digest != production_config_digest(with_principal)
+    with migrated.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+    with pytest.raises(ProductionAssemblyError, match="differs from durable state"):
+        build_production_runtime(
+            with_principal,
+            secret_store=_secret_store(),
+            components=frozenset(),
+        )
+
+
+def test_production_config_digest_composes_empty_callers_with_legacy_predecessor(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor.pop("caller_principals")
+    predecessor["storage"].pop("attachment_staging_dir")
+    predecessor["storage"].pop("attachment_source_roots")
+    predecessor["secrets"].pop("attachment_key_ref")
+    predecessor["capabilities"]["live_providers_ready"] = False
+    predecessor.pop("provider_rollout")
+    for connector in predecessor["connectors"].values():
+        connector.pop("server_identity_digest")
+        connector.pop("tls_server_certificate")
+        connector.pop("tls_server_certificate_sha256")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+
+    migrated = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+
+    with migrated.database.read() as connection:
+        assert {
+            row["config_digest"]
+            for row in connection.execute(
+                "SELECT config_digest FROM production_services"
+            ).fetchall()
+        } == {production_config_digest(config)}
+
+
+def test_config_digest_migration_never_erases_a_divergent_service_digest(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor.pop("caller_principals")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            ("0" * 64,),
+        )
+
+    with pytest.raises(ProductionAssemblyError, match="service config has diverged"):
+        build_production_runtime(
+            config,
+            secret_store=_secret_store(),
+            components=frozenset(),
+        )
 
 
 def _provider_credential_identity(
@@ -1251,8 +1402,14 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     tmp_path: Path,
 ) -> None:
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    secret_store = _secret_store()
+    health_identity = production_instance_identity(config.storage.data_dir.parent)
+    health_secret = secret_store.get(
+        SecretReference.parse(config.secrets.session_secret_ref)
+    ).reveal()
+    health_challenge = "test-health-challenge-value-0123456789"
 
-    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    assembly = build_production_runtime(config, secret_store=secret_store, clock=lambda: 123)
     status = assembly.status()
 
     assert status.schema_version == 19
@@ -1271,13 +1428,27 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     health = TestClient(
         assembly.web,
         base_url="https://signet.example.test",
-    ).get("/healthz")
+    ).get("/healthz", headers={"X-Signet-Health-Challenge": health_challenge})
     assert health.status_code == 503
     assert health.json() == {"status": "unavailable", "service": "signet-web"}
+    assert health.headers["X-Signet-Instance"] == health_identity
+    assert health.headers["X-Signet-Health-Proof"] == production_health_proof(
+        health_secret,
+        identity=health_identity,
+        component="web",
+        challenge=health_challenge,
+    )
     mcp_client = TestClient(assembly.mcp.app, base_url="http://127.0.0.1:8789")
-    mcp_health = mcp_client.get("/healthz")
+    mcp_health = mcp_client.get("/healthz", headers={"X-Signet-Health-Challenge": health_challenge})
     assert mcp_health.status_code == 503
     assert mcp_health.json() == {"status": "unavailable"}
+    assert mcp_health.headers["X-Signet-Instance"] == health_identity
+    assert mcp_health.headers["X-Signet-Health-Proof"] == production_health_proof(
+        health_secret,
+        identity=health_identity,
+        component="mcp",
+        challenge=health_challenge,
+    )
     readiness = mcp_client.get("/readyz")
     assert readiness.status_code == 503
     assert readiness.json() == {"status": "unavailable"}

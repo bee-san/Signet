@@ -1,0 +1,112 @@
+.TH SIGNET 1 "July 2026" "signet-gateway 0.1.0" "User Commands"
+.SH NAME
+signet \- provider-neutral MCP human approval gateway
+.SH SYNOPSIS
+.B signet setup
+.RI [ options ]
+.br
+.B signet
+.RI { manage | status | doctor | backup | restore | upgrade | uninstall }
+.RI [ options ]
+.SH DESCRIPTION
+.B signet setup
+plans, installs, and resumes a private production assembly. Providers and generated
+Hermes MCP entries are disabled by default. Setup stores workflow secrets outside its
+configuration in the operating-system keyring, persists a mode-0600 journal, installs
+loopback-only services, and can prepare multiple named Hermes profiles without
+restarting Hermes.
+.PP
+The default root is
+.IR ~/.local/share/signet .
+Setup refuses ambiguous or foreign resources rather than adopting them.
+.SH SETUP OPTIONS
+.TP
+.B --plan
+Print a read-only JSON plan.
+.TP
+.BI --origin " HTTPS_ORIGIN"
+Use one canonical private HTTPS origin. If omitted, derive
+https://NODE.ts.net:8443 from Tailscale.
+.TP
+.BI --owner " USER_ID"
+Canonical owner ID. Default: user:owner.
+.TP
+.BI --profile " NAME"
+Hermes profile to prepare. Repeat for multiple profiles. If omitted, discover named
+profiles under ~/.hermes/profiles.
+.TP
+.BI --policy-mode " MODE"
+Select the initial policy mode: deny, direct, approval, or approval_with_edit.
+Default: deny.
+.TP
+.B --yes
+Confirm a reviewed plan non-interactively.
+.TP
+.B --no-open-browser
+Print the owner setup URL without asking the operating system to open it. This may be
+used when resuming a failed browser handoff.
+.TP
+.B --rollback
+Resume reverse-order rollback of setup-owned resources.
+.TP
+.BI --root " PATH"
+Use an absolute setup root instead of the default.
+.SH LIFECYCLE COMMANDS
+.TP
+.B signet manage {start|stop|restart|status}
+Operate the exact installed launchd or systemd user services.
+.TP
+.B signet status
+Print persisted setup, service, and production readiness metadata without secrets.
+.TP
+.B signet doctor
+Check journal, config, keyring references, service definitions, and Hermes entries.
+.TP
+.B signet backup [--destination PATH]
+Create and verify an encrypted backup.
+.TP
+.B signet restore BUNDLE
+Verify and decrypt a backup into a new staging directory. Active state is not replaced.
+.TP
+.B signet upgrade
+Create a backup, then apply migrations from the already-installed reviewed package.
+.TP
+.B signet uninstall
+Remove exact service and Hermes integration resources while preserving production data.
+.TP
+.B signet uninstall --purge
+Back up first, then remove setup-owned active data and runtime secrets. The backup key
+and backup directory are retained.
+.SH HERMES
+Setup adds a distinct profile-scoped caller token and disabled signet_approvals MCP
+entry to each selected profile. Tokens are written to private profile environment
+files and are never printed or accepted on argv. Review and enable each entry, then
+run /reload-mcp in that profile. Signet never restarts the Hermes gateway.
+.SH BROWSER SETUP
+The public /setup URL is printed before browser launch. The one-time capability is
+placed in a URL fragment, removed from browser history before submission, retained in
+the operating-system keyring for crash recovery, and omitted from the setup journal
+and normal output. Password setup supports multiple named TOTP and passkey
+authenticators; passkeys require a real browser ceremony at the final HTTPS origin.
+.SH FILES
+.TP
+.I ~/.local/share/signet/.setup-journal.json
+Atomic mode-0600 setup journal.
+.TP
+.I ~/.local/share/signet/production.json
+Provider-disabled production configuration created by setup.
+.TP
+.I ~/Library/LaunchAgents/ai.hermes.signet.{mcp,web}.plist
+macOS user services.
+.TP
+.I ~/.config/systemd/user/signet-{mcp,web}.service
+Linux systemd user services.
+.SH SECURITY
+The MCP listener remains loopback-only. Automatic Tailscale setup manages only a free
+HTTPS 8443 Serve listener and refuses Funnel. Provider enablement is a separate
+reviewed cutover. Do not paste tokens, capabilities, authenticator values, or provider
+credentials into arguments, logs, chat, or documentation.
+.SH SEE ALSO
+The packaged setup guide is docs/setup.md in the source distribution and online
+project documentation. See also docs/security-model.md and
+docs/production-connectors.md.

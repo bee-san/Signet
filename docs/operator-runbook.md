@@ -3,8 +3,9 @@
 This runbook exercises Signet with repository-owned fake identities and in-process
 fake providers only. It does not enroll human authentication, read a Keychain item,
 inspect or change an existing Hermes profile, install a service, alter a proxy, or
-contact Fastmail, WhatsApp, or `wacli`. The live deployment and cutover steps remain
-deferred in [deployment.md](deployment.md).
+contact Fastmail, WhatsApp, or `wacli`. The explicitly confirmed packaged path is
+[`setup.md`](setup.md); provider cutover remains a separate review in
+[`deployment.md`](deployment.md).
 
 Run the Signet commands from the repository root. Keep shell tracing disabled: it
 can echo paths and command substitutions that ordinary logs intentionally omit.
