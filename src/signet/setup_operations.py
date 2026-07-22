@@ -365,6 +365,14 @@ class SetupOperations:
         recovery_receipt: Path | None = None
         if purge:
             journal = self.store.load()
+            if journal.purge_backup is None and journal.step("database").status == "pending":
+                removable = [
+                    record.name
+                    for record in reversed(journal.steps)
+                    if record.status not in {"pending", "rolled_back"}
+                ]
+                engine.rollback(spec)
+                return {"purged": True, "removed": removable}
             self._require_recovery_secrets(journal)
             recovery_directory = self.root.parent / f"{self.root.name}-recovery"
             try:

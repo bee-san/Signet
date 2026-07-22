@@ -1064,6 +1064,28 @@ def test_purge_verifies_the_published_checkpoint_before_destructive_rollback(
     assert store.load().purge_backup is not None
 
 
+def test_partial_setup_purge_rolls_back_before_any_database_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "partial")
+    platform = FakePlatform(fail_once="configuration")
+    store = SetupJournalStore(selected.root)
+    with pytest.raises(SetupError, match="'configuration' failed"):
+        SetupEngine(store, platform).apply(selected)
+    monkeypatch.setattr(setup_platform.keyring, "get_password", lambda service, account: None)
+    operations = SetupOperations(selected.root, platform=platform)
+    monkeypatch.setattr(operations, "spec", lambda: selected)
+
+    result = operations.uninstall(purge=True)
+
+    assert result == {
+        "purged": True,
+        "removed": ["configuration", "secrets", "private_paths", "preflight"],
+    }
+    assert store.load().status == "rolled_back"
+
+
 def test_purge_rejects_missing_recovery_secret_before_quiescing_services(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

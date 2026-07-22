@@ -201,6 +201,7 @@ class ProductionStateStore:
                 services,
                 config_digest=config_digest,
                 now=now,
+                require_complete_inventory=setup is not None,
             )
             connection.execute(
                 """
@@ -738,13 +739,16 @@ class ProductionStateStore:
         *,
         config_digest: str,
         now: int,
+        require_complete_inventory: bool,
     ) -> None:
         configured_names = {service.name for service in services}
         stored_names = {
             str(row["service_name"])
             for row in connection.execute("SELECT service_name FROM production_services").fetchall()
         }
-        if stored_names - configured_names:
+        if stored_names - configured_names or (
+            require_complete_inventory and stored_names != configured_names
+        ):
             raise ProductionStateError("durable production service inventory has diverged")
         for service in services:
             connection.execute(

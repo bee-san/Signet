@@ -1730,7 +1730,7 @@ def _record_matches_manifest(record: StagedFile, item: dict[str, Any]) -> bool:
 
 
 def _table_has_column(connection: Any, table: str, column: str) -> bool:
-    if table not in {"payload_versions", "staged_objects"}:
+    if table not in {"payload_versions", "staged_objects", "web_action_drafts"}:
         raise ValueError("unsupported backup catalog table")
     return any(str(row[1]) == column for row in connection.execute(f"PRAGMA table_info({table})"))
 
@@ -1763,15 +1763,23 @@ def _key_references(connection: Any) -> list[str]:
     queries = (
         (
             "payload_versions",
+            "encryption_key_ref",
             "SELECT encryption_key_ref FROM payload_versions WHERE encryption_key_ref IS NOT NULL",
         ),
         (
             "staged_objects",
+            "encryption_key_ref",
             "SELECT encryption_key_ref FROM staged_objects WHERE encryption_key_ref IS NOT NULL",
         ),
+        (
+            "web_action_drafts",
+            "edit_encryption_key_ref",
+            "SELECT edit_encryption_key_ref FROM web_action_drafts "
+            "WHERE edit_encryption_key_ref IS NOT NULL",
+        ),
     )
-    for table, query in queries:
-        if not _table_has_column(connection, table, "encryption_key_ref"):
+    for table, column, query in queries:
+        if not _table_has_column(connection, table, column):
             continue
         references.update(str(row[0]) for row in connection.execute(query))
     return sorted(references)

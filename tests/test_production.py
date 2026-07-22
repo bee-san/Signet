@@ -168,6 +168,24 @@ def _secret_store(
     )
 
 
+def test_missing_durable_service_inventory_fails_closed(tmp_path: Path) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    with assembly.database.transaction() as connection:
+        connection.execute("DELETE FROM production_services WHERE service_name = 'web'")
+
+    with pytest.raises(ProductionAssemblyError, match="service inventory has diverged"):
+        build_production_runtime(
+            config,
+            secret_store=_secret_store(),
+            components=frozenset(),
+        )
+
+
 def test_production_config_digest_migrates_only_the_empty_caller_principal_predecessor(
     tmp_path: Path,
 ) -> None:
