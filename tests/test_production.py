@@ -478,6 +478,7 @@ def test_production_config_rejects_unsafe_or_ambiguous_values(
         "https://signet.example.test:bad",
         "https://signet.example.test:99999",
         "https://Signet.example.test",
+        "https://127.0.0.1",
     ),
 )
 def test_noncanonical_public_origin_is_rejected_before_database_initialization(
@@ -487,6 +488,20 @@ def test_noncanonical_public_origin_is_rejected_before_database_initialization(
     config_path = tmp_path / "production.json"
     payload = _production_payload(tmp_path)
     payload["public_origin"] = origin
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    config_path.chmod(0o600)
+
+    with pytest.raises(ProductionAssemblyError, match="configuration is invalid"):
+        create_production_assembly(config_path, secret_store=_secret_store())
+
+    assert not (Path(payload["storage"]["data_dir"]) / "signet.db").exists()
+
+
+def test_numeric_public_origin_is_rejected_even_when_rp_id_matches(tmp_path: Path) -> None:
+    config_path = tmp_path / "production.json"
+    payload = _production_payload(tmp_path)
+    payload["public_origin"] = "https://127.0.0.1"
+    payload["rp_id"] = "127.0.0.1"
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     config_path.chmod(0o600)
 
@@ -2094,7 +2109,7 @@ def test_service_specific_factories_do_not_construct_unused_sibling_apps(
     assert app is not None
 
 
-def test_standard_factory_creates_and_verifies_required_upgrade_backup(
+def test_standard_factory_refuses_an_old_schema_without_verified_upgrade_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2144,31 +2159,12 @@ def test_standard_factory_creates_and_verifies_required_upgrade_backup(
     monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 16)
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     config_path.chmod(0o600)
-    original_read_bytes = Path.read_bytes
+    with pytest.raises(ProductionAssemblyError, match="migration was not started"):
+        create_production_mcp_runtime(config_path, secret_store=_secret_store())
 
-    def guarded_read_bytes(path: Path) -> bytes:
-        if path.parent == config.storage.backup_dir:
-            raise AssertionError("production backup digest loaded the complete snapshot")
-        return original_read_bytes(path)
-
-    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
-
-    runtime = create_production_mcp_runtime(config_path, secret_store=_secret_store())
-
-    assert runtime.app is not None
     with Database(config.storage.database_path).read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
-        labels = tuple(
-            row[0]
-            for row in connection.execute(
-                "SELECT factor_label FROM auth_credentials ORDER BY credential_id"
-            )
-        )
-    assert len(labels) == len(set(labels)) == 3
-    assert all(label == label.strip() for label in labels)
-    backups = tuple(config.storage.backup_dir.glob("signet-pre-migration-v15-*.sqlite3"))
-    assert len(backups) == 1
-    Database.verify_snapshot(backups[0])
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+    assert tuple(config.storage.backup_dir.iterdir()) == ()
 
 
 def test_build_fails_closed_on_corrupt_durable_schema_cache(tmp_path: Path) -> None:

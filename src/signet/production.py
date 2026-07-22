@@ -493,11 +493,7 @@ def create_production_assembly(
         attachment_staging_override=attachment_staging_override,
         attachment_source_roots_override=attachment_source_roots_override,
         prepare_directories=prepare_directories,
-        pre_migration_backup=(
-            pre_migration_backup
-            if pre_migration_backup is not None
-            else _snapshot_pre_migration_backup(config.storage.backup_dir)
-        ),
+        pre_migration_backup=pre_migration_backup,
     )
 
 
@@ -1324,16 +1320,20 @@ def _read_private_config(path: Path) -> str:
 
 def _owned_runtime_database(config_path: Path) -> Database:
     # Imported lazily to avoid the setup platform's dependency on this module.
-    from signet.setup_platform import validate_active_database_ownership
+    from signet.setup_platform import validate_active_database_runtime_ownership
     from signet.setup_state import SetupJournalStore
 
     journal = SetupJournalStore(config_path.parent).load()
     config = load_production_config(config_path)
-    expected_identity = validate_active_database_ownership(
+    expected_identity, expected_lock_identity = validate_active_database_runtime_ownership(
         config.storage.database_path.parent,
         setup_id=journal.setup_id,
     )
-    return Database(config.storage.database_path, expected_identity=expected_identity)
+    return Database(
+        config.storage.database_path,
+        expected_identity=expected_identity,
+        expected_lock_identity=expected_lock_identity,
+    )
 
 
 def _production_config_path_from_environment() -> Path:
