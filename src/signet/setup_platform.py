@@ -262,8 +262,9 @@ class ProductionSetupPlatform:
             target = Path.home() / "Library" / "LaunchAgents"
             uid = os.getuid()
             for name, content in rendered.items():
+                _require_exact_owned_file(target / name, content)
+            for name in rendered:
                 path = target / name
-                _require_exact_owned_file(path, content)
                 label = name.removesuffix(".plist")
                 if action == "stop":
                     command = ["launchctl", "bootout", f"gui/{uid}/{label}"]
@@ -271,6 +272,9 @@ class ProductionSetupPlatform:
                     command = ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"]
                 else:
                     command = ["launchctl", "bootstrap", f"gui/{uid}", str(path)]
+                if action == "stop":
+                    self._stop_launchd_unit(command)
+                    continue
                 result = self.command_runner(command, text=True, capture_output=True, check=False)
                 if result.returncode != 0:
                     message = (result.stderr or "").lower()
@@ -674,6 +678,17 @@ class ProductionSetupPlatform:
             target = Path.home() / "Library" / "LaunchAgents"
             ensure_owned_directory(target)
             for name, content in rendered.items():
+                plan_path = plan_dir / name
+                target_path = target / name
+                plan_exists = plan_path.exists() or plan_path.is_symlink()
+                target_exists = target_path.exists() or target_path.is_symlink()
+                if target_exists and not plan_exists:
+                    raise SetupError("launchd unit exists without an ownership plan")
+                if plan_exists:
+                    _require_exact_owned_file(plan_path, content)
+                if target_exists:
+                    _require_exact_owned_file(target_path, content)
+            for name, content in rendered.items():
                 _create_or_verify_private_file(plan_dir / name, content)
                 _create_or_verify_private_file(
                     target / name,
@@ -695,6 +710,18 @@ class ProductionSetupPlatform:
             rendered_text = render_systemd_services(spec, active=True)
             target = Path.home() / ".config" / "systemd" / "user"
             ensure_owned_directory(target)
+            for name, content in rendered_text.items():
+                encoded = content.encode("utf-8")
+                plan_path = plan_dir / name
+                target_path = target / name
+                plan_exists = plan_path.exists() or plan_path.is_symlink()
+                target_exists = target_path.exists() or target_path.is_symlink()
+                if target_exists and not plan_exists:
+                    raise SetupError("systemd unit exists without an ownership plan")
+                if plan_exists:
+                    _require_exact_owned_file(plan_path, encoded)
+                if target_exists:
+                    _require_exact_owned_file(target_path, encoded)
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
                 _create_or_verify_private_file(plan_dir / name, encoded)
@@ -829,9 +856,11 @@ class ProductionSetupPlatform:
             return
         record_path = spec.root / "services" / "tailscale-serve-before.json"
         after_path = spec.root / "services" / "tailscale-serve-after.json"
-        current = self._tailscale_json(
-            ["tailscale", "serve", "status", "--json"],
-            "Tailscale Serve status is unavailable",
+        current = _normalize_serve_config(
+            self._tailscale_json(
+                ["tailscale", "serve", "status", "--json"],
+                "Tailscale Serve status is unavailable",
+            )
         )
         host_port = _managed_tailnet_host_port(spec, port)
         target = "http://127.0.0.1:8790"
@@ -849,7 +878,7 @@ class ProductionSetupPlatform:
                     not isinstance(recorded_after, dict)
                     or set(recorded_after) != {"format", "serve"}
                     or recorded_after.get("format") != 2
-                    or recorded_after.get("serve") != current
+                    or _normalize_serve_config(recorded_after.get("serve")) != current
                     or not _serve_config_has_private_route(
                         current,
                         host_port=host_port,
@@ -864,7 +893,7 @@ class ProductionSetupPlatform:
                 host_port=host_port,
                 port=port,
             )
-            if current != before.get("serve") and not listener_present:
+            if current != _normalize_serve_config(before.get("serve")) and not listener_present:
                 raise SetupError("the pre-setup Tailscale snapshot changed before apply completed")
             if listener_present:
                 if not _serve_config_has_private_route(
@@ -891,9 +920,11 @@ class ProductionSetupPlatform:
             ["tailscale", "serve", "--bg", f"--https={port}", target],
             "Tailscale Serve listener could not be installed",
         )
-        after = self._tailscale_json(
-            ["tailscale", "serve", "status", "--json"],
-            "Tailscale Serve verification failed",
+        after = _normalize_serve_config(
+            self._tailscale_json(
+                ["tailscale", "serve", "status", "--json"],
+                "Tailscale Serve verification failed",
+            )
         )
         if not _serve_config_has_private_route(
             after,
@@ -912,9 +943,11 @@ class ProductionSetupPlatform:
         if port is None:
             return
         record_path = spec.root / "services" / "tailscale-serve-before.json"
-        current = self._tailscale_json(
-            ["tailscale", "serve", "status", "--json"],
-            "Tailscale Serve status is unavailable",
+        current = _normalize_serve_config(
+            self._tailscale_json(
+                ["tailscale", "serve", "status", "--json"],
+                "Tailscale Serve status is unavailable",
+            )
         )
         host_port = _managed_tailnet_host_port(spec, port)
         if not record_path.exists():
@@ -928,7 +961,7 @@ class ProductionSetupPlatform:
             or before.get("format") != 2
         ):
             raise SetupError("Tailscale rollback record is invalid")
-        before_serve = before["serve"]
+        before_serve = _normalize_serve_config(before["serve"])
         if _serve_config_mentions_listener(before_serve, host_port=host_port, port=port):
             raise SetupError("Tailscale rollback record does not describe a free listener")
         after_path = spec.root / "services" / "tailscale-serve-after.json"
@@ -948,7 +981,7 @@ class ProductionSetupPlatform:
             _remove_exact_owned_file(after_path, _canonical_json_bytes(recorded_after))
             _remove_exact_owned_file(record_path, _canonical_json_bytes(before))
             return
-        if recorded_after.get("serve") != current:
+        if _normalize_serve_config(recorded_after.get("serve")) != current:
             raise SetupError("refusing to overwrite a changed Tailscale snapshot")
         target = "http://127.0.0.1:8790"
         if not _serve_config_has_private_route(
@@ -962,9 +995,11 @@ class ProductionSetupPlatform:
             ["tailscale", "serve", f"--https={port}", "off"],
             "Tailscale Serve listener rollback failed",
         )
-        restored = self._tailscale_json(
-            ["tailscale", "serve", "status", "--json"],
-            "Tailscale Serve rollback verification failed",
+        restored = _normalize_serve_config(
+            self._tailscale_json(
+                ["tailscale", "serve", "status", "--json"],
+                "Tailscale Serve rollback verification failed",
+            )
         )
         if restored != before_serve:
             raise SetupError("Tailscale did not return to the exact pre-setup snapshot")
@@ -1016,6 +1051,7 @@ class ProductionSetupPlatform:
                     environment=existing_env,
                     config_exists=config_exists,
                     environment_exists=environment_exists,
+                    setup_id=setup_id,
                 )
                 attempted_profiles.append(profile)
                 merged = _merge_hermes_config(
@@ -1910,6 +1946,20 @@ def _hermes_snapshot_directory(spec: SetupSpec, profile: str) -> Path:
     return spec.root / "services" / "hermes-profile-snapshots" / profile_id
 
 
+def _hermes_resource_matches_snapshot(
+    current: bytes,
+    *,
+    current_exists: bool,
+    original: bytes | None,
+    remove_managed: Callable[[bytes], bytes],
+) -> bool:
+    expected = original or b""
+    original_exists = original is not None
+    if current_exists == original_exists and current == expected:
+        return True
+    return current_exists and current != expected and remove_managed(current) == expected
+
+
 def _capture_hermes_profile_snapshot(
     spec: SetupSpec,
     profile: str,
@@ -1919,6 +1969,7 @@ def _capture_hermes_profile_snapshot(
     environment: bytes,
     config_exists: bool,
     environment_exists: bool,
+    setup_id: str | None = None,
 ) -> None:
     base = ensure_private_directory(spec.root / "services" / "hermes-profile-snapshots")
     directory = ensure_private_directory(_hermes_snapshot_directory(spec, profile))
@@ -1933,6 +1984,30 @@ def _capture_hermes_profile_snapshot(
             raise SetupError("Hermes profile snapshot disappeared during validation")
         if not snapshot[0].same_object(profile_identity):
             raise SetupError("Hermes profile directory changed after its setup snapshot")
+        if setup_id is not None:
+            token_name = _profile_token_name(profile)
+            if not _hermes_resource_matches_snapshot(
+                config,
+                current_exists=config_exists,
+                original=snapshot[1],
+                remove_managed=lambda value: _remove_hermes_config(
+                    value,
+                    token_name=token_name,
+                    setup_id=setup_id,
+                ),
+            ):
+                raise SetupError("Hermes profile config changed after its setup snapshot")
+            if not _hermes_resource_matches_snapshot(
+                environment,
+                current_exists=environment_exists,
+                original=snapshot[2],
+                remove_managed=lambda value: _remove_profile_environment(
+                    value,
+                    token_name=token_name,
+                    setup_id=setup_id,
+                ),
+            ):
+                raise SetupError("Hermes profile environment changed after its setup snapshot")
         return
     metadata = {
         "format": 2,
@@ -2159,28 +2234,30 @@ def _restore_hermes_profile_snapshot(
     profile_identity, original_config, original_environment = snapshot
     config_path = profile_directory / "config.yaml"
     env_path = profile_directory / ".env"
+    config_exists = config_path.exists() or config_path.is_symlink()
+    environment_exists = env_path.exists() or env_path.is_symlink()
     current_config = _read_optional_private_file(config_path)
     current_environment = _read_optional_private_file(env_path)
-    expected_config = original_config or b""
-    expected_environment = original_environment or b""
-    if (
-        current_config != expected_config
-        and _remove_hermes_config(
-            current_config,
+    if not _hermes_resource_matches_snapshot(
+        current_config,
+        current_exists=config_exists,
+        original=original_config,
+        remove_managed=lambda value: _remove_hermes_config(
+            value,
             token_name=token_name,
             setup_id=setup_id,
-        )
-        != expected_config
+        ),
     ):
         raise SetupError("Hermes profile config changed after its setup snapshot")
-    if (
-        current_environment != expected_environment
-        and _remove_profile_environment(
-            current_environment,
+    if not _hermes_resource_matches_snapshot(
+        current_environment,
+        current_exists=environment_exists,
+        original=original_environment,
+        remove_managed=lambda value: _remove_profile_environment(
+            value,
             token_name=token_name,
             setup_id=setup_id,
-        )
-        != expected_environment
+        ),
     ):
         raise SetupError("Hermes profile environment changed after its setup snapshot")
 
@@ -2210,6 +2287,10 @@ def _restore_hermes_profile_snapshot(
     if base.exists() and not any(base.iterdir()):
         base.rmdir()
     return True
+
+
+def _normalize_serve_config(document: Any) -> Any:
+    return {} if document is None else document
 
 
 def _managed_tailnet_port(spec: SetupSpec) -> int | None:

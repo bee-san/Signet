@@ -1651,6 +1651,73 @@ def test_service_install_management_status_and_rollback_are_platform_native(
         assert any("restart" in command for command in commands)
 
 
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+def test_service_install_refuses_exact_preexisting_units_without_ownership_plans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+) -> None:
+    home = ensure_private_directory(tmp_path / "home")
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    selected = replace(
+        spec(tmp_path / f"preexisting-service-{platform_name}"),
+        public_origin="https://example.com",
+    )
+    platform = ProductionSetupPlatform(
+        command_runner=lambda command, **kwargs: (_ for _ in ()).throw(AssertionError(command))
+    )
+    platform._apply_private_paths(selected, "setup-service-test")
+    if platform_name == "darwin":
+        rendered: dict[str, bytes] = render_launchd_services(selected, active=True)
+        target = ensure_private_directory(home / "Library" / "LaunchAgents")
+    else:
+        rendered = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+        target = ensure_private_directory(home / ".config" / "systemd" / "user")
+    for name, content in rendered.items():
+        path = target / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+
+    with pytest.raises(SetupError, match="without an ownership plan"):
+        platform._apply_services(selected, "setup-service-test")
+
+    assert not any((selected.root / "services" / name).exists() for name in rendered)
+    assert all((target / name).read_bytes() == content for name, content in rendered.items())
+
+
+def test_launchd_service_stop_retry_tolerates_an_already_stopped_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = ensure_private_directory(tmp_path / "home")
+    monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    selected = replace(spec(tmp_path / "launchd-stop-retry"), public_origin="https://example.com")
+    target = ensure_private_directory(home / "Library" / "LaunchAgents")
+    rendered = render_launchd_services(selected, active=True)
+    for name, content in rendered.items():
+        path = target / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+    bootouts = 0
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal bootouts
+        if command[:2] == ["launchctl", "bootout"]:
+            bootouts += 1
+            if bootouts == 1:
+                return subprocess.CompletedProcess(command, 3, "", "No such process")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    ProductionSetupPlatform(command_runner=run).manage_services(selected, "stop")
+
+    assert bootouts == len(rendered)
+
+
 def test_database_rollback_refuses_a_same_user_replacement_inode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2391,6 +2458,73 @@ def test_absent_hermes_rollback_files_stay_bound_to_the_snapshotted_profile(
     assert (profile / ".env").exists()
 
 
+def test_absent_hermes_rollback_refuses_present_empty_foreign_files(tmp_path: Path) -> None:
+    selected = replace(spec(tmp_path / "empty-foreign-profile"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=require_private_directory_identity(profile),
+        config=b"",
+        environment=b"",
+        config_exists=False,
+        environment_exists=False,
+    )
+    for name in ("config.yaml", ".env"):
+        path = profile / name
+        path.write_bytes(b"")
+        path.chmod(0o600)
+
+    with pytest.raises(SetupError, match="changed after its setup snapshot"):
+        setup_platform._restore_hermes_profile_snapshot(
+            selected,
+            "work",
+            profile_directory=profile,
+            token_name="SIGNET_MCP_CALLER_TOKEN_WORK",
+            setup_id="setup_0123456789abcdef",
+        )
+
+    assert (profile / "config.yaml").is_file()
+    assert (profile / ".env").is_file()
+
+
+def test_hermes_apply_retry_rejects_drift_outside_the_managed_snapshot(
+    tmp_path: Path,
+) -> None:
+    selected = replace(spec(tmp_path / "profile-retry-drift"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    setup_id = "setup_0123456789abcdef"
+    token_name = "SIGNET_MCP_CALLER_TOKEN_WORK"
+    original_config = b"model: test/work\n"
+    original_environment = b"EXISTING=kept\n"
+    identity = require_private_directory_identity(profile)
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=identity,
+        config=original_config,
+        environment=original_environment,
+        config_exists=True,
+        environment_exists=True,
+    )
+    drifted_config = (
+        _merge_hermes_config(original_config, token_name=token_name, setup_id=setup_id)
+        + b"foreign: changed-after-snapshot\n"
+    )
+
+    with pytest.raises(SetupError, match="changed after its setup snapshot"):
+        setup_platform._capture_hermes_profile_snapshot(
+            selected,
+            "work",
+            profile_identity=identity,
+            config=drifted_config,
+            environment=original_environment,
+            config_exists=True,
+            environment_exists=True,
+            setup_id=setup_id,
+        )
+
+
 def test_hermes_profile_edits_are_transactional_across_profiles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2657,6 +2791,45 @@ def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
     assert (selected.root / "services" / "tailscale-serve-before.json").is_file()
     assert (selected.root / "services" / "tailscale-serve-after.json").is_file()
     platform._rollback_tailnet_route(selected)
+    assert state["serve"] == {}
+    assert not (selected.root / "services" / "tailscale-serve-before.json").exists()
+    assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
+
+
+def test_tailnet_route_normalizes_absent_and_empty_serve_states(tmp_path: Path) -> None:
+    selected = SetupSpec(
+        root=tmp_path / "absent-tailnet",
+        public_origin="https://signet.example.ts.net:8443",
+        owner_user_id="user:owner",
+        hermes_profiles=("work",),
+        executable=Path("/bin/echo"),
+    )
+    ensure_private_directory(selected.root / "services")
+    host_port = "signet.example.ts.net:8443"
+    state: dict[str, Any] = {"serve": None}
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        if command[:3] == ["tailscale", "serve", "status"]:
+            payload = state["serve"]
+        elif "--bg" in command:
+            state["serve"] = {
+                "TCP": {"8443": {"HTTPS": True}},
+                "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+                "AllowFunnel": {host_port: False},
+            }
+            payload = {}
+        elif command[-1] == "off":
+            state["serve"] = {}
+            payload = {}
+        else:  # pragma: no cover - protects the fake boundary
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    platform = ProductionSetupPlatform(command_runner=run)
+    platform._apply_tailnet_route(selected)
+    platform._rollback_tailnet_route(selected)
+
     assert state["serve"] == {}
     assert not (selected.root / "services" / "tailscale-serve-before.json").exists()
     assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
