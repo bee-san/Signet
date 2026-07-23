@@ -57,6 +57,8 @@ from signet.production_connectors import (
     provider_execution_identity_digest,
 )
 from signet.production_state import ProductionStateError, production_config_digest
+from signet.setup_platform import ProductionSetupPlatform
+from signet.setup_state import SetupEngine, SetupJournalStore, SetupSpec
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
@@ -163,6 +165,7 @@ def _secret_store(
             ("signet", "capability"): "capability-secret-" * 3,
             ("signet", "payload"): "payload-secret-" * 3,
             ("signet", "totp"): totp_secret,
+            ("signet", "attachment"): "attachment-key-material-" * 3,
             ("signet", "mail"): "mail-secret-value",
         }
     )
@@ -179,6 +182,44 @@ def test_missing_durable_service_inventory_fails_closed(tmp_path: Path) -> None:
         connection.execute("DELETE FROM production_services WHERE service_name = 'web'")
 
     with pytest.raises(ProductionAssemblyError, match="service inventory has diverged"):
+        build_production_runtime(
+            config,
+            secret_store=_secret_store(),
+            components=frozenset(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("table", "where_clause", "message"),
+    (
+        (
+            "production_secret_references",
+            "purpose = 'session_secret_ref'",
+            "secret reference inventory has diverged",
+        ),
+        (
+            "production_connectors",
+            "connector_alias = 'mail'",
+            "connector inventory has diverged",
+        ),
+    ),
+)
+def test_missing_durable_production_inventory_fails_closed(
+    tmp_path: Path,
+    table: str,
+    where_clause: str,
+    message: str,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    with assembly.database.transaction() as connection:
+        connection.execute(f"DELETE FROM {table} WHERE {where_clause}")
+
+    with pytest.raises(ProductionAssemblyError, match=message):
         build_production_runtime(
             config,
             secret_store=_secret_store(),
@@ -439,6 +480,7 @@ def test_production_config_rejects_unsafe_or_ambiguous_values(
         "https://signet.example.test:bad",
         "https://signet.example.test:99999",
         "https://Signet.example.test",
+        "https://127.0.0.1",
     ),
 )
 def test_noncanonical_public_origin_is_rejected_before_database_initialization(
@@ -448,6 +490,20 @@ def test_noncanonical_public_origin_is_rejected_before_database_initialization(
     config_path = tmp_path / "production.json"
     payload = _production_payload(tmp_path)
     payload["public_origin"] = origin
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    config_path.chmod(0o600)
+
+    with pytest.raises(ProductionAssemblyError, match="configuration is invalid"):
+        create_production_assembly(config_path, secret_store=_secret_store())
+
+    assert not (Path(payload["storage"]["data_dir"]) / "signet.db").exists()
+
+
+def test_numeric_public_origin_is_rejected_even_when_rp_id_matches(tmp_path: Path) -> None:
+    config_path = tmp_path / "production.json"
+    payload = _production_payload(tmp_path)
+    payload["public_origin"] = "https://127.0.0.1"
+    payload["rp_id"] = "127.0.0.1"
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     config_path.chmod(0o600)
 
@@ -1680,6 +1736,131 @@ def test_production_http_surfaces_reject_non_loopback_transport_peers(tmp_path: 
         )
 
 
+def test_production_runtime_refuses_to_rebind_a_historical_auth_owner(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    database = Database(config.storage.database_path)
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO auth_users(user_id, created_at) VALUES (?, ?)",
+            ("user:historical-owner", 100),
+        )
+
+    with pytest.raises(ProductionAssemblyError, match="authenticator owner differs"):
+        build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+
+
+def test_production_config_digest_composes_rollout_and_identity_predecessors(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor["provider_rollout"]["state"] = "enabled"
+    predecessor["capabilities"]["live_providers_ready"] = True
+    for connector in predecessor["connectors"].values():
+        connector.pop("tls_server_certificate")
+        connector.pop("tls_server_certificate_sha256")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+
+    migrated = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+
+    with migrated.database.read() as connection:
+        assert connection.execute(
+            "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+        ).fetchone()["config_digest"] == production_config_digest(config)
+
+
+def test_legacy_config_digest_adds_only_the_new_attachment_secret_inventory(
+    tmp_path: Path,
+) -> None:
+    payload = _production_payload(tmp_path)
+    source_root = tmp_path / "attachment-source"
+    source_root.mkdir(mode=0o700)
+    payload["storage"].update(
+        attachment_staging_dir=str(tmp_path / "attachment-staging"),
+        attachment_source_roots=[str(source_root)],
+    )
+    payload["secrets"]["attachment_key_ref"] = "keychain://signet/attachment"
+    config = ProductionConfig.model_validate(payload)
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor["storage"].pop("attachment_staging_dir")
+    predecessor["storage"].pop("attachment_source_roots")
+    predecessor["secrets"].pop("attachment_key_ref")
+    predecessor["capabilities"]["live_providers_ready"] = False
+    predecessor.pop("provider_rollout")
+    for connector in predecessor["connectors"].values():
+        connector.pop("server_identity_digest")
+        connector.pop("tls_server_certificate")
+        connector.pop("tls_server_certificate_sha256")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "DELETE FROM production_secret_references WHERE purpose = 'attachment_key_ref'"
+        )
+
+    migrated = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+
+    with migrated.database.read() as connection:
+        purposes = {
+            str(row["purpose"])
+            for row in connection.execute(
+                "SELECT purpose FROM production_secret_references"
+            ).fetchall()
+        }
+    assert "attachment_key_ref" in purposes
+
+
+@pytest.mark.parametrize("deleted_table", ["production_setup_state", "production_users"])
+def test_production_runtime_refuses_deleted_durable_identity_rows(
+    tmp_path: Path,
+    deleted_table: str,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    with assembly.database.transaction() as connection:
+        connection.execute(f"DELETE FROM {deleted_table}")
+
+    with pytest.raises(ProductionAssemblyError, match="durable production"):
+        build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 124)
+
+
 @pytest.mark.asyncio
 async def test_production_maintenance_worker_has_explicit_lifecycle(tmp_path: Path) -> None:
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
@@ -1801,6 +1982,19 @@ def test_build_rejects_policy_connector_drift_before_database_creation(tmp_path:
     assert not config.storage.database_path.exists()
 
 
+def test_build_rejects_policy_connector_alias_drift_before_database_creation(
+    tmp_path: Path,
+) -> None:
+    payload = _production_payload(tmp_path)
+    payload["connectors"] = {}
+    config = ProductionConfig.model_validate(payload)
+
+    with pytest.raises(ProductionAssemblyError, match="aliases must match exactly"):
+        build_production_runtime(config, secret_store=_secret_store())
+
+    assert not config.storage.database_path.exists()
+
+
 def test_private_config_loader_and_factory_use_versioned_json(tmp_path: Path) -> None:
     payload = _production_payload(tmp_path)
     config_path = tmp_path / "production.json"
@@ -1824,6 +2018,35 @@ def test_private_config_loader_and_factory_use_versioned_json(tmp_path: Path) ->
         load_production_config(symlink)
 
 
+@pytest.mark.parametrize(
+    ("document", "message"),
+    (
+        ("{", "not valid UTF-8 JSON"),
+        ("[]", "must be a JSON object"),
+    ),
+)
+def test_private_config_loader_rejects_invalid_documents(
+    tmp_path: Path,
+    document: str,
+    message: str,
+) -> None:
+    config_path = tmp_path / "production.json"
+    config_path.write_text(document, encoding="utf-8")
+    config_path.chmod(0o600)
+
+    with pytest.raises(ProductionAssemblyError, match=message):
+        load_production_config(config_path)
+
+
+def test_environment_asgi_factory_requires_the_private_config_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SIGNET_PRODUCTION_CONFIG", raising=False)
+
+    with pytest.raises(ProductionAssemblyError, match="must name the private config file"):
+        create_production_web_app_from_environment(secret_store=_secret_store())
+
+
 def test_environment_asgi_factories_use_only_the_private_config_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1833,12 +2056,80 @@ def test_environment_asgi_factories_use_only_the_private_config_path(
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     config_path.chmod(0o600)
     monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", str(config_path))
+    monkeypatch.setattr(
+        production_module,
+        "_owned_runtime_database",
+        lambda path: Database(Path(payload["storage"]["data_dir"]) / "signet.db"),
+    )
 
     mcp_app = create_production_mcp_app_from_environment(secret_store=_secret_store())
     web_app = create_production_web_app_from_environment(secret_store=_secret_store())
 
     assert mcp_app is not None
     assert web_app is not None
+
+
+def test_environment_asgi_factory_opens_the_owned_setup_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "owned-production"
+    selected = SetupSpec(
+        root=root,
+        public_origin="https://signet.example.test",
+        owner_user_id="user:owner",
+        hermes_profiles=("personal",),
+        executable=Path("/opt/signet/bin/signet"),
+        open_browser=False,
+    )
+
+    class FactorySetupPlatform(ProductionSetupPlatform):
+        def apply(self, step: str, spec: SetupSpec, setup_id: str) -> None:
+            if step in {"private_paths", "configuration", "database"}:
+                super().apply(step, spec, setup_id)
+
+    monkeypatch.setattr(
+        "signet.setup_platform.create_production_assembly",
+        lambda *args, **kwargs: None,
+    )
+    journal = SetupEngine(
+        SetupJournalStore(root),
+        FactorySetupPlatform(),
+    ).apply(selected)
+    config_path = root / "production.json"
+    config = load_production_config(config_path)
+    references = (
+        SecretReference.parse(reference)
+        for reference in config.secrets.model_dump().values()
+        if reference is not None
+    )
+    secret_store = MemorySecretStore(
+        {
+            (reference.service, reference.account): "factory-secret-value-" * 2
+            for reference in references
+        }
+    )
+    receipt = json.loads(
+        (config.storage.data_dir / ".signet-database-ownership.json").read_text(encoding="utf-8")
+    )
+    database_stat = config.storage.database_path.stat()
+    maintenance_lock_stat = config.storage.database_path.with_name(
+        f".{config.storage.database_path.name}.maintenance.lock"
+    ).stat()
+    monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", str(config_path))
+
+    app = create_production_web_app_from_environment(secret_store=secret_store)
+
+    assert app is not None
+    assert receipt["setup_id"] == journal.setup_id
+    assert receipt["runtime_files"]["signet.db"] == {
+        "device": database_stat.st_dev,
+        "inode": database_stat.st_ino,
+    }
+    assert receipt["runtime_files"][".signet.db.maintenance.lock"] == {
+        "device": maintenance_lock_stat.st_dev,
+        "inode": maintenance_lock_stat.st_ino,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1925,7 +2216,7 @@ def test_service_specific_factories_do_not_construct_unused_sibling_apps(
     assert app is not None
 
 
-def test_standard_factory_creates_and_verifies_required_upgrade_backup(
+def test_standard_factory_refuses_an_old_schema_without_verified_upgrade_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1975,31 +2266,12 @@ def test_standard_factory_creates_and_verifies_required_upgrade_backup(
     monkeypatch.setattr(db_module, "LATEST_SCHEMA_VERSION", 16)
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     config_path.chmod(0o600)
-    original_read_bytes = Path.read_bytes
+    with pytest.raises(ProductionAssemblyError, match="migration was not started"):
+        create_production_mcp_runtime(config_path, secret_store=_secret_store())
 
-    def guarded_read_bytes(path: Path) -> bytes:
-        if path.parent == config.storage.backup_dir:
-            raise AssertionError("production backup digest loaded the complete snapshot")
-        return original_read_bytes(path)
-
-    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
-
-    runtime = create_production_mcp_runtime(config_path, secret_store=_secret_store())
-
-    assert runtime.app is not None
     with Database(config.storage.database_path).read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
-        labels = tuple(
-            row[0]
-            for row in connection.execute(
-                "SELECT factor_label FROM auth_credentials ORDER BY credential_id"
-            )
-        )
-    assert len(labels) == len(set(labels)) == 3
-    assert all(label == label.strip() for label in labels)
-    backups = tuple(config.storage.backup_dir.glob("signet-pre-migration-v15-*.sqlite3"))
-    assert len(backups) == 1
-    Database.verify_snapshot(backups[0])
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+    assert tuple(config.storage.backup_dir.iterdir()) == ()
 
 
 def test_build_fails_closed_on_corrupt_durable_schema_cache(tmp_path: Path) -> None:

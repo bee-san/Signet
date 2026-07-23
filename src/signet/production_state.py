@@ -101,6 +101,7 @@ class ProductionStateStore:
         config_digest = production_config_digest(config)
         capability_json = json.dumps(dict(capabilities), sort_keys=True, separators=(",", ":"))
         config_changed = False
+        permitted_missing_secret_purposes: frozenset[str] = frozenset()
         with self.database.transaction() as connection:
             setup = connection.execute(
                 "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
@@ -113,13 +114,31 @@ class ProductionStateStore:
                     config,
                     rollout_state=opposite_rollout,
                 )
-                compatible_digests = {
-                    transition_digest,
+                attachment_inventory_predecessors = {
                     _legacy_production_config_digest(config),
-                    _pre_identity_hardening_production_config_digest(config),
                     _rollout_preparation_base_digest(config),
                 }
+                compatible_digests = {
+                    transition_digest,
+                    _pre_identity_hardening_production_config_digest(config),
+                    _pre_identity_hardening_production_config_digest(
+                        config,
+                        rollout_state=opposite_rollout,
+                    ),
+                    *attachment_inventory_predecessors,
+                }
                 if not config.caller_principals:
+                    callerless_attachment_predecessors = {
+                        _legacy_production_config_digest(
+                            config,
+                            without_caller_principals=True,
+                        ),
+                        _rollout_preparation_base_digest(
+                            config,
+                            without_caller_principals=True,
+                        ),
+                    }
+                    attachment_inventory_predecessors.update(callerless_attachment_predecessors)
                     compatible_digests.update(
                         {
                             _pre_caller_principals_production_config_digest(config),
@@ -127,24 +146,24 @@ class ProductionStateStore:
                                 config,
                                 rollout_state=opposite_rollout,
                             ),
-                            _legacy_production_config_digest(
+                            _pre_identity_hardening_production_config_digest(
                                 config,
                                 without_caller_principals=True,
                             ),
                             _pre_identity_hardening_production_config_digest(
                                 config,
                                 without_caller_principals=True,
+                                rollout_state=opposite_rollout,
                             ),
-                            _rollout_preparation_base_digest(
-                                config,
-                                without_caller_principals=True,
-                            ),
+                            *callerless_attachment_predecessors,
                         }
                     )
                 if setup["config_digest"] not in compatible_digests:
                     raise ProductionStateError(
                         "staged production config differs from durable state"
                     )
+                if setup["config_digest"] in attachment_inventory_predecessors:
+                    permitted_missing_secret_purposes = frozenset({"attachment_key_ref"})
                 service_digest_rows = connection.execute(
                     "SELECT DISTINCT config_digest FROM production_services"
                 ).fetchall()
@@ -172,9 +191,36 @@ class ProductionStateStore:
                     (config_digest, now, setup["config_digest"]),
                 )
 
+            if setup is None:
+                established_rows = sum(
+                    int(connection.execute(query).fetchone()[0])
+                    for query in (
+                        "SELECT count(*) FROM production_users",
+                        "SELECT count(*) FROM production_secret_references",
+                        "SELECT count(*) FROM production_connectors",
+                        "SELECT count(*) FROM production_services",
+                    )
+                )
+                if established_rows:
+                    raise ProductionStateError("durable production setup state is unavailable")
+
             owners = connection.execute("SELECT user_id FROM production_users").fetchall()
-            if any(row["user_id"] != config.owner_user_id for row in owners):
+            if setup is not None and (
+                len(owners) != 1 or owners[0]["user_id"] != config.owner_user_id
+            ):
                 raise ProductionStateError("durable production owner differs from configured owner")
+            if setup is None and owners:
+                raise ProductionStateError("durable production owner differs from configured owner")
+            authenticator_owners = connection.execute(
+                "SELECT user_id FROM auth_users ORDER BY user_id"
+            ).fetchall()
+            if authenticator_owners and (
+                len(authenticator_owners) != 1
+                or authenticator_owners[0]["user_id"] != config.owner_user_id
+            ):
+                raise ProductionStateError(
+                    "durable authenticator owner differs from configured owner"
+                )
 
             connection.execute(
                 """
@@ -189,12 +235,15 @@ class ProductionStateStore:
                 secret_references,
                 identities=secret_identities,
                 now=now,
+                require_complete_inventory=setup is not None,
+                permitted_missing_purposes=permitted_missing_secret_purposes,
             )
             self._stage_connectors(
                 connection,
                 config,
                 now=now,
                 reset_state=config_changed,
+                require_complete_inventory=setup is not None,
             )
             self._stage_services(
                 connection,
@@ -594,6 +643,8 @@ class ProductionStateStore:
         *,
         identities: Mapping[str, str],
         now: int,
+        require_complete_inventory: bool,
+        permitted_missing_purposes: frozenset[str],
     ) -> None:
         if set(identities) - set(references) or any(
             len(identity) != 64
@@ -611,6 +662,10 @@ class ProductionStateStore:
                 (purpose,),
             ).fetchone()
             if stored is None:
+                if require_complete_inventory and purpose not in permitted_missing_purposes:
+                    raise ProductionStateError(
+                        "durable production secret reference inventory has diverged"
+                    )
                 connection.execute(
                     """
                     INSERT INTO production_secret_references(
@@ -662,6 +717,7 @@ class ProductionStateStore:
         *,
         now: int,
         reset_state: bool,
+        require_complete_inventory: bool,
     ) -> None:
         configured_aliases = set(config.connectors)
         stored_aliases = {
@@ -670,7 +726,9 @@ class ProductionStateStore:
                 "SELECT connector_alias FROM production_connectors"
             ).fetchall()
         }
-        if stored_aliases - configured_aliases:
+        if stored_aliases - configured_aliases or (
+            require_complete_inventory and stored_aliases != configured_aliases
+        ):
             raise ProductionStateError("durable production connector inventory has diverged")
         for alias, connector in config.connectors.items():
             document = connector.model_dump(mode="json")
@@ -820,12 +878,16 @@ def _pre_identity_hardening_production_config_digest(
     config: ProductionConfig,
     *,
     without_caller_principals: bool = False,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
 ) -> str:
     """Reconstruct the immediately preceding provider-config document shape."""
 
     document = config.model_dump(mode="json")
     if without_caller_principals:
         document.pop("caller_principals")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
     for connector in document["connectors"].values():
         connector.pop("tls_server_certificate", None)
         connector.pop("tls_server_certificate_sha256", None)

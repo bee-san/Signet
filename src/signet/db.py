@@ -12,11 +12,13 @@ import fcntl
 import hashlib
 import os
 import re
+import secrets
 import stat
 import sys
 import tempfile
+import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,7 +27,10 @@ from signet.private_paths import (
     PrivatePathError,
     ensure_owned_directory,
     ensure_private_directory,
+    rename_entry_no_replace,
     require_no_acl_grants,
+    require_owned_directory_identity,
+    revalidate_directory_identity,
 )
 
 try:  # pragma: no cover - selection depends on the runtime build
@@ -102,6 +107,14 @@ class MigrationBackupReceipt:
     artifact_path: Path
     artifact_sha256: str
     verified_restore_schema_version: int
+    source_database_device: int
+    source_database_inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CopiedSnapshotFile:
+    sha256: str
+    identity: tuple[int, int]
 
 
 MigrationFaultInjector = Callable[[str], None]
@@ -115,6 +128,25 @@ _NETWORK_FILESYSTEMS = {
     "nfs4",
     "smbfs",
 }
+_READ_ONLY_URI_FORBIDDEN = frozenset({"mode", "immutable"})
+_WRITE_FENCES_LOCK = threading.RLock()
+_WRITE_FENCES: dict[Path, _WriteFenceState] = {}
+
+
+class _WriteFenceState:
+    def __init__(
+        self,
+        connection: Any,
+        database: Database,
+        thread_id: int,
+        *,
+        source_identity: tuple[int, int] | None = None,
+    ) -> None:
+        self.connection = connection
+        self.database = database
+        self.thread_id = thread_id
+        self.source_identity = source_identity
+        self.savepoint = 0
 
 
 class Database:
@@ -125,11 +157,35 @@ class Database:
         path: str | os.PathLike[str],
         *,
         timeout: float = 30.0,
+        expected_identity: tuple[int, int] | None = None,
+        expected_lock_identity: tuple[int, int] | None = None,
     ):
         if timeout < 0.1 or timeout > 60:
             raise ValueError("SQLite timeout must be between 0.1 and 60 seconds")
+        if expected_identity is not None and (
+            not isinstance(expected_identity, tuple)
+            or len(expected_identity) != 2
+            or any(type(value) is not int or value < 0 for value in expected_identity)
+        ):
+            raise ValueError("expected database identity must be a device/inode pair")
+        if expected_lock_identity is not None and (
+            not isinstance(expected_lock_identity, tuple)
+            or len(expected_lock_identity) != 2
+            or any(type(value) is not int or value < 0 for value in expected_lock_identity)
+        ):
+            raise ValueError("expected maintenance-lock identity must be a device/inode pair")
         self.path = Path(path).expanduser().absolute()
         self.timeout = timeout
+        self.expected_identity = expected_identity
+        self.expected_lock_identity = expected_lock_identity
+
+    def _require_expected_identity(self) -> None:
+        if self.expected_identity is not None:
+            _require_database_path_identity(
+                self.path,
+                self.expected_identity,
+                message="database changed after setup ownership was established",
+            )
 
     @property
     def migrations_path(self) -> Path:
@@ -140,6 +196,7 @@ class Database:
         *,
         fault_injector: MigrationFaultInjector | None = None,
         pre_migration_backup: PreMigrationBackup | None = None,
+        post_initialize: Callable[[], None] | None = None,
     ) -> None:
         """Create or migrate the database and verify all applied checksums.
 
@@ -154,6 +211,8 @@ class Database:
             raise DatabaseError("the database parent must be an owned mode-0700 directory") from exc
         self.path = parent / self.path.name
         _require_local_filesystem(self.path.parent)
+        if self.expected_identity is not None:
+            self._require_expected_identity()
         if self.path.is_symlink():
             raise DatabaseError("the approval database may not be a symbolic link")
         if not self.path.exists():
@@ -194,6 +253,9 @@ class Database:
                 fault_injector=fault_injector,
                 pre_migration_backup=pre_migration_backup,
             )
+            _require_private_file(self.path, label="approval database")
+            if post_initialize is not None:
+                post_initialize()
 
         _require_private_file(self.path, label="approval database")
 
@@ -209,9 +271,15 @@ class Database:
                 f"database schema {preflight_version} is newer than supported "
                 f"schema {LATEST_SCHEMA_VERSION}"
             )
+        source_identity = _database_path_identity(self.path)
         connection = self._connect()
         operation_error: BaseException | None = None
         try:
+            _require_database_path_identity(
+                self.path,
+                source_identity,
+                message="database path changed while opening the migration source",
+            )
             journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             if str(journal_mode).lower() != "wal":
                 raise DatabaseError(f"SQLite refused WAL mode: {journal_mode!r}")
@@ -236,8 +304,20 @@ class Database:
                     raise PreMigrationBackupRequired(
                         "a verified pre-migration backup callback is required"
                     )
-                receipt = pre_migration_backup(self, current)
-                self._verify_migration_backup_receipt(receipt, current)
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    with self._bound_migration_backup_source(connection, source_identity):
+                        receipt = pre_migration_backup(self, current)
+                    _require_database_path_identity(
+                        self.path,
+                        source_identity,
+                        message="database path changed during the pre-migration backup",
+                    )
+                    self._verify_migration_backup_receipt(receipt, current, source_identity)
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
 
             if current < LATEST_SCHEMA_VERSION:
                 self._apply_migrations(
@@ -245,12 +325,18 @@ class Database:
                     current,
                     migrations,
                     fault_injector=fault_injector,
+                    source_identity=source_identity,
                 )
 
             self._complete_privacy_maintenance(connection, fault_injector=fault_injector)
 
             self._verify_applied_migrations(connection, migrations)
             self._verify_database_integrity(connection)
+            _require_database_path_identity(
+                self.path,
+                source_identity,
+                message="database path changed during migration maintenance",
+            )
             if fault_injector is not None:
                 fault_injector("migration:postcheck")
         except BaseException as exc:
@@ -353,18 +439,35 @@ class Database:
     @contextmanager
     def _maintenance_lock(self) -> Iterator[None]:
         lock_path = self.path.with_name(f".{self.path.name}.maintenance.lock")
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        if self.expected_lock_identity is None:
+            flags |= os.O_CREAT
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            if self.expected_lock_identity is not None:
+                raise DatabaseError(
+                    "the database maintenance lock changed after setup ownership was established"
+                ) from exc
+            raise
         lock_acquired = False
         operation_error: BaseException | None = None
         try:
             metadata = os.fstat(descriptor)
+            named_metadata = lock_path.stat(follow_symlinks=False)
+            current_identity = (metadata.st_dev, metadata.st_ino)
+            named_identity = (named_metadata.st_dev, named_metadata.st_ino)
             current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+            if self.expected_lock_identity is not None and (
+                current_identity != self.expected_lock_identity
+                or named_identity != self.expected_lock_identity
+            ):
+                raise DatabaseError(
+                    "the database maintenance lock changed after setup ownership was established"
+                )
             if (
-                not stat.S_ISREG(metadata.st_mode)
+                current_identity != named_identity
+                or not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_uid != current_uid
                 or metadata.st_nlink != 1
             ):
@@ -439,6 +542,15 @@ class Database:
 
     @contextmanager
     def read(self) -> Iterator[Any]:
+        with _WRITE_FENCES_LOCK:
+            fence = _WRITE_FENCES.get(self.path)
+        if (
+            fence is not None
+            and fence.database is self
+            and fence.thread_id == threading.get_ident()
+        ):
+            yield fence.connection
+            return
         connection = self._connect()
         try:
             yield connection
@@ -452,15 +564,35 @@ class Database:
         if not self.path.is_absolute():
             raise DatabaseError("read-only database path must be absolute")
         snapshot_directory = Path(tempfile.mkdtemp(prefix="signet-read-only-"))
+        created_directory = snapshot_directory.stat(follow_symlinks=False)
+        snapshot_directory_identity = (created_directory.st_dev, created_directory.st_ino)
+        snapshot_artifacts: dict[str, tuple[int, int]] = {}
         try:
             snapshot_directory.chmod(0o700)
-            _require_private_snapshot_directory(snapshot_directory)
+            if (
+                _require_private_snapshot_directory(snapshot_directory)
+                != snapshot_directory_identity
+            ):
+                raise DatabaseError("read-only snapshot directory changed during creation")
             database_path = _copy_stable_database_snapshot(
                 self.path,
                 snapshot_directory,
+                expected_identity=self.expected_identity,
+                created_artifacts=snapshot_artifacts,
             )
-        except BaseException:
-            _remove_read_only_snapshot(snapshot_directory)
+            _prepare_read_only_runtime_files(database_path, snapshot_artifacts)
+        except BaseException as exc:
+            try:
+                _remove_read_only_snapshot(
+                    snapshot_directory,
+                    snapshot_directory_identity,
+                    snapshot_artifacts,
+                )
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "read-only database snapshot cleanup is uncertain: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise
         try:
             connection = sqlite3.connect(
@@ -471,7 +603,17 @@ class Database:
                 check_same_thread=False,
             )
         except sqlite3.Error as exc:
-            _remove_read_only_snapshot(snapshot_directory)
+            try:
+                _remove_read_only_snapshot(
+                    snapshot_directory,
+                    snapshot_directory_identity,
+                    snapshot_artifacts,
+                )
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "read-only database snapshot cleanup is uncertain: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise DatabaseError("database is unavailable for read-only inspection") from exc
         try:
             connection.row_factory = sqlite3.Row
@@ -481,13 +623,36 @@ class Database:
             connection.execute("BEGIN")
             yield connection
         finally:
-            _finalize_read_only_connection(connection, snapshot_directory)
+            _finalize_read_only_connection(
+                connection,
+                snapshot_directory,
+                snapshot_directory_identity,
+                snapshot_artifacts,
+            )
 
     @contextmanager
     def transaction(self, *, mode: str = "IMMEDIATE") -> Iterator[Any]:
         begin = _BEGIN_STATEMENTS.get(mode)
         if begin is None:
             raise ValueError(f"unsupported SQLite transaction mode: {mode}")
+        with _WRITE_FENCES_LOCK:
+            fence = _WRITE_FENCES.get(self.path)
+        if (
+            fence is not None
+            and fence.database is self
+            and fence.thread_id == threading.get_ident()
+        ):
+            fence.savepoint += 1
+            savepoint = f"signet_write_fence_{fence.savepoint}"
+            fence.connection.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield fence.connection
+                fence.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except BaseException:
+                fence.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                fence.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+            return
         connection = self._connect()
         try:
             connection.execute(begin)
@@ -499,6 +664,111 @@ class Database:
             raise
         finally:
             connection.close()
+
+    @contextmanager
+    def migration_backup_source(self) -> Iterator[None]:
+        source_identity = _database_path_identity(self.path)
+        connection = self._connect()
+        operation_error: BaseException | None = None
+        try:
+            _require_database_path_identity(
+                self.path,
+                source_identity,
+                message="database path changed while binding the backup source",
+            )
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                with self._bound_migration_backup_source(connection, source_identity):
+                    yield
+                _require_database_path_identity(
+                    self.path,
+                    source_identity,
+                    message="database path changed during the backup callback",
+                )
+            finally:
+                if connection.in_transaction:
+                    connection.rollback()
+        except BaseException as exc:
+            operation_error = exc
+            raise
+        finally:
+            try:
+                connection.close()
+            except Exception as exc:
+                if operation_error is None:
+                    raise DatabaseError("failed to close migration backup source") from exc
+
+    @contextmanager
+    def _bound_migration_backup_source(
+        self,
+        connection: Any,
+        source_identity: tuple[int, int],
+    ) -> Iterator[None]:
+        owner_thread = threading.get_ident()
+        fence = _WriteFenceState(
+            connection,
+            self,
+            owner_thread,
+            source_identity=source_identity,
+        )
+        with _WRITE_FENCES_LOCK:
+            if self.path in _WRITE_FENCES:
+                raise DatabaseError("a database write fence is already active")
+            _WRITE_FENCES[self.path] = fence
+        try:
+            yield
+        finally:
+            with _WRITE_FENCES_LOCK:
+                if _WRITE_FENCES.get(self.path) is fence:
+                    del _WRITE_FENCES[self.path]
+
+    def migration_source_identity(self) -> tuple[int, int]:
+        with _WRITE_FENCES_LOCK:
+            fence = _WRITE_FENCES.get(self.path)
+            if (
+                fence is None
+                or fence.database is not self
+                or fence.thread_id != threading.get_ident()
+                or fence.source_identity is None
+            ):
+                raise DatabaseError("no bound migration backup source is active")
+            return fence.source_identity
+
+    def has_active_write_fence(self) -> bool:
+        with _WRITE_FENCES_LOCK:
+            fence = _WRITE_FENCES.get(self.path)
+            return (
+                fence is not None
+                and fence.database is self
+                and fence.thread_id == threading.get_ident()
+            )
+
+    @contextmanager
+    def write_fence(self) -> Iterator[Any]:
+        """Block every other SQLite writer until the guarded operation finishes."""
+
+        owner_thread = threading.get_ident()
+        with _WRITE_FENCES_LOCK:
+            if self.path in _WRITE_FENCES:
+                raise DatabaseError("a database write fence is already active")
+        connection = self._connect()
+        fence = _WriteFenceState(connection, self, owner_thread)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            with _WRITE_FENCES_LOCK:
+                if self.path in _WRITE_FENCES:
+                    raise DatabaseError("a database write fence is already active")
+                _WRITE_FENCES[self.path] = fence
+            yield connection
+        finally:
+            with _WRITE_FENCES_LOCK:
+                if _WRITE_FENCES.get(self.path) is fence:
+                    del _WRITE_FENCES[self.path]
+            try:
+                if connection.in_transaction:
+                    connection.rollback()
+            finally:
+                connection.close()
 
     def pragma_values(self) -> dict[str, int | str]:
         with self.read() as connection:
@@ -531,6 +801,7 @@ class Database:
             raise DatabaseError("a backup snapshot must use a separate path")
         try:
             ensure_owned_directory(destination_path.parent)
+            parent_identity = require_owned_directory_identity(destination_path.parent)
         except PrivatePathError as exc:
             raise DatabaseError(
                 "backup snapshot parent must be owned and not writable by others"
@@ -540,48 +811,128 @@ class Database:
         temporary = destination_path.with_name(f".{destination_path.name}.partial")
         if temporary.exists() or temporary.is_symlink():
             raise DatabaseError("backup snapshot temporary path already exists")
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
-        os.fchmod(descriptor, 0o600)
+        parent_descriptor = -1
+        descriptor = -1
+        try:
+            parent_descriptor = os.open(
+                destination_path.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened_parent = os.fstat(parent_descriptor)
+            if (opened_parent.st_dev, opened_parent.st_ino) != (
+                parent_identity.device,
+                parent_identity.inode,
+            ):
+                raise DatabaseError("backup snapshot parent changed before creation")
+            descriptor = os.open(
+                temporary.name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            os.fchmod(descriptor, 0o600)
+            temporary_metadata = os.fstat(descriptor)
+            temporary_identity = (temporary_metadata.st_dev, temporary_metadata.st_ino)
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+            raise
         os.close(descriptor)
 
-        source = self._connect()
-        target = sqlite3.connect(str(temporary), isolation_level=None)
         try:
-            source.backup(target)
-            target.execute("PRAGMA foreign_keys=ON")
-            integrity = str(target.execute("PRAGMA integrity_check").fetchone()[0])
-            foreign_keys = tuple(target.execute("PRAGMA foreign_key_check"))
-            if integrity != "ok" or foreign_keys:
-                raise DatabaseError("backup snapshot failed integrity verification")
-        except BaseException:
-            target.close()
-            temporary.unlink(missing_ok=True)
-            raise
-        else:
-            target.close()
-        finally:
-            source.close()
+            with _WRITE_FENCES_LOCK:
+                fence = _WRITE_FENCES.get(self.path)
+            bound_source = (
+                fence.connection
+                if fence is not None
+                and fence.database is self
+                and fence.thread_id == threading.get_ident()
+                else None
+            )
+            source_context = (
+                nullcontext(bound_source) if bound_source is not None else closing(self._connect())
+            )
+            with source_context as source:
+                if bound_source is not None:
+                    serialized = source.serialize()
+                    descriptor = os.open(
+                        temporary,
+                        os.O_WRONLY
+                        | os.O_TRUNC
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                    )
+                    try:
+                        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                            stream.write(serialized)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                    finally:
+                        os.close(descriptor)
+                with closing(sqlite3.connect(str(temporary), isolation_level=None)) as target:
+                    if bound_source is None:
+                        source.backup(target)
+                    target.execute("PRAGMA foreign_keys=ON")
+                    integrity = str(target.execute("PRAGMA integrity_check").fetchone()[0])
+                    foreign_keys = tuple(target.execute("PRAGMA foreign_key_check"))
+                    if integrity != "ok" or foreign_keys:
+                        raise DatabaseError("backup snapshot failed integrity verification")
 
-        _require_private_file(temporary, label="backup snapshot")
-        descriptor = os.open(temporary, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
+            _require_private_file(temporary, label="backup snapshot")
+            if not _snapshot_temporary_matches(temporary, temporary_identity):
+                raise DatabaseError("backup snapshot temporary path changed during creation")
+            descriptor = os.open(temporary, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            try:
+                rename_entry_no_replace(
+                    parent_descriptor,
+                    temporary.name,
+                    parent_descriptor,
+                    destination_path.name,
+                )
+            except FileExistsError as exc:
+                raise DatabaseError(
+                    "backup snapshot destination appeared before publication"
+                ) from exc
+            except (OSError, PrivatePathError) as exc:
+                raise DatabaseError("backup snapshot could not be published safely") from exc
+            published = os.stat(
+                destination_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (published.st_dev, published.st_ino) != temporary_identity:
+                raise DatabaseError("backup snapshot changed during publication")
+            os.fsync(parent_descriptor)
+            revalidate_directory_identity(parent_identity, private=False)
+        except BaseException as exc:
+            try:
+                _remove_snapshot_attempt_artifact(
+                    parent_descriptor,
+                    temporary.name,
+                    destination_path.name,
+                    expected_identity=temporary_identity,
+                )
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "backup snapshot cleanup is uncertain: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
         finally:
-            os.close(descriptor)
-        os.replace(temporary, destination_path)
-        directory = os.open(destination_path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            os.close(parent_descriptor)
         return destination_path
 
     @staticmethod
@@ -603,6 +954,18 @@ class Database:
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         descriptor = os.open(self.path, flags)
         try:
+            metadata = os.fstat(descriptor)
+            if (
+                self.expected_identity is not None
+                and (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                )
+                != self.expected_identity
+            ):
+                raise MigrationIntegrityError(
+                    "database changed after setup ownership was established"
+                )
             header = os.read(descriptor, 100)
         finally:
             os.close(descriptor)
@@ -630,13 +993,21 @@ class Database:
         self,
         receipt: MigrationBackupReceipt,
         current_version: int,
+        source_identity: tuple[int, int] | None = None,
     ) -> None:
         if not isinstance(receipt, MigrationBackupReceipt):
             raise MigrationIntegrityError("pre-migration backup did not return a verified receipt")
+        if source_identity is None:
+            source_identity = _database_path_identity(self.path)
         if (
             receipt.database_path.resolve() != self.path.resolve()
             or receipt.source_schema_version != current_version
             or receipt.verified_restore_schema_version != current_version
+            or (
+                receipt.source_database_device,
+                receipt.source_database_inode,
+            )
+            != source_identity
             or not receipt.artifact_path.is_absolute()
         ):
             raise MigrationIntegrityError("pre-migration backup receipt is inconsistent")
@@ -671,6 +1042,7 @@ class Database:
             raise MigrationIntegrityError("database integrity verification failed")
 
     def _connect(self) -> Any:
+        self._require_expected_identity()
         current_version = tuple(int(part) for part in sqlite3.sqlite_version.split(".")[:3])
         if current_version < MINIMUM_SQLITE_VERSION:
             required = ".".join(str(part) for part in MINIMUM_SQLITE_VERSION)
@@ -683,6 +1055,7 @@ class Database:
             check_same_thread=False,
         )
         try:
+            self._require_expected_identity()
             connection.row_factory = sqlite3.Row
             expected_timeout = int(self.timeout * 1000)
             connection.execute("PRAGMA foreign_keys=ON")
@@ -731,8 +1104,10 @@ class Database:
         migrations: dict[int, Path],
         *,
         fault_injector: MigrationFaultInjector | None,
+        source_identity: tuple[int, int],
     ) -> None:
-        connection.execute("BEGIN EXCLUSIVE")
+        if not connection.in_transaction:
+            connection.execute("BEGIN EXCLUSIVE")
         try:
             for version in range(current_version + 1, LATEST_SCHEMA_VERSION + 1):
                 path = migrations.get(version)
@@ -767,6 +1142,11 @@ class Database:
             self._verify_database_integrity(connection)
             if fault_injector is not None:
                 fault_injector("migration:transaction:postcheck")
+            _require_database_path_identity(
+                self.path,
+                source_identity,
+                message="database path changed before the migration commit",
+            )
             connection.commit()
         except BaseException:
             if connection.in_transaction:
@@ -823,7 +1203,7 @@ def _require_private_file(path: Path, *, label: str) -> None:
         os.close(descriptor)
 
 
-def _require_private_snapshot_directory(directory: Path) -> None:
+def _require_private_snapshot_directory(directory: Path) -> tuple[int, int]:
     descriptor = -1
     try:
         descriptor = os.open(
@@ -842,6 +1222,7 @@ def _require_private_snapshot_directory(directory: Path) -> None:
         ):
             raise DatabaseError("read-only snapshot directory is unsafe")
         require_no_acl_grants(descriptor)
+        return metadata.st_dev, metadata.st_ino
     except (OSError, PrivatePathError) as exc:
         raise DatabaseError("read-only snapshot directory is unsafe") from exc
     finally:
@@ -849,7 +1230,12 @@ def _require_private_snapshot_directory(directory: Path) -> None:
             os.close(descriptor)
 
 
-def _finalize_read_only_connection(connection: Any, snapshot_directory: Path) -> None:
+def _finalize_read_only_connection(
+    connection: Any,
+    snapshot_directory: Path,
+    snapshot_directory_identity: tuple[int, int],
+    snapshot_artifacts: dict[str, tuple[int, int]],
+) -> None:
     primary = sys.exception()
     failures: list[BaseException] = []
     try:
@@ -862,7 +1248,11 @@ def _finalize_read_only_connection(connection: Any, snapshot_directory: Path) ->
     except BaseException as exc:
         failures.append(exc)
     try:
-        _remove_read_only_snapshot(snapshot_directory)
+        _remove_read_only_snapshot(
+            snapshot_directory,
+            snapshot_directory_identity,
+            snapshot_artifacts,
+        )
     except BaseException as exc:
         failures.append(exc)
     if not failures:
@@ -879,7 +1269,11 @@ def _finalize_read_only_connection(connection: Any, snapshot_directory: Path) ->
     raise error from failures[0]
 
 
-def _remove_read_only_snapshot(directory: Path) -> None:
+def _remove_read_only_snapshot(
+    directory: Path,
+    expected_directory_identity: tuple[int, int],
+    artifacts: dict[str, tuple[int, int]],
+) -> None:
     descriptor = -1
     try:
         descriptor = os.open(
@@ -895,86 +1289,213 @@ def _remove_read_only_snapshot(directory: Path) -> None:
             not stat.S_ISDIR(metadata.st_mode)
             or metadata.st_uid != current_uid
             or stat.S_IMODE(metadata.st_mode) != 0o700
+            or (metadata.st_dev, metadata.st_ino) != expected_directory_identity
         ):
             raise DatabaseError("read-only database snapshot directory changed during cleanup")
-        for name in os.listdir(descriptor):
-            entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-            if (
-                not stat.S_ISREG(entry.st_mode)
-                or entry.st_uid != current_uid
-                or entry.st_nlink != 1
-                or stat.S_IMODE(entry.st_mode) != 0o600
-            ):
-                raise DatabaseError("read-only database snapshot contains an unsafe artifact")
-            os.unlink(name, dir_fd=descriptor)
-    except FileNotFoundError:
-        return
+        failures: list[BaseException] = []
+        for name, identity in artifacts.items():
+            try:
+                _remove_tracked_snapshot_entry(
+                    descriptor,
+                    name,
+                    expected_identity=identity,
+                )
+            except BaseException as exc:
+                failures.append(exc)
+        remaining = os.listdir(descriptor)
+        if remaining:
+            failures.append(
+                DatabaseError("read-only database snapshot contains an untracked artifact")
+            )
+        if failures:
+            error = DatabaseError("read-only database snapshot cleanup did not complete")
+            for failure in failures[1:]:
+                error.add_note(f"{type(failure).__name__}: {failure}")
+            raise error from failures[0]
+    except FileNotFoundError as exc:
+        raise DatabaseError("read-only database snapshot cleanup state is uncertain") from exc
     except OSError as exc:
         raise DatabaseError("read-only database snapshot could not be removed safely") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
     try:
+        current = directory.stat(follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != expected_directory_identity:
+            raise DatabaseError("read-only database snapshot directory changed before removal")
         directory.rmdir()
-    except FileNotFoundError:
-        return
+    except FileNotFoundError as exc:
+        raise DatabaseError("read-only database snapshot directory removal is uncertain") from exc
     except OSError as exc:
         raise DatabaseError("read-only database snapshot directory could not be removed") from exc
 
 
-def _copy_stable_database_snapshot(source: Path, destination: Path) -> Path:
+def _copy_stable_database_snapshot(
+    source: Path,
+    destination: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+    created_artifacts: dict[str, tuple[int, int]] | None = None,
+) -> Path:
     snapshot = destination / source.name
     snapshot_wal = Path(f"{snapshot}-wal")
     source_wal = Path(f"{source}-wal")
     for _ in range(8):
+        attempt_artifacts: dict[str, tuple[int, int]] = {}
         main_descriptor = -1
         wal_descriptor = -1
         try:
-            opened_main = _open_snapshot_source(source, "database")
-            if opened_main is None:  # pragma: no cover - required source invariant
-                raise FileNotFoundError(source)
-            main_descriptor, before_main = opened_main
-            opened_wal = _open_snapshot_source(source_wal, "database WAL", optional=True)
-            if opened_wal is None:
-                before_wal = None
-            else:
-                wal_descriptor, before_wal = opened_wal
+            try:
+                opened_main = _open_snapshot_source(source, "database")
+                if opened_main is None:  # pragma: no cover - required source invariant
+                    raise FileNotFoundError(source)
+                main_descriptor, before_main = opened_main
+                if (
+                    expected_identity is not None
+                    and (
+                        before_main.st_dev,
+                        before_main.st_ino,
+                    )
+                    != expected_identity
+                ):
+                    raise DatabaseError("database changed after setup ownership was established")
+                opened_wal = _open_snapshot_source(source_wal, "database WAL", optional=True)
+                if opened_wal is None:
+                    before_wal = None
+                else:
+                    wal_descriptor, before_wal = opened_wal
 
-            copied_main_digest = _copy_descriptor_to_private_file(
-                main_descriptor,
-                snapshot,
-            )
-            copied_wal_digest = (
-                _copy_descriptor_to_private_file(wal_descriptor, snapshot_wal)
-                if before_wal is not None
-                else None
-            )
-            after_main = os.fstat(main_descriptor)
-            after_wal = os.fstat(wal_descriptor) if before_wal is not None else None
-            stable = (
-                _stable_copy_identity(before_main) == _stable_copy_identity(after_main)
-                and _optional_stable_copy_identity(before_wal)
-                == _optional_stable_copy_identity(after_wal)
-                and copied_main_digest == _descriptor_sha256(main_descriptor)
-                and copied_wal_digest
-                == (_descriptor_sha256(wal_descriptor) if before_wal is not None else None)
-                and _descriptor_still_names_path(source, main_descriptor)
-                and (
-                    _descriptor_still_names_path(source_wal, wal_descriptor)
-                    if before_wal is not None
-                    else not source_wal.exists() and not source_wal.is_symlink()
+                copied_main = _copy_descriptor_to_private_file(
+                    main_descriptor,
+                    snapshot,
                 )
-            )
-        except FileNotFoundError:
-            stable = False
-        finally:
-            _close_snapshot_descriptors(wal_descriptor, main_descriptor)
+                attempt_artifacts[snapshot.name] = copied_main.identity
+                copied_wal = (
+                    _copy_descriptor_to_private_file(wal_descriptor, snapshot_wal)
+                    if before_wal is not None
+                    else None
+                )
+                if copied_wal is not None:
+                    attempt_artifacts[snapshot_wal.name] = copied_wal.identity
+                after_main = os.fstat(main_descriptor)
+                after_wal = os.fstat(wal_descriptor) if before_wal is not None else None
+                stable = (
+                    _stable_copy_identity(before_main) == _stable_copy_identity(after_main)
+                    and _optional_stable_copy_identity(before_wal)
+                    == _optional_stable_copy_identity(after_wal)
+                    and copied_main.sha256 == _descriptor_sha256(main_descriptor)
+                    and (copied_wal.sha256 if copied_wal is not None else None)
+                    == (_descriptor_sha256(wal_descriptor) if before_wal is not None else None)
+                    and _descriptor_still_names_path(source, main_descriptor)
+                    and (
+                        _descriptor_still_names_path(source_wal, wal_descriptor)
+                        if before_wal is not None
+                        else not source_wal.exists() and not source_wal.is_symlink()
+                    )
+                )
+            except FileNotFoundError:
+                stable = False
+            finally:
+                _close_snapshot_descriptors(wal_descriptor, main_descriptor)
+        except BaseException as exc:
+            try:
+                _remove_snapshot_copy_artifacts(destination, attempt_artifacts)
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "database snapshot copy cleanup is uncertain: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
         if stable:
+            if created_artifacts is not None:
+                created_artifacts.update(attempt_artifacts)
             return snapshot
-        else:
-            snapshot.unlink(missing_ok=True)
-            snapshot_wal.unlink(missing_ok=True)
+        _remove_snapshot_copy_artifacts(destination, attempt_artifacts)
     raise DatabaseError("database changed during read-only snapshot")
+
+
+def _remove_snapshot_copy_artifacts(
+    directory: Path,
+    artifacts: dict[str, tuple[int, int]],
+) -> None:
+    if not artifacts:
+        return
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        for name, identity in artifacts.items():
+            _remove_tracked_snapshot_entry(
+                descriptor,
+                name,
+                expected_identity=identity,
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _prepare_read_only_runtime_files(
+    database_path: Path,
+    artifacts: dict[str, tuple[int, int]],
+) -> None:
+    parent_descriptor = os.open(
+        database_path.parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        for suffix in ("-wal", "-shm"):
+            name = f"{database_path.name}{suffix}"
+            if name in artifacts:
+                continue
+            descriptor = -1
+            created_identity: tuple[int, int] | None = None
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                os.fchmod(descriptor, 0o600)
+                require_no_acl_grants(descriptor)
+                created = os.fstat(descriptor)
+                created_identity = (created.st_dev, created.st_ino)
+                os.fsync(descriptor)
+                named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                if (named.st_dev, named.st_ino) != created_identity:
+                    raise DatabaseError("read-only snapshot runtime artifact changed")
+                artifacts[name] = created_identity
+            except FileExistsError as exc:
+                raise DatabaseError(
+                    "read-only snapshot contains an untracked runtime artifact"
+                ) from exc
+            except BaseException:
+                if created_identity is not None:
+                    _remove_tracked_snapshot_entry(
+                        parent_descriptor,
+                        name,
+                        expected_identity=created_identity,
+                    )
+                raise
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        os.fsync(parent_descriptor)
+    except (OSError, PrivatePathError) as exc:
+        raise DatabaseError("read-only snapshot runtime files could not be prepared") from exc
+    finally:
+        os.close(parent_descriptor)
 
 
 def _close_snapshot_descriptors(*descriptors: int) -> None:
@@ -1025,9 +1546,14 @@ def _open_snapshot_source(
         raise
 
 
-def _copy_descriptor_to_private_file(descriptor: int, destination: Path) -> str:
+def _copy_descriptor_to_private_file(
+    descriptor: int,
+    destination: Path,
+) -> _CopiedSnapshotFile:
     output = -1
     digest = hashlib.sha256()
+    created_identity: tuple[int, int] | None = None
+    operation_error: BaseException | None = None
     try:
         output = os.open(
             destination,
@@ -1038,6 +1564,8 @@ def _copy_descriptor_to_private_file(descriptor: int, destination: Path) -> str:
             | getattr(os, "O_CLOEXEC", 0),
             0o600,
         )
+        created = os.fstat(output)
+        created_identity = (created.st_dev, created.st_ino)
         os.fchmod(output, 0o600)
         require_no_acl_grants(output)
         os.lseek(descriptor, 0, os.SEEK_SET)
@@ -1050,13 +1578,31 @@ def _copy_descriptor_to_private_file(descriptor: int, destination: Path) -> str:
                     raise OSError("short database snapshot write")
                 view = view[written:]
         os.fsync(output)
-    except (OSError, PrivatePathError) as exc:
-        destination.unlink(missing_ok=True)
-        raise DatabaseError("database snapshot could not be copied safely") from exc
+        named = destination.stat(follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != created_identity:
+            raise DatabaseError("database snapshot output changed during copy")
+    except BaseException as exc:
+        operation_error = exc
     finally:
         if output >= 0:
             os.close(output)
-    return digest.hexdigest()
+    if operation_error is not None:
+        if created_identity is not None:
+            try:
+                _remove_snapshot_copy_artifacts(
+                    destination.parent,
+                    {destination.name: created_identity},
+                )
+            except BaseException as cleanup_error:
+                operation_error.add_note(
+                    "database snapshot output cleanup is uncertain: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        if isinstance(operation_error, DatabaseError):
+            raise operation_error
+        raise DatabaseError("database snapshot could not be copied safely") from operation_error
+    assert created_identity is not None
+    return _CopiedSnapshotFile(digest.hexdigest(), created_identity)
 
 
 def _descriptor_sha256(descriptor: int) -> str:
@@ -1076,6 +1622,91 @@ def _descriptor_still_names_path(path: Path, descriptor: int) -> bool:
     return (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino)
 
 
+def _snapshot_temporary_matches(path: Path, expected_identity: tuple[int, int]) -> bool:
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and (metadata.st_dev, metadata.st_ino) == expected_identity
+    )
+
+
+def _remove_snapshot_attempt_artifact(
+    parent_descriptor: int,
+    temporary_name: str,
+    destination_name: str,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    matches: list[str] = []
+    for name in (temporary_name, destination_name):
+        try:
+            metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (metadata.st_dev, metadata.st_ino) == expected_identity:
+            matches.append(name)
+    if len(matches) != 1:
+        raise DatabaseError("backup snapshot artifact identity could not be located for cleanup")
+    _remove_tracked_snapshot_entry(
+        parent_descriptor,
+        matches[0],
+        expected_identity=expected_identity,
+    )
+
+
+def _remove_tracked_snapshot_entry(
+    parent_descriptor: int,
+    name: str,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    descriptor = -1
+    removal_name = f".signet-snapshot-remove-{secrets.token_urlsafe(24)}"
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != expected_identity or (
+            named.st_dev,
+            named.st_ino,
+        ) != expected_identity:
+            raise DatabaseError("backup snapshot artifact changed during cleanup")
+        rename_entry_no_replace(
+            parent_descriptor,
+            name,
+            parent_descriptor,
+            removal_name,
+        )
+        moved = os.stat(removal_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (moved.st_dev, moved.st_ino) != expected_identity:
+            with suppress(OSError, PrivatePathError):
+                rename_entry_no_replace(
+                    parent_descriptor,
+                    removal_name,
+                    parent_descriptor,
+                    name,
+                )
+            raise DatabaseError("backup snapshot artifact changed during quarantine")
+        os.unlink(removal_name, dir_fd=parent_descriptor)
+        if os.fstat(descriptor).st_nlink != 0:
+            raise DatabaseError("backup snapshot artifact deletion could not be confirmed")
+    except FileNotFoundError as exc:
+        raise DatabaseError("backup snapshot artifact cleanup state is uncertain") from exc
+    except (OSError, PrivatePathError) as exc:
+        raise DatabaseError("backup snapshot artifact could not be removed safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _optional_stable_copy_identity(
     metadata: os.stat_result | None,
 ) -> tuple[int, ...] | None:
@@ -1092,6 +1723,29 @@ def _stable_copy_identity(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_size,
         metadata.st_mtime_ns,
     )
+
+
+def _database_path_identity(path: Path) -> tuple[int, int]:
+    _require_private_file(path, label="migration source database")
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise MigrationIntegrityError("migration source database is unavailable") from exc
+    return metadata.st_dev, metadata.st_ino
+
+
+def _require_database_path_identity(
+    path: Path,
+    expected: tuple[int, int],
+    *,
+    message: str,
+) -> None:
+    try:
+        actual = _database_path_identity(path)
+    except DatabaseError as exc:
+        raise MigrationIntegrityError(message) from exc
+    if actual != expected:
+        raise MigrationIntegrityError(message)
 
 
 def _private_file_metadata(metadata: os.stat_result) -> bool:

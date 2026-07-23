@@ -120,6 +120,34 @@ def _manager(
     return BackupBundleManager(database, staging=staging, encryption_key=key)
 
 
+def test_backup_key_identity_inventory_detects_wrong_recovery_secret(tmp_path: Path) -> None:
+    database, staging, _ = _fixture(tmp_path)
+    capability_ref = "keychain://Signet/capability-backupfixture"
+    key_values = {
+        PAYLOAD_KEY_REF: "payload-key-material",
+        FAKE_ATTACHMENT_KEY_REF: "attachment-key-material",
+        capability_ref: "capability-key-material",
+    }
+    manager = BackupBundleManager(
+        database,
+        staging=staging,
+        encryption_key=b"k" * 32,
+        key_identity_resolver=key_values.__getitem__,
+    )
+    bundle = manager.create(
+        tmp_path / "identity.signet-backup",
+        created_at=100,
+        required_key_references=(capability_ref,),
+    )
+    restored = manager.restore(bundle, tmp_path / "identity-restore")
+
+    assert capability_ref in restored.manifest["key_references"]
+    manager.require_key_identities(restored.manifest)
+    key_values[capability_ref] = "wrong-key-material"
+    with pytest.raises(BackupError, match="recovery key has changed"):
+        manager.require_key_identities(restored.manifest)
+
+
 def test_backup_refuses_a_source_database_replacement_during_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -143,25 +171,183 @@ def test_backup_refuses_a_source_database_replacement_during_snapshot(
     assert not destination.exists()
 
 
-def test_key_reference_inventory_includes_encrypted_edit_drafts() -> None:
+def test_key_reference_inventory_includes_encrypted_drafts_and_connector_credentials() -> None:
     connection = sqlite3.connect(":memory:")
     try:
         connection.execute("CREATE TABLE payload_versions(encryption_key_ref TEXT)")
         connection.execute("CREATE TABLE staged_objects(attachment_id TEXT PRIMARY KEY)")
         connection.execute("CREATE TABLE web_action_drafts(edit_encryption_key_ref TEXT)")
+        connection.execute("CREATE TABLE connector_configurations(credential_ref TEXT)")
         connection.execute(
             "INSERT INTO payload_versions(encryption_key_ref) VALUES (?)",
             (PAYLOAD_KEY_REF,),
         )
         draft_ref = "keychain://Signet/edit-draft-backupfixture"
+        connector_ref = "keychain://Signet/connector-backupfixture"
         connection.execute(
             "INSERT INTO web_action_drafts(edit_encryption_key_ref) VALUES (?)",
             (draft_ref,),
         )
+        connection.execute(
+            "INSERT INTO connector_configurations(credential_ref) VALUES (?)",
+            (connector_ref,),
+        )
 
-        assert backup_module._key_references(connection) == [draft_ref, PAYLOAD_KEY_REF]
+        assert backup_module._key_references(connection) == [
+            connector_ref,
+            draft_ref,
+            PAYLOAD_KEY_REF,
+        ]
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("schema_version", range(1, 7))
+def test_restore_accepts_legacy_pre_catalog_schemas(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    legacy = tmp_path / f"legacy-schema-{schema_version}.sqlite3"
+    connection = sqlite3.connect(legacy)
+    try:
+        migrations = sorted((Path(backup_module.__file__).with_name("migrations")).glob("*.sql"))[
+            :schema_version
+        ]
+        for migration in migrations:
+            connection.executescript(migration.read_text(encoding="utf-8"))
+        connection.execute(f"PRAGMA user_version = {schema_version}")
+        connection.commit()
+    finally:
+        connection.close()
+    legacy.chmod(0o600)
+    current = Database(tmp_path / "current" / "approvals.sqlite3")
+    current.initialize()
+    staging = StagingStore(
+        tmp_path / "staging-empty",
+        database=current,
+        cipher=attachment_cipher(),
+        minimum_free_bytes=0,
+    )
+    manager = _manager(current, staging)
+    restored_root = tmp_path / f"restored-schema-{schema_version}"
+    restored_root.mkdir(mode=0o700)
+
+    manager._relocate_restored_attachments(
+        restored_root,
+        legacy,
+        {"attachments": [], "key_references": []},
+    )
+
+    with sqlite3.connect(legacy) as restored:
+        assert restored.execute("PRAGMA user_version").fetchone()[0] == schema_version
+
+
+def test_legacy_manifest_ignores_edit_keys_that_older_writers_did_not_inventory(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "legacy-edit-key.sqlite3"
+    connection = sqlite3.connect(snapshot)
+    try:
+        connection.execute("CREATE TABLE payload_versions(encryption_key_ref TEXT)")
+        connection.execute("CREATE TABLE staged_objects(attachment_id TEXT PRIMARY KEY)")
+        connection.execute("CREATE TABLE web_action_drafts(edit_encryption_key_ref TEXT)")
+        connection.execute(
+            "INSERT INTO web_action_drafts(edit_encryption_key_ref) VALUES (?)",
+            ("keychain://Signet/edit-draft-legacy",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    backup_module._verify_key_reference_manifest(
+        snapshot,
+        {"format": 2, "key_references": []},
+    )
+
+
+def test_current_manifest_requires_edit_key_inventory(tmp_path: Path) -> None:
+    snapshot = tmp_path / "current-edit-key.sqlite3"
+    connection = sqlite3.connect(snapshot)
+    try:
+        connection.execute("CREATE TABLE payload_versions(encryption_key_ref TEXT)")
+        connection.execute("CREATE TABLE staged_objects(attachment_id TEXT PRIMARY KEY)")
+        connection.execute("CREATE TABLE web_action_drafts(edit_encryption_key_ref TEXT)")
+        connection.execute(
+            "INSERT INTO web_action_drafts(edit_encryption_key_ref) VALUES (?)",
+            ("keychain://Signet/edit-draft-current",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(BackupError, match="key-reference inventory"):
+        backup_module._verify_key_reference_manifest(
+            snapshot,
+            {"format": 3, "key_references": []},
+        )
+
+
+def test_schema_18_key_inventory_accepts_enrollment_rows_without_cleanup_column(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "schema-18.sqlite3"
+    connection = sqlite3.connect(snapshot)
+    try:
+        connection.execute("CREATE TABLE browser_totp_enrollments (secret_reference TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO browser_totp_enrollments(secret_reference) VALUES (?)",
+            ("keychain://Signet/browser-totp-user",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    backup_module._verify_key_reference_manifest(
+        snapshot,
+        {
+            "format": 3,
+            "key_references": ["keychain://Signet/browser-totp-user"],
+        },
+    )
+
+
+def test_previous_format_two_inventory_includes_drafts_but_excludes_auth_references(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "previous-format-two.sqlite3"
+    connection = sqlite3.connect(snapshot)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE web_action_drafts (
+                edit_encryption_key_ref TEXT NOT NULL
+            );
+            CREATE TABLE browser_totp_enrollments (
+                secret_reference TEXT NOT NULL,
+                cleanup_completed_at INTEGER
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO web_action_drafts(edit_encryption_key_ref) VALUES (?)",
+            ("keychain://Signet/edit-draft",),
+        )
+        connection.execute(
+            "INSERT INTO browser_totp_enrollments(secret_reference, cleanup_completed_at) "
+            "VALUES (?, NULL)",
+            ("keychain://Signet/browser-totp-user",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    backup_module._verify_key_reference_manifest(
+        snapshot,
+        {
+            "format": 2,
+            "key_references": ["keychain://Signet/edit-draft"],
+        },
+    )
 
 
 def _restored_store(restored: RestoredBundle) -> StagingStore:
@@ -295,7 +481,7 @@ def test_encrypted_bundle_restores_catalogued_envelopes_and_key_manifest(
     assert b"keychain://" not in encrypted
 
     restored = manager.restore(bundle, tmp_path / "restored")
-    assert restored.manifest["format"] == 2
+    assert restored.manifest["format"] == 3
     assert restored.manifest["created_at"] == 123
     assert restored.manifest["key_references"] == sorted([FAKE_ATTACHMENT_KEY_REF, PAYLOAD_KEY_REF])
     restored_envelope = restored.attachments_root / staged.opaque_id
@@ -434,7 +620,7 @@ def test_concurrent_backup_publication_has_exactly_one_non_overwriting_winner(
     winning_manager = managers[winners[0][0]]
     losing_manager = managers[losers[0][0]]
     restored = winning_manager.restore(destination, tmp_path / "winner-restored")
-    assert restored.manifest["format"] == 2
+    assert restored.manifest["format"] == 3
     with pytest.raises(BackupError, match="authentication"):
         losing_manager.restore(destination, tmp_path / "loser-restored")
     assert tuple(tmp_path.glob(".concurrent.signet.partial-*")) == ()

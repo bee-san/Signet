@@ -409,12 +409,23 @@ def build_live_provider_bundle(
     policy: PolicySnapshot,
     secret_store: SecretStore,
     credential_identity_key: bytes,
+    attachment_staging_override: Path | None = None,
+    attachment_source_roots_override: tuple[Path, ...] | None = None,
 ) -> ProductionProviderBundle:
     """Assemble the explicitly enabled provider paths without starting sessions."""
 
     if config.provider_rollout.state != "enabled":
         raise ProductionConnectorError("live provider rollout is disabled")
-    staging_root = config.storage.attachment_staging_dir
+    staging_root = (
+        attachment_staging_override
+        if attachment_staging_override is not None
+        else config.storage.attachment_staging_dir
+    )
+    attachment_source_roots = (
+        attachment_source_roots_override
+        if attachment_source_roots_override is not None
+        else config.storage.attachment_source_roots
+    )
     attachment_reference = config.secrets.attachment_key_ref
     if staging_root is None or attachment_reference is None:
         raise ProductionConnectorError("live provider attachment staging is unavailable")
@@ -426,7 +437,7 @@ def build_live_provider_bundle(
             staging_root,
             database=database,
             cipher=cipher,
-            allowed_source_roots=config.storage.attachment_source_roots,
+            allowed_source_roots=attachment_source_roots,
         )
     except Exception:
         raise ProductionConnectorError(

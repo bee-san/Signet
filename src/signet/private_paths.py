@@ -459,6 +459,76 @@ def _remove_created_directory(
         pass
 
 
+def rename_entry_no_replace(
+    source_directory_descriptor: int,
+    source_name: str,
+    destination_directory_descriptor: int,
+    destination_name: str,
+) -> None:
+    """Atomically rename one descriptor-relative entry without replacing another."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(source_name)
+    destination = os.fsencode(destination_name)
+    rename = getattr(libc, "renameat2", None)
+    flag = 1  # RENAME_NOREPLACE
+    if rename is None:
+        rename = getattr(libc, "renameatx_np", None)
+        flag = 0x00000004  # RENAME_EXCL
+    if rename is None:
+        raise PrivatePathError("atomic no-replace rename is unavailable")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if (
+        rename(
+            source_directory_descriptor,
+            source,
+            destination_directory_descriptor,
+            destination,
+            flag,
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno()
+        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(error_number, os.strerror(error_number), destination_name)
+        raise OSError(error_number, os.strerror(error_number), source_name)
+
+
+def exchange_entries(
+    first_directory_descriptor: int,
+    first_name: str,
+    second_directory_descriptor: int,
+    second_name: str,
+) -> None:
+    """Atomically exchange two descriptor-relative entries."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    first = os.fsencode(first_name)
+    second = os.fsencode(second_name)
+    rename = getattr(libc, "renameat2", None)
+    flag = 2  # RENAME_EXCHANGE
+    if rename is None:
+        rename = getattr(libc, "renameatx_np", None)
+        flag = 0x00000002  # RENAME_SWAP
+    if rename is None:
+        raise PrivatePathError("atomic entry exchange is unavailable")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if (
+        rename(
+            first_directory_descriptor,
+            first,
+            second_directory_descriptor,
+            second,
+            flag,
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), first_name)
+
+
 def _normal_directory_open_flags() -> int:
     return (
         os.O_RDONLY

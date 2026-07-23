@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 import zipfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -139,14 +139,13 @@ class BackupBundleManager:
         encryption_key: bytes,
         max_bundle_bytes: int = 512 * 1024 * 1024,
         backup_pins: BackupPins | None = None,
+        key_identity_resolver: Callable[[str], str] | None = None,
     ) -> None:
         if len(encryption_key) != 32:
             raise ValueError("backup encryption key must be exactly 32 bytes")
         if max_bundle_bytes <= 0:
             raise ValueError("maximum bundle size must be positive")
-        if not isinstance(staging, StagingStore) or staging.database.path.resolve() != (
-            database.path.resolve()
-        ):
+        if staging.database.path.resolve() != database.path.resolve():
             raise ValueError("backup staging store must use the backup database")
         self.database = database
         self.staging = staging
@@ -163,11 +162,70 @@ class BackupBundleManager:
         self._encryption_key = bytes(encryption_key)
         self.max_bundle_bytes = max_bundle_bytes
         self._backup_pins = backup_pins or BackupPins(database)
+        self._key_identity_resolver = key_identity_resolver
 
     def __repr__(self) -> str:
         return f"BackupBundleManager(database={self.database.path!s}, encryption_key=<redacted>)"
 
-    def create(self, destination: Path, *, created_at: int | None = None) -> Path:
+    def require_live_key_references(
+        self,
+        required_key_references: Iterable[str] = (),
+    ) -> tuple[str, ...]:
+        with self.database.read_only() as connection:
+            references = tuple(sorted({*_key_references(connection), *required_key_references}))
+        if self._key_identity_resolver is None:
+            raise BackupError("backup key identity inventory is unavailable or invalid")
+        try:
+            for reference in references:
+                self._key_identity(reference, self._key_identity_resolver(reference))
+        except Exception as exc:
+            raise BackupError("backup key identity could not be verified") from exc
+        return references
+
+    def require_key_identities(self, manifest: Mapping[str, Any]) -> None:
+        references = manifest.get("key_references")
+        identities = manifest.get("key_identities")
+        if (
+            self._key_identity_resolver is None
+            or not isinstance(references, list)
+            or not all(isinstance(reference, str) for reference in references)
+            or not isinstance(identities, dict)
+            or set(identities) != set(references)
+            or not all(isinstance(value, str) for value in identities.values())
+        ):
+            raise BackupError("backup key identity inventory is unavailable or invalid")
+        try:
+            expected = {
+                reference: self._key_identity(
+                    reference,
+                    self._key_identity_resolver(reference),
+                )
+                for reference in references
+            }
+        except Exception as exc:
+            raise BackupError("backup key identity could not be verified") from exc
+        if any(
+            not hmac.compare_digest(expected[reference], identities[reference])
+            for reference in references
+        ):
+            raise BackupError("a backup recovery key has changed since backup creation")
+
+    def _key_identity(self, reference: str, secret: str) -> str:
+        message = (
+            b"signet-backup-key-identity-v1\0"
+            + reference.encode("utf-8")
+            + b"\0"
+            + secret.encode("utf-8")
+        )
+        return hmac.new(self._encryption_key, message, hashlib.sha256).hexdigest()
+
+    def create(
+        self,
+        destination: Path,
+        *,
+        created_at: int | None = None,
+        required_key_references: tuple[str, ...] = (),
+    ) -> Path:
         requested = _absolute_backup_path(
             destination,
             message="backup destination path is unavailable or unsafe",
@@ -210,15 +268,31 @@ class BackupBundleManager:
                 attachment_manifest = self._copy_attachments(snapshot, attachments_dir)
                 with _snapshot_connection(snapshot) as connection:
                     schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-                    key_references = _key_references(connection)
+                    key_references = sorted(
+                        set(_key_references(connection)) | set(required_key_references)
+                    )
+                key_identities: dict[str, str] | None = None
+                if self._key_identity_resolver is not None:
+                    try:
+                        key_identities = {
+                            reference: self._key_identity(
+                                reference,
+                                self._key_identity_resolver(reference),
+                            )
+                            for reference in key_references
+                        }
+                    except Exception as exc:
+                        raise BackupError("backup key identity could not be captured") from exc
                 manifest = {
-                    "format": 2,
+                    "format": 3,
                     "schema_version": schema_version,
                     "created_at": created_at if created_at is not None else int(time.time()),
                     "database_sha256": _file_hash(snapshot),
                     "attachments": attachment_manifest,
                     "key_references": key_references,
                 }
+                if key_identities is not None:
+                    manifest["key_identities"] = key_identities
                 manifest_path = workspace / "manifest.json"
                 _write_new_file(
                     manifest_path,
@@ -461,7 +535,7 @@ class BackupBundleManager:
             _fsync_directory(destination_root)
             manifest_path = destination_root / "manifest.json"
             manifest = _read_json_file(manifest_path)
-            if not isinstance(manifest, dict) or manifest.get("format") != 2:
+            if not isinstance(manifest, dict) or manifest.get("format") not in {2, 3}:
                 raise BackupError("backup manifest format is unsupported")
             database_path = destination_root / "approvals.sqlite3"
             if _file_hash(database_path) != manifest.get("database_sha256"):
@@ -509,9 +583,14 @@ class BackupBundleManager:
             raise
 
     def create_pre_migration_callback(
-        self, backup_directory: Path
+        self,
+        backup_directory: Path,
+        *,
+        required_key_references: Iterable[str] = (),
+        verify_restored: Callable[[Path], None] | None = None,
     ) -> Callable[[Database, int], MigrationBackupReceipt]:
         backup_directory = Path(backup_directory)
+        required_references = tuple(required_key_references)
 
         def backup(database: Database, current_version: int) -> MigrationBackupReceipt:
             if database.path.resolve() != self.database.path.resolve():
@@ -520,7 +599,11 @@ class BackupBundleManager:
             destination = backup_directory / (
                 f"pre-migration-v{current_version}-{timestamp}.signet-backup"
             )
-            self.create(destination, created_at=timestamp)
+            self.create(
+                destination,
+                created_at=timestamp,
+                required_key_references=required_references,
+            )
             staged = backup_directory / f".verify-{timestamp}"
             restored: RestoredBundle | None = None
             verification_error: BaseException | None = None
@@ -528,6 +611,10 @@ class BackupBundleManager:
                 restored = self.restore(destination, staged)
                 if restored.manifest.get("schema_version") != current_version:
                     raise BackupError("pre-migration backup schema version is inconsistent")
+                if required_references:
+                    self.require_key_identities(restored.manifest)
+                if verify_restored is not None:
+                    verify_restored(restored.database_path)
             except BaseException as exc:
                 verification_error = exc
             if restored is not None:
@@ -564,12 +651,15 @@ class BackupBundleManager:
                     "complete; do not migrate or recreate the backup; inspect the published "
                     "bundle before continuing"
                 ) from verification_error
+            source_device, source_inode = database.migration_source_identity()
             return MigrationBackupReceipt(
                 database_path=database.path,
                 source_schema_version=current_version,
                 artifact_path=destination.absolute(),
                 artifact_sha256=_file_hash(destination),
                 verified_restore_schema_version=current_version,
+                source_database_device=source_device,
+                source_database_inode=source_inode,
             )
 
         return backup
@@ -713,8 +803,11 @@ class BackupBundleManager:
             connection.execute("PRAGMA synchronous=FULL")
             rows = _active_staged_rows(connection)
             _require_consistent_attachment_references(connection)
-            key_refs = _key_references(connection)
-            if key_refs != manifest.get("key_references"):
+            key_ref_inventories = _key_reference_inventories(connection, manifest)
+            manifest_references = tuple(manifest.get("key_references", ()))
+            if not any(
+                set(inventory).issubset(manifest_references) for inventory in key_ref_inventories
+            ):
                 raise BackupError("backup key-reference manifest is inconsistent")
             if len(rows) != len(expected):
                 raise BackupError("backup attachment manifest is incomplete")
@@ -749,16 +842,24 @@ class BackupBundleManager:
                 relocations.append((record, path))
 
             connection.execute("BEGIN IMMEDIATE")
-            active_count = int(
-                connection.execute(
-                    """
-                    SELECT count(*) FROM staged_objects
-                    WHERE storage_path IS NOT NULL AND purged_at IS NULL
-                    """
-                ).fetchone()[0]
+            has_staged_catalog = _table_has_column(connection, "staged_objects", "attachment_id")
+            active_count = (
+                int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM staged_objects
+                        WHERE storage_path IS NOT NULL AND purged_at IS NULL
+                        """
+                    ).fetchone()[0]
+                )
+                if has_staged_catalog
+                else 0
             )
-            current_key_refs = _key_references(connection)
-            if active_count != len(relocations) or current_key_refs != key_refs:
+            current_key_ref_inventories = _key_reference_inventories(connection, manifest)
+            if (
+                active_count != len(relocations)
+                or current_key_ref_inventories != key_ref_inventories
+            ):
                 raise BackupError("restored database changed during attachment validation")
             for record, restored_path in relocations:
                 updated = connection.execute(
@@ -817,16 +918,14 @@ class BackupBundleManager:
         manifest: dict[str, Any],
     ) -> None:
         expected = _attachment_manifest(manifest)
+        _verify_key_reference_manifest(database_path, manifest)
         connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         try:
             rows = _active_staged_rows(connection)
             _require_consistent_attachment_references(connection)
-            key_refs = _key_references(connection)
         finally:
             connection.close()
-        if key_refs != manifest.get("key_references"):
-            raise BackupError("backup key-reference manifest is inconsistent")
         if len(rows) != len(expected):
             raise BackupError("backup attachment manifest is incomplete")
         for row in rows:
@@ -1730,7 +1829,14 @@ def _record_matches_manifest(record: StagedFile, item: dict[str, Any]) -> bool:
 
 
 def _table_has_column(connection: Any, table: str, column: str) -> bool:
-    if table not in {"payload_versions", "staged_objects", "web_action_drafts"}:
+    if table not in {
+        "auth_credentials",
+        "browser_totp_enrollments",
+        "connector_configurations",
+        "payload_versions",
+        "staged_objects",
+        "web_action_drafts",
+    }:
         raise ValueError("unsupported backup catalog table")
     return any(str(row[1]) == column for row in connection.execute(f"PRAGMA table_info({table})"))
 
@@ -1758,9 +1864,14 @@ def _active_staged_rows(connection: Any) -> list[Any]:
     )
 
 
-def _key_references(connection: Any) -> list[str]:
+def _key_references(
+    connection: Any,
+    *,
+    include_edit_drafts: bool = True,
+    include_auth_references: bool = True,
+) -> list[str]:
     references: set[str] = set()
-    queries = (
+    queries = [
         (
             "payload_versions",
             "encryption_key_ref",
@@ -1772,17 +1883,85 @@ def _key_references(connection: Any) -> list[str]:
             "SELECT encryption_key_ref FROM staged_objects WHERE encryption_key_ref IS NOT NULL",
         ),
         (
-            "web_action_drafts",
-            "edit_encryption_key_ref",
-            "SELECT edit_encryption_key_ref FROM web_action_drafts "
-            "WHERE edit_encryption_key_ref IS NOT NULL",
+            "connector_configurations",
+            "credential_ref",
+            "SELECT credential_ref FROM connector_configurations WHERE credential_ref IS NOT NULL",
         ),
-    )
+    ]
+    if include_edit_drafts:
+        queries.append(
+            (
+                "web_action_drafts",
+                "edit_encryption_key_ref",
+                "SELECT edit_encryption_key_ref FROM web_action_drafts "
+                "WHERE edit_encryption_key_ref IS NOT NULL",
+            )
+        )
+    if include_auth_references:
+        auth_credentials_query = (
+            "SELECT secret_reference FROM auth_credentials WHERE secret_reference IS NOT NULL"
+        )
+        if _table_has_column(connection, "auth_credentials", "disabled_at"):
+            auth_credentials_query += " AND disabled_at IS NULL"
+        enrollment_query = (
+            "SELECT secret_reference FROM browser_totp_enrollments "
+            "WHERE secret_reference IS NOT NULL"
+        )
+        if _table_has_column(
+            connection,
+            "browser_totp_enrollments",
+            "cleanup_completed_at",
+        ):
+            enrollment_query += " AND cleanup_completed_at IS NULL"
+        queries.extend(
+            (
+                ("auth_credentials", "secret_reference", auth_credentials_query),
+                ("browser_totp_enrollments", "secret_reference", enrollment_query),
+            )
+        )
     for table, column, query in queries:
         if not _table_has_column(connection, table, column):
             continue
         references.update(str(row[0]) for row in connection.execute(query))
     return sorted(references)
+
+
+def _key_reference_inventories(
+    connection: Any,
+    manifest: Mapping[str, Any],
+) -> tuple[tuple[str, ...], ...]:
+    current = tuple(_key_references(connection))
+    if manifest.get("format") != 2:
+        return (current,)
+    legacy = tuple(
+        _key_references(
+            connection,
+            include_edit_drafts=False,
+            include_auth_references=False,
+        )
+    )
+    previous = tuple(
+        _key_references(
+            connection,
+            include_edit_drafts=True,
+            include_auth_references=False,
+        )
+    )
+    return tuple(dict.fromkeys((legacy, previous, current)))
+
+
+def _verify_key_reference_manifest(
+    database_path: Path,
+    manifest: Mapping[str, Any],
+) -> None:
+    connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+    try:
+        inventories = _key_reference_inventories(connection, manifest)
+    finally:
+        connection.close()
+    manifest_references = tuple(manifest.get("key_references", ()))
+    if not any(set(inventory).issubset(manifest_references) for inventory in inventories):
+        raise BackupError("backup key-reference inventory is inconsistent")
 
 
 def _require_consistent_attachment_references(connection: Any) -> None:
