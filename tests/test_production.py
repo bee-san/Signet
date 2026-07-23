@@ -63,7 +63,7 @@ from signet.production_connectors import (
 )
 from signet.production_state import ProductionStateError, production_config_digest
 from signet.setup_platform import ProductionSetupPlatform
-from signet.setup_state import SetupEngine, SetupJournalStore, SetupSpec
+from signet.setup_state import SetupEngine, SetupError, SetupJournalStore, SetupSpec
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
@@ -2198,10 +2198,10 @@ def test_environment_asgi_factories_use_only_the_private_config_path(
     assert web_app is not None
 
 
-def test_environment_asgi_factory_opens_the_owned_setup_database(
+def _prepare_owned_environment_factory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+) -> tuple[Path, ProductionConfig, MemorySecretStore, str]:
     root = tmp_path / "owned-production"
     selected = SetupSpec(
         root=root,
@@ -2238,6 +2238,33 @@ def test_environment_asgi_factory_opens_the_owned_setup_database(
             for reference in references
         }
     )
+    monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", str(config_path))
+    return config_path, config, secret_store, journal.setup_id
+
+
+@pytest.mark.parametrize(
+    ("factory_name", "downstream_name"),
+    (
+        (
+            "create_production_mcp_app_from_environment",
+            "create_production_mcp_runtime",
+        ),
+        (
+            "create_production_web_app_from_environment",
+            "create_production_web_app",
+        ),
+    ),
+)
+def test_environment_asgi_factories_pass_the_owned_database_and_lock_identities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_name: str,
+    downstream_name: str,
+) -> None:
+    config_path, config, secret_store, setup_id = _prepare_owned_environment_factory(
+        tmp_path,
+        monkeypatch,
+    )
     receipt = json.loads(
         (config.storage.data_dir / ".signet-database-ownership.json").read_text(encoding="utf-8")
     )
@@ -2245,12 +2272,19 @@ def test_environment_asgi_factory_opens_the_owned_setup_database(
     maintenance_lock_stat = config.storage.database_path.with_name(
         f".{config.storage.database_path.name}.maintenance.lock"
     ).stat()
-    monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", str(config_path))
+    original_downstream = getattr(production_module, downstream_name)
+    overrides: list[Database | None] = []
 
-    app = create_production_web_app_from_environment(secret_store=secret_store)
+    def record_database_override(*args: Any, **kwargs: Any) -> Any:
+        overrides.append(kwargs.get("database_override"))
+        return original_downstream(*args, **kwargs)
+
+    monkeypatch.setattr(production_module, downstream_name, record_database_override)
+
+    app = getattr(production_module, factory_name)(secret_store=secret_store)
 
     assert app is not None
-    assert receipt["setup_id"] == journal.setup_id
+    assert receipt["setup_id"] == setup_id
     assert receipt["runtime_files"]["signet.db"] == {
         "device": database_stat.st_dev,
         "inode": database_stat.st_ino,
@@ -2259,6 +2293,77 @@ def test_environment_asgi_factory_opens_the_owned_setup_database(
         "device": maintenance_lock_stat.st_dev,
         "inode": maintenance_lock_stat.st_ino,
     }
+    assert len(overrides) == 1
+    owned_database = overrides[0]
+    assert isinstance(owned_database, Database)
+    assert owned_database.path == config.storage.database_path
+    assert owned_database.expected_identity == (database_stat.st_dev, database_stat.st_ino)
+    assert owned_database.expected_lock_identity == (
+        maintenance_lock_stat.st_dev,
+        maintenance_lock_stat.st_ino,
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory_name", "downstream_name"),
+    (
+        (
+            "create_production_mcp_app_from_environment",
+            "create_production_mcp_runtime",
+        ),
+        (
+            "create_production_web_app_from_environment",
+            "create_production_web_app",
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    ("drift", "message"),
+    (
+        ("journal", "database ownership receipt is invalid"),
+        ("database", "database changed after setup ownership was recorded"),
+        ("maintenance_lock", "database runtime artifact changed after ownership was recorded"),
+    ),
+)
+def test_environment_asgi_factories_reject_stale_owned_runtime_before_assembly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_name: str,
+    downstream_name: str,
+    drift: str,
+    message: str,
+) -> None:
+    config_path, config, secret_store, _setup_id = _prepare_owned_environment_factory(
+        tmp_path,
+        monkeypatch,
+    )
+    if drift == "journal":
+        store = SetupJournalStore(config_path.parent)
+        journal = store.load()
+        journal.setup_id = "setup_replaced_journal"
+        store.save(journal)
+    elif drift == "database":
+        database_path = config.storage.database_path
+        displaced = config_path.parent / "signet.db.displaced"
+        database_path.replace(displaced)
+        database_path.write_bytes(displaced.read_bytes())
+        database_path.chmod(0o600)
+    else:
+        lock_path = config.storage.database_path.with_name(
+            f".{config.storage.database_path.name}.maintenance.lock"
+        )
+        displaced = config_path.parent / f"{lock_path.name}.displaced"
+        lock_path.replace(displaced)
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o600)
+
+    def unexpected_assembly(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("factory reached assembly after owned runtime drift")
+
+    monkeypatch.setattr(production_module, downstream_name, unexpected_assembly)
+
+    with pytest.raises(SetupError, match=message):
+        getattr(production_module, factory_name)(secret_store=secret_store)
 
 
 @pytest.mark.parametrize(
