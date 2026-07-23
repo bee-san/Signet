@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
 import stat
+import subprocess
 import tarfile
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
 import signet.provider_setup as provider_setup_module
+from signet.canonical import canonical_json, sha256_hex
 from signet.config import DownstreamConfig, ProductionConfig
 from signet.credential_broker import MemorySecretStore
 from signet.db import Database
@@ -496,3 +501,550 @@ def test_failed_live_rollout_restores_disabled_config(
     assert persisted == config
     assert attempts == 2
     assert platform.events == ["stop", "stop", "start", "verify"]
+
+
+def test_guided_fastmail_setup_persists_the_reviewed_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "fastmail"
+    current = _config(root)
+    root.mkdir(mode=0o700)
+    current.policy_path.write_bytes(dump_policy(_base_policy()))
+    current.policy_path.chmod(0o600)
+    operations = ProviderSetupOperations(root)
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(operations.setup, "lifecycle_lock", lambda: nullcontext())
+    monkeypatch.setattr(
+        operations.setup.store,
+        "load",
+        lambda: SimpleNamespace(setup_id="setup_0123456789abcdef"),
+    )
+    monkeypatch.setattr(operations, "_require_installed_config", lambda: current)
+    monkeypatch.setattr(
+        operations,
+        "_store_fastmail_token",
+        lambda reference, token: captured.update(reference=reference, token=token),
+    )
+    monkeypatch.setattr(operations, "_capability_key", lambda _config: b"k" * 32)
+    monkeypatch.setattr(
+        provider_setup_module,
+        "_fetch_fastmail_certificate",
+        lambda _url: (b"reviewed certificate", "c" * 64),
+    )
+
+    async def probe(
+        connector: DownstreamConfig,
+        **kwargs: Any,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        captured.update(probe_connector=connector, probe_arguments=kwargs)
+        return FASTMAIL_TOOLS, {"protocolVersion": "2025-06-18"}
+
+    monkeypatch.setattr(provider_setup_module, "_probe_fastmail", probe)
+
+    def install_provider(**kwargs: Any) -> ProductionConfig:
+        captured.update(install=kwargs)
+        configured = kwargs["configured"]
+        return configured.model_copy(
+            update={
+                "provider_rollout": configured.provider_rollout.model_copy(
+                    update={"state": "enabled"}
+                )
+            }
+        )
+
+    monkeypatch.setattr(operations, "_install_provider", install_provider)
+
+    result = operations.setup_fastmail(
+        token="fastmail-token",
+        sender="sender@example.test",
+        recipient="recipient@example.test",
+    )
+
+    assert result == {
+        "provider": "fastmail",
+        "configured": True,
+        "test_send": "succeeded",
+        "enabled": True,
+    }
+    assert captured["reference"].endswith("/setup_0123456789abcdef-fastmail")
+    assert captured["token"] == "fastmail-token"
+    assert captured["install"]["alias"] == "fastmail"
+    assert captured["install"]["tools"] == FASTMAIL_TOOLS
+    connector = captured["install"]["configured"].connectors["fastmail"]
+    assert connector.server_identity_digest == sha256_hex(
+        canonical_json({"protocolVersion": "2025-06-18"})
+    )
+    assert connector.tls_server_certificate.read_bytes() == b"reviewed certificate"
+
+
+@pytest.mark.parametrize(
+    ("token", "sender", "recipient", "message"),
+    (
+        ("", "sender@example.test", "recipient@example.test", "token"),
+        ("token\n", "sender@example.test", "recipient@example.test", "token"),
+        ("token", "", "recipient@example.test", "sender"),
+        ("token", "sender@example.test", "", "recipient"),
+    ),
+)
+def test_guided_fastmail_setup_rejects_incomplete_inputs(
+    tmp_path: Path,
+    token: str,
+    sender: str,
+    recipient: str,
+    message: str,
+) -> None:
+    with pytest.raises(SetupError, match=message):
+        ProviderSetupOperations(tmp_path).setup_fastmail(
+            token=token,
+            sender=sender,
+            recipient=recipient,
+        )
+
+
+def test_guided_whatsapp_setup_installs_pairs_and_tests_wacli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "whatsapp"
+    current = _config(root)
+    root.mkdir(mode=0o700)
+    current.policy_path.write_bytes(dump_policy(_base_policy()))
+    current.policy_path.chmod(0o600)
+    operations = ProviderSetupOperations(root)
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(provider_setup_module.sys, "platform", "linux")
+    monkeypatch.setattr(provider_setup_module.host_platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(operations.setup, "lifecycle_lock", lambda: nullcontext())
+    monkeypatch.setattr(operations, "_require_installed_config", lambda: current)
+
+    def install_wacli(path: Path) -> None:
+        provider_setup_module._write_private_resource(path, b"\x7fELFreviewed-wacli")
+        path.chmod(0o500)
+
+    monkeypatch.setattr(operations, "_install_wacli", install_wacli)
+    monkeypatch.setattr(
+        operations,
+        "_pair_wacli",
+        lambda executable, **kwargs: captured.update(pair=(executable, kwargs)),
+    )
+    monkeypatch.setattr(
+        operations,
+        "_wacli_linked_jid",
+        lambda executable, **kwargs: "447700900123@s.whatsapp.net",
+    )
+
+    class Wrapper:
+        def __init__(self, config: Any) -> None:
+            captured["wrapper_config"] = config
+
+        async def send_text(self, arguments: dict[str, str]) -> dict[str, Any]:
+            captured["send"] = arguments
+            return {"sent": True, "message_id": "setup-test"}
+
+    monkeypatch.setattr(provider_setup_module, "WacliWrapper", Wrapper)
+
+    def install_provider(**kwargs: Any) -> ProductionConfig:
+        captured.update(install=kwargs)
+        configured = kwargs["configured"]
+        return configured.model_copy(
+            update={
+                "provider_rollout": configured.provider_rollout.model_copy(
+                    update={"state": "enabled"}
+                )
+            }
+        )
+
+    monkeypatch.setattr(operations, "_install_provider", install_provider)
+
+    result = operations.setup_whatsapp(
+        recipient="+447700900123",
+        install_wacli=True,
+    )
+
+    assert result == {
+        "provider": "whatsapp",
+        "configured": True,
+        "test_send": "succeeded",
+        "enabled": True,
+    }
+    executable = operations._managed_wacli_path()
+    assert executable.read_bytes() == b"\x7fELFreviewed-wacli"
+    assert captured["send"] == {
+        "to": "+447700900123",
+        "message": "Signet setup test",
+    }
+    assert captured["wrapper_config"].expected_linked_jid == "447700900123@s.whatsapp.net"
+    configured = captured["install"]["configured"]
+    assert configured.connectors["whatsapp"].command == (str(executable),)
+    assert configured.provider_rollout.wacli is not None
+    assert configured.provider_rollout.wacli.account == "signet"
+    account_config = root / "wacli-runtime" / "home" / ".local" / "state" / "wacli" / "config.yaml"
+    assert yaml.safe_load(account_config.read_text(encoding="utf-8"))["default_account"] == "signet"
+
+
+def test_provider_controls_validate_setup_and_switch_the_shared_rollout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "controls"
+    connector = _fastmail_connector(root)
+    config = _config(root, connectors={"fastmail": connector})
+    _write_config(root, config)
+    platform = RecordingPlatform()
+    operations = ProviderSetupOperations(root, platform=platform)
+    monkeypatch.setattr(operations.setup, "spec", lambda: SimpleNamespace(root=root))
+    monkeypatch.setattr(operations.setup, "lifecycle_lock", lambda: nullcontext())
+    monkeypatch.setattr(
+        provider_setup_module,
+        "create_production_assembly",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    enabled = operations._switch_rollout(config, enabled=True)
+    assert enabled.provider_rollout.state == "enabled"
+    assert enabled.capabilities.live_providers_ready
+    assert platform.events == ["stop", "start", "verify"]
+
+    switched: list[bool] = []
+    monkeypatch.setattr(operations, "_require_installed_config", lambda: config)
+    monkeypatch.setattr(
+        operations,
+        "_switch_rollout",
+        lambda selected, *, enabled: (
+            switched.append(enabled)
+            or selected.model_copy(
+                update={
+                    "provider_rollout": selected.provider_rollout.model_copy(
+                        update={"state": "enabled" if enabled else "disabled"}
+                    )
+                }
+            )
+        ),
+    )
+    assert operations.enable("fastmail") == {
+        "provider": "fastmail",
+        "rollout": "enabled",
+        "affected": ["fastmail"],
+    }
+    assert operations.disable("fastmail") == {
+        "provider": "fastmail",
+        "rollout": "disabled",
+        "affected": ["fastmail"],
+    }
+    assert switched == [True, False]
+
+    with pytest.raises(SetupError, match="not configured"):
+        operations._require_provider(config, "whatsapp")
+    monkeypatch.setattr(provider_setup_module, "_whatsapp_supported", lambda: False)
+    whatsapp = config.model_copy(
+        update={"connectors": {**config.connectors, "whatsapp": connector}}
+    )
+    with pytest.raises(SetupError, match="unsupported"):
+        operations._require_provider(whatsapp, "whatsapp")
+
+    empty = _config(tmp_path / "empty")
+    with pytest.raises(SetupError, match="no provider"):
+        ProviderSetupOperations(tmp_path / "empty")._switch_rollout(empty, enabled=True)
+
+
+def test_installed_config_and_disabled_rollout_preconditions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    operations = ProviderSetupOperations(tmp_path)
+    monkeypatch.setattr(
+        operations.setup.store,
+        "load",
+        lambda: SimpleNamespace(status="failed"),
+    )
+    with pytest.raises(SetupError, match="complete signet setup"):
+        operations._require_installed_config()
+
+    monkeypatch.setattr(
+        operations.setup.store,
+        "load",
+        lambda: SimpleNamespace(status="completed"),
+    )
+    monkeypatch.setattr(
+        provider_setup_module,
+        "load_production_config",
+        lambda _path: config,
+    )
+    assert operations._require_installed_config() is config
+    assert operations._disable_for_setup(config) is config
+
+    enabled = config.model_copy(
+        update={"provider_rollout": config.provider_rollout.model_copy(update={"state": "enabled"})}
+    )
+    monkeypatch.setattr(
+        operations,
+        "_switch_rollout",
+        lambda selected, *, enabled: config,
+    )
+    assert operations._disable_for_setup(enabled) is config
+
+
+def test_fastmail_probe_validates_tools_sends_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = _fastmail_connector(tmp_path)
+    selected: list[Any] = []
+
+    class Client:
+        def __init__(
+            self,
+            tools: list[dict[str, Any]],
+            *,
+            result: dict[str, Any] | None = None,
+            initialization: dict[str, Any] | None = None,
+        ) -> None:
+            self.tools = tools
+            self.result = result or {"content": [{"type": "text", "text": "sent"}]}
+            self.initialization_identity = initialization
+            self.closed = False
+            self.call: tuple[str, dict[str, Any]] | None = None
+
+        async def start(self) -> None:
+            return None
+
+        async def discover_all_tools(self) -> list[dict[str, Any]]:
+            return self.tools
+
+        async def call_tool_raw(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.call = (name, arguments)
+            return self.result
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        provider_setup_module,
+        "pinned_tls_http_connector",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        provider_setup_module,
+        "DownstreamClient",
+        lambda *_args, **_kwargs: selected[-1],
+    )
+
+    client = Client(
+        FASTMAIL_TOOLS,
+        initialization={"protocolVersion": "2025-06-18"},
+    )
+    selected.append(client)
+    tools, initialization = asyncio.run(
+        provider_setup_module._probe_fastmail(
+            connector,
+            certificate_pem=b"certificate",
+            certificate_digest="c" * 64,
+            sender="sender@example.test",
+            recipient="recipient@example.test",
+        )
+    )
+    assert tools == FASTMAIL_TOOLS
+    assert initialization == {"protocolVersion": "2025-06-18"}
+    assert client.call == (
+        "send_email",
+        {
+            "from": "sender@example.test",
+            "to": ["recipient@example.test"],
+            "subject": "Signet setup test",
+            "body": "Signet successfully connected to Fastmail.",
+        },
+    )
+    assert client.closed
+
+    invalid_cases = (
+        (
+            Client([FASTMAIL_TOOLS[0]], initialization={"protocolVersion": "test"}),
+            "required tools",
+        ),
+        (
+            Client(
+                [
+                    {
+                        **FASTMAIL_TOOLS[0],
+                        "inputSchema": {"type": "object", "properties": {}},
+                    },
+                    FASTMAIL_TOOLS[1],
+                ],
+                initialization={"protocolVersion": "test"},
+            ),
+            "unsupported",
+        ),
+        (
+            Client(
+                FASTMAIL_TOOLS,
+                result={"isError": True},
+                initialization={"protocolVersion": "test"},
+            ),
+            "test email failed",
+        ),
+        (Client(FASTMAIL_TOOLS), "identity is unavailable"),
+    )
+    for invalid, message in invalid_cases:
+        selected.append(invalid)
+        with pytest.raises(SetupError, match=message):
+            asyncio.run(
+                provider_setup_module._probe_fastmail(
+                    connector,
+                    certificate_pem=b"certificate",
+                    certificate_digest="c" * 64,
+                    sender="sender@example.test",
+                    recipient="recipient@example.test",
+                )
+            )
+        assert invalid.closed
+
+
+def test_keychain_and_wacli_command_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored: dict[tuple[str, str], str] = {}
+    monkeypatch.setattr(
+        provider_setup_module.keyring,
+        "set_password",
+        lambda service, account, token: stored.__setitem__((service, account), token),
+    )
+    monkeypatch.setattr(
+        provider_setup_module.keyring,
+        "get_password",
+        lambda service, account: stored.get((service, account)),
+    )
+    ProviderSetupOperations._store_fastmail_token(
+        "keychain://Signet-Setup/setup-fastmail",
+        "token",
+    )
+    assert stored == {("Signet-Setup", "setup-fastmail"): "token"}
+
+    monkeypatch.setattr(provider_setup_module.keyring, "get_password", lambda *_args: "changed")
+    with pytest.raises(SetupError, match="could not be verified"):
+        ProviderSetupOperations._store_fastmail_token(
+            "keychain://Signet-Setup/setup-fastmail",
+            "token",
+        )
+    monkeypatch.setattr(
+        provider_setup_module.keyring,
+        "set_password",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("unavailable")),
+    )
+    with pytest.raises(SetupError, match="could not be stored"):
+        ProviderSetupOperations._store_fastmail_token(
+            "keychain://Signet-Setup/setup-fastmail",
+            "token",
+        )
+
+    executable = tmp_path / "wacli"
+    home = tmp_path / "home"
+    store = tmp_path / "store"
+    responses = iter(
+        (
+            subprocess.CompletedProcess([], 0, '{"authenticated":false}', ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        )
+    )
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return next(responses)
+
+    operations = ProviderSetupOperations(tmp_path, command_runner=runner)
+    operations._pair_wacli(executable, home=home, store=store)
+    assert calls[0][-3:] == ["auth", "status", "--read-only"]
+    assert calls[1][-3:] == ["auth", "--idle-exit", "30s"]
+
+    operations.command_runner = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+        [], 0, '{"authenticated":true,"linked_jid":"447700900123@s.whatsapp.net"}', ""
+    )
+    operations._pair_wacli(executable, home=home, store=store)
+    assert (
+        operations._wacli_linked_jid(executable, home=home, store=store)
+        == "447700900123@s.whatsapp.net"
+    )
+
+    operations.command_runner = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+        [], 0, "not-json", ""
+    )
+    assert operations._wacli_status(executable, home=home, store=store) == {}
+    with pytest.raises(SetupError, match="not authenticated"):
+        operations._wacli_linked_jid(executable, home=home, store=store)
+
+    responses = iter(
+        (
+            subprocess.CompletedProcess([], 1, "", ""),
+            subprocess.CompletedProcess([], 1, "", ""),
+        )
+    )
+    operations.command_runner = lambda *_args, **_kwargs: next(responses)
+    with pytest.raises(SetupError, match="pairing did not complete"):
+        operations._pair_wacli(executable, home=home, store=store)
+
+
+def test_bounded_download_archive_and_private_file_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return self.payload
+
+    monkeypatch.setattr(
+        provider_setup_module.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: Response(b"archive"),
+    )
+    assert provider_setup_module._download_bounded("https://example.test/wacli") == b"archive"
+
+    monkeypatch.setattr(provider_setup_module, "_DOWNLOAD_LIMIT", 4)
+    with pytest.raises(SetupError, match="size limit"):
+        provider_setup_module._download_bounded("https://example.test/wacli")
+    monkeypatch.setattr(
+        provider_setup_module.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")),
+    )
+    with pytest.raises(SetupError, match="download failed"):
+        provider_setup_module._download_bounded("https://example.test/wacli")
+
+    with pytest.raises(SetupError, match="archive is invalid"):
+        _extract_wacli(b"not-a-tarball")
+    empty_archive = io.BytesIO()
+    with tarfile.open(fileobj=empty_archive, mode="w:gz"):
+        pass
+    with pytest.raises(SetupError, match="layout is invalid"):
+        _extract_wacli(empty_archive.getvalue())
+
+    home = tmp_path / "wacli-home"
+    store = tmp_path / "wacli-store"
+    provider_setup_module._write_wacli_account_config(home, store)
+    assert provider_setup_module._wacli_environment(home) == {
+        "HOME": str(home),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+    }
+
+    resource = tmp_path / "private" / "resource"
+    provider_setup_module._write_private_resource(resource, b"one")
+    provider_setup_module._write_private_resource(resource, b"two")
+    assert resource.read_bytes() == b"two"
+    assert provider_setup_module._file_sha256(resource) == hashlib.sha256(b"two").hexdigest()
+    with pytest.raises(SetupError, match="could not be read"):
+        provider_setup_module._file_sha256(tmp_path / "missing")
