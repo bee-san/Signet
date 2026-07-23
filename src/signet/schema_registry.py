@@ -124,6 +124,25 @@ class DurableSchemaRegistry:
                 raise
             raise SchemaRegistryError("the durable schema cache failed integrity review") from None
 
+    def capture_reviewed(
+        self,
+        alias: str,
+        tools: Sequence[Mapping[str, Any] | types.Tool],
+        *,
+        discovered_at: int,
+    ) -> tuple[str, ...]:
+        """Persist schemas already bound to the active policy while services are stopped."""
+
+        return tuple(
+            sorted(
+                self._capture(
+                    alias,
+                    tools,
+                    discovered_at=discovered_at,
+                )
+            )
+        )
+
     async def refresh(
         self,
         alias: str,

@@ -4,8 +4,8 @@ This document describes the owned process contract used by the gated production
 assembly. Configuration remains disabled by default, performs no store migration or
 pairing, and cannot contact WhatsApp until every rollout prerequisite is satisfied.
 The persistent `signet deployment` staging assembly remains downstream-disabled.
-The current reviewed artifact still cannot activate because it has no compatible
-reviewed host/artifact pair, as described below.
+`signet provider setup whatsapp` supplies the reviewed Linux x86_64 artifact and
+pairing flow described below.
 
 ## Exact reviewed invocation
 
@@ -19,15 +19,12 @@ mounted `/proc/self/fd`. Every other host fails with
 `process_boundary_platform_unsupported` before creating an executable snapshot or
 starting a child process.
 
-The repository contains no distributable `wacli` artifact and no independently
-verified artifact provenance record. The macOS Homebrew path and digest in the
-no-live example are local prerelease fixture inputs, not evidence that the artifact
-was externally reviewed. That build cannot run on the Linux-only process boundary,
-while macOS does not satisfy that boundary. Consequently this fixture has no
-reviewed host/artifact pair and `wacli` activation is blocked on every host. A
-Linux build requires a recorded source URL/version, acquisition method, file hash,
-native-format check, owner/mode review, reviewer, and review date before its path
-and digest can enter enabled configuration.
+Guided setup downloads the upstream
+`wacli_0.12.0_linux_amd64.tar.gz` release asset and requires archive SHA-256
+`49baa180fa7f0f4a694f683b8f7386ea64023ed79c0307037f0680bd21c116e0`.
+It extracts exactly one native ELF `wacli` payload into the private setup root,
+records the executable digest in configuration, and refuses any digest or archive
+layout mismatch. The old macOS Homebrew fixture is not used for this path.
 
 The wrapper does not combine named `--account` selection with the explicit store.
 It opens one reviewed store directory without following a symbolic link, verifies
@@ -121,8 +118,6 @@ provider or `wacli`. Do not work around the block with `/dev/fd`, configured pat
 names, a still-linked snapshot, a shell, or `preexec_fn`; each would weaken the
 reviewed execution or directory-swap boundary. macOS local-process support requires
 a separately reviewed native descriptor-exec/chdir implementation and target-host
-characterization. Any real pairing or send remains a separate explicit human
-authorization. Until both implementation and characterization exist,
-`must_not_dispatch` remains true and live local-process activation is blocked.
-The alternative Linux route remains equally blocked for `wacli` until a Linux
-artifact is captured and reviewed; the macOS Homebrew digest cannot be reused.
+characterization. On macOS, `must_not_dispatch` remains true and live local-process
+activation is blocked. The supported alternative is the guided Linux x86_64 setup
+with the pinned archive above; the macOS Homebrew digest cannot be reused.

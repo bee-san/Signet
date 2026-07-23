@@ -11,12 +11,14 @@ The shipped runnable choices are intentionally limited:
 | --- | --- | --- |
 | Fake demo | `fastmail`, `whatsapp`, `approvals` | In-process fake providers only |
 | Persistent disabled staging | `approvals` only | Every tool call returns `deployment_disabled` |
-| Live provider deployment | None shipped | Requires the deferred human-reviewed assembly and enrollment |
+| Packaged production | `approvals` plus configured providers | Guided Fastmail or Linux x86_64 WhatsApp setup |
 
 Neither the fake demo nor disabled staging can be switched to a live provider by
 changing a client route. Start and verify the fake assembly with the
 [operator runbook](operator-runbook.md), or create the persistent disabled state
-with the [deployment guide](deployment.md).
+with the [deployment guide](deployment.md). For a packaged installation, use
+[`signet setup` followed by `signet provider setup`](setup.md); the client route
+alone never activates a provider.
 
 ## Route mapping
 
@@ -151,7 +153,7 @@ network boundaries, and bypass limitations are in the
 Before enabling a client profile, verify all of the following:
 
 - every URL is exact numeric loopback and every configured alias is intended;
-- the token belongs to one caller namespace and only the required aliases;
+- the token belongs to one caller namespace and only fixed Signet aliases are staged;
 - unauthenticated MCP access returns `401` and authenticated discovery matches the
   reviewed schemas;
 - the client does not expose headers, full tool arguments, or results in debug logs;

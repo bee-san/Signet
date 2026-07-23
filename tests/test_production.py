@@ -34,7 +34,12 @@ from signet.app import main as run_cli
 from signet.auth import SessionManager, SQLiteSessionRepository
 from signet.browser_auth import BootstrapService
 from signet.canonical import canonical_json
-from signet.config import ProductionConfig, production_health_proof, production_instance_identity
+from signet.config import (
+    DownstreamConfig,
+    ProductionConfig,
+    production_health_proof,
+    production_instance_identity,
+)
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
 from signet.db import Database
 from signet.downstream import DownstreamClient
@@ -1580,6 +1585,130 @@ def test_disabled_runtime_requires_atomic_reviewed_connector_identity_rotation(
         "b" * 64,
         "disabled",
     )
+
+
+def test_disabled_runtime_can_add_update_and_remove_a_provider_atomically(
+    tmp_path: Path,
+) -> None:
+    payload = _production_payload(tmp_path)
+    payload["connectors"] = {}
+    Path(payload["policy_path"]).write_text(
+        "version: 1\ndefault_mode: deny\ndownstreams: {}\n",
+        encoding="utf-8",
+    )
+    config = ProductionConfig.model_validate(payload)
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+        clock=lambda: 123,
+    )
+    connector = DownstreamConfig(
+        transport="http",
+        credential_ref="keychain://signet/fastmail",
+        credential_identity_digest="a" * 64,
+        server_identity_digest="b" * 64,
+        url="https://api.fastmail.com/mcp",
+        tls_server_certificate=tmp_path / "fastmail.pem",
+        tls_server_certificate_sha256="c" * 64,
+    )
+    added = config.model_copy(update={"connectors": {"fastmail": connector}})
+
+    assembly.state.configure_provider(
+        current_config=config,
+        next_config=added,
+        alias="fastmail",
+        now=124,
+    )
+    with assembly.database.read() as connection:
+        stored = connection.execute(
+            """
+            SELECT connector_alias, credential_identity_digest, state
+            FROM production_connectors
+            """
+        ).fetchone()
+    assert tuple(stored) == ("fastmail", "a" * 64, "disabled")
+
+    updated_connector = connector.model_copy(
+        update={
+            "credential_identity_digest": "d" * 64,
+            "server_identity_digest": "e" * 64,
+        }
+    )
+    updated = added.model_copy(update={"connectors": {"fastmail": updated_connector}})
+    assembly.state.configure_provider(
+        current_config=added,
+        next_config=updated,
+        alias="fastmail",
+        now=125,
+    )
+    with assembly.database.read() as connection:
+        stored = connection.execute(
+            """
+            SELECT credential_identity_digest, state
+            FROM production_connectors WHERE connector_alias = 'fastmail'
+            """
+        ).fetchone()
+    assert tuple(stored) == ("d" * 64, "disabled")
+
+    removed = updated.model_copy(update={"connectors": {}})
+    assembly.state.configure_provider(
+        current_config=updated,
+        next_config=removed,
+        alias="fastmail",
+        now=126,
+    )
+    with assembly.database.read() as connection:
+        connector_count = connection.execute(
+            "SELECT count(*) FROM production_connectors"
+        ).fetchone()[0]
+        setup_digest = connection.execute(
+            "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+        ).fetchone()["config_digest"]
+        service_digests = {
+            row["config_digest"]
+            for row in connection.execute(
+                "SELECT DISTINCT config_digest FROM production_services"
+            ).fetchall()
+        }
+    expected_digest = production_config_digest(removed)
+    assert connector_count == 0
+    assert setup_digest == expected_digest
+    assert service_digests == {expected_digest}
+
+    with pytest.raises(ProductionStateError, match="selected provider"):
+        assembly.state.configure_provider(
+            current_config=removed,
+            next_config=removed,
+            alias="fastmail",
+            now=127,
+        )
+    unrelated = removed.model_copy(
+        update={
+            "mcp_port": 9000,
+            "connectors": {"fastmail": connector},
+        }
+    )
+    with pytest.raises(ProductionStateError, match="selected provider"):
+        assembly.state.configure_provider(
+            current_config=removed,
+            next_config=unrelated,
+            alias="fastmail",
+            now=127,
+        )
+    rollout_enabled = removed.model_copy(
+        update={
+            "capabilities": removed.capabilities.model_copy(update={"live_providers_ready": True}),
+            "provider_rollout": removed.provider_rollout.model_copy(update={"state": "enabled"}),
+        }
+    )
+    with pytest.raises(ProductionStateError, match="disabled rollout"):
+        assembly.state.configure_provider(
+            current_config=rollout_enabled,
+            next_config=added,
+            alias="fastmail",
+            now=127,
+        )
 
 
 def test_web_health_uses_durable_maintenance_state_from_a_separate_worker(

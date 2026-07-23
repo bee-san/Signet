@@ -131,8 +131,14 @@ def test_plan_is_read_only_and_defaults_providers_to_disabled(tmp_path: Path) ->
     assert config["provider_rollout"] == {"state": "disabled"}
     assert config["connectors"] == {}
     assert config["caller_principals"] == [
-        {"namespace": "profile:personal", "allowed_aliases": ["approvals"]},
-        {"namespace": "profile:work", "allowed_aliases": ["approvals"]},
+        {
+            "namespace": "profile:personal",
+            "allowed_aliases": ["approvals", "fastmail", "whatsapp"],
+        },
+        {
+            "namespace": "profile:work",
+            "allowed_aliases": ["approvals", "fastmail", "whatsapp"],
+        },
     ]
 
 
@@ -1324,6 +1330,7 @@ def test_purge_preserves_every_key_needed_to_recover_an_encrypted_backup(
             "attachment",
             "backup",
             "browser-bootstrap",
+            "fastmail",
         )
     }
     monkeypatch.setattr(
@@ -4295,7 +4302,7 @@ def test_hermes_apply_binds_an_issued_token_to_its_rollback_snapshot(
         @staticmethod
         def issue(namespace: str, aliases: set[str]) -> Issued:
             assert namespace == "profile:work"
-            assert aliases == {"approvals"}
+            assert aliases == {"approvals", "fastmail", "whatsapp"}
             return Issued()
 
         @staticmethod
@@ -5225,8 +5232,8 @@ def test_real_platform_builds_a_provider_disabled_production_assembly(
     assert config.provider_rollout.state == "disabled"
     assert config.connectors == {}
     assert config.allowed_principals == {
-        "profile:personal": ("approvals",),
-        "profile:work": ("approvals",),
+        "profile:personal": ("approvals", "fastmail", "whatsapp"),
+        "profile:work": ("approvals", "fastmail", "whatsapp"),
     }
     assembly = create_production_assembly(
         config_path,
@@ -5237,11 +5244,17 @@ def test_real_platform_builds_a_provider_disabled_production_assembly(
     for profile in selected.hermes_profiles:
         rendered = (profile_home / profile / "config.yaml").read_text(encoding="utf-8")
         environment = (profile_home / profile / ".env").read_text(encoding="utf-8")
-        assert "enabled: false" in rendered
+        for alias in ("approvals", "fastmail", "whatsapp"):
+            assert f"signet_{alias}:" in rendered
+            assert f"/mcp/{alias}" in rendered
         assert "existing:" in rendered
         token_line = next(line for line in environment.splitlines() if line.startswith("SIGNET_"))
         profile_tokens.append(token_line.split("=", 1)[1])
     assert len(set(profile_tokens)) == 2
+    for profile, token in zip(selected.hermes_profiles, profile_tokens, strict=True):
+        for alias in ("fastmail", "whatsapp"):
+            principal = assembly.token_registry.authenticate(f"Bearer {token}", alias=alias)
+            assert principal.namespace == f"profile:{profile}"
     assert not any("sgt_" in message for message in output)
 
     operations = SetupOperations(selected.root, platform=platform)

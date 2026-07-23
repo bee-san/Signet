@@ -236,7 +236,7 @@ def test_provider_neutral_client_guide_preserves_transport_and_safety_contract()
         "must not forward `Authorization` across a redirect",
         "unauthenticated MCP access returns `401`",
         "no direct provider MCP route",
-        "Live provider deployment | None shipped",
+        "Packaged production | `approvals` plus configured providers",
     ):
         assert expected in normalized_document
     assert re.search(r"fake:sgt_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}", document) is None

@@ -194,6 +194,13 @@ def validate_message(value: str) -> str:
     return value
 
 
+def _canonical_send_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    message_id = result.get("id", result.get("message_id"))
+    if result.get("sent") is not True or not isinstance(message_id, str) or not message_id:
+        raise WacliError("invalid_send_result", dispatch_may_have_occurred=True)
+    return {"sent": True, "message_id": message_id}
+
+
 def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
     return (
         metadata.st_dev,
@@ -736,7 +743,7 @@ class WacliWrapper:
             dispatch_may_have_occurred=True,
             required_signature=verified_signature,
         )
-        return result
+        return _canonical_send_result(result)
 
     async def send_file(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {
@@ -841,6 +848,6 @@ class WacliWrapper:
                     required_signature=verified_signature,
                     pass_fds=(descriptor,),
                 )
-                return result
+                return _canonical_send_result(result)
         except StagingError as exc:
             raise WacliError("media_integrity_mismatch", dispatch_may_have_occurred=False) from exc

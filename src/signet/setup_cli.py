@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TextIO, cast
 
+from signet.provider_setup import ProviderSetupOperations
 from signet.setup_operations import SetupOperations, setup_lifecycle_lock
 from signet.setup_platform import ProductionSetupPlatform
 from signet.setup_state import PolicyMode, SetupEngine, SetupError, SetupJournalStore, SetupSpec
@@ -26,6 +29,7 @@ _SETUP_COMMANDS = frozenset(
         "restore",
         "upgrade",
         "uninstall",
+        "provider",
         "production",
     }
 )
@@ -104,6 +108,40 @@ def add_setup_parsers(subcommands: Any) -> None:
     )
     uninstall.add_argument("--yes", action="store_true")
 
+    provider = subcommands.add_parser(
+        "provider",
+        help="configure and control Fastmail or WhatsApp",
+    )
+    provider_commands = provider.add_subparsers(dest="provider_command", required=True)
+    provider_setup = provider_commands.add_parser("setup", help="configure and test a provider")
+    setup_commands = provider_setup.add_subparsers(dest="provider_name", required=True)
+    fastmail = setup_commands.add_parser("fastmail", help="configure Fastmail")
+    _root_argument(fastmail)
+    fastmail.add_argument("--from", dest="sender", help="sender email address")
+    fastmail.add_argument("--to", dest="recipient", help="test recipient email address")
+    fastmail.add_argument(
+        "--token-stdin",
+        action="store_true",
+        help="read the Fastmail API token from standard input",
+    )
+    fastmail.add_argument("--yes", action="store_true", help="confirm the test send")
+
+    whatsapp = setup_commands.add_parser("whatsapp", help="configure WhatsApp on Linux")
+    _root_argument(whatsapp)
+    whatsapp.add_argument("--to", dest="recipient", help="test phone number or JID")
+    whatsapp.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm the verified wacli download, pairing, and test send",
+    )
+
+    provider_status = provider_commands.add_parser("status", help="show provider status")
+    _root_argument(provider_status)
+    for action in ("enable", "disable"):
+        control = provider_commands.add_parser(action, help=f"{action} provider rollout")
+        _root_argument(control)
+        control.add_argument("provider_name", choices=("fastmail", "whatsapp"))
+
     production = subcommands.add_parser(
         "production",
         help="run an installed-package production component (service-manager use)",
@@ -126,12 +164,54 @@ def run_setup_command(
     input_fn: Callable[[str], str] = input,
     platform: ProductionSetupPlatform | Any | None = None,
     operations_factory: Callable[..., SetupOperations] = SetupOperations,
+    provider_operations_factory: Callable[..., ProviderSetupOperations] = ProviderSetupOperations,
     runner: Callable[..., Any] | None = None,
+    secret_input_fn: Callable[[str], str] = getpass.getpass,
+    stdin: TextIO | None = None,
 ) -> int:
     selected_platform = platform or ProductionSetupPlatform(output=output)
     if args.command == "production":
         return _run_production_service(args, runner=runner)
     root = _absolute_path(args.root)
+    if args.command == "provider":
+        providers = provider_operations_factory(root, platform=selected_platform)
+        if args.provider_command == "status":
+            provider_result = providers.status()
+        elif args.provider_command == "enable":
+            provider_result = providers.enable(args.provider_name)
+        elif args.provider_command == "disable":
+            provider_result = providers.disable(args.provider_name)
+        elif args.provider_name == "fastmail":
+            _require_confirmation(
+                args.yes,
+                input_fn,
+                "Configure Fastmail, send one test email, and enable it?",
+            )
+            token = (
+                (stdin or sys.stdin).readline().rstrip("\r\n")
+                if args.token_stdin
+                else secret_input_fn("Fastmail API token: ")
+            )
+            sender = args.sender or input_fn("Fastmail sender address: ").strip()
+            recipient = args.recipient or input_fn("Fastmail test recipient: ").strip()
+            provider_result = providers.setup_fastmail(
+                token=token,
+                sender=sender,
+                recipient=recipient,
+            )
+        else:
+            _require_confirmation(
+                args.yes,
+                input_fn,
+                "Download verified wacli if needed, pair WhatsApp, send one test, and enable it?",
+            )
+            recipient = args.recipient or input_fn("WhatsApp test recipient: ").strip()
+            provider_result = providers.setup_whatsapp(
+                recipient=recipient,
+                install_wacli=True,
+            )
+        _emit(provider_result, output)
+        return 0
     if args.command == "setup":
         store = SetupJournalStore(root)
         spec = _setup_spec(args, store)

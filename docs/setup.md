@@ -3,8 +3,8 @@
 `signet setup` is the packaged, resumable installation path for macOS and Linux. It
 creates production state with every provider disabled, installs two loopback-only
 services, prepares one or more named Hermes profiles, and opens the authenticated
-owner ceremony at the final private HTTPS origin. It never enables a provider or
-restarts Hermes.
+owner ceremony at the final private HTTPS origin. Provider setup is a separate guided
+command, and Signet never restarts Hermes.
 
 The setup path changes real user resources. Read the plan and this guide before
 confirming it. For the repository-owned fake demo, use
@@ -20,7 +20,9 @@ confirming it. For the repository-owned fake demo, use
   `~/.hermes/profiles/PROFILE` and not group/world writable;
 - for automatic private HTTPS, Tailscale logged in with MagicDNS and the intended
   `*.ts.net` node name. Signet manages HTTPS port 8443 only and refuses an existing
-  Serve or Funnel listener there.
+  Serve or Funnel listener there;
+- for Fastmail, an API token and the sender address to test; or
+- for WhatsApp, Linux x86_64 and a phone available to scan the pairing QR code.
 
 A different canonical HTTPS origin can be supplied with `--origin`. Signet assumes
 that its reverse proxy is independently configured and does not adopt it.
@@ -107,21 +109,53 @@ through the CLI.
 
 ## Review and enable Hermes entries
 
-Each selected profile receives a distinct caller token and one `signet_approvals` MCP
-entry. The token is written automatically to that profile's private `.env`; it is not
-printed, placed in YAML, accepted on argv, or copied by the operator. Existing config
-and environment text is preserved through marker-bounded edits, and rollback removes
-only those exact edits.
+Each selected profile receives a distinct caller token and disabled
+`signet_approvals`, `signet_fastmail`, and `signet_whatsapp` MCP entries. The token
+is written automatically to that profile's private `.env`; it is not printed, placed
+in YAML, accepted on argv, or copied by the operator. Existing config and environment
+text is preserved through marker-bounded edits, and rollback removes only those exact
+edits.
 
-The generated entry is intentionally `enabled: false`. Review its local URL,
-`Authorization` environment reference, and profile scope. Enable it only after review,
-then run `/reload-mcp` in that profile and test the `approvals` tools. Signet never
-runs `hermes gateway restart`, never edits gateway tokens, and never assumes that
-editing one profile reloads another.
+Review the local URLs, `Authorization` environment reference, and profile scope.
+Enable `signet_approvals` and only the provider entries you configure, then run
+`/reload-mcp` in that profile. Signet never runs `hermes gateway restart`, never edits
+gateway tokens, and never assumes that editing one profile reloads another.
 
-Providers remain disabled after Hermes integration. Enabling Fastmail or another
-provider is a separate schema, policy, credential-identity, readiness, and cutover
-review described in [`production-connectors.md`](production-connectors.md).
+## Configure a provider
+
+Fastmail setup prompts for the API token, discovers the live MCP schemas, sends one
+test email, saves the generated policy, and enables the provider:
+
+```console
+signet provider setup fastmail \
+  --from you@example.com \
+  --to you@example.com
+```
+
+For non-interactive secret-broker integration, pass one token line on standard input
+with `--token-stdin`; do not put the token in an argument.
+
+WhatsApp setup is available on Linux x86_64. It downloads the pinned
+`wacli 0.12.0` archive, verifies its SHA-256, opens the pairing flow, sends one test
+message, and enables the provider:
+
+```console
+signet provider setup whatsapp --to +447700900123
+```
+
+Inspect or control the rollout with:
+
+```console
+signet provider status
+signet provider disable fastmail
+signet provider enable fastmail
+```
+
+The rollout gate is shared by all configured providers; enable and disable output
+lists every affected alias. If startup health verification fails, Signet restores the
+disabled configuration. Re-running setup with the same provider is idempotent.
+The lower-level connector contract remains documented in
+[`production-connectors.md`](production-connectors.md).
 
 ## Lifecycle commands
 
@@ -191,10 +225,11 @@ the changed resource has been reviewed.
 ## Installed files and package data
 
 The setup root contains the journal, owner marker, policy, production config,
-database, encrypted attachment staging, restore staging, backups, logs, and reviewed
-service definitions. Modes are 0700 for private directories and 0600 for private
-files. Launchd definitions are installed under `~/Library/LaunchAgents`; systemd user
-units are installed under `~/.config/systemd/user`.
+database, provider resources, encrypted attachment staging, restore staging, backups,
+logs, and reviewed service definitions. Modes are 0700 for private directories and
+0600 for private files. Launchd definitions are installed under
+`~/Library/LaunchAgents`; systemd user units are installed under
+`~/.config/systemd/user`.
 
 The wheel includes the `signet(1)` manual page. Depending on the installer, it is
 available under the wheel shared-data `share/man/man1` location; `signet --help` and

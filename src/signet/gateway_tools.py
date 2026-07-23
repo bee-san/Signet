@@ -25,6 +25,7 @@ import mcp.types as types
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from mcp.shared.exceptions import McpError
 
+from signet import __version__
 from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.auth import (
     ActionBinding,
@@ -928,7 +929,7 @@ class GatewayToolSurface:
     ) -> None:
         self.tools = tools
         self.principal_provider = principal_provider
-        self.server: LosslessToolServer = LosslessToolServer("Signet", version="0.1.0")
+        self.server: LosslessToolServer = LosslessToolServer("Signet", version=__version__)
         self.server.request_handlers[types.ListToolsRequest] = self._list_tools
         self.server.request_handlers[types.CallToolRequest] = self._call_tool
 

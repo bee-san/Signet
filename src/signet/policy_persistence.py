@@ -334,6 +334,145 @@ class SQLitePolicyPromotionBoundary:
     def ready(self) -> bool:
         return self._ready
 
+    def install_provider_setup(
+        self,
+        snapshot: PolicySnapshot,
+        *,
+        alias: str,
+        now: int,
+    ) -> None:
+        """Install one generated provider policy while services are stopped."""
+
+        if alias not in {"fastmail", "whatsapp"}:
+            raise ValueError("provider policy alias is unsupported")
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("provider policy time is invalid")
+        if not isinstance(snapshot, PolicySnapshot):
+            raise TypeError("provider policy snapshot is invalid")
+
+        committed = False
+        with self._locked():
+            self._require_ready()
+            stored = self._stored_policy(verify_history=True)
+            if stored is None:
+                raise PolicyUnavailable("durable policy state is unavailable")
+            previous = self._validate_stored(stored)
+            if (
+                stored.sync_state != "synced"
+                or stored.publication_pending
+                or previous != self.engine.snapshot
+            ):
+                raise PolicyUnavailable("durable policy is stale or not fully synced")
+            _validate_provider_setup_transition(previous, snapshot, alias)
+            snapshot_yaml = dump_policy(snapshot)
+            config_hash = policy_config_hash(snapshot)
+            file_sha256 = hashlib.sha256(snapshot_yaml).hexdigest()
+            current = _read_regular(self.policy_path)
+            if not _same_digest(current, stored.file_sha256):
+                raise PolicyDivergenceError("policy file changed before provider setup")
+
+            self._write_pending(snapshot_yaml)
+            try:
+                with self.database.transaction() as connection:
+                    self._require_history_capacity(
+                        connection,
+                        additional_bytes=len(snapshot_yaml),
+                    )
+                    row = connection.execute(
+                        """
+                        SELECT policy_version_id, config_hash, file_sha256,
+                               sync_state, publication_pending
+                        FROM durable_policy_file_state WHERE singleton = 1
+                        """
+                    ).fetchone()
+                    if (
+                        row is None
+                        or int(row["policy_version_id"]) != previous.version
+                        or not _same_text(str(row["config_hash"]), stored.config_hash)
+                        or not _same_text(str(row["file_sha256"]), stored.file_sha256)
+                        or row["sync_state"] != "synced"
+                        or bool(row["publication_pending"])
+                    ):
+                        raise PolicyUnavailable("durable policy changed concurrently")
+                    connection.execute(
+                        """
+                        INSERT INTO policy_versions(
+                            policy_version_id, actor, created_at, mode_diffs_json,
+                            originating_event, config_hash, applied
+                        ) VALUES (?, 'gateway:provider-setup', ?, ?, 'file_change', ?, 1)
+                        """,
+                        (
+                            snapshot.version,
+                            now,
+                            _canonical_json({"alias": alias, "operation": "provider_setup"}),
+                            config_hash,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO durable_policy_snapshots(
+                            policy_version_id, config_hash, prior_config_hash,
+                            snapshot_yaml, file_sha256
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            snapshot.version,
+                            config_hash,
+                            stored.config_hash,
+                            snapshot_yaml,
+                            file_sha256,
+                        ),
+                    )
+                    updated = connection.execute(
+                        """
+                        UPDATE durable_policy_file_state
+                        SET policy_version_id = ?, config_hash = ?, file_sha256 = ?,
+                            sync_state = 'pending', publication_pending = 0,
+                            updated_at = ?
+                        WHERE singleton = 1 AND policy_version_id = ?
+                          AND config_hash = ? AND file_sha256 = ?
+                          AND sync_state = 'synced' AND publication_pending = 0
+                        """,
+                        (
+                            snapshot.version,
+                            config_hash,
+                            file_sha256,
+                            now,
+                            previous.version,
+                            stored.config_hash,
+                            stored.file_sha256,
+                        ),
+                    ).rowcount
+                    if updated != 1:
+                        raise PolicyUnavailable("durable policy changed concurrently")
+                committed = True
+                self._ready = False
+                self._replace_pending(
+                    expected_current_hash=stored.file_sha256,
+                    expected_pending_hash=file_sha256,
+                )
+                published = _StoredPolicy(
+                    snapshot.version,
+                    config_hash,
+                    file_sha256,
+                    "pending",
+                    snapshot_yaml,
+                    True,
+                    False,
+                    stored.file_sha256,
+                )
+                self._mark_synced(published, now=now)
+                self.engine.restore_durable_snapshot(snapshot)
+                if self._apply_policy is not None:
+                    self._apply_policy(snapshot)
+                self._ready = True
+            except BaseException:
+                if not committed:
+                    self._remove_untracked_pending()
+                else:
+                    self._ready = False
+                raise
+
     async def publish_pending(self, *, now: int | None = None) -> bool:
         """Attempt one durable list-change publication and acknowledge it on success."""
 
@@ -1682,6 +1821,16 @@ def _validate_policy_transition(
         audit = json.loads(str(history_row["mode_diffs_json"]))
     except (TypeError, ValueError):
         raise PolicyDivergenceError("durable policy audit history is invalid") from None
+    if history_row["originating_event"] == "file_change":
+        if (
+            not isinstance(audit, dict)
+            or set(audit) != {"alias", "operation"}
+            or audit.get("operation") != "provider_setup"
+            or audit.get("alias") not in {"fastmail", "whatsapp"}
+        ):
+            raise PolicyDivergenceError("durable provider policy audit is invalid")
+        _validate_provider_setup_transition(previous, current, audit["alias"])
+        return
     if (
         not isinstance(audit, dict)
         or set(audit) != {"alias", "new_mode", "old_mode", "request_id", "tool"}
@@ -1713,3 +1862,27 @@ def _validate_policy_transition(
     current_document["downstreams"][alias]["tools"][tool]["mode"] = previous_tool.mode.value
     if current_document != previous_document:
         raise PolicyDivergenceError("durable policy transition changed unreviewed fields")
+
+
+def _validate_provider_setup_transition(
+    previous: PolicySnapshot,
+    current: PolicySnapshot,
+    alias: str,
+) -> None:
+    if current.version != previous.version + 1:
+        raise PolicyDivergenceError("provider policy version is not consecutive")
+    previous_document = policy_document(previous)
+    current_document = policy_document(current)
+    previous_document["version"] = current.version
+    previous_downstreams = previous_document["downstreams"]
+    current_downstreams = current_document["downstreams"]
+    previous_provider = previous_downstreams.pop(alias, None)
+    current_provider = current_downstreams.pop(alias, None)
+    if (
+        current_provider is None
+        or current_provider == previous_provider
+        or current_document != previous_document
+    ):
+        raise PolicyDivergenceError(
+            "provider policy setup changed fields outside the selected provider"
+        )

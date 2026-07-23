@@ -15,23 +15,19 @@ modes, immutable payloads are encrypted, approval transitions are persisted in
 SQLite, dispatch is fenced, ambiguous delivery enters bounded reconciliation, and
 the authenticated web app presents the private review queue.
 
-## Safety status
+## Public beta
 
-This repository now includes one explicitly confirmed production setup path. The
-packaged `signet setup` command can create a marker-owned private root, write secrets
-to the operating-system keyring, install launchd/systemd user services, claim a free
-Tailscale Serve HTTPS 8443 listener, prepare existing named Hermes profiles, and open
-a real owner authentication ceremony. It prints a read-only plan first when requested,
-refuses ambiguous or foreign resources, persists resumable rollback state, keeps every
-provider and generated Hermes entry disabled, and never restarts Hermes. Read the
-[packaged setup guide](docs/setup.md) before running it.
+Signet `0.1.0b1` ships a complete packaged setup path and guided provider setup.
+`signet setup` creates the private installation, services, Hermes entries, and owner
+ceremony. Providers start disabled. A separate `signet provider setup` command then
+stores the credential, discovers schemas, sends one test message, writes the generated
+configuration and policy, and enables the rollout.
 
-No provider becomes live through setup. Fastmail and `wacli` still require separate
-schema, policy, account, credential-identity, attachment, host-readiness, and cutover
-review. Automated tests use explicit `fake:*` identities, fake downstreams, isolated
-profile trees, and injected operating-system boundaries; CI does not enroll a passkey
-or TOTP, read a live credential, install a host service, alter Tailscale, or send a
-provider request.
+Fastmail is supported on Linux x86_64 and macOS arm64. WhatsApp is supported on Linux
+x86_64 through the pinned `wacli 0.12.0` release; it is not available on macOS.
+This is a public beta, so take a backup before upgrading and verify the test message
+before relying on a provider. Read the [packaged setup guide](docs/setup.md) for the
+full flow.
 
 The files under `deploy/` remain inert review templates. Their placeholders prevent
 installation without review. The older installed `signet deployment` commands provide
@@ -77,22 +73,27 @@ browser sessions, webhooks, or other paths that bypass Signet. See
 
 ## Packaged setup
 
-After installing a reviewed wheel, inspect the read-only plan and select every Hermes
-profile explicitly:
+Install the beta, create the private service, then configure the provider you use:
 
 ```console
+python3.12 -m pip install 'signet-gateway==0.1.0b1'
 signet setup --plan --profile personal --profile work
 signet setup --profile personal --profile work
+signet provider setup fastmail --from you@example.com --to you@example.com
+signet provider status
 ```
 
-The default private origin is the current Tailscale node on HTTPS 8443. Setup creates
-provider-disabled state, starts installed-package user services, stages disabled
-`signet_approvals` entries in both profiles, prints the public owner setup URL before
-browser launch, and resumes from an atomic journal after interruption. Review each
-Hermes entry, enable it deliberately, then run `/reload-mcp`; Signet does not restart
-the gateway or enable providers. See [`docs/setup.md`](docs/setup.md) for prerequisites,
-resource-adoption rules, browser ceremonies, backup/restore, upgrade, uninstall, and
-rollback.
+Fastmail prompts for its API token without echoing it. On Linux x86_64, use
+`signet provider setup whatsapp --to PHONE_OR_JID` instead; Signet downloads the
+verified binary, opens the pairing flow, and sends one test message. The provider
+rollout gate is shared, so `provider enable` and `provider disable` report every
+configured alias they affect.
+
+The default private origin is the current Tailscale node on HTTPS 8443. Review the
+generated Hermes entries, enable approvals and the providers you configured, then
+run `/reload-mcp`; Signet never restarts Hermes itself. See
+[`docs/setup.md`](docs/setup.md) for prerequisites, browser setup, backup/restore,
+upgrade, uninstall, and rollback.
 
 ## Development
 
@@ -138,13 +139,10 @@ that remain intentionally absent and the prerequisites for any future live work.
 )
 ```
 
-The generic reviewed local stdio boundary currently requires Linux with
-`/proc/self/fd`. macOS remains supported for the downstream-disabled launchd demo
-and separately reviewed HTTPS downstreams, but local process activation fails
-closed with `process_boundary_platform_unsupported`. The sole reviewed `wacli`
-fixture pins a macOS Homebrew artifact, so `wacli` activation is blocked on every
-host until either a Linux artifact is reviewed or a secure native macOS descriptor
-boundary is implemented and characterized.
+The reviewed local stdio boundary requires Linux with `/proc/self/fd`. Guided
+WhatsApp setup therefore supports Linux x86_64 and installs the pinned
+`wacli 0.12.0` Linux artifact. macOS arm64 supports the packaged service and Fastmail,
+but local WhatsApp activation remains unsupported.
 On Linux, Signet also uses the kernel-owned `/proc/self/fd` view to change the mode
 of an already-held mode-`000` directory without reopening an attacker-controlled
 path. It fails closed if procfs is unavailable. macOS instead uses a verified

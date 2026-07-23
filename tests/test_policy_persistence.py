@@ -517,6 +517,94 @@ def test_web_totp_promotion_is_atomic_distinct_audited_and_single_use(
     assert not installed.boundary.pending_path.exists()
 
 
+def test_provider_setup_policy_is_durable_audited_and_history_checked(
+    durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
+) -> None:
+    bundle, policy_path, installed = durable_bundle
+    document = policy_document(installed.engine.snapshot)
+    document["version"] = 2
+    document["downstreams"]["fastmail"] = {
+        "transport": "http",
+        "url": "https://api.fastmail.com/mcp",
+        "credential_ref": "keychain://Signet-Setup/setup-fastmail",
+        "account_ref": "account:fastmail",
+        "tools": {
+            "send_email": {
+                "mode": "approval",
+                "adapter": "fastmail.send",
+                "communication_send": True,
+                "schema_digest": "b" * 64,
+                "account_ref": "account:fastmail",
+            },
+            "search_email": {
+                "mode": "passthrough",
+                "reviewed_read_only": True,
+                "schema_digest": "c" * 64,
+                "account_ref": "account:fastmail",
+            },
+        },
+    }
+    provider_policy = parse_policy(document)
+
+    installed.boundary.install_provider_setup(
+        provider_policy,
+        alias="fastmail",
+        now=NOW + 1,
+    )
+
+    assert load_policy(policy_path) == provider_policy
+    assert installed.engine.snapshot == provider_policy
+    assert installed.mirror.policy == provider_policy
+    with bundle.database.read() as connection:
+        row = connection.execute(
+            """
+            SELECT actor, originating_event, mode_diffs_json, applied
+            FROM policy_versions WHERE policy_version_id = 2
+            """
+        ).fetchone()
+    assert tuple(row) == (
+        "gateway:provider-setup",
+        "file_change",
+        '{"alias":"fastmail","operation":"provider_setup"}',
+        1,
+    )
+
+    recovered = _install(bundle, policy_path)
+    assert recovered.boundary.ready
+    assert recovered.engine.snapshot == provider_policy
+
+    no_op_document = policy_document(provider_policy)
+    no_op_document["version"] = 3
+    with pytest.raises(PolicyDivergenceError, match="selected provider"):
+        recovered.boundary.install_provider_setup(
+            parse_policy(no_op_document),
+            alias="fastmail",
+            now=NOW + 2,
+        )
+
+
+def test_provider_setup_policy_cannot_change_an_unselected_downstream(
+    durable_bundle: tuple[BackendBundle, Path, InstalledBoundary],
+) -> None:
+    _, _, installed = durable_bundle
+    document = policy_document(installed.engine.snapshot)
+    document["version"] = 2
+    document["downstreams"]["fake-service"]["tools"]["create_item"]["mode"] = "approval"
+    document["downstreams"]["fastmail"] = {
+        "transport": "http",
+        "url": "https://api.fastmail.com/mcp",
+        "credential_ref": "keychain://Signet-Setup/setup-fastmail",
+        "tools": {},
+    }
+
+    with pytest.raises(PolicyDivergenceError, match="outside the selected provider"):
+        installed.boundary.install_provider_setup(
+            parse_policy(document),
+            alias="fastmail",
+            now=NOW + 1,
+        )
+
+
 @pytest.mark.asyncio
 async def test_async_policy_publication_is_awaited_before_acknowledgement(
     tmp_path: Path,
