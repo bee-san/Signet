@@ -57,6 +57,8 @@ from signet.production_connectors import (
     provider_execution_identity_digest,
 )
 from signet.production_state import ProductionStateError, production_config_digest
+from signet.setup_platform import ProductionSetupPlatform
+from signet.setup_state import SetupEngine, SetupJournalStore, SetupSpec
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
@@ -2023,6 +2025,69 @@ def test_environment_asgi_factories_use_only_the_private_config_path(
 
     assert mcp_app is not None
     assert web_app is not None
+
+
+def test_environment_asgi_factory_opens_the_owned_setup_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "owned-production"
+    selected = SetupSpec(
+        root=root,
+        public_origin="https://signet.example.test",
+        owner_user_id="user:owner",
+        hermes_profiles=("personal",),
+        executable=Path("/opt/signet/bin/signet"),
+        open_browser=False,
+    )
+
+    class FactorySetupPlatform(ProductionSetupPlatform):
+        def apply(self, step: str, spec: SetupSpec, setup_id: str) -> None:
+            if step in {"private_paths", "configuration", "database"}:
+                super().apply(step, spec, setup_id)
+
+    monkeypatch.setattr(
+        "signet.setup_platform.create_production_assembly",
+        lambda *args, **kwargs: None,
+    )
+    journal = SetupEngine(
+        SetupJournalStore(root),
+        FactorySetupPlatform(),
+    ).apply(selected)
+    config_path = root / "production.json"
+    config = load_production_config(config_path)
+    references = (
+        SecretReference.parse(reference)
+        for reference in config.secrets.model_dump().values()
+        if reference is not None
+    )
+    secret_store = MemorySecretStore(
+        {
+            (reference.service, reference.account): "factory-secret-value-" * 2
+            for reference in references
+        }
+    )
+    receipt = json.loads(
+        (config.storage.data_dir / ".signet-database-ownership.json").read_text(encoding="utf-8")
+    )
+    database_stat = config.storage.database_path.stat()
+    maintenance_lock_stat = config.storage.database_path.with_name(
+        f".{config.storage.database_path.name}.maintenance.lock"
+    ).stat()
+    monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", str(config_path))
+
+    app = create_production_web_app_from_environment(secret_store=secret_store)
+
+    assert app is not None
+    assert receipt["setup_id"] == journal.setup_id
+    assert receipt["runtime_files"]["signet.db"] == {
+        "device": database_stat.st_dev,
+        "inode": database_stat.st_ino,
+    }
+    assert receipt["runtime_files"][".signet.db.maintenance.lock"] == {
+        "device": maintenance_lock_stat.st_dev,
+        "inode": maintenance_lock_stat.st_ino,
+    }
 
 
 @pytest.mark.parametrize(
