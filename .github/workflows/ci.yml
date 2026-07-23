@@ -270,7 +270,7 @@ jobs:
       - name: Test
         run: >-
           uv run pytest -q --cov=signet --cov-report=term-missing
-          --cov-fail-under=85
+          --cov-fail-under=85 --cov-precision=2
       - name: Build distributions
         run: uv build --no-sources
       - name: Smoke-test the isolated wheel

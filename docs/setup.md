@@ -193,6 +193,8 @@ After installing a reviewed newer wheel, back up and apply its schema migrations
 signet upgrade
 ```
 
+The upgrade runs inside a maintenance window, creates and verifies an encrypted backup before the first schema mutation, and reports a durable `upgrade_receipt` beside that backup. The receipt records the backup hash, source schema, and live schema observed after migration; it remains available if later assembly or service restart fails, and retries inspect the live schema again.
+
 A normal uninstall stops and removes exact service definitions and removes only the
 owned Hermes blocks while preserving production data and keyring material:
 

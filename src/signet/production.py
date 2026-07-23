@@ -480,17 +480,21 @@ def create_production_assembly(
     secret_store: SecretStore,
     pre_migration_backup: PreMigrationBackup | None = None,
     components: frozenset[str] = frozenset({"mcp", "web"}),
+    database_override: Database | None = None,
+    attachment_staging_override: Path | None = None,
+    attachment_source_roots_override: tuple[Path, ...] | None = None,
+    prepare_directories: bool = True,
 ) -> ProductionAssembly:
     config = load_production_config(config_path)
     return build_production_runtime(
         config,
         secret_store=secret_store,
         components=components,
-        pre_migration_backup=(
-            pre_migration_backup
-            if pre_migration_backup is not None
-            else _snapshot_pre_migration_backup(config.storage.backup_dir)
-        ),
+        database_override=database_override,
+        attachment_staging_override=attachment_staging_override,
+        attachment_source_roots_override=attachment_source_roots_override,
+        prepare_directories=prepare_directories,
+        pre_migration_backup=pre_migration_backup,
     )
 
 
@@ -499,12 +503,14 @@ def create_production_mcp_runtime(
     *,
     secret_store: SecretStore,
     pre_migration_backup: PreMigrationBackup | None = None,
+    database_override: Database | None = None,
 ) -> MCPRuntime:
     runtime = create_production_assembly(
         config_path,
         secret_store=secret_store,
         pre_migration_backup=pre_migration_backup,
         components=frozenset({"mcp"}),
+        database_override=database_override,
     ).mcp
     if runtime is None:
         raise AssertionError("MCP assembly did not produce its requested component")
@@ -516,12 +522,14 @@ def create_production_web_app(
     *,
     secret_store: SecretStore,
     pre_migration_backup: PreMigrationBackup | None = None,
+    database_override: Database | None = None,
 ) -> FastAPI:
     app = create_production_assembly(
         config_path,
         secret_store=secret_store,
         pre_migration_backup=pre_migration_backup,
         components=frozenset({"web"}),
+        database_override=database_override,
     ).web
     if app is None:
         raise AssertionError("web assembly did not produce its requested component")
@@ -534,9 +542,11 @@ def create_production_mcp_app_from_environment(
 ) -> Starlette:
     """ASGI factory for the configured fail-closed MCP service."""
 
+    config_path = _production_config_path_from_environment()
     return create_production_mcp_runtime(
-        _production_config_path_from_environment(),
+        config_path,
         secret_store=secret_store or KeychainSecretStore(),
+        database_override=_owned_runtime_database(config_path),
     ).app
 
 
@@ -546,9 +556,11 @@ def create_production_web_app_from_environment(
 ) -> FastAPI:
     """ASGI factory for the staged production web service."""
 
+    config_path = _production_config_path_from_environment()
     return create_production_web_app(
-        _production_config_path_from_environment(),
+        config_path,
         secret_store=secret_store or KeychainSecretStore(),
+        database_override=_owned_runtime_database(config_path),
     )
 
 
@@ -573,6 +585,10 @@ def build_production_runtime(
     totp_provisioner: TotpSecretProvisioner | None = None,
     clock: Callable[[], int] | None = None,
     components: frozenset[str] = frozenset({"mcp", "web"}),
+    database_override: Database | None = None,
+    attachment_staging_override: Path | None = None,
+    attachment_source_roots_override: tuple[Path, ...] | None = None,
+    prepare_directories: bool = True,
 ) -> ProductionAssembly:
     """Assemble MCP, web, and workers without dispatching provider calls."""
 
@@ -583,7 +599,8 @@ def build_production_runtime(
     if not isinstance(selected_now, int) or isinstance(selected_now, bool) or selected_now < 0:
         raise ProductionAssemblyError("production clock returned an invalid value")
 
-    config.prepare_directories()
+    if prepare_directories:
+        config.prepare_directories()
     policy = _load_policy(config.policy_path)
     _validate_policy_connector_bindings(config, policy)
     secret_references, secret_values, secret_identities = _resolve_secret_inventory(
@@ -601,7 +618,7 @@ def build_production_runtime(
             challenge=challenge,
         )
 
-    database = Database(config.storage.data_dir / "signet.db")
+    database = database_override or Database(config.storage.data_dir / "signet.db")
     verified_backup_version: int | None = None
 
     def track_verified_backup(
@@ -655,6 +672,8 @@ def build_production_runtime(
                 credential_identity_key=secret_values["capability_key_ref"]
                 .reveal()
                 .encode("utf-8"),
+                attachment_staging_override=attachment_staging_override,
+                attachment_source_roots_override=attachment_source_roots_override,
             )
         except ProductionConnectorError as exc:
             raise ProductionAssemblyError(str(exc)) from None
@@ -673,12 +692,21 @@ def build_production_runtime(
                 for alias in config.connectors
             }
         )
-        attachment_root = config.storage.attachment_staging_dir
+        attachment_root = (
+            attachment_staging_override
+            if attachment_staging_override is not None
+            else config.storage.attachment_staging_dir
+        )
+        attachment_source_roots = (
+            attachment_source_roots_override
+            if attachment_source_roots_override is not None
+            else config.storage.attachment_source_roots
+        )
         attachment_reference = config.secrets.attachment_key_ref
         if (
             attachment_root is not None
             and attachment_reference is not None
-            and config.storage.attachment_source_roots
+            and attachment_source_roots
         ):
             try:
                 staging = StagingStore(
@@ -688,7 +716,7 @@ def build_production_runtime(
                         secret_values["attachment_key_ref"],
                         attachment_reference,
                     ),
-                    allowed_source_roots=config.storage.attachment_source_roots,
+                    allowed_source_roots=attachment_source_roots,
                 )
             except Exception:
                 raise ProductionAssemblyError(
@@ -1158,12 +1186,15 @@ def _snapshot_pre_migration_backup(backup_dir: Path) -> PreMigrationBackup:
         )
         snapshot = database.create_snapshot(destination)
         Database.verify_snapshot(snapshot)
+        source_device, source_inode = database.migration_source_identity()
         return MigrationBackupReceipt(
             database_path=database.path,
             source_schema_version=current_version,
             artifact_path=snapshot.absolute(),
             artifact_sha256=_file_sha256(snapshot),
             verified_restore_schema_version=current_version,
+            source_database_device=source_device,
+            source_database_inode=source_inode,
         )
 
     return backup
@@ -1287,6 +1318,24 @@ def _read_private_config(path: Path) -> str:
     if not isinstance(parsed, dict):
         raise ProductionAssemblyError("production configuration must be a JSON object")
     return payload
+
+
+def _owned_runtime_database(config_path: Path) -> Database:
+    # Imported lazily to avoid the setup platform's dependency on this module.
+    from signet.setup_platform import validate_active_database_runtime_ownership
+    from signet.setup_state import SetupJournalStore
+
+    journal = SetupJournalStore(config_path.parent).load()
+    config = load_production_config(config_path)
+    expected_identity, expected_lock_identity = validate_active_database_runtime_ownership(
+        config.storage.database_path.parent,
+        setup_id=journal.setup_id,
+    )
+    return Database(
+        config.storage.database_path,
+        expected_identity=expected_identity,
+        expected_lock_identity=expected_lock_identity,
+    )
 
 
 def _production_config_path_from_environment() -> Path:
