@@ -56,7 +56,8 @@ _CONFIG_NAME = "production.json"
 _POLICY_NAME = "policy.yaml"
 _SECRET_PURPOSES = ("session", "csrf", "capability", "payload", "attachment", "backup")
 _SERVICE_NAME = "Signet-Setup"
-_HERMES_SERVER_NAME = "signet_approvals"
+_PRODUCTION_MCP_ALIASES = ("approvals", "fastmail", "whatsapp")
+_HERMES_SERVER_NAMES = {alias: f"signet_{alias}" for alias in _PRODUCTION_MCP_ALIASES}
 _DATABASE_OWNERSHIP_MARKER = ".signet-database-ownership.json"
 _DATABASE_RUNTIME_NAMES = frozenset(
     {
@@ -138,7 +139,10 @@ def render_production_config(spec: SetupSpec, *, setup_id: str) -> dict[str, Any
             "live_providers_ready": False,
         },
         "caller_principals": [
-            {"namespace": f"profile:{profile}", "allowed_aliases": ["approvals"]}
+            {
+                "namespace": f"profile:{profile}",
+                "allowed_aliases": list(_PRODUCTION_MCP_ALIASES),
+            }
             for profile in spec.hermes_profiles
         ],
         "connectors": {},
@@ -352,7 +356,7 @@ class ProductionSetupPlatform:
         return result
 
     def remove_setup_secrets(self, setup_id: str, *, preserve_backup: bool) -> None:
-        purposes = (*_SECRET_PURPOSES, "browser-bootstrap")
+        purposes = (*_SECRET_PURPOSES, "browser-bootstrap", "fastmail")
         errors: list[str] = []
         for purpose in purposes:
             if preserve_backup and purpose in {
@@ -1099,7 +1103,10 @@ class ProductionSetupPlatform:
                             and metadata.revoked_at is None
                         ):
                             assembly.token_registry.revoke(metadata.token_id)
-                    issued = assembly.token_registry.issue(f"profile:{profile}", {"approvals"})
+                    issued = assembly.token_registry.issue(
+                        f"profile:{profile}",
+                        set(_PRODUCTION_MCP_ALIASES),
+                    )
                     token = issued.token
                     issued_token_ids.append(token.removeprefix("sgt_").split(".", 1)[0])
                 updated_env = _merge_profile_environment(
@@ -2421,10 +2428,21 @@ def _merge_hermes_config(
     servers = document.get("mcp_servers")
     if servers is not None and not isinstance(servers, dict):
         raise SetupError("Hermes mcp_servers must be a mapping")
-    expected = _hermes_server(token_name)
-    existing = servers.get(_HERMES_SERVER_NAME) if isinstance(servers, dict) else None
-    if existing is not None:
-        if not _is_owned_hermes_server(existing, token_name=token_name):
+    expected = _hermes_servers(token_name)
+    existing = (
+        {
+            alias: servers.get(server_name)
+            for alias, server_name in _HERMES_SERVER_NAMES.items()
+            if servers.get(server_name) is not None
+        }
+        if isinstance(servers, dict)
+        else {}
+    )
+    if existing:
+        if set(existing) != set(_PRODUCTION_MCP_ALIASES) or any(
+            not _is_owned_hermes_server(value, token_name=token_name, alias=alias)
+            for alias, value in existing.items()
+        ):
             raise SetupError("Hermes profile has a conflicting Signet MCP server")
         _, owned, _ = _remove_owned_block(
             text,
@@ -2440,7 +2458,7 @@ def _merge_hermes_config(
         raise SetupError("Hermes mcp_servers must use an editable block mapping")
     if key_match is None:
         rendered = yaml.safe_dump(
-            {"mcp_servers": {_HERMES_SERVER_NAME: expected}},
+            {"mcp_servers": expected},
             sort_keys=False,
             allow_unicode=False,
         )
@@ -2455,7 +2473,7 @@ def _merge_hermes_config(
             raise SetupError("Hermes mcp_servers block must end with a newline")
         insertion = _mapping_block_end(text, key_match.end())
         rendered = yaml.safe_dump(
-            {_HERMES_SERVER_NAME: expected},
+            expected,
             sort_keys=False,
             allow_unicode=False,
         )
@@ -2469,7 +2487,10 @@ def _merge_hermes_config(
     merged = merged_text.encode("utf-8")
     merged_document = _yaml_document(merged)
     merged_servers = merged_document.get("mcp_servers")
-    if not isinstance(merged_servers, dict) or merged_servers.get(_HERMES_SERVER_NAME) != expected:
+    if not isinstance(merged_servers, dict) or any(
+        merged_servers.get(server_name) != expected[server_name]
+        for server_name in _HERMES_SERVER_NAMES.values()
+    ):
         raise SetupError("Hermes profile integration could not be rendered safely")
     return merged
 
@@ -2486,37 +2507,44 @@ def _remove_hermes_config(
         raise SetupError("Hermes profile config is not UTF-8") from None
     document = _yaml_document(encoded)
     servers = document.get("mcp_servers")
-    existing = servers.get(_HERMES_SERVER_NAME) if isinstance(servers, dict) else None
-    if existing is not None and not _is_owned_hermes_server(
-        existing,
-        token_name=token_name,
+    existing = (
+        {
+            alias: servers.get(server_name)
+            for alias, server_name in _HERMES_SERVER_NAMES.items()
+            if servers.get(server_name) is not None
+        }
+        if isinstance(servers, dict)
+        else {}
+    )
+    if any(
+        not _is_owned_hermes_server(value, token_name=token_name, alias=alias)
+        for alias, value in existing.items()
     ):
         raise SetupError("Hermes profile has a changed or foreign Signet MCP server")
     owned_block = _owned_hermes_block_document(text, setup_id=setup_id)
     if owned_block is not None:
         indent, block_payload = owned_block
-        expected_document = (
-            {"mcp_servers": {_HERMES_SERVER_NAME: existing}}
-            if indent == ""
-            else {_HERMES_SERVER_NAME: existing}
-        )
+        named_existing = {_HERMES_SERVER_NAMES[alias]: value for alias, value in existing.items()}
+        expected_document = {"mcp_servers": named_existing} if indent == "" else named_existing
         expected_payload = yaml.safe_dump(
             expected_document,
             sort_keys=False,
             allow_unicode=False,
         )
-        if existing is None or block_payload != expected_payload:
+        if not existing or block_payload != expected_payload:
             raise SetupError("Hermes profile has changed or foreign content inside its marker")
     restored, removed, _ = _remove_owned_block(
         text,
         label="hermes config",
         setup_id=setup_id,
     )
-    if existing is not None and not removed:
+    if existing and not removed:
         raise SetupError("Hermes profile has an unowned Signet MCP server")
     restored_document = _yaml_document(restored.encode("utf-8"))
     restored_servers = restored_document.get("mcp_servers")
-    if isinstance(restored_servers, dict) and _HERMES_SERVER_NAME in restored_servers:
+    if isinstance(restored_servers, dict) and any(
+        name in restored_servers for name in _HERMES_SERVER_NAMES.values()
+    ):
         raise SetupError("Hermes profile integration rollback was incomplete")
     return restored.encode("utf-8")
 
@@ -2639,17 +2667,24 @@ def _yaml_document(encoded: bytes) -> dict[str, Any]:
     return dict(value)
 
 
-def _is_owned_hermes_server(value: Any, *, token_name: str) -> bool:
+def _is_owned_hermes_server(value: Any, *, token_name: str, alias: str) -> bool:
     if not isinstance(value, dict) or not isinstance(value.get("enabled"), bool):
         return False
     normalized = dict(value)
     normalized["enabled"] = False
-    return normalized == _hermes_server(token_name)
+    return normalized == _hermes_server(token_name, alias=alias)
 
 
-def _hermes_server(token_name: str) -> dict[str, Any]:
+def _hermes_servers(token_name: str) -> dict[str, dict[str, Any]]:
     return {
-        "url": "http://127.0.0.1:8789/mcp/approvals",
+        server_name: _hermes_server(token_name, alias=alias)
+        for alias, server_name in _HERMES_SERVER_NAMES.items()
+    }
+
+
+def _hermes_server(token_name: str, *, alias: str) -> dict[str, Any]:
+    return {
+        "url": f"http://127.0.0.1:8789/mcp/{alias}",
         "headers": {"Authorization": f"Bearer ${{{token_name}}}"},
         "enabled": False,
         "connect_timeout": 10,

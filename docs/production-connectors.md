@@ -17,6 +17,12 @@ exact connector/policy alias inventory, encrypted attachment staging, an
 attachment key reference, and all provider-specific prerequisites below.
 Generic plugin review never changes these fields and cannot activate this path.
 
+For installations created by `signet setup`, do not edit these fields manually.
+Use `signet provider setup fastmail` or, on Linux x86_64,
+`signet provider setup whatsapp`. The guided command performs discovery, one test
+send, policy/schema persistence, and the rollout transition. The details below are
+the runtime contract and manual recovery reference.
+
 ## Shared production boundary
 
 Live clients are process-lifetime sessions shared by the MCP and web/worker
@@ -99,7 +105,7 @@ expired or cancelled requests, and after seven days for failures. Sensitive
 payload rows are retained for seven days in terminal states; ambiguous outcomes
 are not auto-purged.
 
-## WhatsApp prerequisites and host blocker
+## WhatsApp prerequisites and platform support
 
 The connector alias must be exactly `whatsapp` and use one hash-pinned stdio
 executable with no configured arguments. `provider_rollout.wacli` supplies a
@@ -121,12 +127,11 @@ oversized output is classified as an unknown outcome and is not automatically
 retried. WhatsApp has no reviewed remote lookup for reconciliation, so unknown
 outcomes remain manual.
 
-The local process boundary activates only on a supported Linux descriptor-exec
-host with a separately reviewed native `wacli` artifact. The repository's current
-macOS Homebrew artifact has no compatible reviewed host/artifact pair. macOS and
-an unreviewed Linux binary therefore fail closed with
-`process_boundary_platform_unsupported`; do not bypass that check. See
-[`wacli-process-boundary.md`](wacli-process-boundary.md).
+Guided setup supports Linux x86_64 and installs the pinned upstream
+`wacli_0.12.0_linux_amd64.tar.gz` artifact after verifying its reviewed SHA-256.
+The local process boundary still requires Linux descriptor execution. macOS and
+other architectures fail with `process_boundary_platform_unsupported`; do not
+bypass that check. See [`wacli-process-boundary.md`](wacli-process-boundary.md).
 
 ## Migration and cutover sequence
 

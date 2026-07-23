@@ -1,4 +1,4 @@
-.TH SIGNET 1 "July 2026" "signet-gateway 0.1.0" "User Commands"
+.TH SIGNET 1 "July 2026" "signet-gateway 0.1.0b1" "User Commands"
 .SH NAME
 signet \- provider-neutral MCP human approval gateway
 .SH SYNOPSIS
@@ -7,6 +7,10 @@ signet \- provider-neutral MCP human approval gateway
 .br
 .B signet
 .RI { manage | status | doctor | backup | restore | upgrade | uninstall }
+.RI [ options ]
+.br
+.B signet provider
+.RI { setup | status | enable | disable }
 .RI [ options ]
 .SH DESCRIPTION
 .B signet setup
@@ -77,11 +81,27 @@ Remove exact service and Hermes integration resources while preserving productio
 .B signet uninstall --purge
 Back up first, then remove setup-owned active data and runtime secrets. The backup key
 and backup directory are retained.
+.SH PROVIDER COMMANDS
+.TP
+.B signet provider setup fastmail --from ADDRESS --to ADDRESS
+Prompt for a Fastmail API token, send one test email, save the generated policy and
+schemas, and enable the configured provider rollout.
+.TP
+.B signet provider setup whatsapp --to PHONE_OR_JID
+On Linux x86_64, install the pinned wacli release if needed, pair the account, send
+one test message, and enable the configured provider rollout.
+.TP
+.B signet provider status
+Show platform support, configuration, credential readiness, and rollout state.
+.TP
+.B signet provider {enable|disable} {fastmail|whatsapp}
+Start or stop the shared rollout for all configured providers.
 .SH HERMES
-Setup adds a distinct profile-scoped caller token and disabled signet_approvals MCP
-entry to each selected profile. Tokens are written to private profile environment
-files and are never printed or accepted on argv. Review and enable each entry, then
-run /reload-mcp in that profile. Signet never restarts the Hermes gateway.
+Setup adds a distinct profile-scoped caller token and disabled signet_approvals,
+signet_fastmail, and signet_whatsapp MCP entries to each selected profile. Tokens are
+written to private profile environment files and are never printed or accepted on
+argv. Review the entries, enable approvals and configured providers, then run
+/reload-mcp in that profile. Signet never restarts the Hermes gateway.
 .SH BROWSER SETUP
 The public /setup URL is printed before browser launch. The one-time capability is
 placed in a URL fragment, removed from browser history before submission, retained in

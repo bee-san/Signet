@@ -443,12 +443,15 @@ class ProductionProviderRollout(BaseModel):
 
 
 class ProductionCallerPrincipal(BaseModel):
-    """One reviewed Hermes profile allowed to use the approvals-only MCP route."""
+    """One reviewed Hermes profile allowed to use fixed production MCP routes."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     namespace: str
-    allowed_aliases: tuple[Literal["approvals"], ...] = ("approvals",)
+    allowed_aliases: tuple[
+        Literal["approvals", "fastmail", "whatsapp"],
+        ...,
+    ] = ("approvals",)
 
     @field_validator("namespace")
     @classmethod
@@ -459,12 +462,14 @@ class ProductionCallerPrincipal(BaseModel):
 
     @field_validator("allowed_aliases")
     @classmethod
-    def aliases_are_approvals_only(
+    def aliases_are_fixed_production_routes(
         cls,
-        value: tuple[Literal["approvals"], ...],
-    ) -> tuple[Literal["approvals"], ...]:
-        if value != ("approvals",):
-            raise ValueError("production callers may use only the approvals alias")
+        value: tuple[Literal["approvals", "fastmail", "whatsapp"], ...],
+    ) -> tuple[Literal["approvals", "fastmail", "whatsapp"], ...]:
+        if "approvals" not in value or len(value) != len(set(value)):
+            raise ValueError(
+                "production callers require approvals and unique fixed provider aliases"
+            )
         return value
 
 

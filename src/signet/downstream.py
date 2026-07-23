@@ -33,6 +33,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 
+from signet import __version__
 from signet.adapters.base import AdapterProtocolError, copy_json_object
 from signet.config import DownstreamConfig
 from signet.credential_broker import Secret, SecretReference, SecretStore
@@ -480,7 +481,7 @@ def _official_session_factory(
         read_stream,
         write_stream,
         read_timeout_seconds=timeout,
-        client_info=types.Implementation(name="signet-downstream", version="0.1.0"),
+        client_info=types.Implementation(name="signet-downstream", version=__version__),
     )
     return cast(AbstractAsyncContextManager[DownstreamSession], session)
 

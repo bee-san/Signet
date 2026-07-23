@@ -494,6 +494,157 @@ class ProductionStateStore:
                 (next_config_digest, now, current_config_digest),
             )
 
+    def configure_provider(
+        self,
+        *,
+        current_config: ProductionConfig,
+        next_config: ProductionConfig,
+        alias: Literal["fastmail", "whatsapp"],
+        now: int,
+    ) -> None:
+        """Add, replace, or remove one provider while live rollout is stopped."""
+
+        if alias not in {"fastmail", "whatsapp"}:
+            raise ValueError("provider alias is unsupported")
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("provider configuration time is invalid")
+        if any(
+            config.provider_rollout.state != "disabled" or config.capabilities.live_providers_ready
+            for config in (current_config, next_config)
+        ):
+            raise ProductionStateError("provider configuration requires disabled rollout")
+
+        current_document = current_config.model_dump(mode="json")
+        next_document = next_config.model_dump(mode="json")
+        current_connector = current_document["connectors"].pop(alias, None)
+        next_connector = next_document["connectors"].pop(alias, None)
+        if alias == "whatsapp":
+            current_wacli = current_document["provider_rollout"].pop("wacli", None)
+            next_wacli = next_document["provider_rollout"].pop("wacli", None)
+        else:
+            current_wacli = next_wacli = None
+        if current_document != next_document or (
+            current_connector == next_connector and current_wacli == next_wacli
+        ):
+            raise ProductionStateError(
+                "provider configuration may change only the selected provider"
+            )
+        if alias == "whatsapp" and (next_connector is None) != (next_wacli is None):
+            raise ProductionStateError("WhatsApp configuration requires its wacli boundary")
+
+        current_digest = production_config_digest(current_config)
+        next_digest = production_config_digest(next_config)
+        with self.database.transaction() as connection:
+            setup = connection.execute(
+                "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()
+            service_digests = connection.execute(
+                "SELECT DISTINCT config_digest FROM production_services"
+            ).fetchall()
+            stored_aliases = {
+                str(row["connector_alias"])
+                for row in connection.execute(
+                    "SELECT connector_alias FROM production_connectors"
+                ).fetchall()
+            }
+            if (
+                setup is None
+                or setup["config_digest"] != current_digest
+                or len(service_digests) != 1
+                or service_digests[0]["config_digest"] != current_digest
+                or stored_aliases != set(current_config.connectors)
+            ):
+                raise ProductionStateError("provider configuration precondition failed")
+
+            current_model = current_config.connectors.get(alias)
+            stored = connection.execute(
+                """
+                SELECT config_digest, transport, credential_ref,
+                       credential_identity_digest, state
+                FROM production_connectors WHERE connector_alias = ?
+                """,
+                (alias,),
+            ).fetchone()
+            if current_model is None:
+                if stored is not None:
+                    raise ProductionStateError("provider configuration precondition failed")
+            else:
+                expected_connector_digest = _connector_config_digest(
+                    current_model.model_dump(mode="json")
+                )
+                if (
+                    stored is None
+                    or stored["config_digest"] != expected_connector_digest
+                    or stored["transport"] != current_model.transport
+                    or stored["credential_ref"] != current_model.credential_ref
+                    or stored["credential_identity_digest"]
+                    != current_model.credential_identity_digest
+                    or stored["state"] != "disabled"
+                ):
+                    raise ProductionStateError("provider configuration precondition failed")
+
+            next_model = next_config.connectors.get(alias)
+            if next_model is None:
+                connection.execute(
+                    "DELETE FROM production_connectors WHERE connector_alias = ?",
+                    (alias,),
+                )
+            elif stored is None:
+                connection.execute(
+                    """
+                    INSERT INTO production_connectors(
+                        connector_alias, config_digest, transport, credential_ref,
+                        credential_identity_digest, state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'disabled', ?, ?)
+                    """,
+                    (
+                        alias,
+                        _connector_config_digest(next_model.model_dump(mode="json")),
+                        next_model.transport,
+                        next_model.credential_ref,
+                        next_model.credential_identity_digest,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE production_connectors
+                    SET config_digest = ?, transport = ?, credential_ref = ?,
+                        credential_identity_digest = ?, state = 'disabled',
+                        updated_at = MAX(updated_at, ?)
+                    WHERE connector_alias = ?
+                    """,
+                    (
+                        _connector_config_digest(next_model.model_dump(mode="json")),
+                        next_model.transport,
+                        next_model.credential_ref,
+                        next_model.credential_identity_digest,
+                        now,
+                        alias,
+                    ),
+                )
+
+            updated_setup = connection.execute(
+                """
+                UPDATE production_setup_state
+                SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                WHERE state_id = 1 AND config_digest = ?
+                """,
+                (next_digest, now, current_digest),
+            ).rowcount
+            updated_services = connection.execute(
+                """
+                UPDATE production_services
+                SET config_digest = ?, updated_at = MAX(updated_at, ?)
+                WHERE config_digest = ?
+                """,
+                (next_digest, now, current_digest),
+            ).rowcount
+            if updated_setup != 1 or updated_services < 1:
+                raise ProductionStateError("provider configuration precondition failed")
+
     def status(self, *, read_only: bool = False) -> ProductionStatus:
         reader = self.database.read_only if read_only else self.database.read
         with reader() as connection:

@@ -59,7 +59,7 @@ def make_fake_wacli(
     tmp_path: Path,
     *,
     version: str = "0.12.0",
-    send_body: str = '{"sent":true,"message_id":"wa-safe-id"}',
+    send_body: str = '{"sent":true,"to":"15550102030@s.whatsapp.net","id":"wa-safe-id"}',
     send_prelude: str = "",
     linked_jid: str = "15551234567@s.whatsapp.net",
     fd_report: Path | None = None,
@@ -346,6 +346,18 @@ async def test_wacli_wrapper_is_pinned_no_shell_minimal_env_and_json_only(
     assert "--json\n--timeout\n15s" in logged
     assert "send\ntext\n--to\n+15550102030" in logged
     assert f"--message\n{hostile_message}\n--no-preview" in logged
+
+
+@pytest.mark.asyncio
+async def test_wacli_wrapper_rejects_invalid_send_result_as_ambiguous(tmp_path: Path) -> None:
+    executable, _ = make_fake_wacli(tmp_path, send_body='{"sent":true}')
+    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path))
+
+    with pytest.raises(WacliError) as caught:
+        await wrapper.send_text(text_arguments())
+
+    assert caught.value.code == "invalid_send_result"
+    assert caught.value.dispatch_may_have_occurred is True
 
 
 @pytest.mark.asyncio

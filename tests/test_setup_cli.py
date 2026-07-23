@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,136 @@ def test_parser_exposes_setup_lifecycle_commands(command: str) -> None:
     else:
         args = parser.parse_args([command])
     assert args.command == command
+
+
+def test_parser_and_dispatch_expose_simple_provider_workflows(tmp_path: Path) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class Providers:
+        def setup_fastmail(
+            self,
+            *,
+            token: str,
+            sender: str,
+            recipient: str,
+        ) -> dict[str, object]:
+            calls.append(("fastmail", (token, sender, recipient)))
+            return {"provider": "fastmail", "enabled": True}
+
+        def setup_whatsapp(
+            self,
+            *,
+            recipient: str,
+            install_wacli: bool,
+        ) -> dict[str, object]:
+            calls.append(("whatsapp", (recipient, install_wacli)))
+            return {"provider": "whatsapp", "enabled": True}
+
+        def status(self) -> dict[str, object]:
+            calls.append(("status", None))
+            return {"rollout": "disabled"}
+
+        def enable(self, provider: str) -> dict[str, object]:
+            calls.append(("enable", provider))
+            return {"provider": provider, "rollout": "enabled"}
+
+        def disable(self, provider: str) -> dict[str, object]:
+            calls.append(("disable", provider))
+            return {"provider": provider, "rollout": "disabled"}
+
+    roots: list[Path] = []
+
+    def factory(root: Path, platform: object) -> Providers:
+        del platform
+        roots.append(root)
+        return Providers()
+
+    parser = _parser()
+    commands = [
+        [
+            "provider",
+            "setup",
+            "fastmail",
+            "--root",
+            str(tmp_path),
+            "--from",
+            "sender@example.test",
+            "--to",
+            "recipient@example.test",
+            "--token-stdin",
+            "--yes",
+        ],
+        [
+            "provider",
+            "setup",
+            "whatsapp",
+            "--root",
+            str(tmp_path),
+            "--to",
+            "+447700900123",
+            "--yes",
+        ],
+        ["provider", "status", "--root", str(tmp_path)],
+        ["provider", "enable", "--root", str(tmp_path), "fastmail"],
+        ["provider", "disable", "--root", str(tmp_path), "whatsapp"],
+    ]
+    output: list[str] = []
+    for command in commands:
+        assert (
+            run_setup_command(
+                parser.parse_args(command),
+                output=output.append,
+                platform=FakePlatform(),
+                provider_operations_factory=factory,
+                stdin=StringIO("secret-token\n"),
+            )
+            == 0
+        )
+
+    assert roots == [tmp_path] * len(commands)
+    assert calls == [
+        (
+            "fastmail",
+            ("secret-token", "sender@example.test", "recipient@example.test"),
+        ),
+        ("whatsapp", ("+447700900123", True)),
+        ("status", None),
+        ("enable", "fastmail"),
+        ("disable", "whatsapp"),
+    ]
+    assert [json.loads(item) for item in output] == [
+        {"provider": "fastmail", "enabled": True},
+        {"provider": "whatsapp", "enabled": True},
+        {"rollout": "disabled"},
+        {"provider": "fastmail", "rollout": "enabled"},
+        {"provider": "whatsapp", "rollout": "disabled"},
+    ]
+
+
+def test_provider_setup_requires_confirmation_before_reading_a_secret(
+    tmp_path: Path,
+) -> None:
+    args = _parser().parse_args(
+        [
+            "provider",
+            "setup",
+            "fastmail",
+            "--root",
+            str(tmp_path),
+            "--from",
+            "sender@example.test",
+            "--to",
+            "recipient@example.test",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="confirmation"):
+        run_setup_command(
+            args,
+            input_fn=lambda _: "no",
+            secret_input_fn=lambda _: pytest.fail("secret was requested before confirmation"),
+            provider_operations_factory=lambda *_args, **_kwargs: object(),
+        )
 
 
 def test_setup_plan_is_json_and_does_not_create_state(tmp_path: Path) -> None:

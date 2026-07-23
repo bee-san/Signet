@@ -430,6 +430,7 @@ class ProductionAssembly:
     config: ProductionConfig
     database: Database
     policy_engine: PolicyEngine
+    policy_promotions: SQLitePolicyPromotionBoundary
     mcp: MCPRuntime | None
     web: FastAPI | None
     workers: ProductionWorkers
@@ -969,6 +970,7 @@ def build_production_runtime(
         config=config,
         database=database,
         policy_engine=engine,
+        policy_promotions=policy_promotions,
         mcp=mcp,
         web=web,
         workers=workers,

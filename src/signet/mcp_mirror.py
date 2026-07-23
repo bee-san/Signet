@@ -26,6 +26,7 @@ from pydantic import PrivateAttr, model_serializer
 from referencing import Registry
 from referencing.exceptions import NoSuchResource
 
+from signet import __version__
 from signet.async_support import run_sync_non_abandoning as _run_sync
 from signet.canonical import canonical_json, sha256_hex
 from signet.policy import DownstreamPolicy, PolicyMode, PolicySnapshot, ToolPolicy
@@ -1268,7 +1269,7 @@ class LosslessToolServer(Server[None, Any]):
     ) -> InitializationOptions:
         return InitializationOptions(
             server_name=self.name,
-            server_version=self.version or "0.1.0",
+            server_version=self.version or __version__,
             capabilities=types.ServerCapabilities(tools=types.ToolsCapability(listChanged=True)),
             instructions=self.instructions,
             website_url=self.website_url,
@@ -1298,7 +1299,7 @@ class AliasToolSurface:
         self.call_handler = call_handler
         self.denied_event_handler = denied_event_handler
         self.namespace_provider = namespace_provider
-        self.server: LosslessToolServer = LosslessToolServer("Signet", version="0.1.0")
+        self.server: LosslessToolServer = LosslessToolServer("Signet", version=__version__)
         self._sessions: set[Any] = set()
         self._session_invocation_scopes: dict[Any, str] = {}
         self._session_ids: dict[str, Any] = {}
