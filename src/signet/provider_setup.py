@@ -753,9 +753,15 @@ def _fetch_fastmail_certificate(url: str) -> tuple[bytes, str]:
 
 
 def _download_bounded(url: str) -> bytes:
+    if url != WACLI_ARCHIVE_URL:
+        raise SetupError("wacli download URL is not reviewed")
     request = urllib.request.Request(url, headers={"User-Agent": "signet-gateway"})
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        # The exact pinned HTTPS URL is checked before opening it.
+        with urllib.request.urlopen(  # nosec B310
+            request,
+            timeout=60,
+        ) as response:
             payload = cast(bytes, response.read(_DOWNLOAD_LIMIT + 1))
     except OSError as exc:
         raise SetupError("wacli download failed") from exc

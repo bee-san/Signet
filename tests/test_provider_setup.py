@@ -1010,18 +1010,23 @@ def test_bounded_download_archive_and_private_file_helpers(
         "urlopen",
         lambda *_args, **_kwargs: Response(b"archive"),
     )
-    assert provider_setup_module._download_bounded("https://example.test/wacli") == b"archive"
+    assert (
+        provider_setup_module._download_bounded(provider_setup_module.WACLI_ARCHIVE_URL)
+        == b"archive"
+    )
+    with pytest.raises(SetupError, match="URL is not reviewed"):
+        provider_setup_module._download_bounded("https://example.test/wacli")
 
     monkeypatch.setattr(provider_setup_module, "_DOWNLOAD_LIMIT", 4)
     with pytest.raises(SetupError, match="size limit"):
-        provider_setup_module._download_bounded("https://example.test/wacli")
+        provider_setup_module._download_bounded(provider_setup_module.WACLI_ARCHIVE_URL)
     monkeypatch.setattr(
         provider_setup_module.urllib.request,
         "urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")),
     )
     with pytest.raises(SetupError, match="download failed"):
-        provider_setup_module._download_bounded("https://example.test/wacli")
+        provider_setup_module._download_bounded(provider_setup_module.WACLI_ARCHIVE_URL)
 
     with pytest.raises(SetupError, match="archive is invalid"):
         _extract_wacli(b"not-a-tarball")
