@@ -1982,6 +1982,19 @@ def test_build_rejects_policy_connector_drift_before_database_creation(tmp_path:
     assert not config.storage.database_path.exists()
 
 
+def test_build_rejects_policy_connector_alias_drift_before_database_creation(
+    tmp_path: Path,
+) -> None:
+    payload = _production_payload(tmp_path)
+    payload["connectors"] = {}
+    config = ProductionConfig.model_validate(payload)
+
+    with pytest.raises(ProductionAssemblyError, match="aliases must match exactly"):
+        build_production_runtime(config, secret_store=_secret_store())
+
+    assert not config.storage.database_path.exists()
+
+
 def test_private_config_loader_and_factory_use_versioned_json(tmp_path: Path) -> None:
     payload = _production_payload(tmp_path)
     config_path = tmp_path / "production.json"
@@ -2003,6 +2016,35 @@ def test_private_config_loader_and_factory_use_versioned_json(tmp_path: Path) ->
     symlink.symlink_to(config_path)
     with pytest.raises(ProductionAssemblyError, match="opened safely"):
         load_production_config(symlink)
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    (
+        ("{", "not valid UTF-8 JSON"),
+        ("[]", "must be a JSON object"),
+    ),
+)
+def test_private_config_loader_rejects_invalid_documents(
+    tmp_path: Path,
+    document: str,
+    message: str,
+) -> None:
+    config_path = tmp_path / "production.json"
+    config_path.write_text(document, encoding="utf-8")
+    config_path.chmod(0o600)
+
+    with pytest.raises(ProductionAssemblyError, match=message):
+        load_production_config(config_path)
+
+
+def test_environment_asgi_factory_requires_the_private_config_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SIGNET_PRODUCTION_CONFIG", raising=False)
+
+    with pytest.raises(ProductionAssemblyError, match="must name the private config file"):
+        create_production_web_app_from_environment(secret_store=_secret_store())
 
 
 def test_environment_asgi_factories_use_only_the_private_config_path(
