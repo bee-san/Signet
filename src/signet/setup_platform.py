@@ -248,6 +248,79 @@ class ProductionSetupPlatform:
         self.command_runner = command_runner
         self._database_override: Database | None = None
 
+    @staticmethod
+    def _command_output_lines(
+        result: subprocess.CompletedProcess[str],
+    ) -> tuple[str, ...]:
+        return tuple(
+            line.strip().lower()
+            for line in f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()
+            if line.strip()
+        )
+
+    @staticmethod
+    def _service_manager_environment() -> dict[str, str]:
+        return {**os.environ, "LANG": "C", "LC_ALL": "C"}
+
+    @classmethod
+    def _launchd_result_means_already_loaded(
+        cls,
+        result: subprocess.CompletedProcess[str],
+        *,
+        target: Path,
+    ) -> bool:
+        return cls._command_output_lines(result) == (
+            f"{str(target).lower()}: service already loaded",
+        )
+
+    @classmethod
+    def _launchd_result_means_missing(
+        cls,
+        result: subprocess.CompletedProcess[str],
+        *,
+        label: str,
+        uid: int,
+    ) -> bool:
+        lines = cls._command_output_lines(result)
+        missing_line = f'could not find service "{label.lower()}" in domain for user gui: {uid}'
+        return lines == (missing_line,) or lines == ("bad request.", missing_line)
+
+    @classmethod
+    def _launchd_service_state(
+        cls,
+        status: subprocess.CompletedProcess[str],
+        *,
+        label: str,
+        uid: int,
+    ) -> Literal["active", "inactive", "unavailable"]:
+        if status.returncode == 0:
+            return "active"
+        if cls._launchd_result_means_missing(status, label=label, uid=uid):
+            return "inactive"
+        return "unavailable"
+
+    @classmethod
+    def _systemd_service_state(
+        cls,
+        status: subprocess.CompletedProcess[str],
+        *,
+        unit: str,
+    ) -> Literal["active", "inactive", "unavailable"]:
+        if status.returncode == 0:
+            return "active"
+        lines = cls._command_output_lines(status)
+        if status.returncode == 3 and lines in {("inactive",), ("failed",)}:
+            return "inactive"
+        missing_line = f"unit {unit.lower()} could not be found"
+        named_missing_lines = {missing_line, f"{missing_line}."}
+        if (
+            status.returncode == 4
+            and any(line in named_missing_lines for line in lines)
+            and all(line in {"unknown", "not-found", *named_missing_lines} for line in lines)
+        ):
+            return "inactive"
+        return "unavailable"
+
     @contextmanager
     def use_database(self, database: Database) -> Iterator[None]:
         if self._database_override is not None:
@@ -317,11 +390,18 @@ class ProductionSetupPlatform:
                 if action == "stop":
                     self._stop_launchd_unit(command)
                     continue
-                result = self.command_runner(command, text=True, capture_output=True, check=False)
-                if result.returncode != 0:
-                    message = (result.stderr or "").lower()
-                    if not (action == "start" and "already" in message):
-                        raise SetupError(f"launchd {action} failed for {label}")
+                result = self.command_runner(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=self._service_manager_environment(),
+                )
+                if result.returncode != 0 and not (
+                    action == "start"
+                    and self._launchd_result_means_already_loaded(result, target=path)
+                ):
+                    raise SetupError(f"launchd {action} failed for {label}")
         else:
             rendered = render_systemd_services(spec, active=True)
             target = Path.home() / ".config" / "systemd" / "user"
@@ -351,8 +431,13 @@ class ProductionSetupPlatform:
                     text=True,
                     capture_output=True,
                     check=False,
+                    env=self._service_manager_environment(),
                 )
-                result[label] = "active" if status.returncode == 0 else "inactive"
+                result[label] = self._launchd_service_state(
+                    status,
+                    label=label,
+                    uid=uid,
+                )
         else:
             rendered = render_systemd_services(spec, active=True)
             target = Path.home() / ".config" / "systemd" / "user"
@@ -367,8 +452,9 @@ class ProductionSetupPlatform:
                     text=True,
                     capture_output=True,
                     check=False,
+                    env=self._service_manager_environment(),
                 )
-                result[name] = "active" if status.returncode == 0 else "inactive"
+                result[name] = self._systemd_service_state(status, unit=name)
         port = _managed_tailnet_port(spec)
         if port is not None:
             try:
@@ -1163,8 +1249,12 @@ class ProductionSetupPlatform:
                     text=True,
                     capture_output=True,
                     check=False,
+                    env=self._service_manager_environment(),
                 )
-                if result.returncode != 0 and "already" not in (result.stderr or "").lower():
+                if result.returncode != 0 and not self._launchd_result_means_already_loaded(
+                    result,
+                    target=path,
+                ):
                     raise SetupError(f"launchd could not load {name}")
         else:
             rendered_text = render_systemd_services(spec, active=True)
@@ -1226,9 +1316,17 @@ class ProductionSetupPlatform:
                     text=True,
                     capture_output=True,
                     check=False,
+                    env=self._service_manager_environment(),
                 )
-                if status.returncode == 0:
+                state = self._launchd_service_state(
+                    status,
+                    label=label,
+                    uid=uid,
+                )
+                if state == "active":
                     raise SetupError("launchd did not quiesce every Signet service")
+                if state == "unavailable":
+                    raise SetupError("launchd service status is unavailable")
             for name, content in rendered.items():
                 path = target / name
                 plan_path = spec.root / "services" / name
@@ -1259,9 +1357,13 @@ class ProductionSetupPlatform:
                     text=True,
                     capture_output=True,
                     check=False,
+                    env=self._service_manager_environment(),
                 )
-                if status.returncode == 0:
+                state = self._systemd_service_state(status, unit=name)
+                if state == "active":
                     raise SetupError("systemd did not quiesce every Signet service")
+                if state == "unavailable":
+                    raise SetupError("systemd service status is unavailable")
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
                 target_path = target / name
@@ -1927,17 +2029,29 @@ class ProductionSetupPlatform:
             text=True,
             capture_output=True,
             check=False,
+            env=self._service_manager_environment(),
         )
-        detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        already_stopped = any(
-            marker in detail
-            for marker in (
-                "is not loaded",
-                "not loaded",
-                "does not exist",
-                "not-found",
-                "no files found",
+        lines = self._command_output_lines(result)
+        escaped_unit = re.escape(command[-1].lower())
+        already_stopped = bool(lines) and all(
+            re.fullmatch(rf"unit {escaped_unit} (?:is )?not loaded\.?", line) is not None
+            or re.fullmatch(
+                rf"failed to disable unit: unit(?: file)? {escaped_unit} does not exist\.?",
+                line,
             )
+            is not None
+            or re.fullmatch(
+                rf"failed to disable unit, unit {escaped_unit} does not exist\.?",
+                line,
+            )
+            is not None
+            or re.fullmatch(
+                rf"failed to stop {escaped_unit}: unit {escaped_unit} not loaded\.?",
+                line,
+            )
+            is not None
+            or re.fullmatch(rf"no files found for {escaped_unit}\.?", line) is not None
+            for line in lines
         )
         if result.returncode != 0 and not already_stopped:
             raise SetupError("systemd could not stop Signet")
@@ -1948,9 +2062,37 @@ class ProductionSetupPlatform:
             text=True,
             capture_output=True,
             check=False,
+            env=self._service_manager_environment(),
         )
-        detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        already_stopped = "no such process" in detail or "could not find service" in detail
+        lines = self._command_output_lines(result)
+        missing_target = False
+        expected_label: str | None = None
+        expected_uid: int | None = None
+        if len(command) == 3:
+            service_target = re.fullmatch(r"gui/(\d+)/([a-zA-Z0-9._-]+)", command[-1])
+            if service_target is not None:
+                expected_uid = int(service_target.group(1))
+                expected_label = service_target.group(2)
+        elif len(command) >= 4:
+            domain = re.fullmatch(r"gui/(\d+)", command[-2].lower())
+            target_name = Path(command[-1]).name
+            if domain is not None and target_name.endswith(".plist"):
+                expected_uid = int(domain.group(1))
+                expected_label = target_name.removesuffix(".plist")
+        if expected_label is not None and expected_uid is not None:
+            missing_target = self._launchd_result_means_missing(
+                result,
+                label=expected_label,
+                uid=expected_uid,
+            )
+        already_stopped = (
+            missing_target
+            or lines == ("no such process",)
+            or (
+                len(lines) == 1
+                and re.fullmatch(r"boot-out failed: \d+: no such process", lines[0]) is not None
+            )
+        )
         if result.returncode != 0 and not already_stopped:
             raise SetupError("launchd could not stop Signet")
 
