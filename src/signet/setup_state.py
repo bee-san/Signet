@@ -532,6 +532,16 @@ class SetupJournalStore:
                 expected_identity=intent_identity,
             )
             os.fsync(parent_descriptor)
+            for cleanup_name in self._owner_cleanup_links(
+                parent_descriptor,
+                expected_identity=intent_identity,
+            ):
+                self._remove_owner_link(
+                    parent_descriptor,
+                    cleanup_name,
+                    expected_identity=intent_identity,
+                )
+                os.fsync(parent_descriptor)
             published = self._inspect_owner_candidate(
                 parent_descriptor,
                 self.OWNER_NAME,
@@ -646,6 +656,25 @@ class SetupJournalStore:
                 "setup owner publication artifact could not be removed safely"
             ) from exc
 
+    def _owner_cleanup_links(
+        self,
+        parent_descriptor: int,
+        *,
+        expected_identity: tuple[int, int],
+    ) -> tuple[str, ...]:
+        prefix = f".{self.OWNER_NAME}."
+        candidates: list[str] = []
+        for name in os.listdir(parent_descriptor):
+            if not name.startswith(prefix) or not name.endswith(".tmp"):
+                continue
+            token = name[len(prefix) : -4]
+            if not token or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None:
+                continue
+            candidate = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (candidate.st_dev, candidate.st_ino) == expected_identity:
+                candidates.append(name)
+        return tuple(candidates)
+
     def _recover_owner_publication(self, *, spec: SetupSpec) -> str | None:
         """Finish the recoverable hard-link publication boundary for the owner marker."""
 
@@ -664,7 +693,7 @@ class SetupJournalStore:
             not stat.S_ISREG(owner.st_mode)
             or owner.st_uid != current_uid
             or stat.S_IMODE(owner.st_mode) != 0o600
-            or owner.st_nlink != 2
+            or owner.st_nlink < 2
         ):
             raise SetupError("setup owner marker is not a private owned file")
         parent_identity = require_private_directory_identity(self.root)
@@ -677,18 +706,11 @@ class SetupJournalStore:
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_CLOEXEC", 0),
             )
-            prefix = f".{self.OWNER_NAME}."
-            candidates: list[str] = []
-            for name in os.listdir(parent_descriptor):
-                if not name.startswith(prefix) or not name.endswith(".tmp"):
-                    continue
-                token = name[len(prefix) : -4]
-                if not token or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None:
-                    continue
-                candidate = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-                if (candidate.st_dev, candidate.st_ino) == (owner.st_dev, owner.st_ino):
-                    candidates.append(name)
-            if len(candidates) != 1:
+            candidates = self._owner_cleanup_links(
+                parent_descriptor,
+                expected_identity=(owner.st_dev, owner.st_ino),
+            )
+            if not candidates or len(candidates) != owner.st_nlink - 1:
                 raise SetupError("setup owner marker publication state is ambiguous")
             current = os.stat(
                 self.OWNER_NAME,
@@ -698,14 +720,15 @@ class SetupJournalStore:
             if (current.st_dev, current.st_ino) != (
                 owner.st_dev,
                 owner.st_ino,
-            ) or current.st_nlink != 2:
+            ) or current.st_nlink != owner.st_nlink:
                 raise SetupError("setup owner marker changed during publication recovery")
-            self._remove_owner_link(
-                parent_descriptor,
-                candidates[0],
-                expected_identity=(owner.st_dev, owner.st_ino),
-            )
-            os.fsync(parent_descriptor)
+            for candidate in candidates:
+                self._remove_owner_link(
+                    parent_descriptor,
+                    candidate,
+                    expected_identity=(owner.st_dev, owner.st_ino),
+                )
+                os.fsync(parent_descriptor)
             published_owner = os.stat(
                 self.OWNER_NAME,
                 dir_fd=parent_descriptor,

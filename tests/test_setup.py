@@ -641,6 +641,75 @@ def test_apply_recovers_owner_marker_temporary_before_its_final_link(
     assert not any(path.name.endswith(".tmp") for path in selected.root.iterdir())
 
 
+def test_apply_recovers_owner_marker_cleanup_crash_in_one_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet-owner-cleanup-crash")
+    store = SetupJournalStore(selected.root)
+    setup_id = "setup_0123456789abcdef"
+    real_unlink = setup_state.os.unlink
+    crashed = False
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_after_cleanup_rename(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal crashed
+        if not crashed and str(path).startswith(f".{store.OWNER_NAME}."):
+            crashed = True
+            raise SimulatedCrash
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(setup_state.os, "unlink", crash_after_cleanup_rename)
+    with pytest.raises(SimulatedCrash):
+        store.prepare(selected, setup_id)
+
+    monkeypatch.setattr(setup_state.os, "unlink", real_unlink)
+    journal = SetupEngine(store, FakePlatform()).apply(selected)
+
+    assert journal.setup_id == setup_id
+    assert store.owner_path.stat().st_nlink == 1
+    assert not (selected.root / store.OWNER_INTENT_NAME).exists()
+    assert not any(path.name.endswith(".tmp") for path in selected.root.iterdir())
+
+
+def test_apply_recovers_owner_marker_after_repeated_cleanup_crashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet-owner-repeated-cleanup-crash")
+    store = SetupJournalStore(selected.root)
+    setup_id = "setup_0123456789abcdef"
+    real_unlink = setup_state.os.unlink
+    crash_count = 0
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_twice_after_cleanup_rename(path: Any, *args: Any, **kwargs: Any) -> None:
+        nonlocal crash_count
+        if crash_count < 2 and str(path).startswith(f".{store.OWNER_NAME}."):
+            crash_count += 1
+            raise SimulatedCrash
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(setup_state.os, "unlink", crash_twice_after_cleanup_rename)
+    with pytest.raises(SimulatedCrash):
+        store.prepare(selected, setup_id)
+    with pytest.raises(SimulatedCrash):
+        SetupEngine(store, FakePlatform()).apply(selected)
+
+    monkeypatch.setattr(setup_state.os, "unlink", real_unlink)
+    journal = SetupEngine(store, FakePlatform()).apply(selected)
+
+    assert crash_count == 2
+    assert journal.setup_id == setup_id
+    assert store.owner_path.stat().st_nlink == 1
+    assert not (selected.root / store.OWNER_INTENT_NAME).exists()
+    assert not any(path.name.endswith(".tmp") for path in selected.root.iterdir())
+
+
 def test_apply_refuses_nonempty_foreign_root(tmp_path: Path) -> None:
     root = tmp_path / "signet"
     root.mkdir()
@@ -5017,9 +5086,9 @@ def test_absent_hermes_rollback_files_stay_bound_to_the_snapshotted_profile(
     real_observe = setup_platform._observe_optional_private_file
     reads = 0
 
-    def swap_after_reads(path: Path) -> Any:
+    def swap_after_reads(path: Path, **kwargs: Any) -> Any:
         nonlocal reads
-        observation = real_observe(path)
+        observation = real_observe(path, **kwargs)
         if path.parent == profile:
             reads += 1
             if reads == 2:
@@ -5110,6 +5179,136 @@ def test_hermes_apply_retry_rejects_drift_outside_the_managed_snapshot(
             environment_exists=True,
             setup_id=setup_id,
         )
+
+
+def test_hermes_snapshot_capture_rejects_a_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(spec(tmp_path / "snapshot-directory-swap"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    profile_identity = require_private_directory_identity(profile)
+    snapshot_directory = setup_platform._hermes_snapshot_directory(selected, "work")
+    displaced = snapshot_directory.parent / f"{snapshot_directory.name}.displaced"
+    real_create = setup_platform._create_or_verify_private_file
+    swapped = False
+
+    def swap_before_first_snapshot_write(path: Path, content: bytes) -> None:
+        nonlocal swapped
+        if not swapped and path.parent == snapshot_directory:
+            snapshot_directory.rename(displaced)
+            ensure_private_directory(snapshot_directory)
+            swapped = True
+        real_create(path, content)
+
+    monkeypatch.setattr(
+        setup_platform,
+        "_create_or_verify_private_file",
+        swap_before_first_snapshot_write,
+    )
+
+    with pytest.raises(SetupError, match="snapshot directory changed during capture"):
+        setup_platform._capture_hermes_profile_snapshot(
+            selected,
+            "work",
+            profile_identity=profile_identity,
+            config=b"model: original\n",
+            environment=b"EXISTING=kept\n",
+            config_exists=True,
+            environment_exists=True,
+        )
+
+    assert swapped is True
+    assert displaced.is_dir()
+
+
+def test_hermes_snapshot_capture_rejects_an_aba_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(spec(tmp_path / "snapshot-directory-aba"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    profile_identity = require_private_directory_identity(profile)
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=profile_identity,
+        config=b"model: original\n",
+        environment=b"",
+        config_exists=True,
+        environment_exists=False,
+    )
+    snapshot_directory = setup_platform._hermes_snapshot_directory(selected, "work")
+    original_directory = snapshot_directory.parent / f"{snapshot_directory.name}.original"
+    alternate_directory = snapshot_directory.parent / f"{snapshot_directory.name}.alternate"
+    shutil.copytree(snapshot_directory, alternate_directory)
+    alternate_config = alternate_directory / "config.yaml"
+    alternate_config.write_bytes(b"model: user-drift\n")
+    alternate_metadata_path = alternate_directory / "metadata.json"
+    alternate_metadata = json.loads(alternate_metadata_path.read_bytes())
+    alternate_metadata["config_sha256"] = hashlib.sha256(alternate_config.read_bytes()).hexdigest()
+    alternate_metadata_path.write_bytes(setup_platform._canonical_json_bytes(alternate_metadata))
+    real_open = setup_platform.os.open
+    real_lstat = Path.lstat
+    alternate_is_published = False
+    raced = False
+
+    def publish_alternate() -> None:
+        nonlocal alternate_is_published, raced
+        snapshot_directory.rename(original_directory)
+        alternate_directory.rename(snapshot_directory)
+        alternate_is_published = True
+        raced = True
+
+    def restore_original() -> None:
+        nonlocal alternate_is_published
+        snapshot_directory.rename(alternate_directory)
+        original_directory.rename(snapshot_directory)
+        alternate_is_published = False
+
+    def swap_while_opening(path: Any, *args: Any, **kwargs: Any) -> int:
+        selected_path = Path(path) if isinstance(path, (str, os.PathLike)) else None
+        if selected_path == snapshot_directory:
+            publish_alternate()
+            try:
+                return real_open(path, *args, **kwargs)
+            finally:
+                restore_original()
+        if selected_path == snapshot_directory / "metadata.json" and not alternate_is_published:
+            publish_alternate()
+        return real_open(path, *args, **kwargs)
+
+    def restore_after_alternate_config_stat(path: Path) -> os.stat_result:
+        metadata = real_lstat(path)
+        if path == snapshot_directory / "config.yaml" and alternate_is_published:
+            restore_original()
+        return metadata
+
+    monkeypatch.setattr(setup_platform.os, "open", swap_while_opening)
+    monkeypatch.setattr(Path, "lstat", restore_after_alternate_config_stat)
+
+    with pytest.raises(
+        SetupError,
+        match=(
+            "snapshot directory changed during capture|"
+            "profile resource parent changed during inspection|"
+            "config changed after its setup snapshot"
+        ),
+    ):
+        setup_platform._capture_hermes_profile_snapshot(
+            selected,
+            "work",
+            profile_identity=profile_identity,
+            config=b"model: user-drift\n",
+            environment=b"",
+            config_exists=True,
+            environment_exists=False,
+            setup_id="setup_0123456789abcdef",
+        )
+
+    assert raced is True
+    assert alternate_is_published is False
+    assert (snapshot_directory / "config.yaml").read_bytes() == b"model: original\n"
 
 
 def test_hermes_apply_binds_an_issued_token_to_its_rollback_snapshot(
@@ -5522,6 +5721,101 @@ def test_hermes_snapshot_token_update_rejects_a_same_content_inode_swap(
     assert (metadata_path.stat().st_dev, metadata_path.stat().st_ino) != before_identity
 
 
+@pytest.mark.parametrize("operation", ("bind", "clear"))
+def test_hermes_snapshot_token_update_rejects_an_aba_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    selected = replace(spec(tmp_path / "snapshot-token-directory-aba"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=require_private_directory_identity(profile),
+        config=b"",
+        environment=b"",
+        config_exists=False,
+        environment_exists=False,
+    )
+    token_id = "0000000000000001"
+    if operation == "clear":
+        setup_platform._bind_hermes_snapshot_token(
+            selected,
+            "work",
+            profile_directory=profile,
+            token_id=token_id,
+        )
+    snapshot_directory = setup_platform._hermes_snapshot_directory(selected, "work")
+    original_directory = snapshot_directory.parent / f"{snapshot_directory.name}.original"
+    alternate_directory = snapshot_directory.parent / f"{snapshot_directory.name}.alternate"
+    shutil.copytree(snapshot_directory, alternate_directory)
+    metadata_path = snapshot_directory / "metadata.json"
+    before = metadata_path.read_bytes()
+    real_observe = setup_platform._observe_optional_private_file
+    real_replace = setup_platform._replace_private_file
+    metadata_reads = 0
+    alternate_is_published = False
+    raced = False
+
+    def publish_alternate() -> None:
+        nonlocal alternate_is_published, raced
+        snapshot_directory.rename(original_directory)
+        alternate_directory.rename(snapshot_directory)
+        alternate_is_published = True
+        raced = True
+
+    def restore_original() -> None:
+        nonlocal alternate_is_published
+        snapshot_directory.rename(alternate_directory)
+        original_directory.rename(snapshot_directory)
+        alternate_is_published = False
+
+    def swap_before_update_observation(path: Path, **kwargs: Any) -> Any:
+        nonlocal metadata_reads
+        if path == metadata_path:
+            metadata_reads += 1
+            if metadata_reads == 2:
+                publish_alternate()
+                try:
+                    return real_observe(path, **kwargs)
+                except BaseException:
+                    restore_original()
+                    raise
+        return real_observe(path, **kwargs)
+
+    def restore_after_update(path: Path, content: bytes, **kwargs: Any) -> None:
+        try:
+            real_replace(path, content, **kwargs)
+        finally:
+            if alternate_is_published:
+                restore_original()
+
+    monkeypatch.setattr(
+        setup_platform,
+        "_observe_optional_private_file",
+        swap_before_update_observation,
+    )
+    monkeypatch.setattr(setup_platform, "_replace_private_file", restore_after_update)
+    update = (
+        setup_platform._bind_hermes_snapshot_token
+        if operation == "bind"
+        else setup_platform._clear_hermes_snapshot_token
+    )
+
+    with pytest.raises(SetupError, match="parent changed|directory changed"):
+        update(
+            selected,
+            "work",
+            profile_directory=profile,
+            token_id=token_id,
+        )
+
+    assert raced is True
+    assert alternate_is_published is False
+    assert metadata_path.read_bytes() == before
+
+
 def test_tailnet_rollback_rejects_the_right_target_on_the_wrong_port(
     tmp_path: Path,
 ) -> None:
@@ -5575,6 +5869,107 @@ def test_tailnet_private_route_rejects_foreground_funnel_permission() -> None:
                 "AllowFunnel": {host_port: True},
             }
         },
+    }
+
+    assert not setup_platform._serve_config_has_private_route(
+        serve,
+        host_port=host_port,
+        port=8443,
+        target="http://127.0.0.1:8790",
+    )
+
+
+def test_tailnet_apply_rejects_ambiguous_private_route_types_after_mutation(
+    tmp_path: Path,
+) -> None:
+    selected = SetupSpec(
+        root=tmp_path / "ambiguous-tailnet-route",
+        public_origin="https://signet.example.ts.net:8443",
+        owner_user_id="user:owner",
+        hermes_profiles=("work",),
+        executable=Path("/bin/echo"),
+    )
+    ensure_private_directory(selected.root / "services")
+    host_port = "signet.example.ts.net:8443"
+    state: dict[str, Any] = {"serve": {}}
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        commands.append(command)
+        if command[:3] == ["tailscale", "serve", "status"]:
+            payload = state["serve"]
+        elif "--bg" in command:
+            state["serve"] = {
+                "TCP": {"8443": {"HTTPS": 1}},
+                "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+                "AllowFunnel": {host_port: "true"},
+            }
+            payload = {}
+        elif command[-1] == "off":
+            state["serve"] = {}
+            payload = {}
+        else:  # pragma: no cover - protects the fake boundary
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    platform = ProductionSetupPlatform(command_runner=run)
+    with pytest.raises(SetupError, match="did not match the requested private route"):
+        platform._apply_tailnet_route(selected)
+
+    assert any("--bg" in command for command in commands)
+    assert any(command[-1] == "off" for command in commands)
+    assert state["serve"] == {}
+    assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected_baseline"),
+    [
+        pytest.param({}, {}, id="absent"),
+        pytest.param({"AllowFunnel": {}}, {}, id="empty"),
+        pytest.param(
+            {"AllowFunnel": {"other.example.ts.net:443": False}},
+            {"AllowFunnel": {"other.example.ts.net:443": False}},
+            id="unrelated",
+        ),
+    ],
+)
+def test_tailnet_private_route_removal_handles_every_accepted_funnel_shape(
+    extra: dict[str, Any],
+    expected_baseline: dict[str, Any],
+) -> None:
+    host_port = "signet.example.ts.net:8443"
+    serve = {
+        "TCP": {"8443": {"HTTPS": True}},
+        "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+        **extra,
+    }
+
+    assert setup_platform._serve_config_has_private_route(
+        serve,
+        host_port=host_port,
+        port=8443,
+        target="http://127.0.0.1:8790",
+    )
+    assert (
+        setup_platform._serve_config_without_private_route(
+            serve,
+            host_port=host_port,
+            port=8443,
+            target="http://127.0.0.1:8790",
+        )
+        == expected_baseline
+    )
+
+
+@pytest.mark.parametrize("section", ["AllowFunnel", "Foreground"])
+def test_tailnet_private_route_rejects_explicit_null_optional_sections(section: str) -> None:
+    host_port = "signet.example.ts.net:8443"
+    serve = {
+        "TCP": {"8443": {"HTTPS": True}},
+        "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+        section: None,
     }
 
     assert not setup_platform._serve_config_has_private_route(
@@ -5680,6 +6075,14 @@ def test_tailnet_apply_rejects_concurrent_route_drift_after_mutation(tmp_path: P
                 },
                 "AllowFunnel": {host_port: False},
             }
+            payload = {}
+        elif command[-1] == "off":
+            state["serve"] = setup_platform._serve_config_without_private_route(
+                state["serve"],
+                host_port=host_port,
+                port=8443,
+                target="http://127.0.0.1:8790",
+            )
             payload = {}
         else:  # pragma: no cover - protects the fake boundary
             raise AssertionError(command)
