@@ -2245,6 +2245,27 @@ def _prepare_owned_environment_factory(
     return config_path, config, secret_store, journal.setup_id
 
 
+@pytest.mark.parametrize("component", ["mcp", "web"])
+def test_owned_production_service_builds_one_validated_component_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    config_path, config, secret_store, _setup_id = _prepare_owned_environment_factory(
+        tmp_path,
+        monkeypatch,
+    )
+
+    selected, app = production_module.create_owned_production_service(
+        config_path,
+        component=component,
+        secret_store=secret_store,
+    )
+
+    assert selected.storage.data_dir == config.storage.data_dir
+    assert app is not None
+
+
 @pytest.mark.parametrize(
     "factory_name",
     [
@@ -2341,6 +2362,25 @@ def test_environment_asgi_factories_reject_replaced_data_directory_before_assemb
 
     with pytest.raises(DatabaseError, match="database parent changed after setup ownership"):
         getattr(production_module, factory_name)(secret_store=secret_store)
+
+
+def test_owned_runtime_read_only_rejects_replaced_data_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, config, _secret_store_value, _setup_id = _prepare_owned_environment_factory(
+        tmp_path,
+        monkeypatch,
+    )
+    _selected_config, database = production_module._owned_runtime_database(config_path)
+    displaced = config.storage.data_dir.with_name("data-before-read-only-race")
+    config.storage.data_dir.rename(displaced)
+    config.storage.data_dir.mkdir(mode=0o700)
+    for child in tuple(displaced.iterdir()):
+        child.rename(config.storage.data_dir / child.name)
+
+    with pytest.raises(DatabaseError, match="parent changed"), database.read_only():
+        pass
 
 
 @pytest.mark.parametrize(
@@ -2481,10 +2521,37 @@ def test_environment_factories_require_the_configured_listener_endpoint(
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     config_path.chmod(0o600)
     monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", str(config_path))
-    calls: list[dict[str, Any]] = []
+    calls: list[tuple[object, dict[str, Any]]] = []
+    service_app = object()
+    built_components: list[str] = []
 
-    def runner(_app: str, **kwargs: Any) -> None:
-        calls.append(kwargs)
+    def build_service(
+        component: str,
+        *,
+        expected_listener: tuple[str, int] | None = None,
+    ) -> tuple[ProductionConfig, object]:
+        built_components.append(component)
+        selected = load_production_config(config_path)
+        configured_listener = (
+            (selected.mcp_host, selected.mcp_port)
+            if component == "mcp"
+            else (selected.web_host, selected.web_port)
+        )
+        if expected_listener is not None and expected_listener != configured_listener:
+            raise ProductionAssemblyError(
+                "listener host and port must match the production configuration"
+            )
+        return selected, service_app
+
+    monkeypatch.setattr(
+        production_module,
+        "create_owned_production_service_from_environment",
+        build_service,
+        raising=False,
+    )
+
+    def runner(app: object, **kwargs: Any) -> None:
+        calls.append((app, kwargs))
 
     with pytest.raises(SystemExit):
         run_cli([command, "--factory", factory], runner=runner)
@@ -2495,15 +2562,19 @@ def test_environment_factories_require_the_configured_listener_endpoint(
         runner=runner,
     )
     assert calls == [
-        {
-            "factory": True,
-            "host": host,
-            "port": port,
-            "server_header": False,
-            "limit_concurrency": 64,
-            "proxy_headers": False,
-        }
+        (
+            service_app,
+            {
+                "factory": False,
+                "host": host,
+                "port": port,
+                "server_header": False,
+                "limit_concurrency": 64,
+                "proxy_headers": False,
+            },
+        )
     ]
+    assert built_components == [service, service]
 
 
 def test_service_specific_factories_do_not_construct_unused_sibling_apps(

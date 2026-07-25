@@ -22,7 +22,11 @@ from signet.browser_auth import BootstrapService
 from signet.config import ProductionConfig, production_instance_identity
 from signet.credential_broker import KeychainSecretStore
 from signet.db import LATEST_SCHEMA_VERSION, Database, MigrationBackupReceipt
-from signet.private_paths import ensure_private_directory, require_private_directory_identity
+from signet.private_paths import (
+    PrivatePathError,
+    ensure_private_directory,
+    require_private_directory_identity,
+)
 from signet.production import (
     ProductionAssemblyError,
     create_production_assembly,
@@ -3491,6 +3495,16 @@ def test_launchd_already_loaded_diagnostics_are_exact_and_target_bound(
         ),
         (
             "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                0,
+                "",
+                "active\n",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
             subprocess.CompletedProcess(["systemctl", "is-active"], 0, "", ""),
             "unavailable",
         ),
@@ -3579,6 +3593,26 @@ def test_launchd_already_loaded_diagnostics_are_exact_and_target_bound(
             subprocess.CompletedProcess(
                 ["systemctl", "is-active"],
                 3,
+                "",
+                "inactive\n",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                3,
+                "",
+                "failed\n",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                3,
                 "inactive\n",
                 "Failed to connect to bus",
             ),
@@ -3643,6 +3677,54 @@ def test_service_status_maps_service_manager_execution_failures_to_unavailable(
     assert set(ProductionSetupPlatform(command_runner=run).service_status(selected).values()) == {
         "unavailable"
     }
+
+
+def test_exact_owned_file_requirement_rejects_acl_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = ensure_private_directory(tmp_path / "service-plans")
+    path = parent / "signet.service"
+    content = b"owned unit\n"
+    path.write_bytes(content)
+    path.chmod(0o600)
+
+    def reject_acl(_descriptor: int) -> None:
+        raise PrivatePathError("ACL inspection failed")
+
+    monkeypatch.setattr(setup_platform, "require_no_acl_grants", reject_acl)
+
+    with pytest.raises(SetupError, match="could not be inspected"):
+        setup_platform._require_exact_owned_file(path, content)
+
+
+def test_exact_owned_file_requirement_rejects_named_inode_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = ensure_private_directory(tmp_path / "service-plans")
+    path = parent / "signet.service"
+    content = b"owned unit\n"
+    path.write_bytes(content)
+    path.chmod(0o600)
+    original_read = setup_platform._read_owned_descriptor
+
+    def replace_after_descriptor_read(descriptor: int, limit: int) -> bytes:
+        actual = original_read(descriptor, limit)
+        displaced = parent / "signet.service.displaced"
+        path.rename(displaced)
+        path.write_bytes(content)
+        path.chmod(0o600)
+        return actual
+
+    monkeypatch.setattr(
+        setup_platform,
+        "_read_owned_descriptor",
+        replace_after_descriptor_read,
+    )
+
+    with pytest.raises(SetupError, match="changed or foreign"):
+        setup_platform._require_exact_owned_file(path, content)
 
 
 @pytest.mark.parametrize("platform_name", ["darwin", "linux"])
@@ -4033,6 +4115,62 @@ def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
     for name in rendered:
         assert not (target / name).exists()
         assert not (selected.root / "services" / name).exists()
+
+
+def test_launchd_rollback_retry_uses_the_verified_label_after_target_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    bootouts: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[:2] == ["launchctl", "bootout"]:
+            bootouts.append(command)
+            if len(command) == 4:
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    "",
+                    "Bootstrap failed: 2: No such file or directory",
+                )
+            uid, label = command[-1].split("/", 2)[1:]
+            return subprocess.CompletedProcess(
+                command,
+                113,
+                "",
+                f'Could not find service "{label}" in domain for user gui: {uid}',
+            )
+        if command[:2] == ["launchctl", "print"]:
+            uid, label = command[-1].split("/", 2)[1:]
+            return subprocess.CompletedProcess(
+                command,
+                113,
+                "",
+                f'Could not find service "{label}" in domain for user gui: {uid}',
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    selected = replace(
+        spec(tmp_path / "root-darwin-target-deleted-retry"),
+        public_origin="https://example.com",
+    )
+    platform = ProductionSetupPlatform(command_runner=run)
+    monkeypatch.setattr(platform, "_wait_for_local_services", lambda selected: None)
+    platform._apply_private_paths(selected, "setup-service-test")
+    platform._apply_services(selected, "setup-service-test")
+    rendered = render_launchd_services(selected, active=True)
+    target = home / "Library" / "LaunchAgents"
+    (target / next(iter(rendered))).unlink()
+
+    platform._rollback_services(selected, "setup-service-test")
+
+    assert bootouts and all(len(command) == 3 for command in bootouts)
+    assert all(not (target / name).exists() for name in rendered)
+    assert all(not (selected.root / "services" / name).exists() for name in rendered)
 
 
 def test_launchd_rollback_refuses_a_changed_unit_before_stopping_services(

@@ -587,6 +587,7 @@ class Database:
 
         if not self.path.is_absolute():
             raise DatabaseError("read-only database path must be absolute")
+        self._require_expected_parent_identity()
         snapshot_directory = Path(tempfile.mkdtemp(prefix="signet-read-only-"))
         created_directory = snapshot_directory.stat(follow_symlinks=False)
         snapshot_directory_identity = (created_directory.st_dev, created_directory.st_ino)
@@ -605,6 +606,7 @@ class Database:
                 created_artifacts=snapshot_artifacts,
             )
             _prepare_read_only_runtime_files(database_path, snapshot_artifacts)
+            self._require_expected_parent_identity()
         except BaseException as exc:
             try:
                 _remove_read_only_snapshot(
@@ -646,6 +648,7 @@ class Database:
             connection.execute(f"PRAGMA busy_timeout={int(self.timeout * 1000)}")
             connection.execute("BEGIN")
             yield connection
+            self._require_expected_parent_identity()
         finally:
             _finalize_read_only_connection(
                 connection,

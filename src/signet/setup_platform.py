@@ -249,14 +249,15 @@ class ProductionSetupPlatform:
         self._database_override: Database | None = None
 
     @staticmethod
+    def _output_lines(output: str | None) -> tuple[str, ...]:
+        return tuple(line.strip() for line in (output or "").splitlines() if line.strip())
+
+    @classmethod
     def _command_output_lines(
+        cls,
         result: subprocess.CompletedProcess[str],
     ) -> tuple[str, ...]:
-        return tuple(
-            line.strip()
-            for line in f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()
-            if line.strip()
-        )
+        return cls._output_lines(result.stdout) + cls._output_lines(result.stderr)
 
     @staticmethod
     def _service_manager_environment() -> dict[str, str]:
@@ -320,19 +321,24 @@ class ProductionSetupPlatform:
         *,
         unit: str,
     ) -> Literal["active", "inactive", "unavailable"]:
-        lines = cls._command_output_lines(status)
+        stdout_lines = cls._output_lines(status.stdout)
+        stderr_lines = cls._output_lines(status.stderr)
         if status.returncode == 0:
-            return "active" if lines == ("active",) else "unavailable"
-        if status.returncode == 3 and lines in {("inactive",), ("failed",)}:
+            return "active" if stdout_lines == ("active",) and not stderr_lines else "unavailable"
+        if (
+            status.returncode == 3
+            and stdout_lines in {("inactive",), ("failed",)}
+            and not stderr_lines
+        ):
             return "inactive"
-        if status.returncode == 4 and lines == ("inactive",):
+        if status.returncode == 4 and stdout_lines == ("inactive",) and not stderr_lines:
             return "inactive"
         missing_line = f"Unit {unit} could not be found"
-        named_missing_lines = {missing_line, f"{missing_line}."}
+        named_missing_lines = {(missing_line,), (f"{missing_line}.",)}
         if (
             status.returncode == 4
-            and any(line in named_missing_lines for line in lines)
-            and all(line in {"unknown", "not-found", *named_missing_lines} for line in lines)
+            and stdout_lines in {(), ("unknown",), ("not-found",)}
+            and stderr_lines in named_missing_lines
         ):
             return "inactive"
         return "unavailable"
@@ -1344,8 +1350,8 @@ class ProductionSetupPlatform:
                 if plan_exists:
                     _verify_exact_owned_file(plan_path, content)
             for name in rendered:
-                path = target / name
-                self._stop_launchd_unit(["launchctl", "bootout", f"gui/{uid}", str(path)])
+                label = name.removesuffix(".plist")
+                self._stop_launchd_unit(["launchctl", "bootout", f"gui/{uid}/{label}"])
             for name in rendered:
                 label = name.removesuffix(".plist")
                 status = self.command_runner(
@@ -2991,20 +2997,8 @@ def _create_or_verify_private_file(
 
 
 def _require_exact_owned_file(path: Path, content: bytes) -> None:
-    if not path.exists() or path.is_symlink():
+    if _inspect_exact_owned_file(path, content) is None:
         raise SetupError(f"owned resource is unavailable: {path}")
-    try:
-        metadata = path.stat()
-        actual = path.read_bytes()
-    except OSError as exc:
-        raise SetupError(f"owned resource is unavailable: {path}") from exc
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or actual != content
-    ):
-        raise SetupError(f"owned resource changed or is ambiguous: {path}")
 
 
 def _replace_private_file(
@@ -3491,12 +3485,12 @@ def _inspect_exact_owned_file(
     if not path.exists() and not path.is_symlink():
         return None
     descriptor = -1
-    parent_identity = expected_parent_identity or require_owned_directory_identity(path.parent)
-    if expected_parent_identity is not None:
-        try:
+    try:
+        parent_identity = expected_parent_identity or require_owned_directory_identity(path.parent)
+        if expected_parent_identity is not None:
             revalidate_directory_identity(parent_identity, private=parent_private)
-        except PrivatePathError as exc:
-            raise SetupError(f"owned resource parent changed: {path.parent}") from exc
+    except PrivatePathError as exc:
+        raise SetupError(f"owned resource parent changed: {path.parent}") from exc
     try:
         descriptor = os.open(
             path,

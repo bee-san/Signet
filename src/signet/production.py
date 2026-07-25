@@ -536,23 +536,69 @@ def create_production_web_app(
     return app
 
 
+def create_owned_production_service(
+    config_path: Path,
+    *,
+    component: str,
+    secret_store: SecretStore | None = None,
+    expected_listener: tuple[str, int] | None = None,
+) -> tuple[ProductionConfig, Starlette | FastAPI]:
+    """Build one owned service and its listener configuration from one validated snapshot."""
+
+    if component not in {"mcp", "web"}:
+        raise ValueError("production service component is invalid")
+    config, database = _owned_runtime_database(config_path)
+    configured_listener = (
+        (config.mcp_host, config.mcp_port)
+        if component == "mcp"
+        else (config.web_host, config.web_port)
+    )
+    if expected_listener is not None and expected_listener != configured_listener:
+        raise ProductionAssemblyError(
+            "listener host and port must match the production configuration"
+        )
+    assembly = build_production_runtime(
+        config,
+        secret_store=secret_store or KeychainSecretStore(),
+        components=frozenset({component}),
+        database_override=database,
+    )
+    if component == "mcp":
+        if assembly.mcp is None:
+            raise AssertionError("MCP assembly did not produce its requested component")
+        return config, assembly.mcp.app
+    if assembly.web is None:
+        raise AssertionError("web assembly did not produce its requested component")
+    return config, assembly.web
+
+
+def create_owned_production_service_from_environment(
+    component: str,
+    *,
+    secret_store: SecretStore | None = None,
+    expected_listener: tuple[str, int] | None = None,
+) -> tuple[ProductionConfig, Starlette | FastAPI]:
+    """Build an owned service from the environment-selected private configuration."""
+
+    return create_owned_production_service(
+        _production_config_path_from_environment(),
+        component=component,
+        secret_store=secret_store,
+        expected_listener=expected_listener,
+    )
+
+
 def create_production_mcp_app_from_environment(
     *,
     secret_store: SecretStore | None = None,
 ) -> Starlette:
     """ASGI factory for the configured fail-closed MCP service."""
 
-    config_path = _production_config_path_from_environment()
-    config, database = _owned_runtime_database(config_path)
-    runtime = build_production_runtime(
-        config,
-        secret_store=secret_store or KeychainSecretStore(),
-        components=frozenset({"mcp"}),
-        database_override=database,
-    ).mcp
-    if runtime is None:
-        raise AssertionError("MCP assembly did not produce its requested component")
-    return runtime.app
+    _config, app = create_owned_production_service_from_environment(
+        "mcp",
+        secret_store=secret_store,
+    )
+    return app
 
 
 def create_production_web_app_from_environment(
@@ -561,17 +607,11 @@ def create_production_web_app_from_environment(
 ) -> FastAPI:
     """ASGI factory for the staged production web service."""
 
-    config_path = _production_config_path_from_environment()
-    config, database = _owned_runtime_database(config_path)
-    app = build_production_runtime(
-        config,
-        secret_store=secret_store or KeychainSecretStore(),
-        components=frozenset({"web"}),
-        database_override=database,
-    ).web
-    if app is None:
-        raise AssertionError("web assembly did not produce its requested component")
-    return app
+    _config, app = create_owned_production_service_from_environment(
+        "web",
+        secret_store=secret_store,
+    )
+    return cast(FastAPI, app)
 
 
 def production_listener_from_environment(

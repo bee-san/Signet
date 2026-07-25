@@ -123,15 +123,27 @@ def main(
     if production_service is not None:
         from signet.production import (
             ProductionAssemblyError,
-            production_listener_from_environment,
+            create_owned_production_service_from_environment,
         )
 
         try:
-            expected_host, expected_port = production_listener_from_environment(production_service)
+            _config, application = create_owned_production_service_from_environment(
+                production_service,
+                expected_listener=(args.host, args.port),
+            )
         except (ProductionAssemblyError, ValueError) as exc:
             parser.error(str(exc))
-        if (args.host, args.port) != (expected_host, expected_port):
-            parser.error("listener host and port must match the production configuration")
+        selected_runner = runner or uvicorn.run
+        selected_runner(
+            application,
+            factory=False,
+            host=args.host,
+            port=args.port,
+            server_header=False,
+            limit_concurrency=args.limit_concurrency,
+            proxy_headers=False,
+        )
+        return
 
     selected_runner = runner or uvicorn.run
     selected_runner(

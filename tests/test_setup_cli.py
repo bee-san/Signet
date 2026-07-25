@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+import signet.production as production_module
 from signet.app import _parser
 from signet.setup_cli import _discover_hermes_profiles, run_setup_command
 from signet.setup_platform import render_production_config
@@ -546,17 +547,41 @@ def test_internal_production_service_uses_installed_factory_and_restores_environ
     )
     config.chmod(0o600)
     captured: dict[str, Any] = {}
+    service_app = object()
 
-    def runner(app: str, **kwargs: Any) -> None:
-        captured.update(app=app, config=os.environ["SIGNET_PRODUCTION_CONFIG"], **kwargs)
+    def build_service(config_path: Path, *, component: str) -> tuple[Any, object]:
+        assert component == "web"
+        selected = production_module.load_production_config(config_path)
+        replacement_payload = json.loads(config_path.read_text(encoding="utf-8"))
+        replacement_payload["web_host"] = "127.0.0.9"
+        replacement_payload["web_port"] = 9999
+        replacement = config_path.with_name("production-replaced.json")
+        replacement.write_text(json.dumps(replacement_payload), encoding="utf-8")
+        replacement.chmod(0o600)
+        replacement.replace(config_path)
+        return selected, service_app
+
+    monkeypatch.setattr(
+        production_module,
+        "create_owned_production_service",
+        build_service,
+        raising=False,
+    )
+
+    def runner(app: object, **kwargs: Any) -> None:
+        captured.update(
+            app=app,
+            config=os.environ.get("SIGNET_PRODUCTION_CONFIG"),
+            **kwargs,
+        )
 
     monkeypatch.delenv("SIGNET_PRODUCTION_CONFIG", raising=False)
     args = _parser().parse_args(["production", "serve-web", "--config", str(config)])
 
     assert run_setup_command(args, runner=runner) == 0
-    assert captured["app"] == "signet.production:create_production_web_app_from_environment"
-    assert captured["factory"] is True
-    assert captured["config"] == str(config)
+    assert captured["app"] is service_app
+    assert captured["factory"] is False
+    assert captured["config"] is None
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8790
     assert "SIGNET_PRODUCTION_CONFIG" not in os.environ

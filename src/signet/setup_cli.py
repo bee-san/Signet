@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -434,33 +433,26 @@ def _run_production_service(
 ) -> int:
     import uvicorn
 
-    from signet.production import load_production_config
+    from signet.production import create_owned_production_service
 
     config_path = _absolute_path(args.config)
-    config = load_production_config(config_path)
     component = args.production_command.removeprefix("serve-")
+    config, application = create_owned_production_service(
+        config_path,
+        component=component,
+    )
     if component == "mcp":
-        factory = "signet.production:create_production_mcp_app_from_environment"
         host, port = config.mcp_host, config.mcp_port
     else:
-        factory = "signet.production:create_production_web_app_from_environment"
         host, port = config.web_host, config.web_port
     selected_runner = runner or uvicorn.run
-    previous = os.environ.get("SIGNET_PRODUCTION_CONFIG")
-    os.environ["SIGNET_PRODUCTION_CONFIG"] = str(config_path)
-    try:
-        selected_runner(
-            factory,
-            factory=True,
-            host=host,
-            port=port,
-            server_header=False,
-            limit_concurrency=args.limit_concurrency,
-            proxy_headers=False,
-        )
-    finally:
-        if previous is None:
-            os.environ.pop("SIGNET_PRODUCTION_CONFIG", None)
-        else:
-            os.environ["SIGNET_PRODUCTION_CONFIG"] = previous
+    selected_runner(
+        application,
+        factory=False,
+        host=host,
+        port=port,
+        server_header=False,
+        limit_concurrency=args.limit_concurrency,
+        proxy_headers=False,
+    )
     return 0
