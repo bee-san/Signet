@@ -430,13 +430,17 @@ class ProductionSetupPlatform:
                 except SetupError:
                     result[label] = "missing_or_changed"
                     continue
-                status = self.command_runner(
-                    ["launchctl", "print", f"gui/{uid}/{label}"],
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    env=self._service_manager_environment(),
-                )
+                try:
+                    status = self.command_runner(
+                        ["launchctl", "print", f"gui/{uid}/{label}"],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        env=self._service_manager_environment(),
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    result[label] = "unavailable"
+                    continue
                 result[label] = self._launchd_service_state(
                     status,
                     label=label,
@@ -451,13 +455,17 @@ class ProductionSetupPlatform:
                 except SetupError:
                     result[name] = "missing_or_changed"
                     continue
-                status = self.command_runner(
-                    ["systemctl", "--user", "is-active", name],
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    env=self._service_manager_environment(),
-                )
+                try:
+                    status = self.command_runner(
+                        ["systemctl", "--user", "is-active", name],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        env=self._service_manager_environment(),
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    result[name] = "unavailable"
+                    continue
                 result[name] = self._systemd_service_state(status, unit=name)
         port = _managed_tailnet_port(spec)
         if port is not None:

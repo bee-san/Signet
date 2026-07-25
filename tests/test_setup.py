@@ -3513,6 +3513,105 @@ def test_service_status_rejects_prefix_collisions_and_mixed_diagnostics(
     assert actual == expected
 
 
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+def test_service_status_maps_service_manager_execution_failures_to_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    selected = replace(
+        spec(tmp_path / f"root-status-exec-{platform_name}"),
+        public_origin="https://example.com",
+    )
+    if platform_name == "darwin":
+        rendered = render_launchd_services(selected, active=True)
+        target = home / "Library" / "LaunchAgents"
+    else:
+        rendered = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+        target = home / ".config" / "systemd" / "user"
+    target.mkdir(parents=True, mode=0o700)
+    target.chmod(0o700)
+    for name, content in rendered.items():
+        path = target / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+
+    assert set(ProductionSetupPlatform(command_runner=run).service_status(selected).values()) == {
+        "unavailable"
+    }
+
+
+@pytest.mark.parametrize("operation", ["apply", "manage"])
+@pytest.mark.parametrize(
+    ("diagnostic", "succeeds"),
+    [("exact", True), ("wrong_target", False), ("mixed", False)],
+)
+def test_launchd_start_paths_require_exact_target_bound_already_bootstrapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    diagnostic: str,
+    succeeds: bool,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    selected = replace(
+        spec(tmp_path / f"root-launchd-start-{operation}-{diagnostic}"),
+        public_origin="https://example.com",
+    )
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command[:2] == ["launchctl", "bootstrap"]
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        assert environment["LANG"] == environment["LC_ALL"] == "C"
+        target = Path(command[-1])
+        if diagnostic == "exact":
+            detail = f"{target}: service already bootstrapped"
+        elif diagnostic == "wrong_target":
+            detail = f"{target}.other: service already bootstrapped"
+        else:
+            detail = f"{target}: service already bootstrapped\nFailed to connect to service manager"
+        return subprocess.CompletedProcess(command, 5, "", detail)
+
+    monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    platform = ProductionSetupPlatform(command_runner=run)
+    platform._apply_private_paths(selected, "setup-service-test")
+    monkeypatch.setattr(platform, "_wait_for_local_services", lambda selected: None)
+    if operation == "manage":
+        target = home / "Library" / "LaunchAgents"
+        target.mkdir(parents=True, mode=0o700)
+        target.chmod(0o700)
+        for name, content in render_launchd_services(selected, active=True).items():
+            path = target / name
+            path.write_bytes(content)
+            path.chmod(0o600)
+
+    def invoke() -> None:
+        if operation == "apply":
+            platform._apply_services(selected, "setup-service-test")
+        else:
+            platform.manage_services(selected, "start")
+
+    if succeeds:
+        invoke()
+    else:
+        with pytest.raises(SetupError, match="launchd"):
+            invoke()
+
+
 @pytest.mark.parametrize(
     ("manager", "detail"),
     [
