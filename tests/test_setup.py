@@ -3306,7 +3306,12 @@ def test_systemd_rollback_retries_after_reload_failure_and_tolerates_unloaded_un
                 f"Unit {command[-1]} is not loaded",
             )
         if "is-active" in command:
-            return subprocess.CompletedProcess(command, 3, "inactive\n", "")
+            return subprocess.CompletedProcess(
+                command,
+                3 if (target / command[-1]).exists() else 4,
+                "inactive\n",
+                "",
+            )
         if command[-1] == "daemon-reload":
             reloads += 1
             return subprocess.CompletedProcess(
@@ -3335,7 +3340,9 @@ def test_systemd_rollback_retries_after_reload_failure_and_tolerates_unloaded_un
     ("detail", "expected"),
     [
         ("/tmp/com.example.signet.plist: service already loaded", True),
+        ("/tmp/com.example.signet.plist: service already bootstrapped", True),
         ("/tmp/com.example.other.plist: service already loaded", False),
+        ("/tmp/com.example.other.plist: service already bootstrapped", False),
         ("launchctl already failed for an unrelated reason", False),
         (
             "/tmp/com.example.signet.plist: service already loaded\n"
@@ -3412,6 +3419,26 @@ def test_launchd_already_loaded_diagnostics_are_exact_and_target_bound(
                 "",
                 "Bad request.\n"
                 'Could not find service "com.example.different" in domain for user gui: 501',
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "inactive\n",
+                "",
+            ),
+            "inactive",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "inactive\n",
+                "Failed to connect to bus",
             ),
             "unavailable",
         ),

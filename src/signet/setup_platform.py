@@ -269,9 +269,11 @@ class ProductionSetupPlatform:
         *,
         target: Path,
     ) -> bool:
-        return cls._command_output_lines(result) == (
-            f"{str(target).lower()}: service already loaded",
-        )
+        expected_target = str(target).lower()
+        return cls._command_output_lines(result) in {
+            (f"{expected_target}: service already loaded",),
+            (f"{expected_target}: service already bootstrapped",),
+        }
 
     @classmethod
     def _launchd_result_means_missing(
@@ -310,6 +312,8 @@ class ProductionSetupPlatform:
             return "active"
         lines = cls._command_output_lines(status)
         if status.returncode == 3 and lines in {("inactive",), ("failed",)}:
+            return "inactive"
+        if status.returncode == 4 and lines == ("inactive",):
             return "inactive"
         missing_line = f"unit {unit.lower()} could not be found"
         named_missing_lines = {missing_line, f"{missing_line}."}
