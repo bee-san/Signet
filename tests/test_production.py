@@ -41,7 +41,7 @@ from signet.config import (
     production_instance_identity,
 )
 from signet.credential_broker import MemorySecretStore, Secret, SecretReference
-from signet.db import Database
+from signet.db import Database, DatabaseError
 from signet.downstream import DownstreamClient
 from signet.policy import parse_policy_yaml
 from signet.production import (
@@ -2188,7 +2188,10 @@ def test_environment_asgi_factories_use_only_the_private_config_path(
     monkeypatch.setattr(
         production_module,
         "_owned_runtime_database",
-        lambda path: Database(Path(payload["storage"]["data_dir"]) / "signet.db"),
+        lambda path: (
+            load_production_config(path),
+            Database(Path(payload["storage"]["data_dir"]) / "signet.db"),
+        ),
     )
 
     mcp_app = create_production_mcp_app_from_environment(secret_store=_secret_store())
@@ -2243,23 +2246,16 @@ def _prepare_owned_environment_factory(
 
 
 @pytest.mark.parametrize(
-    ("factory_name", "downstream_name"),
-    (
-        (
-            "create_production_mcp_app_from_environment",
-            "create_production_mcp_runtime",
-        ),
-        (
-            "create_production_web_app_from_environment",
-            "create_production_web_app",
-        ),
-    ),
+    "factory_name",
+    [
+        "create_production_mcp_app_from_environment",
+        "create_production_web_app_from_environment",
+    ],
 )
 def test_environment_asgi_factories_pass_the_owned_database_and_lock_identities(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_name: str,
-    downstream_name: str,
 ) -> None:
     config_path, config, secret_store, setup_id = _prepare_owned_environment_factory(
         tmp_path,
@@ -2268,18 +2264,19 @@ def test_environment_asgi_factories_pass_the_owned_database_and_lock_identities(
     receipt = json.loads(
         (config.storage.data_dir / ".signet-database-ownership.json").read_text(encoding="utf-8")
     )
+    data_directory_stat = config.storage.data_dir.stat()
     database_stat = config.storage.database_path.stat()
     maintenance_lock_stat = config.storage.database_path.with_name(
         f".{config.storage.database_path.name}.maintenance.lock"
     ).stat()
-    original_downstream = getattr(production_module, downstream_name)
+    original_build = production_module.build_production_runtime
     overrides: list[Database | None] = []
 
-    def record_database_override(*args: Any, **kwargs: Any) -> Any:
+    def record_database_override(config: ProductionConfig, **kwargs: Any) -> Any:
         overrides.append(kwargs.get("database_override"))
-        return original_downstream(*args, **kwargs)
+        return original_build(config, **kwargs)
 
-    monkeypatch.setattr(production_module, downstream_name, record_database_override)
+    monkeypatch.setattr(production_module, "build_production_runtime", record_database_override)
 
     app = getattr(production_module, factory_name)(secret_store=secret_store)
 
@@ -2297,6 +2294,11 @@ def test_environment_asgi_factories_pass_the_owned_database_and_lock_identities(
     owned_database = overrides[0]
     assert isinstance(owned_database, Database)
     assert owned_database.path == config.storage.database_path
+    assert owned_database.expected_parent_identity is not None
+    assert (
+        owned_database.expected_parent_identity.device,
+        owned_database.expected_parent_identity.inode,
+    ) == (data_directory_stat.st_dev, data_directory_stat.st_ino)
     assert owned_database.expected_identity == (database_stat.st_dev, database_stat.st_ino)
     assert owned_database.expected_lock_identity == (
         maintenance_lock_stat.st_dev,
@@ -2305,17 +2307,98 @@ def test_environment_asgi_factories_pass_the_owned_database_and_lock_identities(
 
 
 @pytest.mark.parametrize(
-    ("factory_name", "downstream_name"),
-    (
-        (
-            "create_production_mcp_app_from_environment",
-            "create_production_mcp_runtime",
-        ),
-        (
-            "create_production_web_app_from_environment",
-            "create_production_web_app",
-        ),
-    ),
+    "factory_name",
+    [
+        "create_production_mcp_app_from_environment",
+        "create_production_web_app_from_environment",
+    ],
+)
+def test_environment_asgi_factories_reject_replaced_data_directory_before_assembly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_name: str,
+) -> None:
+    config_path, config, secret_store, _setup_id = _prepare_owned_environment_factory(
+        tmp_path,
+        monkeypatch,
+    )
+    original_owned_runtime = production_module._owned_runtime_database
+
+    def replace_parent_after_validation(path: Path) -> Any:
+        owned_runtime = original_owned_runtime(path)
+        displaced = config.storage.data_dir.with_name("data-displaced")
+        config.storage.data_dir.rename(displaced)
+        config.storage.data_dir.mkdir(mode=0o700)
+        for entry in tuple(displaced.iterdir()):
+            entry.rename(config.storage.data_dir / entry.name)
+        return owned_runtime
+
+    monkeypatch.setattr(
+        production_module,
+        "_owned_runtime_database",
+        replace_parent_after_validation,
+    )
+
+    with pytest.raises(DatabaseError, match="database parent changed after setup ownership"):
+        getattr(production_module, factory_name)(secret_store=secret_store)
+
+
+@pytest.mark.parametrize(
+    "factory_name",
+    [
+        "create_production_mcp_app_from_environment",
+        "create_production_web_app_from_environment",
+    ],
+)
+def test_environment_asgi_factories_use_one_validated_configuration_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_name: str,
+) -> None:
+    config_path, config, secret_store, _setup_id = _prepare_owned_environment_factory(
+        tmp_path,
+        monkeypatch,
+    )
+    original_owned_runtime = production_module._owned_runtime_database
+    original_build = production_module.build_production_runtime
+    observed_configs: list[ProductionConfig] = []
+
+    def replace_config_after_validation(path: Path) -> Any:
+        owned_runtime = original_owned_runtime(path)
+        replacement_payload = json.loads(config_path.read_text(encoding="utf-8"))
+        replacement_payload["storage"]["data_dir"] = str(
+            config.storage.data_dir.with_name("other-data")
+        )
+        replacement = config_path.with_name("production-replacement.json")
+        replacement.write_text(json.dumps(replacement_payload), encoding="utf-8")
+        replacement.chmod(0o600)
+        replacement.replace(config_path)
+        return owned_runtime
+
+    def record_config(selected: ProductionConfig, **kwargs: Any) -> Any:
+        observed_configs.append(selected)
+        return original_build(selected, **kwargs)
+
+    monkeypatch.setattr(
+        production_module,
+        "_owned_runtime_database",
+        replace_config_after_validation,
+    )
+    monkeypatch.setattr(production_module, "build_production_runtime", record_config)
+
+    app = getattr(production_module, factory_name)(secret_store=secret_store)
+
+    assert app is not None
+    assert len(observed_configs) == 1
+    assert observed_configs[0].storage.data_dir == config.storage.data_dir
+
+
+@pytest.mark.parametrize(
+    "factory_name",
+    [
+        "create_production_mcp_app_from_environment",
+        "create_production_web_app_from_environment",
+    ],
 )
 @pytest.mark.parametrize(
     ("drift", "message"),
@@ -2329,7 +2412,6 @@ def test_environment_asgi_factories_reject_stale_owned_runtime_before_assembly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_name: str,
-    downstream_name: str,
     drift: str,
     message: str,
 ) -> None:
@@ -2360,7 +2442,7 @@ def test_environment_asgi_factories_reject_stale_owned_runtime_before_assembly(
     def unexpected_assembly(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("factory reached assembly after owned runtime drift")
 
-    monkeypatch.setattr(production_module, downstream_name, unexpected_assembly)
+    monkeypatch.setattr(production_module, "build_production_runtime", unexpected_assembly)
 
     with pytest.raises(SetupError, match=message):
         getattr(production_module, factory_name)(secret_store=secret_store)

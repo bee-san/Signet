@@ -2466,7 +2466,7 @@ def test_service_install_management_status_and_rollback_are_platform_native(
             return subprocess.CompletedProcess(
                 command,
                 0 if services_active else 3,
-                "",
+                (f"{command[-1]} = {{\n\tstate = running\n}}\n" if services_active else ""),
                 ""
                 if services_active
                 else (
@@ -2575,11 +2575,12 @@ def test_launchd_service_stop_retry_tolerates_an_already_stopped_unit(
     monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
     selected = replace(spec(tmp_path / "launchd-stop-retry"), public_origin="https://example.com")
     target = ensure_private_directory(home / "Library" / "LaunchAgents")
+    plan_dir = ensure_private_directory(selected.root / "services")
     rendered = render_launchd_services(selected, active=True)
     for name, content in rendered.items():
-        path = target / name
-        path.write_bytes(content)
-        path.chmod(0o600)
+        for path in (target / name, plan_dir / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
     bootouts = 0
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
@@ -3341,6 +3342,7 @@ def test_systemd_rollback_retries_after_reload_failure_and_tolerates_unloaded_un
     [
         ("/tmp/com.example.signet.plist: service already loaded", True),
         ("/tmp/com.example.signet.plist: service already bootstrapped", True),
+        ("/TMP/com.example.signet.plist: service already bootstrapped", False),
         ("/tmp/com.example.other.plist: service already loaded", False),
         ("/tmp/com.example.other.plist: service already bootstrapped", False),
         ("launchctl already failed for an unrelated reason", False),
@@ -3373,12 +3375,67 @@ def test_launchd_already_loaded_diagnostics_are_exact_and_target_bound(
             "launchd",
             subprocess.CompletedProcess(
                 ["launchctl", "print"],
+                0,
+                "gui/501/com.example.signet = {\n\tstate = running\n}\n",
+                "",
+            ),
+            "active",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(["launchctl", "print"], 0, "", ""),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                0,
+                "gui/501/com.example.signet = {\n\tstate = not running\n}\n",
+                "",
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                0,
+                "gui/501/COM.example.signet = {\n\tstate = running\n}\n",
+                "",
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                0,
+                "gui/501/com.example.signet = {\n\tstate = running\n}\n",
+                "Failed to connect to service manager",
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
                 113,
                 "",
                 "Bad request.\n"
                 'Could not find service "com.example.signet" in domain for user gui: 501',
             ),
             "inactive",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                113,
+                "",
+                'Could not find service "COM.example.signet" in domain for user gui: 501',
+            ),
+            "unavailable",
         ),
         (
             "launchd",
@@ -3426,6 +3483,31 @@ def test_launchd_already_loaded_diagnostics_are_exact_and_target_bound(
             "systemd",
             subprocess.CompletedProcess(
                 ["systemctl", "is-active"],
+                0,
+                "active\n",
+                "",
+            ),
+            "active",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(["systemctl", "is-active"], 0, "", ""),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                0,
+                "active\n",
+                "Failed to connect to bus",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
                 4,
                 "inactive\n",
                 "",
@@ -3451,6 +3533,16 @@ def test_launchd_already_loaded_diagnostics_are_exact_and_target_bound(
                 "Unit signet.service could not be found.",
             ),
             "inactive",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "unknown\n",
+                "Unit SIGNET.service could not be found.",
+            ),
+            "unavailable",
         ),
         (
             "systemd",
@@ -3536,10 +3628,11 @@ def test_service_status_maps_service_manager_execution_failures_to_unavailable(
         target = home / ".config" / "systemd" / "user"
     target.mkdir(parents=True, mode=0o700)
     target.chmod(0o700)
+    ensure_private_directory(selected.root / "services")
     for name, content in rendered.items():
-        path = target / name
-        path.write_bytes(content)
-        path.chmod(0o600)
+        for path in (target / name, selected.root / "services" / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError(command[0])
@@ -3550,6 +3643,110 @@ def test_service_status_maps_service_manager_execution_failures_to_unavailable(
     assert set(ProductionSetupPlatform(command_runner=run).service_status(selected).values()) == {
         "unavailable"
     }
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+def test_service_status_maps_tailscale_execution_failures_to_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    selected = replace(
+        spec(tmp_path / f"root-tailnet-status-{platform_name}"),
+        public_origin="https://signet.example.ts.net:8443",
+    )
+    if platform_name == "darwin":
+        rendered = render_launchd_services(selected, active=True)
+        target = home / "Library" / "LaunchAgents"
+    else:
+        rendered = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+        target = home / ".config" / "systemd" / "user"
+    target.mkdir(parents=True, mode=0o700)
+    target.chmod(0o700)
+    ensure_private_directory(selected.root / "services")
+    for name, content in rendered.items():
+        for path in (target / name, selected.root / "services" / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[0] == "tailscale":
+            raise subprocess.TimeoutExpired(command, 15)
+        if command[:2] == ["launchctl", "print"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"{command[-1]} = {{\n\tstate = running\n}}\n",
+                "",
+            )
+        return subprocess.CompletedProcess(command, 0, "active\n", "")
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+
+    status = ProductionSetupPlatform(command_runner=run).service_status(selected)
+    assert status["tailscale:8443"] == "unavailable"
+    assert all(
+        value == "active" for name, value in status.items() if not name.startswith("tailscale:")
+    )
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+@pytest.mark.parametrize("operation", ["status", "manage"])
+def test_service_entrypoints_refuse_units_without_ownership_plans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+    operation: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    selected = replace(
+        spec(tmp_path / f"root-ownerless-{platform_name}-{operation}"),
+        public_origin="https://example.com",
+    )
+    if platform_name == "darwin":
+        rendered = render_launchd_services(selected, active=True)
+        target = home / "Library" / "LaunchAgents"
+    else:
+        rendered = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+        target = home / ".config" / "systemd" / "user"
+    target.mkdir(parents=True, mode=0o700)
+    target.chmod(0o700)
+    for name, content in rendered.items():
+        path = target / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if command[:2] == ["launchctl", "print"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"{command[-1]} = {{\n\tstate = running\n}}\n",
+                "",
+            )
+        return subprocess.CompletedProcess(command, 0, "active\n", "")
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    platform = ProductionSetupPlatform(command_runner=run)
+    if operation == "status":
+        assert set(platform.service_status(selected).values()) == {"missing_or_changed"}
+    else:
+        with pytest.raises(SetupError):
+            platform.manage_services(selected, "start")
+    assert commands == []
 
 
 @pytest.mark.parametrize("operation", ["apply", "manage"])
@@ -3595,9 +3792,9 @@ def test_launchd_start_paths_require_exact_target_bound_already_bootstrapped(
         target.mkdir(parents=True, mode=0o700)
         target.chmod(0o700)
         for name, content in render_launchd_services(selected, active=True).items():
-            path = target / name
-            path.write_bytes(content)
-            path.chmod(0o600)
+            for path in (target / name, selected.root / "services" / name):
+                path.write_bytes(content)
+                path.chmod(0o600)
 
     def invoke() -> None:
         if operation == "apply":
@@ -3648,6 +3845,21 @@ def test_service_stop_rejects_prefix_collisions_and_mixed_diagnostics(
             ],
             "Bad request.\n"
             'Could not find service "com.example.different" in domain for user gui: 501',
+        ),
+        (
+            "launchd",
+            [
+                "launchctl",
+                "bootout",
+                "gui/501",
+                "/tmp/com.example.signet.plist",
+            ],
+            'Could not find service "COM.example.signet" in domain for user gui: 501',
+        ),
+        (
+            "systemd",
+            ["systemctl", "--user", "disable", "--now", "signet.service"],
+            "Unit SIGNET.service not loaded.",
         ),
         (
             "systemd",

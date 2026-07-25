@@ -543,11 +543,16 @@ def create_production_mcp_app_from_environment(
     """ASGI factory for the configured fail-closed MCP service."""
 
     config_path = _production_config_path_from_environment()
-    return create_production_mcp_runtime(
-        config_path,
+    config, database = _owned_runtime_database(config_path)
+    runtime = build_production_runtime(
+        config,
         secret_store=secret_store or KeychainSecretStore(),
-        database_override=_owned_runtime_database(config_path),
-    ).app
+        components=frozenset({"mcp"}),
+        database_override=database,
+    ).mcp
+    if runtime is None:
+        raise AssertionError("MCP assembly did not produce its requested component")
+    return runtime.app
 
 
 def create_production_web_app_from_environment(
@@ -557,11 +562,16 @@ def create_production_web_app_from_environment(
     """ASGI factory for the staged production web service."""
 
     config_path = _production_config_path_from_environment()
-    return create_production_web_app(
-        config_path,
+    config, database = _owned_runtime_database(config_path)
+    app = build_production_runtime(
+        config,
         secret_store=secret_store or KeychainSecretStore(),
-        database_override=_owned_runtime_database(config_path),
-    )
+        components=frozenset({"web"}),
+        database_override=database,
+    ).web
+    if app is None:
+        raise AssertionError("web assembly did not produce its requested component")
+    return app
 
 
 def production_listener_from_environment(
@@ -1320,19 +1330,22 @@ def _read_private_config(path: Path) -> str:
     return payload
 
 
-def _owned_runtime_database(config_path: Path) -> Database:
+def _owned_runtime_database(config_path: Path) -> tuple[ProductionConfig, Database]:
     # Imported lazily to avoid the setup platform's dependency on this module.
     from signet.setup_platform import validate_active_database_runtime_ownership
     from signet.setup_state import SetupJournalStore
 
     journal = SetupJournalStore(config_path.parent).load()
     config = load_production_config(config_path)
-    expected_identity, expected_lock_identity = validate_active_database_runtime_ownership(
-        config.storage.database_path.parent,
-        setup_id=journal.setup_id,
+    expected_identity, expected_lock_identity, expected_parent_identity = (
+        validate_active_database_runtime_ownership(
+            config.storage.database_path.parent,
+            setup_id=journal.setup_id,
+        )
     )
-    return Database(
+    return config, Database(
         config.storage.database_path,
+        expected_parent_identity=expected_parent_identity,
         expected_identity=expected_identity,
         expected_lock_identity=expected_lock_identity,
     )

@@ -136,13 +136,16 @@ class SetupOperations:
             database_path = config.storage.database_path
             if database_path.is_symlink() or not database_path.is_file():
                 raise SetupError("production database is unavailable for read-only inspection")
-            expected_identity, expected_lock_identity = validate_active_database_runtime_ownership(
-                database_path.parent,
-                setup_id=journal.setup_id,
+            expected_identity, expected_lock_identity, expected_parent_identity = (
+                validate_active_database_runtime_ownership(
+                    database_path.parent,
+                    setup_id=journal.setup_id,
+                )
             )
             production = ProductionStateStore(
                 Database(
                     database_path,
+                    expected_parent_identity=expected_parent_identity,
                     expected_identity=expected_identity,
                     expected_lock_identity=expected_lock_identity,
                 ),
@@ -1023,6 +1026,7 @@ class SetupOperations:
         ownership_marker = database_path.parent / ".signet-database-ownership.json"
         expected_identity = None
         expected_lock_identity = None
+        expected_parent_identity = None
         if (
             database_path.exists()
             or database_path.is_symlink()
@@ -1032,12 +1036,14 @@ class SetupOperations:
             (
                 expected_identity,
                 expected_lock_identity,
+                expected_parent_identity,
             ) = validate_active_database_runtime_ownership(
                 database_path.parent,
                 setup_id=journal.setup_id,
             )
         database = Database(
             database_path,
+            expected_parent_identity=expected_parent_identity,
             expected_identity=expected_identity,
             expected_lock_identity=expected_lock_identity,
         )

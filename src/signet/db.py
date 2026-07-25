@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from signet.private_paths import (
+    DirectoryIdentity,
     PrivatePathError,
     ensure_owned_directory,
     ensure_private_directory,
@@ -157,6 +158,7 @@ class Database:
         path: str | os.PathLike[str],
         *,
         timeout: float = 30.0,
+        expected_parent_identity: DirectoryIdentity | None = None,
         expected_identity: tuple[int, int] | None = None,
         expected_lock_identity: tuple[int, int] | None = None,
     ):
@@ -175,11 +177,28 @@ class Database:
         ):
             raise ValueError("expected maintenance-lock identity must be a device/inode pair")
         self.path = Path(path).expanduser().absolute()
+        if expected_parent_identity is not None and (
+            not isinstance(expected_parent_identity, DirectoryIdentity)
+            or expected_parent_identity.path.expanduser().absolute() != self.path.parent
+        ):
+            raise ValueError("expected database-parent identity must bind the database parent")
         self.timeout = timeout
+        self.expected_parent_identity = expected_parent_identity
         self.expected_identity = expected_identity
         self.expected_lock_identity = expected_lock_identity
 
+    def _require_expected_parent_identity(self) -> None:
+        if self.expected_parent_identity is None:
+            return
+        try:
+            revalidate_directory_identity(self.expected_parent_identity, private=True)
+        except PrivatePathError as exc:
+            raise DatabaseError(
+                "database parent changed after setup ownership was established"
+            ) from exc
+
     def _require_expected_identity(self) -> None:
+        self._require_expected_parent_identity()
         if self.expected_identity is not None:
             _require_database_path_identity(
                 self.path,
@@ -205,14 +224,19 @@ class Database:
         partially understood state machine.
         """
 
-        try:
-            parent = ensure_private_directory(self.path.parent)
-        except PrivatePathError as exc:
-            raise DatabaseError("the database parent must be an owned mode-0700 directory") from exc
+        if self.expected_parent_identity is not None:
+            self._require_expected_parent_identity()
+            parent = self.expected_parent_identity.path
+        else:
+            try:
+                parent = ensure_private_directory(self.path.parent)
+            except PrivatePathError as exc:
+                raise DatabaseError(
+                    "the database parent must be an owned mode-0700 directory"
+                ) from exc
         self.path = parent / self.path.name
         _require_local_filesystem(self.path.parent)
-        if self.expected_identity is not None:
-            self._require_expected_identity()
+        self._require_expected_identity()
         if self.path.is_symlink():
             raise DatabaseError("the approval database may not be a symbolic link")
         if not self.path.exists():

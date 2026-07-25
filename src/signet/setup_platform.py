@@ -253,7 +253,7 @@ class ProductionSetupPlatform:
         result: subprocess.CompletedProcess[str],
     ) -> tuple[str, ...]:
         return tuple(
-            line.strip().lower()
+            line.strip()
             for line in f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()
             if line.strip()
         )
@@ -269,7 +269,7 @@ class ProductionSetupPlatform:
         *,
         target: Path,
     ) -> bool:
-        expected_target = str(target).lower()
+        expected_target = str(target)
         return cls._command_output_lines(result) in {
             (f"{expected_target}: service already loaded",),
             (f"{expected_target}: service already bootstrapped",),
@@ -284,8 +284,8 @@ class ProductionSetupPlatform:
         uid: int,
     ) -> bool:
         lines = cls._command_output_lines(result)
-        missing_line = f'could not find service "{label.lower()}" in domain for user gui: {uid}'
-        return lines == (missing_line,) or lines == ("bad request.", missing_line)
+        missing_line = f'Could not find service "{label}" in domain for user gui: {uid}'
+        return lines == (missing_line,) or lines == ("Bad request.", missing_line)
 
     @classmethod
     def _launchd_service_state(
@@ -296,7 +296,19 @@ class ProductionSetupPlatform:
         uid: int,
     ) -> Literal["active", "inactive", "unavailable"]:
         if status.returncode == 0:
-            return "active"
+            stdout_lines = tuple(
+                line.strip() for line in (status.stdout or "").splitlines() if line.strip()
+            )
+            expected_header = f"gui/{uid}/{label} = {{"
+            if (
+                not (status.stderr or "").strip()
+                and stdout_lines
+                and stdout_lines[0] == expected_header
+                and stdout_lines[-1] == "}"
+                and stdout_lines.count("state = running") == 1
+            ):
+                return "active"
+            return "unavailable"
         if cls._launchd_result_means_missing(status, label=label, uid=uid):
             return "inactive"
         return "unavailable"
@@ -308,14 +320,14 @@ class ProductionSetupPlatform:
         *,
         unit: str,
     ) -> Literal["active", "inactive", "unavailable"]:
-        if status.returncode == 0:
-            return "active"
         lines = cls._command_output_lines(status)
+        if status.returncode == 0:
+            return "active" if lines == ("active",) else "unavailable"
         if status.returncode == 3 and lines in {("inactive",), ("failed",)}:
             return "inactive"
         if status.returncode == 4 and lines == ("inactive",):
             return "inactive"
-        missing_line = f"unit {unit.lower()} could not be found"
+        missing_line = f"Unit {unit} could not be found"
         named_missing_lines = {missing_line, f"{missing_line}."}
         if (
             status.returncode == 4
@@ -344,12 +356,15 @@ class ProductionSetupPlatform:
             if database_path.exists() or database_path.is_symlink():
                 raise SetupError("database exists without an active ownership receipt")
             return None
-        database_identity, lock_identity = validate_active_database_runtime_ownership(
-            database_path.parent,
-            setup_id=setup_id,
+        database_identity, lock_identity, parent_identity = (
+            validate_active_database_runtime_ownership(
+                database_path.parent,
+                setup_id=setup_id,
+            )
         )
         return Database(
             database_path,
+            expected_parent_identity=parent_identity,
             expected_identity=database_identity,
             expected_lock_identity=lock_identity,
         )
@@ -379,8 +394,10 @@ class ProductionSetupPlatform:
         if sys.platform == "darwin":
             rendered = render_launchd_services(spec, active=True)
             target = Path.home() / "Library" / "LaunchAgents"
+            plan_dir = spec.root / "services"
             uid = os.getuid()
             for name, content in rendered.items():
+                _require_exact_owned_file(plan_dir / name, content)
                 _require_exact_owned_file(target / name, content)
             for name in rendered:
                 path = target / name
@@ -409,8 +426,11 @@ class ProductionSetupPlatform:
         else:
             rendered = render_systemd_services(spec, active=True)
             target = Path.home() / ".config" / "systemd" / "user"
+            plan_dir = spec.root / "services"
             for name, content in rendered.items():
-                _require_exact_owned_file(target / name, content.encode("utf-8"))
+                encoded = content.encode("utf-8")
+                _require_exact_owned_file(plan_dir / name, encoded)
+                _require_exact_owned_file(target / name, encoded)
             self._run_checked(
                 ["systemctl", "--user", action, *rendered],
                 f"systemd {action} failed for Signet",
@@ -421,11 +441,13 @@ class ProductionSetupPlatform:
         if sys.platform == "darwin":
             rendered = render_launchd_services(spec, active=True)
             target = Path.home() / "Library" / "LaunchAgents"
+            plan_dir = spec.root / "services"
             uid = os.getuid()
             for name, content in rendered.items():
                 path = target / name
                 label = name.removesuffix(".plist")
                 try:
+                    _require_exact_owned_file(plan_dir / name, content)
                     _require_exact_owned_file(path, content)
                 except SetupError:
                     result[label] = "missing_or_changed"
@@ -449,9 +471,12 @@ class ProductionSetupPlatform:
         else:
             rendered = render_systemd_services(spec, active=True)
             target = Path.home() / ".config" / "systemd" / "user"
+            plan_dir = spec.root / "services"
             for name, content in rendered.items():
+                encoded = content.encode("utf-8")
                 try:
-                    _require_exact_owned_file(target / name, content.encode("utf-8"))
+                    _require_exact_owned_file(plan_dir / name, encoded)
+                    _require_exact_owned_file(target / name, encoded)
                 except SetupError:
                     result[name] = "missing_or_changed"
                     continue
@@ -1628,13 +1653,16 @@ class ProductionSetupPlatform:
         _remove_exact_owned_file(record_path, _canonical_json_bytes(before))
 
     def _tailscale_json(self, command: list[str], message: str) -> Any:
-        result = self.command_runner(
-            command,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=15,
-        )
+        try:
+            result = self.command_runner(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SetupError(message) from exc
         if result.returncode != 0:
             raise SetupError(message)
         try:
@@ -2044,25 +2072,25 @@ class ProductionSetupPlatform:
             env=self._service_manager_environment(),
         )
         lines = self._command_output_lines(result)
-        escaped_unit = re.escape(command[-1].lower())
+        escaped_unit = re.escape(command[-1])
         already_stopped = bool(lines) and all(
-            re.fullmatch(rf"unit {escaped_unit} (?:is )?not loaded\.?", line) is not None
+            re.fullmatch(rf"Unit {escaped_unit} (?:is )?not loaded\.?", line) is not None
             or re.fullmatch(
-                rf"failed to disable unit: unit(?: file)? {escaped_unit} does not exist\.?",
+                rf"Failed to disable unit: Unit(?: file)? {escaped_unit} does not exist\.?",
                 line,
             )
             is not None
             or re.fullmatch(
-                rf"failed to disable unit, unit {escaped_unit} does not exist\.?",
+                rf"Failed to disable unit, unit {escaped_unit} does not exist\.?",
                 line,
             )
             is not None
             or re.fullmatch(
-                rf"failed to stop {escaped_unit}: unit {escaped_unit} not loaded\.?",
+                rf"Failed to stop {escaped_unit}: Unit {escaped_unit} not loaded\.?",
                 line,
             )
             is not None
-            or re.fullmatch(rf"no files found for {escaped_unit}\.?", line) is not None
+            or re.fullmatch(rf"No files found for {escaped_unit}\.?", line) is not None
             for line in lines
         )
         if result.returncode != 0 and not already_stopped:
@@ -2086,7 +2114,7 @@ class ProductionSetupPlatform:
                 expected_uid = int(service_target.group(1))
                 expected_label = service_target.group(2)
         elif len(command) >= 4:
-            domain = re.fullmatch(r"gui/(\d+)", command[-2].lower())
+            domain = re.fullmatch(r"gui/(\d+)", command[-2])
             target_name = Path(command[-1]).name
             if domain is not None and target_name.endswith(".plist"):
                 expected_uid = int(domain.group(1))
@@ -2099,10 +2127,10 @@ class ProductionSetupPlatform:
             )
         already_stopped = (
             missing_target
-            or lines == ("no such process",)
+            or lines == ("No such process",)
             or (
                 len(lines) == 1
-                and re.fullmatch(r"boot-out failed: \d+: no such process", lines[0]) is not None
+                and re.fullmatch(r"Boot-out failed: \d+: No such process", lines[0]) is not None
             )
         )
         if result.returncode != 0 and not already_stopped:
@@ -2731,8 +2759,8 @@ def validate_active_database_runtime_ownership(
     data_directory: Path,
     *,
     setup_id: str,
-) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Validate the setup receipt and return the bound database and lock identities."""
+) -> tuple[tuple[int, int], tuple[int, int], DirectoryIdentity]:
+    """Validate the setup receipt and return bound database, lock, and parent identities."""
 
     try:
         data_identity = require_private_directory_identity(data_directory)
@@ -2752,6 +2780,7 @@ def validate_active_database_runtime_ownership(
     return (
         (int(database_identity["device"]), int(database_identity["inode"])),
         (int(lock_identity["device"]), int(lock_identity["inode"])),
+        data_identity,
     )
 
 
@@ -2762,9 +2791,11 @@ def validate_active_database_ownership(
 ) -> tuple[int, int]:
     """Validate the setup receipt and return the bound main-database identity."""
 
-    database_identity, _lock_identity = validate_active_database_runtime_ownership(
-        data_directory,
-        setup_id=setup_id,
+    database_identity, _lock_identity, _parent_identity = (
+        validate_active_database_runtime_ownership(
+            data_directory,
+            setup_id=setup_id,
+        )
     )
     return database_identity
 
