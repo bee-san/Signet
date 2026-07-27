@@ -806,7 +806,7 @@ def test_public_backup_refuses_to_cross_an_active_lifecycle_epoch(
     )
 
     with (
-        setup_operations.setup_lifecycle_lock(selected.root),
+        operations.lifecycle_lock(),
         pytest.raises(SetupError, match="another setup lifecycle operation"),
     ):
         operations.backup(tmp_path / "locked.signet-backup")

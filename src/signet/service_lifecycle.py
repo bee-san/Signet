@@ -11,6 +11,7 @@ from signet.lifecycle import (
     LifecycleOperationRecord,
     LifecycleOperationStore,
     LifecyclePlan,
+    lifecycle_recovery_directory,
     setup_lifecycle_lock,
 )
 from signet.setup_platform import _managed_tailnet_port
@@ -64,7 +65,7 @@ class ServiceLifecycle:
             observed={
                 "setup_status": journal.status,
                 "setup_spec_digest": journal.spec_digest,
-                "previous_lifecycle_plan_id": self._previous_plan_id(),
+                "previous_lifecycle_plan_id": self._previous_plan_id(journal.setup_id),
                 "tailscale_serve_port": managed_tailnet_port,
                 "services": dict(sorted(services.items())),
             },
@@ -77,11 +78,12 @@ class ServiceLifecycle:
         if action not in {"start", "stop", "restart"}:
             raise SetupError("service plan action must be start, stop, or restart")
         store = LifecycleOperationStore(self.root)
-        with setup_lifecycle_lock(self.root):
-            self.journal_factory()
+        with setup_lifecycle_lock(lifecycle_recovery_directory(self.root)):
+            journal = self.journal_factory()
             existing = store.load_optional()
             if existing is not None and existing.plan.plan_id == plan_id:
                 record = existing
+                self._require_current_setup(record, journal.setup_id)
                 if record.plan.operation != "services" or record.plan.action != action:
                     raise SetupError("reviewed lifecycle plan does not match the service action")
             else:
@@ -94,8 +96,8 @@ class ServiceLifecycle:
 
     def rollback(self, plan_id: str) -> dict[str, Any]:
         store = LifecycleOperationStore(self.root)
-        with setup_lifecycle_lock(self.root):
-            self.journal_factory()
+        with setup_lifecycle_lock(lifecycle_recovery_directory(self.root)):
+            journal = self.journal_factory()
             spec = self.spec_factory()
             record = store.load_optional()
             if (
@@ -104,6 +106,7 @@ class ServiceLifecycle:
                 or record.plan.operation != "services"
             ):
                 raise SetupError("reviewed lifecycle plan is unavailable for rollback")
+            self._require_current_setup(record, journal.setup_id)
             before = service_observation(record.plan)
             managed_tailnet_port = tailscale_port(record.plan)
             current = self.platform.service_status(spec)
@@ -151,7 +154,8 @@ class ServiceLifecycle:
         record: LifecycleOperationRecord,
         store: LifecycleOperationStore,
     ) -> dict[str, Any]:
-        self.journal_factory()
+        journal = self.journal_factory()
+        self._require_current_setup(record, journal.setup_id)
         spec = self.spec_factory()
         before = service_observation(record.plan)
         managed_tailnet_port = tailscale_port(record.plan)
@@ -232,13 +236,22 @@ class ServiceLifecycle:
         store.save(record)
         self.platform.manage_services(spec, action)
 
-    def _previous_plan_id(self) -> str | None:
+    def _previous_plan_id(self, setup_id: str) -> str | None:
         previous = LifecycleOperationStore(self.root).load_optional()
         if previous is None:
             return None
+        if previous.setup_id != setup_id:
+            if previous.status in {"completed", "rolled_back"}:
+                return None
+            raise SetupError("an incomplete lifecycle plan belongs to another setup")
         if previous.status not in {"completed", "rolled_back"}:
             raise SetupError("a reviewed lifecycle plan is incomplete and must be resumed")
         return previous.plan.plan_id
+
+    @staticmethod
+    def _require_current_setup(record: LifecycleOperationRecord, setup_id: str) -> None:
+        if record.setup_id != setup_id:
+            raise SetupError("reviewed lifecycle plan belongs to another setup")
 
 
 def local_service_states(services: dict[str, str]) -> dict[str, str]:

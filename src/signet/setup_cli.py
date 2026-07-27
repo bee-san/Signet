@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO, cast
 
-from signet.lifecycle import setup_lifecycle_lock
+from signet.lifecycle import lifecycle_recovery_directory, setup_lifecycle_lock
 from signet.provider_setup import ProviderSetupOperations
 from signet.setup_operations import SetupOperations
 from signet.setup_platform import ProductionSetupPlatform
@@ -324,7 +324,7 @@ def run_setup_command(
             input_fn,
             "Apply the reviewed automatic steps, then continue with the labelled human ceremonies?",
         )
-        with setup_lifecycle_lock(root):
+        with setup_lifecycle_lock(lifecycle_recovery_directory(root)):
             journal = engine.apply(spec)
         output(
             "Review the generated MCP entry, then run /reload-mcp in each selected Hermes profile; "

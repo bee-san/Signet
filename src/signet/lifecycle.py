@@ -232,13 +232,19 @@ class LifecycleOperationRecord:
         )
 
 
+def lifecycle_recovery_directory(root: Path) -> Path:
+    """Return the durable lock/receipt directory outside the purgeable setup root."""
+
+    return root.parent / f"{root.name}-recovery"
+
+
 class LifecycleOperationStore:
     """CAS-style private receipt stored outside the purgeable setup root."""
 
     NAME = "lifecycle-operation.json"
 
     def __init__(self, root: Path) -> None:
-        self.directory = root.parent / f"{root.name}-recovery"
+        self.directory = lifecycle_recovery_directory(root)
         self.path = self.directory / self.NAME
 
     def load_optional(self) -> LifecycleOperationRecord | None:

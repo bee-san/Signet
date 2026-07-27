@@ -148,6 +148,35 @@ def test_backup_key_identity_inventory_detects_wrong_recovery_secret(tmp_path: P
         manager.require_key_identities(restored.manifest)
 
 
+def test_restore_prepares_a_staged_tree_before_atomic_publication(tmp_path: Path) -> None:
+    database, staging, _ = _fixture(tmp_path)
+    manager = _manager(database, staging)
+    bundle = manager.create(tmp_path / "atomic-restore.signet-backup", created_at=100)
+    destination = tmp_path / "atomic-restore"
+    staged_root: Path | None = None
+
+    def prepare(restored: RestoredBundle, selected: Path) -> None:
+        nonlocal staged_root
+        assert selected == destination
+        assert restored.root != destination
+        assert restored.root.parent == destination.parent
+        assert restored.root.is_dir()
+        assert not destination.exists()
+        staged_root = restored.root
+
+    restored = manager.restore(
+        bundle,
+        destination,
+        prepare_publication=prepare,
+    )
+
+    assert staged_root is not None
+    assert not staged_root.exists()
+    assert restored.root == destination
+    assert restored.database_path == destination / "approvals.sqlite3"
+    assert restored.attachments_root == destination / "attachments"
+
+
 def test_backup_refuses_a_source_database_replacement_during_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1422,15 +1451,18 @@ def test_restore_failure_reports_identity_checked_cleanup_failure(
     bundle = manager.create(tmp_path / "restore-cleanup.signet")
     destination = tmp_path / "retained-restore"
     original_rmtree = backup_module.shutil.rmtree
+    retained_root: Path | None = None
 
     def fail_after_private_extract(_archive: object, root: Path) -> None:
+        nonlocal retained_root
+        retained_root = root
         retained = root / "retained-private-content"
         retained.write_bytes(b"private restored bytes")
         retained.chmod(0o600)
         raise BackupError("injected restore validation failure")
 
     def retain_restore_tree(path: Path) -> None:
-        if path == destination:
+        if path == retained_root:
             raise OSError("injected restore cleanup failure")
         original_rmtree(path)
 
@@ -1444,9 +1476,10 @@ def test_restore_failure_reports_identity_checked_cleanup_failure(
         manager.restore(bundle, destination)
 
     assert "injected" not in caught.value.operator_message()
-    assert (destination / "retained-private-content").read_bytes() == b"private restored bytes"
+    assert retained_root is not None
+    assert (retained_root / "retained-private-content").read_bytes() == b"private restored bytes"
     monkeypatch.setattr(backup_module.shutil, "rmtree", original_rmtree)
-    original_rmtree(destination)
+    original_rmtree(retained_root)
 
 
 def test_restore_preserves_replacement_when_mkdir_outcome_is_unknown(
@@ -1459,6 +1492,7 @@ def test_restore_preserves_replacement_when_mkdir_outcome_is_unknown(
     destination = tmp_path / "uncaptured-restore"
     displaced = tmp_path / "restore-created-before-interrupt"
     original_mkdir = backup_module.os.mkdir
+    replacement: Path | None = None
 
     def replace_then_interrupt(
         path: Path,
@@ -1466,13 +1500,17 @@ def test_restore_preserves_replacement_when_mkdir_outcome_is_unknown(
         *args: object,
         **kwargs: object,
     ) -> None:
+        nonlocal replacement
         original_mkdir(path, mode, *args, **kwargs)
         selected = Path(path)
-        if selected == destination:
+        if selected.parent == destination.parent and selected.name.startswith(
+            f".{destination.name}.restore-"
+        ):
             selected.rename(displaced)
             original_mkdir(selected, 0o700)
             (selected / "replacement-marker").write_text("preserve\n", encoding="utf-8")
             selected.chmod(0o500)
+            replacement = selected
             raise KeyboardInterrupt
 
     monkeypatch.setattr(backup_module.os, "mkdir", replace_then_interrupt)
@@ -1483,10 +1521,12 @@ def test_restore_preserves_replacement_when_mkdir_outcome_is_unknown(
     ):
         manager.restore(bundle, destination)
 
-    assert (destination / "replacement-marker").read_text(encoding="utf-8") == "preserve\n"
-    assert stat.S_IMODE(destination.stat().st_mode) == 0o500
-    destination.chmod(0o700)
-    backup_module.shutil.rmtree(destination)
+    assert replacement is not None
+    assert not destination.exists()
+    assert (replacement / "replacement-marker").read_text(encoding="utf-8") == "preserve\n"
+    assert stat.S_IMODE(replacement.stat().st_mode) == 0o500
+    replacement.chmod(0o700)
+    backup_module.shutil.rmtree(replacement)
     backup_module.shutil.rmtree(displaced)
 
 
