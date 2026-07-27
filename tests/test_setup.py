@@ -246,6 +246,7 @@ def test_setup_status_and_doctor_do_not_construct_or_mutate_production_state(
             "signet-mcp": "unavailable",
             "signet-web": "unavailable",
         },
+        "remediation": "Review the service plan, then apply a start or restart plan.",
     }
     assert before == after
     assert not (selected.root / "data" / "signet.db").exists()

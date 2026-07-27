@@ -47,7 +47,17 @@ def test_profile_discovery_includes_the_hermes_default_profile(
 
 @pytest.mark.parametrize(
     "command",
-    ["setup", "manage", "status", "doctor", "backup", "restore", "upgrade", "uninstall"],
+    [
+        "setup",
+        "manage",
+        "status",
+        "doctor",
+        "verify",
+        "backup",
+        "restore",
+        "upgrade",
+        "uninstall",
+    ],
 )
 def test_parser_exposes_setup_lifecycle_commands(command: str) -> None:
     parser = _parser()
@@ -433,6 +443,13 @@ def test_lifecycle_commands_dispatch_to_operations_without_mutating_setup_state(
 ) -> None:
     calls: list[tuple[str, object]] = []
 
+    class Plan:
+        def __init__(self, plan_id: str) -> None:
+            self.plan_id = plan_id
+
+        def document(self) -> dict[str, str]:
+            return {"plan_id": self.plan_id}
+
     class Operations:
         def status(self) -> dict[str, str]:
             calls.append(("status", None))
@@ -442,27 +459,56 @@ def test_lifecycle_commands_dispatch_to_operations_without_mutating_setup_state(
             calls.append(("doctor", None))
             return {"healthy": True}
 
-        def backup(self, destination: Path | None = None) -> Path:
-            calls.append(("backup", destination))
-            return tmp_path / "backup.signet-backup"
+        def verify(self) -> dict[str, bool]:
+            calls.append(("verify", None))
+            return {"verified": True}
 
-        def restore(self, bundle: Path) -> object:
-            calls.append(("restore", bundle))
-            return type(
-                "Restored",
-                (),
-                {
-                    "root": tmp_path / "restore",
-                    "database_path": tmp_path / "restore" / "signet.sqlite3",
-                },
-            )()
+        def plan_backup(self, destination: Path | None = None) -> Plan:
+            calls.append(("plan_backup", destination))
+            return Plan("backup-plan")
 
-        def upgrade(self) -> dict[str, int]:
-            calls.append(("upgrade", None))
+        def apply_backup(
+            self,
+            plan_id: str,
+            destination: Path | None = None,
+        ) -> dict[str, str]:
+            calls.append(("apply_backup", (plan_id, destination)))
+            return {"backup": str(tmp_path / "backup.signet-backup")}
+
+        def plan_restore(self, bundle: Path) -> Plan:
+            calls.append(("plan_restore", bundle))
+            return Plan("restore-plan")
+
+        def apply_restore(self, plan_id: str, bundle: Path) -> dict[str, object]:
+            calls.append(("apply_restore", (plan_id, bundle)))
+            return {"restored_to": str(tmp_path / "restore"), "activated": False}
+
+        def plan_services(self, action: str) -> Plan:
+            calls.append(("plan_services", action))
+            return Plan("service-plan")
+
+        def apply_service_plan(self, action: str, plan_id: str) -> dict[str, str]:
+            calls.append(("apply_service_plan", (action, plan_id)))
+            return {"action": action}
+
+        def rollback_service_plan(self, plan_id: str) -> dict[str, str]:
+            calls.append(("rollback_service_plan", plan_id))
+            return {"action": "rollback"}
+
+        def plan_upgrade(self) -> Plan:
+            calls.append(("plan_upgrade", None))
+            return Plan("upgrade-plan")
+
+        def apply_upgrade(self, plan_id: str) -> dict[str, int]:
+            calls.append(("apply_upgrade", plan_id))
             return {"schema_version": 1}
 
-        def uninstall(self, *, purge: bool = False) -> dict[str, bool]:
-            calls.append(("uninstall", purge))
+        def plan_uninstall(self, *, purge: bool = False) -> Plan:
+            calls.append(("plan_uninstall", purge))
+            return Plan("purge-plan" if purge else "uninstall-plan")
+
+        def apply_uninstall(self, plan_id: str, *, purge: bool = False) -> dict[str, bool]:
+            calls.append(("apply_uninstall", (plan_id, purge)))
             return {"purged": purge}
 
     def factory(root: Path, platform: Any) -> Operations:
@@ -474,10 +520,25 @@ def test_lifecycle_commands_dispatch_to_operations_without_mutating_setup_state(
     commands = (
         ["status", "--root", str(tmp_path)],
         ["doctor", "--root", str(tmp_path)],
+        ["verify", "--root", str(tmp_path)],
         ["backup", "--root", str(tmp_path)],
         ["restore", "--root", str(tmp_path), str(tmp_path / "bundle")],
-        ["upgrade", "--root", str(tmp_path), "--yes"],
-        ["uninstall", "--root", str(tmp_path), "--yes"],
+        ["manage", "--root", str(tmp_path), "stop"],
+        ["upgrade", "--root", str(tmp_path)],
+        ["uninstall", "--root", str(tmp_path), "--purge"],
+        ["backup", "--root", str(tmp_path), "--apply", "backup-plan"],
+        [
+            "restore",
+            "--root",
+            str(tmp_path),
+            str(tmp_path / "bundle"),
+            "--apply",
+            "restore-plan",
+        ],
+        ["manage", "--root", str(tmp_path), "stop", "--apply", "service-plan"],
+        ["manage", "--root", str(tmp_path), "stop", "--rollback", "service-plan"],
+        ["upgrade", "--root", str(tmp_path), "--apply", "upgrade-plan"],
+        ["uninstall", "--root", str(tmp_path), "--apply", "uninstall-plan"],
     )
     for command in commands:
         assert (
@@ -492,10 +553,18 @@ def test_lifecycle_commands_dispatch_to_operations_without_mutating_setup_state(
     assert [name for name, _ in calls] == [
         "status",
         "doctor",
-        "backup",
-        "restore",
-        "upgrade",
-        "uninstall",
+        "verify",
+        "plan_backup",
+        "plan_restore",
+        "plan_services",
+        "plan_upgrade",
+        "plan_uninstall",
+        "apply_backup",
+        "apply_restore",
+        "apply_service_plan",
+        "rollback_service_plan",
+        "apply_upgrade",
+        "apply_uninstall",
     ]
     assert not (tmp_path / ".setup-journal.json").exists()
 

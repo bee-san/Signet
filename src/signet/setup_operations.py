@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
 import secrets
 import stat
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -24,6 +23,12 @@ from signet.backup import (
 from signet.credential_broker import KeychainSecretStore, SecretReference
 from signet.crypto import PayloadCipher
 from signet.db import LATEST_SCHEMA_VERSION, Database, DatabaseError, MigrationBackupReceipt
+from signet.lifecycle import (
+    LifecycleOperationRecord,
+    LifecycleOperationStore,
+    LifecyclePlan,
+    setup_lifecycle_lock,
+)
 from signet.private_paths import (
     PrivatePathError,
     ensure_private_directory,
@@ -35,8 +40,17 @@ from signet.production import (
     load_production_config,
 )
 from signet.production_state import ProductionStateStore
+from signet.service_lifecycle import (
+    ServiceLifecycle,
+    local_service_states,
+    require_same_service_inventory,
+    service_observation,
+    tailscale_port,
+    validate_service_snapshot,
+)
 from signet.setup_platform import (
     ProductionSetupPlatform,
+    _managed_tailnet_port,
     _replace_private_file,
     validate_active_database_runtime_ownership,
 )
@@ -49,36 +63,6 @@ from signet.setup_state import (
     SetupSpec,
 )
 from signet.staging import StagingStore
-
-
-@contextmanager
-def setup_lifecycle_lock(root_path: Path) -> Iterator[None]:
-    descriptor = -1
-    try:
-        root = ensure_private_directory(root_path)
-        descriptor = os.open(
-            root,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
-        require_no_acl_grants(descriptor)
-    except (OSError, PrivatePathError) as exc:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise SetupError("setup lifecycle lock is unavailable or unsafe") from exc
-    try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SetupError("another setup lifecycle operation is in progress") from None
-        yield
-    finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
 
 
 class SetupOperations:
@@ -124,11 +108,15 @@ class SetupOperations:
 
     def status(self) -> dict[str, Any]:
         journal = self.store.load()
+        lifecycle = LifecycleOperationStore(self.root).load_optional()
         result: dict[str, Any] = {
             "setup_id": journal.setup_id,
             "setup_status": journal.status,
             "steps": {step.name: step.status for step in journal.steps},
             "provider_rollout": "disabled",
+            "lifecycle_operation": (
+                None if lifecycle is None else _lifecycle_operation_metadata(lifecycle)
+            ),
             "services": self.platform.service_status(self.spec()),
         }
         try:
@@ -181,33 +169,65 @@ class SetupOperations:
         try:
             journal = self.store.load()
         except Exception as exc:
-            checks["journal"] = _failed_check(exc)
+            checks["journal"] = {
+                **_failed_check(exc),
+                "remediation": "Restore the owned setup journal from a verified backup.",
+            }
             return {"healthy": False, "checks": checks}
-        checks["journal"] = {"ok": journal.status == "completed", "status": journal.status}
+        checks["journal"] = {
+            "ok": journal.status == "completed",
+            "status": journal.status,
+            "remediation": "Resume or roll back the recorded setup operation.",
+        }
+        try:
+            lifecycle = LifecycleOperationStore(self.root).load_optional()
+        except Exception as exc:
+            checks["lifecycle_operation"] = {
+                **_failed_check(exc),
+                "remediation": (
+                    "Inspect and restore the owned lifecycle receipt before applying plans."
+                ),
+            }
+        else:
+            lifecycle_ok = lifecycle is None or lifecycle.status in {"completed", "rolled_back"}
+            checks["lifecycle_operation"] = {
+                "ok": lifecycle_ok,
+                "status": "idle" if lifecycle is None else lifecycle.status,
+                "remediation": (
+                    "No action required."
+                    if lifecycle_ok
+                    else (
+                        "Resume the exact reviewed plan; use explicit rollback only for "
+                        "a service plan."
+                    )
+                ),
+            }
         try:
             config = load_production_config(self.root / "production.json")
         except Exception as exc:
-            checks["configuration"] = _failed_check(exc)
+            checks["configuration"] = {
+                **_failed_check(exc),
+                "remediation": "Restore the exact owned production configuration.",
+            }
         else:
             checks["configuration"] = {
                 "ok": True,
                 "provider_rollout": config.provider_rollout.state,
                 "connector_count": len(config.connectors),
+                "remediation": "No action required.",
             }
-            store = KeychainSecretStore()
-            missing: list[str] = []
-            for reference in config.secrets.model_dump().values():
-                if reference is None:
-                    continue
-                try:
-                    store.get(SecretReference.parse(reference))
-                except Exception:
-                    missing.append(reference.rsplit("/", 1)[-1].split("-", 1)[-1])
-            checks["secrets"] = {"ok": not missing, "missing_purposes": sorted(missing)}
+            checks["secret_references"] = {
+                "ok": True,
+                "verification": "deferred_attended_check",
+                "remediation": (
+                    "Run an attended backup verification before destructive maintenance."
+                ),
+            }
         services = self.platform.service_status(self.spec())
         checks["services"] = {
             "ok": bool(services) and all(status == "active" for status in services.values()),
             "status": services,
+            "remediation": "Review the service plan, then apply a start or restart plan.",
         }
         checks["hermes_reload"] = {
             "ok": False,
@@ -222,6 +242,86 @@ class SetupOperations:
             ),
             "checks": checks,
         }
+
+    def verify(self) -> dict[str, Any]:
+        doctor = self.doctor()
+        return {
+            "automatic_safe_checks": doctor,
+            "required_human_ceremonies": [
+                {
+                    "name": "owner_authentication_enrollment",
+                    "action": (
+                        "Complete the attended passkey and TOTP enrollment ceremony, "
+                        "then retain recovery material offline."
+                    ),
+                },
+                {
+                    "name": "hermes_mcp_review_and_reload",
+                    "action": (
+                        "Review each generated MCP block and run /reload-mcp in each "
+                        "configured Hermes profile."
+                    ),
+                },
+            ],
+            "deferred_live_provider_proof": [
+                "credential_configuration",
+                "read_only_discovery",
+                "live_send",
+            ],
+            "gateway_restart": False,
+        }
+
+    def plan_backup(self, destination: Path | None = None) -> LifecyclePlan:
+        journal = self._completed_journal()
+        if destination is not None and (
+            not destination.is_absolute() or ".." in destination.parts
+        ):
+            raise SetupError("backup destination must be an absolute lexical path")
+        previous_plan_id = self._previous_lifecycle_plan_id()
+        selected_destination = destination or _default_reviewed_backup_destination(
+            self.root,
+            setup_id=journal.setup_id,
+            previous_plan_id=previous_plan_id,
+        )
+        return LifecyclePlan(
+            setup_id=journal.setup_id,
+            operation="backup",
+            action="backup",
+            observed={
+                "setup_status": journal.status,
+                "setup_spec_digest": journal.spec_digest,
+                "previous_lifecycle_plan_id": previous_plan_id,
+                "destination": str(selected_destination),
+            },
+            steps=(
+                "inspect_setup_ownership",
+                "validate_private_path_identity",
+                "create_consistent_encrypted_bundle",
+                "verify_encrypted_bundle",
+            ),
+            automatic_safe_checks=("setup_ownership", "private_path_identity"),
+            destructive_actions=(),
+        )
+
+    def apply_backup(self, plan_id: str, destination: Path | None = None) -> dict[str, Any]:
+        selected_destination = destination
+        if selected_destination is None:
+            existing = LifecycleOperationStore(self.root).load_optional()
+            if existing is not None and existing.plan.plan_id == plan_id:
+                selected_destination = _backup_destination(existing.plan)
+            else:
+                selected_destination = _backup_destination(self.plan_backup())
+        return self._apply_reviewed_operation(
+            plan_id=plan_id,
+            operation="backup",
+            action="backup",
+            plan_factory=lambda: self.plan_backup(selected_destination),
+            runner=lambda: {"backup": str(self._backup(selected_destination))},
+            resume_validator=lambda plan: _require_backup_destination(
+                plan,
+                selected_destination,
+            ),
+        )
 
     def backup(self, destination: Path | None = None) -> Path:
         with self.lifecycle_lock():
@@ -263,6 +363,52 @@ class SetupOperations:
         with self.lifecycle_lock():
             return self._restore(bundle)
 
+    def plan_restore(self, bundle: Path) -> LifecyclePlan:
+        journal = self._completed_journal()
+        if not bundle.is_absolute() or ".." in bundle.parts:
+            raise SetupError("restore bundle must be an absolute lexical path")
+        return LifecyclePlan(
+            setup_id=journal.setup_id,
+            operation="restore",
+            action="restore",
+            observed={
+                "setup_status": journal.status,
+                "setup_spec_digest": journal.spec_digest,
+                "previous_lifecycle_plan_id": self._previous_lifecycle_plan_id(),
+                "bundle": _private_file_checkpoint(bundle),
+            },
+            steps=(
+                "inspect_setup_ownership",
+                "verify_encrypted_bundle_identity",
+                "decrypt_into_new_private_staging_root",
+                "validate_restored_schema_and_key_references",
+            ),
+            automatic_safe_checks=(
+                "setup_ownership",
+                "private_path_identity",
+                "encrypted_bundle_identity",
+            ),
+            destructive_actions=(),
+        )
+
+    def apply_restore(self, plan_id: str, bundle: Path) -> dict[str, Any]:
+        def restore() -> dict[str, Any]:
+            restored = self._restore(bundle)
+            return {
+                "restored_to": str(restored.root),
+                "database": str(restored.database_path),
+                "activated": False,
+            }
+
+        return self._apply_reviewed_operation(
+            plan_id=plan_id,
+            operation="restore",
+            action="restore",
+            plan_factory=lambda: self.plan_restore(bundle),
+            runner=restore,
+            resume_validator=lambda plan: _require_restore_bundle(plan, bundle),
+        )
+
     def _restore(self, bundle: Path) -> RestoredBundle:
         if not bundle.is_absolute() or ".." in bundle.parts:
             raise SetupError("restore bundle must be an absolute lexical path")
@@ -303,36 +449,94 @@ class SetupOperations:
                 raise SetupError(str(exc)) from exc
             raise
 
+    def plan_upgrade(self) -> LifecyclePlan:
+        journal = self._completed_journal()
+        spec = self.spec()
+        services = self.platform.service_status(spec)
+        tailscale_port = _managed_tailnet_port(spec)
+        validate_service_snapshot(
+            services,
+            allow_mixed=False,
+            tailscale_port=tailscale_port,
+        )
+        schema_version = self._current_schema_version()
+        return LifecyclePlan(
+            setup_id=journal.setup_id,
+            operation="upgrade",
+            action="upgrade",
+            observed={
+                "setup_status": journal.status,
+                "setup_spec_digest": journal.spec_digest,
+                "previous_lifecycle_plan_id": self._previous_lifecycle_plan_id(),
+                "tailscale_serve_port": tailscale_port,
+                "services": dict(sorted(services.items())),
+                "schema_version": schema_version,
+                "target_schema_version": LATEST_SCHEMA_VERSION,
+            },
+            steps=(
+                "run_read_only_preflight",
+                "quiesce_active_local_services",
+                "create_and_verify_pre_migration_backup",
+                "apply_schema_migrations",
+                "restore_prior_local_service_state",
+                "verify_instance_bound_service_health_if_started",
+            ),
+            automatic_safe_checks=(
+                "setup_ownership",
+                "private_path_identity",
+                "service_manager_state",
+                "database_schema_version",
+            ),
+            destructive_actions=(),
+        )
+
+    def apply_upgrade(self, plan_id: str) -> dict[str, Any]:
+        return self._apply_reviewed_operation(
+            plan_id=plan_id,
+            operation="upgrade",
+            action="upgrade",
+            plan_factory=self.plan_upgrade,
+            runner=lambda: self._upgrade(self._reviewed_plan(plan_id, operation="upgrade")),
+            resume_validator=_require_upgrade_target,
+        )
+
     def upgrade(self) -> dict[str, Any]:
         with self.lifecycle_lock():
             return self._upgrade()
 
-    def _upgrade(self) -> dict[str, Any]:
+    def _upgrade(self, reviewed_plan: LifecyclePlan | None = None) -> dict[str, Any]:
         spec = self.spec()
         journal = self.store.load()
-        self.platform.preflight(spec)
+        if reviewed_plan is None:
+            self.platform.preflight(spec)
         SetupEngine(self.store, self.platform).validate_private_paths(spec, journal=journal)
         initial_status = self.platform.service_status(spec)
-        local_services = {
-            name: state
-            for name, state in initial_status.items()
-            if not name.startswith("tailscale:")
-        }
-        if len(local_services) != 2 or any(
-            state not in {"active", "inactive"} for state in local_services.values()
-        ):
-            raise SetupError("upgrade could not determine the prior Signet service state")
-        prior_active = all(state == "active" for state in local_services.values())
-        if not prior_active and any(state != "inactive" for state in local_services.values()):
-            raise SetupError("upgrade refuses to change a mixed Signet service state")
-        stop_attempted = False
+        if reviewed_plan is None:
+            local_services = local_service_states(initial_status)
+            if len(local_services) != 2 or any(
+                state not in {"active", "inactive"} for state in local_services.values()
+            ):
+                raise SetupError("upgrade could not determine the prior Signet service state")
+            prior_active = all(state == "active" for state in local_services.values())
+            if not prior_active and any(state != "inactive" for state in local_services.values()):
+                raise SetupError("upgrade refuses to change a mixed Signet service state")
+            services_quiesced = False
+        else:
+            _require_upgrade_target(reviewed_plan)
+            prior_active, services_quiesced = _reviewed_upgrade_service_state(
+                reviewed_plan,
+                initial_status,
+            )
+        stop_attempted = services_quiesced
         migration_receipt: Any | None = None
         upgrade_receipt: Path | None = None
         schema_version: int | None = None
         assembly: Any | None = None
         recovery_directory = spec.root.parent / f"{spec.root.name}-recovery"
         try:
-            if prior_active:
+            if reviewed_plan is not None:
+                self.platform.preflight(spec)
+            if prior_active and not services_quiesced:
                 stop_attempted = True
                 self._stop_and_verify_services(spec)
             manager = self._backup_manager(journal)
@@ -493,6 +697,71 @@ class SetupOperations:
             raise SetupError(
                 "upgrade completed, but Signet services were left stopped after restart failed"
             ) from start_exc
+
+    def plan_uninstall(self, *, purge: bool = False) -> LifecyclePlan:
+        journal = self._completed_journal()
+        spec = self.spec()
+        services = self.platform.service_status(spec)
+        tailscale_port = _managed_tailnet_port(spec)
+        validate_service_snapshot(
+            services,
+            allow_mixed=False,
+            tailscale_port=tailscale_port,
+        )
+        action = "purge" if purge else "uninstall"
+        steps = [
+            "inspect_setup_ownership",
+            "remove_owned_services_and_tailscale_route",
+            "remove_owned_hermes_profile_blocks_and_tokens",
+        ]
+        destructive = [
+            "remove_owned_services_and_tailscale_route",
+            "remove_owned_hermes_profile_blocks_and_tokens",
+        ]
+        if purge:
+            steps.extend(
+                [
+                    "create_and_verify_encrypted_backup",
+                    "write_durable_external_recovery_receipt",
+                    "remove_owned_production_data",
+                    "remove_owned_non_backup_secrets",
+                ]
+            )
+            destructive.extend(
+                [
+                    "remove_owned_production_data",
+                    "remove_owned_non_backup_secrets",
+                ]
+            )
+        return LifecyclePlan(
+            setup_id=journal.setup_id,
+            operation="uninstall",
+            action=action,
+            observed={
+                "setup_status": journal.status,
+                "setup_spec_digest": journal.spec_digest,
+                "previous_lifecycle_plan_id": self._previous_lifecycle_plan_id(),
+                "tailscale_serve_port": tailscale_port,
+                "services": dict(sorted(services.items())),
+                "data_preserved": not purge,
+            },
+            steps=tuple(steps),
+            automatic_safe_checks=(
+                "setup_ownership",
+                "private_path_identity",
+                "service_manager_state",
+            ),
+            destructive_actions=tuple(destructive),
+        )
+
+    def apply_uninstall(self, plan_id: str, *, purge: bool = False) -> dict[str, Any]:
+        return self._apply_reviewed_operation(
+            plan_id=plan_id,
+            operation="uninstall",
+            action="purge" if purge else "uninstall",
+            plan_factory=lambda: self.plan_uninstall(purge=purge),
+            runner=lambda: self._uninstall(purge=purge),
+        )
 
     def uninstall(self, *, purge: bool = False) -> dict[str, Any]:
         with self.lifecycle_lock():
@@ -793,6 +1062,138 @@ class SetupOperations:
         self.platform.manage_services(self.spec(), action)
         return self.platform.service_status(self.spec())
 
+    def plan_services(self, action: str) -> LifecyclePlan:
+        return self._service_lifecycle().plan(action)
+
+    def apply_service_plan(self, action: str, plan_id: str) -> dict[str, Any]:
+        return self._service_lifecycle().apply(action, plan_id)
+
+    def rollback_service_plan(self, plan_id: str) -> dict[str, Any]:
+        return self._service_lifecycle().rollback(plan_id)
+
+    def _service_lifecycle(self) -> ServiceLifecycle:
+        return ServiceLifecycle(
+            root=self.root,
+            platform=self.platform,
+            spec_factory=self.spec,
+            journal_factory=self._completed_journal,
+        )
+
+    def _completed_journal(self) -> SetupJournal:
+        journal = self.store.load()
+        if journal.status != "completed":
+            raise SetupError("lifecycle planning requires a completed owned setup")
+        SetupEngine(self.store, self.platform).validate_private_paths(
+            self.spec(),
+            journal=journal,
+        )
+        return journal
+
+    def _previous_lifecycle_plan_id(self) -> str | None:
+        previous = LifecycleOperationStore(self.root).load_optional()
+        if previous is None:
+            return None
+        if previous.status not in {"completed", "rolled_back"}:
+            raise SetupError("a reviewed lifecycle plan is incomplete and must be resumed")
+        return previous.plan.plan_id
+
+    def _reviewed_plan(self, plan_id: str, *, operation: str) -> LifecyclePlan:
+        record = LifecycleOperationStore(self.root).load_optional()
+        if (
+            record is None
+            or record.plan.plan_id != plan_id
+            or record.plan.operation != operation
+            or record.setup_id != self.store.load().setup_id
+        ):
+            raise SetupError("reviewed lifecycle operation receipt is unavailable or mismatched")
+        return record.plan
+
+    def _current_schema_version(self) -> int:
+        journal = self._completed_journal()
+        database_path = self.root / "data" / "signet.db"
+        if database_path.is_symlink() or not database_path.is_file():
+            raise SetupError("upgrade planning requires the owned production database")
+        expected_identity, expected_lock_identity, expected_parent_identity = (
+            validate_active_database_runtime_ownership(
+                database_path.parent,
+                setup_id=journal.setup_id,
+            )
+        )
+        database = Database(
+            database_path,
+            expected_parent_identity=expected_parent_identity,
+            expected_identity=expected_identity,
+            expected_lock_identity=expected_lock_identity,
+        )
+        try:
+            with database.read_only() as connection:
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        except (DatabaseError, OSError, TypeError, ValueError) as exc:
+            raise SetupError("upgrade planning could not inspect the database schema") from exc
+        if version <= 0 or version > LATEST_SCHEMA_VERSION:
+            raise SetupError("upgrade source schema version is unsupported")
+        return version
+
+    def _apply_reviewed_operation(
+        self,
+        *,
+        plan_id: str,
+        operation: str,
+        action: str,
+        plan_factory: Callable[[], LifecyclePlan],
+        runner: Callable[[], dict[str, Any]],
+        resume_validator: Callable[[LifecyclePlan], None] | None = None,
+    ) -> dict[str, Any]:
+        store = LifecycleOperationStore(self.root)
+        existing = store.load_optional()
+        if existing is not None and existing.plan.plan_id == plan_id:
+            if existing.plan.operation != operation or existing.plan.action != action:
+                raise SetupError("reviewed lifecycle plan does not match the requested operation")
+            if resume_validator is not None:
+                resume_validator(existing.plan)
+            if existing.status == "completed":
+                if existing.result is None:
+                    raise SetupError("completed lifecycle operation receipt has no result")
+                return dict(existing.result)
+        with self.lifecycle_lock():
+            existing = store.load_optional()
+            if existing is not None and existing.plan.plan_id == plan_id:
+                record = existing
+                if record.plan.operation != operation or record.plan.action != action:
+                    raise SetupError(
+                        "reviewed lifecycle plan does not match the requested operation"
+                    )
+                if resume_validator is not None:
+                    resume_validator(record.plan)
+                if record.status == "completed":
+                    if record.result is None:
+                        raise SetupError("completed lifecycle operation receipt has no result")
+                    return dict(record.result)
+                if record.status in {"rolling_back", "rolled_back"}:
+                    raise SetupError("reviewed lifecycle operation is in rollback state")
+            else:
+                plan = plan_factory()
+                if plan.plan_id != plan_id:
+                    raise SetupError("reviewed lifecycle plan no longer matches observed state")
+                record = store.begin(plan, phase="execute")
+            record.status = "applying"
+            record.attempts += 1
+            record.error_kind = None
+            store.save(record)
+            try:
+                result = runner()
+            except Exception as exc:
+                record.status = "failed"
+                record.error_kind = type(exc).__name__
+                store.save(record)
+                raise
+            record.status = "completed"
+            record.phase = "completed"
+            record.error_kind = None
+            record.result = dict(result)
+            store.save(record)
+            return dict(result)
+
     def _require_recovery_secrets(self, journal: SetupJournal) -> None:
         references = [
             SecretReference(
@@ -1061,6 +1462,85 @@ class SetupOperations:
                 SecretReference.parse(reference)
             ).reveal(),
         )
+
+
+def _lifecycle_operation_metadata(record: LifecycleOperationRecord) -> dict[str, Any]:
+    return {
+        "plan_id": record.plan.plan_id,
+        "operation": record.plan.operation,
+        "action": record.plan.action,
+        "status": record.status,
+        "phase": record.phase,
+        "attempts": record.attempts,
+        "error_kind": record.error_kind,
+    }
+
+
+def _require_backup_destination(plan: LifecyclePlan, destination: Path | None) -> None:
+    reviewed = _backup_destination(plan)
+    selected = None if destination is None else str(destination)
+    if selected != str(reviewed):
+        raise SetupError("backup resume destination does not match the reviewed destination")
+
+
+def _backup_destination(plan: LifecyclePlan) -> Path:
+    reviewed = plan.observed.get("destination")
+    if not isinstance(reviewed, str):
+        raise SetupError("reviewed backup destination is invalid")
+    destination = Path(reviewed)
+    if not destination.is_absolute() or ".." in destination.parts:
+        raise SetupError("reviewed backup destination is invalid")
+    return destination
+
+
+def _default_reviewed_backup_destination(
+    root: Path,
+    *,
+    setup_id: str,
+    previous_plan_id: str | None,
+) -> Path:
+    chain = previous_plan_id or "initial"
+    suffix = hashlib.sha256(f"{setup_id}:{chain}:backup-v1".encode()).hexdigest()[:16]
+    return (root / "backups" / f"reviewed-{suffix}.signet-backup").absolute()
+
+
+def _require_restore_bundle(plan: LifecyclePlan, bundle: Path) -> None:
+    reviewed = plan.observed.get("bundle")
+    if not isinstance(reviewed, dict) or _private_file_checkpoint(bundle) != reviewed:
+        raise SetupError("restore resume bundle does not match the reviewed bundle")
+
+
+def _require_upgrade_target(plan: LifecyclePlan) -> None:
+    target = plan.observed.get("target_schema_version")
+    if (
+        not isinstance(target, int)
+        or isinstance(target, bool)
+        or target != LATEST_SCHEMA_VERSION
+    ):
+        raise SetupError("upgrade target no longer matches the reviewed schema version")
+
+
+def _reviewed_upgrade_service_state(
+    plan: LifecyclePlan,
+    current: dict[str, str],
+) -> tuple[bool, bool]:
+    before = service_observation(plan)
+    managed_tailnet_port = tailscale_port(plan)
+    validate_service_snapshot(
+        current,
+        allow_mixed=False,
+        tailscale_port=managed_tailnet_port,
+    )
+    require_same_service_inventory(before, current)
+    prior_active = set(local_service_states(before).values()) == {"active"}
+    if current == before:
+        return prior_active, False
+    quiesced = dict(before)
+    for name in local_service_states(quiesced):
+        quiesced[name] = "inactive"
+    if prior_active and current == quiesced:
+        return True, True
+    raise SetupError("upgrade service state no longer matches the reviewed plan")
 
 
 def _fsync_directory(path: Path) -> None:

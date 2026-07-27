@@ -13,8 +13,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO, cast
 
+from signet.lifecycle import setup_lifecycle_lock
 from signet.provider_setup import ProviderSetupOperations
-from signet.setup_operations import SetupOperations, setup_lifecycle_lock
+from signet.setup_operations import SetupOperations
 from signet.setup_platform import ProductionSetupPlatform
 from signet.setup_state import PolicyMode, SetupEngine, SetupError, SetupJournalStore, SetupSpec
 
@@ -24,6 +25,7 @@ _SETUP_COMMANDS = frozenset(
         "manage",
         "status",
         "doctor",
+        "verify",
         "backup",
         "restore",
         "upgrade",
@@ -73,6 +75,17 @@ def add_setup_parsers(subcommands: Any) -> None:
     )
     _root_argument(manage)
     manage.add_argument("action", choices=("start", "stop", "restart", "status"))
+    manage_mode = manage.add_mutually_exclusive_group()
+    manage_mode.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed service plan",
+    )
+    manage_mode.add_argument(
+        "--rollback",
+        metavar="PLAN_ID",
+        help="resume rollback of the exact reviewed service plan",
+    )
 
     status = subcommands.add_parser("status", help="show persisted setup and runtime status")
     _root_argument(status)
@@ -80,20 +93,40 @@ def add_setup_parsers(subcommands: Any) -> None:
     doctor = subcommands.add_parser("doctor", help="run non-secret installation diagnostics")
     _root_argument(doctor)
 
+    verify = subcommands.add_parser(
+        "verify",
+        help="classify automatic checks, human ceremonies, and deferred provider proof",
+    )
+    _root_argument(verify)
+
     backup = subcommands.add_parser("backup", help="create a verified encrypted backup")
     _root_argument(backup)
     backup.add_argument("--destination", type=Path)
+    backup.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed backup plan",
+    )
 
     restore = subcommands.add_parser("restore", help="verify and stage an encrypted backup")
     _root_argument(restore)
     restore.add_argument("bundle", type=Path)
+    restore.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed restore plan",
+    )
 
     upgrade = subcommands.add_parser(
         "upgrade",
         help="back up data and apply installed-package schema upgrades",
     )
     _root_argument(upgrade)
-    upgrade.add_argument("--yes", action="store_true")
+    upgrade.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed upgrade plan",
+    )
 
     uninstall = subcommands.add_parser(
         "uninstall",
@@ -105,7 +138,11 @@ def add_setup_parsers(subcommands: Any) -> None:
         action="store_true",
         help="back up, then remove owned data and secrets",
     )
-    uninstall.add_argument("--yes", action="store_true")
+    uninstall.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed uninstall or purge plan",
+    )
 
     provider = subcommands.add_parser(
         "provider",
@@ -276,38 +313,48 @@ def run_setup_command(
     operations = operations_factory(root, platform=selected_platform)
     document: dict[str, Any]
     if args.command == "manage":
-        document = (
-            operations.status() if args.action == "status" else operations.manage(args.action)
-        )
+        if args.action == "status":
+            if args.apply is not None or args.rollback is not None:
+                raise ValueError("manage status cannot apply or roll back a plan")
+            document = operations.status()
+        elif args.rollback is not None:
+            document = operations.rollback_service_plan(args.rollback)
+        elif args.apply is not None:
+            document = operations.apply_service_plan(args.action, args.apply)
+        else:
+            document = operations.plan_services(args.action).document()
     elif args.command == "status":
         document = operations.status()
     elif args.command == "doctor":
         document = operations.doctor()
+    elif args.command == "verify":
+        document = operations.verify()
     elif args.command == "backup":
         destination = _absolute_path(args.destination) if args.destination is not None else None
-        document = {"backup": str(operations.backup(destination))}
+        document = (
+            operations.apply_backup(args.apply, destination)
+            if args.apply is not None
+            else operations.plan_backup(destination).document()
+        )
     elif args.command == "restore":
-        restored = operations.restore(_absolute_path(args.bundle))
-        document = {
-            "restored_to": str(restored.root),
-            "database": str(restored.database_path),
-            "activated": False,
-        }
+        bundle = _absolute_path(args.bundle)
+        document = (
+            operations.apply_restore(args.apply, bundle)
+            if args.apply is not None
+            else operations.plan_restore(bundle).document()
+        )
     elif args.command == "upgrade":
-        _require_confirmation(
-            args.yes,
-            input_fn,
-            "Create a backup and apply installed schema upgrades?",
+        document = (
+            operations.apply_upgrade(args.apply)
+            if args.apply is not None
+            else operations.plan_upgrade().document()
         )
-        document = operations.upgrade()
     elif args.command == "uninstall":
-        prompt = (
-            "Back up and purge all setup-owned Signet data?"
-            if args.purge
-            else "Remove Signet services and Hermes integration while preserving data?"
+        document = (
+            operations.apply_uninstall(args.apply, purge=args.purge)
+            if args.apply is not None
+            else operations.plan_uninstall(purge=args.purge).document()
         )
-        _require_confirmation(args.yes, input_fn, prompt)
-        document = operations.uninstall(purge=args.purge)
     else:  # pragma: no cover - parser and main dispatch are closed over this set
         raise SetupError("unsupported setup command")
     _emit(document, output)
