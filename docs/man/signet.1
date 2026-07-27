@@ -6,7 +6,10 @@ signet \- provider-neutral MCP human approval gateway
 .RI [ options ]
 .br
 .B signet
-.RI { manage | status | doctor | backup | restore | upgrade | uninstall }
+.RI { manage | status | doctor | verify | backup | restore | upgrade | uninstall }
+.RI [ options ]
+.br
+.B signet authenticators open
 .RI [ options ]
 .br
 .B signet provider
@@ -18,7 +21,8 @@ plans, installs, and resumes a private production assembly. Providers and genera
 Hermes MCP entries are disabled by default. Setup stores workflow secrets outside its
 configuration in the operating-system keyring, persists a mode-0600 journal, installs
 loopback-only services, and can prepare multiple named Hermes profiles without
-restarting Hermes.
+restarting Hermes. The default apply path prints the automatic safe steps, human
+ceremonies, deferred provider proofs, and destructive-action set before confirmation.
 .PP
 The default root is
 .IR ~/.local/share/signet .
@@ -58,7 +62,9 @@ Use an absolute setup root instead of the default.
 .SH LIFECYCLE COMMANDS
 .TP
 .B signet manage {start|stop|restart|status}
-Operate the exact installed launchd or systemd user services.
+Print a read-only plan for the exact installed launchd or systemd user services.
+Pass the emitted ID as --apply PLAN_ID to execute that exact reviewed plan, or
+--rollback PLAN_ID to reverse an applied service plan. manage status is read-only.
 .TP
 .B signet status
 Print persisted setup, service, and production readiness metadata without secrets.
@@ -66,21 +72,36 @@ Print persisted setup, service, and production readiness metadata without secret
 .B signet doctor
 Check journal, config, keyring references, service definitions, and Hermes entries.
 .TP
+.B signet verify
+Report fail-closed filesystem, database, service, route, Hermes, provider, and backup
+readiness without mutation or secrets.
+.TP
 .B signet backup [--destination PATH]
-Create and verify an encrypted backup.
+Print an encrypted-backup plan. Pass its exact ID as --apply PLAN_ID to create and
+verify the backup.
 .TP
 .B signet restore BUNDLE
-Verify and decrypt a backup into a new staging directory. Active state is not replaced.
+Print a restore plan. Pass its exact ID as --apply PLAN_ID to verify and decrypt the
+bundle into a new staging directory. Active state is not replaced.
 .TP
 .B signet upgrade
-Create a backup, then apply migrations from the already-installed reviewed package.
+Print an upgrade plan. Pass its exact ID as --apply PLAN_ID to create a backup, then
+apply migrations from the already-installed reviewed package.
 .TP
 .B signet uninstall
-Remove exact service and Hermes integration resources while preserving production data.
+Print an uninstall plan that preserves production data. Pass its exact ID as
+--apply PLAN_ID to remove exact service and Hermes integration resources.
 .TP
 .B signet uninstall --purge
-Back up first, then remove setup-owned active data and runtime secrets. The backup key
-and backup directory are retained.
+Print a destructive purge plan. Its exact --apply PLAN_ID backs up first, then removes
+setup-owned active data and runtime secrets. The backup key and backup directory remain.
+.SH AUTHENTICATOR COMMANDS
+.TP
+.B signet authenticators open [--no-open-browser]
+Print the exact private /authenticators URL before opening named passkey and TOTP
+management in the authenticated browser. With --no-open-browser, print the URL only.
+Enrollment, naming, reauthentication, and deletion remain browser ceremonies;
+credential material never crosses the CLI.
 .SH PROVIDER COMMANDS
 .TP
 .B signet provider setup fastmail --from ADDRESS --to ADDRESS
@@ -108,6 +129,16 @@ placed in a URL fragment, removed from browser history before submission, retain
 the operating-system keyring for crash recovery, and omitted from the setup journal
 and normal output. Password setup supports multiple named TOTP and passkey
 authenticators; passkeys require a real browser ceremony at the final HTTPS origin.
+.SH RECOVERY AND EXIT STATUS
+Setup and lifecycle applies persist atomic journals or receipts. After interruption,
+run signet status and signet doctor, correct the reported condition, and rerun the same
+setup command or exact reviewed lifecycle PLAN_ID. Conflicting specifications and
+foreign owner markers are refused rather than adopted or overwritten.
+.PP
+Exit status 0 means the requested read-only operation, plan, or apply completed. Exit
+status 2 means invalid input, declined confirmation, safety refusal, conflict, or
+incomplete work; stderr includes a redacted recovery command. A signal interruption
+may use the shell's signal status.
 .SH FILES
 .TP
 .I ~/.local/share/signet/.setup-journal.json

@@ -27,7 +27,18 @@ confirming it. For the repository-owned fake demo, use
 A different canonical HTTPS origin can be supplied with `--origin`. Signet assumes
 that its reverse proxy is independently configured and does not adopt it.
 
+With Python 3.12 selected for `pipx`, install the reviewed package without a source
+checkout or `uv`:
+
+```console
+pipx install signet-gateway
+```
+
 ## Review the read-only plan
+
+The normal happy path is simply `signet setup`; it prints this plan before asking for
+confirmation. Use `--plan` when a separate review must finish before any apply.
+The following example limits integration to two explicit profiles:
 
 Select profiles explicitly when a host contains profiles that should not receive a
 Signet entry:
@@ -48,13 +59,14 @@ requires a different baseline. The default root is `~/.local/share/signet`.
 
 Planning is read-only. The JSON plan names every step, the root, profiles, final owner
 URL, disabled provider state, browser behavior, and the fact that Hermes will not be
-restarted. It separates `automatic_steps`, `human_ceremonies`, and
-`deferred_provider_proof` so manual authentication and post-setup provider proof are
-explicit before apply.
+restarted. It separates `automatic_steps`, `human_ceremonies`,
+`deferred_provider_proof`, and `destructive_actions` so manual authentication,
+post-setup provider proof, and an empty destructive set are explicit before apply.
 
 ## Apply or resume
 
-Run the same command without `--plan` and review the confirmation prompt:
+Run the same command without `--plan`. It prints the plan again before the confirmation
+prompt, so the default `signet setup` remains a one-command workflow:
 
 ```console
 signet setup \
@@ -107,6 +119,17 @@ named TOTP and passkey authenticators. Passkeys must be enrolled by a real brows
 authenticator at the final HTTPS origin. Do not try to generate or transfer a passkey
 through the CLI.
 
+After setup, print that final private management URL before reopening the authenticated
+named passkey/TOTP ceremony:
+
+```console
+signet authenticators open
+```
+
+Use `--no-open-browser` to print only the URL. Enrollment, naming, fresh-factor
+reauthentication, last-factor protection, and deletion remain browser actions;
+credential material never crosses the CLI.
+
 ## Review and enable Hermes entries
 
 Each selected profile receives a distinct caller token and disabled
@@ -117,9 +140,37 @@ text is preserved through marker-bounded edits, and rollback removes only those 
 edits.
 
 Review the local URLs, `Authorization` environment reference, and profile scope.
-Enable `signet_approvals` and only the provider entries you configure, then run
-`/reload-mcp` in that profile. Signet never runs `hermes gateway restart`, never edits
-gateway tokens, and never assumes that editing one profile reloads another.
+Before enabling entries, use the reviewed Hermes executable bound to the selected
+profile to validate configuration and inspect the disabled entries:
+
+```console
+hermes -p PROFILE config check
+hermes -p PROFILE mcp list
+```
+
+`PROFILE` is a visible placeholder. Complete owner authentication and the provider's
+separate live proof before enabling `signet_approvals` and only the provider entries
+you configured. Then test each enabled server:
+
+```console
+hermes -p PROFILE mcp test signet_approvals
+hermes -p PROFILE mcp test signet_fastmail
+```
+
+Omit `signet_fastmail` unless Fastmail passed its live proof; substitute
+`signet_whatsapp` only after the WhatsApp proof. These connection tests prove only
+configuration parsing, loopback transport, and caller authentication; they do not
+replace human authentication, queue-behavior review, or the provider live send. If
+production is bound to a version-locked Hermes wrapper, use that reviewed wrapper
+instead of the bare command.
+Source operators can follow the bounded wrapper procedure in
+[`deploy/hermes/README.md`](../deploy/hermes/README.md); packaged setup itself does not
+depend on that checkout or on `uv`.
+
+After those tests, run `/reload-mcp` inside that interactive profile, then start a new
+session before checking discovered tools.
+Do not run `/reload-mcp` as a shell command. Signet never runs `hermes gateway restart`,
+never edits gateway tokens, and never assumes that editing one profile reloads another.
 
 ## Configure a provider
 
@@ -161,36 +212,52 @@ The lower-level connector contract remains documented in
 
 All commands accept `--root`; examples below use the default root.
 
+Mutation-capable lifecycle commands default to a read-only plan. Copy the emitted
+`plan_id` only after reviewing the operation, exact root, targets, backup requirements,
+and preconditions. Apply or roll back only that exact plan; changed state, changed
+arguments, an expired plan, or a foreign owner marker is refused.
+
+```console
+signet manage stop
+signet manage stop --apply PLAN_ID
+signet manage stop --rollback PLAN_ID
+```
+
+`PLAN_ID` is the value emitted by the immediately preceding matching plan, not a
+literal value. `manage status` is read-only and cannot apply or roll back a plan:
+
 ```console
 signet status
 signet doctor
 signet manage status
-signet manage stop
-signet manage start
-signet manage restart
 ```
 
 `status` and `doctor` report metadata only. They do not print caller tokens, keyring
 values, browser capabilities, encrypted payloads, or authenticator material.
 
-Create an encrypted backup before changes:
+Plan an encrypted backup, then apply the exact reviewed plan:
 
 ```console
-signet backup
 signet backup --destination /absolute/private/path/archive.signet-backup
+signet backup --destination /absolute/private/path/archive.signet-backup --apply PLAN_ID
 ```
+
+Omit `--destination` from both commands to use the private default backup location
+recorded in the plan.
 
 Restore verifies and decrypts into a new private staging directory; it never replaces
 active state:
 
 ```console
 signet restore /absolute/path/archive.signet-backup
+signet restore /absolute/path/archive.signet-backup --apply PLAN_ID
 ```
 
 After installing a reviewed newer wheel, back up and apply its schema migrations:
 
 ```console
 signet upgrade
+signet upgrade --apply PLAN_ID
 ```
 
 The upgrade runs inside a maintenance window, creates and verifies an encrypted backup before the first schema mutation, and reports a durable `upgrade_receipt` beside that backup. The receipt records the backup hash, source schema, and live schema observed after migration; it remains available if later assembly or service restart fails, and retries inspect the live schema again.
@@ -200,16 +267,23 @@ owned Hermes blocks while preserving production data and keyring material:
 
 ```console
 signet uninstall
+signet uninstall --apply PLAN_ID
 ```
 
 This records an `uninstalled` checkpoint. Running `signet setup` again with the same
 specification reinstalls only the removed service, Hermes, and owner-bootstrap
 integration steps; preserved data and configuration are not recreated.
 
-`signet uninstall --purge` first creates a verified encrypted backup, removes owned
-active data and runtime secrets, and intentionally retains the backup encryption key
-and backup directory. It refuses changed or foreign resources. Use purge only after
-recording and testing the returned backup path.
+`signet uninstall --purge` prints a destructive plan. Its exact `--apply PLAN_ID`
+first creates a verified encrypted backup, removes owned active data and runtime
+secrets, and intentionally retains the backup encryption key and backup directory. It
+refuses changed or foreign resources. Apply purge only after recording and testing the
+returned backup path.
+
+```console
+signet uninstall --purge
+signet uninstall --purge --apply PLAN_ID
+```
 
 To reverse an incomplete installation in exact reverse order:
 
@@ -221,6 +295,29 @@ Rollback is resumable. For a completed setup, the CLI creates and verifies an
 encrypted backup before removing active resources and retains its key. It records every
 rollback failure, continues with independent owned steps, and can be run again after
 the changed resource has been reviewed.
+
+## Crash recovery and exit status
+
+Setup and lifecycle applies write atomic journals or receipts before advancing. After
+an interruption, do not edit or delete them. Inspect the recorded owner, specification,
+completed or failed step, service state, and lifecycle receipt:
+
+```console
+signet status
+signet doctor
+```
+
+Correct the reported condition and rerun the same `signet setup` command to resume.
+For a lifecycle apply, rerun only the exact command and `PLAN_ID` shown by status.
+Rerunning completed setup reconciles the owner ceremony without repeating completed
+automatic steps. A conflicting specification or foreign marker is refused rather than
+adopted or overwritten.
+
+Exit status is stable for automation: `0` means the requested read-only operation,
+plan, or apply completed; `2` means invalid input, declined confirmation, safety
+refusal, conflict, or incomplete work. Stderr includes a redacted recovery command.
+An interrupted process may use the shell's signal status. Never infer success from
+partial stdout; inspect the exit status and `signet status`.
 
 ## Installed files and package data
 

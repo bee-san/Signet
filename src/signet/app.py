@@ -21,7 +21,12 @@ from signet.integration_cli import (
     run_integration_command,
 )
 from signet.runtime import RuntimeAssemblyError, _loopback_address
-from signet.setup_cli import add_setup_parsers, is_setup_command, run_setup_command
+from signet.setup_cli import (
+    add_setup_parsers,
+    is_setup_command,
+    run_setup_command,
+    setup_error_message,
+)
 from signet.setup_state import SetupError
 
 _FACTORY_PATTERN = re.compile(
@@ -79,7 +84,7 @@ def main(
         try:
             run_setup_command(args, runner=runner or uvicorn.run)
         except (CredentialError, DatabaseError, SetupError, ValueError) as exc:
-            parser.error(str(exc))
+            parser.error(setup_error_message(args, exc))
         return
     if args.command == "bootstrap":
         from signet.authenticator_management import KeychainTotpSecretProvisioner
@@ -162,7 +167,18 @@ def _supported_platform(value: str) -> bool:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="signet")
+    parser = argparse.ArgumentParser(
+        prog="signet",
+        description=(
+            "Install and operate a private, resumable Signet approval gateway from the "
+            "packaged command. Mutation commands print a plan or require an exact reviewed plan."
+        ),
+        epilog=(
+            "Exit status: 0 on success; 2 for invalid input, safety refusal, or incomplete work. "
+            "An interrupted command may use the shell's signal status. Run signet status and "
+            "signet doctor before resuming the exact command."
+        ),
+    )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     mcp = subcommands.add_parser("serve-mcp", help="serve an assembled local MCP app")
