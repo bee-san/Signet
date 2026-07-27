@@ -273,9 +273,7 @@ class SetupOperations:
 
     def plan_backup(self, destination: Path | None = None) -> LifecyclePlan:
         journal = self._completed_journal()
-        if destination is not None and (
-            not destination.is_absolute() or ".." in destination.parts
-        ):
+        if destination is not None and (not destination.is_absolute() or ".." in destination.parts):
             raise SetupError("backup destination must be an absolute lexical path")
         previous_plan_id = self._previous_lifecycle_plan_id()
         selected_destination = destination or _default_reviewed_backup_destination(
@@ -1512,11 +1510,7 @@ def _require_restore_bundle(plan: LifecyclePlan, bundle: Path) -> None:
 
 def _require_upgrade_target(plan: LifecyclePlan) -> None:
     target = plan.observed.get("target_schema_version")
-    if (
-        not isinstance(target, int)
-        or isinstance(target, bool)
-        or target != LATEST_SCHEMA_VERSION
-    ):
+    if not isinstance(target, int) or isinstance(target, bool) or target != LATEST_SCHEMA_VERSION:
         raise SetupError("upgrade target no longer matches the reviewed schema version")
 
 

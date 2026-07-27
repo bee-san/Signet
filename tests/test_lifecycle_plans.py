@@ -160,9 +160,7 @@ def test_restart_plan_resumes_after_each_service_manager_crash_boundary(
     with pytest.raises(KeyboardInterrupt, match="injected crash"):
         operations.apply_service_plan("restart", plan.plan_id)
 
-    assert platform.states["signet-mcp"] == (
-        "inactive" if crash_after == "stop" else "active"
-    )
+    assert platform.states["signet-mcp"] == ("inactive" if crash_after == "stop" else "active")
     assert operations.apply_service_plan("restart", plan.plan_id)["services"]["signet-web"] == (
         "active"
     )
@@ -366,9 +364,7 @@ def test_interrupted_backup_and_restore_reject_unreviewed_resume_arguments(
         operations.apply_backup(backup_plan.plan_id, destination)
     with pytest.raises(SetupError, match="does not match the reviewed destination"):
         operations.apply_backup(backup_plan.plan_id, wrong_destination)
-    assert operations.apply_backup(backup_plan.plan_id, destination) == {
-        "backup": str(destination)
-    }
+    assert operations.apply_backup(backup_plan.plan_id, destination) == {"backup": str(destination)}
 
     bundle = tmp_path / "reviewed-bundle.signet-backup"
     wrong_bundle = tmp_path / "wrong-bundle.signet-backup"

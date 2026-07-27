@@ -242,9 +242,7 @@ class ServiceLifecycle:
 
 
 def local_service_states(services: dict[str, str]) -> dict[str, str]:
-    return {
-        name: state for name, state in services.items() if not name.startswith("tailscale:")
-    }
+    return {name: state for name, state in services.items() if not name.startswith("tailscale:")}
 
 
 def validate_service_snapshot(
@@ -256,9 +254,7 @@ def validate_service_snapshot(
     local = local_service_states(services)
     if len(local) != 2 or any(state not in {"active", "inactive"} for state in local.values()):
         raise SetupError("owned service-manager state is unavailable or ambiguous")
-    serve = {
-        name: state for name, state in services.items() if name.startswith("tailscale:")
-    }
+    serve = {name: state for name, state in services.items() if name.startswith("tailscale:")}
     expected_serve = set() if tailscale_port is None else {f"tailscale:{tailscale_port}"}
     if set(serve) != expected_serve or any(state != "active" for state in serve.values()):
         raise SetupError("owned Tailscale Serve state is unavailable or ambiguous")
@@ -277,8 +273,7 @@ def require_same_service_inventory(before: dict[str, str], current: dict[str, st
 def service_observation(plan: LifecyclePlan) -> dict[str, str]:
     services = plan.observed.get("services")
     if not isinstance(services, dict) or any(
-        not isinstance(name, str) or not isinstance(state, str)
-        for name, state in services.items()
+        not isinstance(name, str) or not isinstance(state, str) for name, state in services.items()
     ):
         raise SetupError("reviewed lifecycle plan service observation is invalid")
     result = dict(services)

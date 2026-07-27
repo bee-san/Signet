@@ -54,6 +54,7 @@ def setup_lifecycle_lock(root_path: Path) -> Iterator[None]:
         finally:
             os.close(descriptor)
 
+
 _PLAN_KEYS = {
     "version",
     "plan_id",
