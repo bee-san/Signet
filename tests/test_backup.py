@@ -177,6 +177,34 @@ def test_restore_prepares_a_staged_tree_before_atomic_publication(tmp_path: Path
     assert restored.attachments_root == destination / "attachments"
 
 
+def test_backup_publication_callbacks_bracket_the_atomic_rename(tmp_path: Path) -> None:
+    database, staging, _ = _fixture(tmp_path)
+    manager = _manager(database, staging)
+    destination = tmp_path / "callback-order.signet-backup"
+    observed: list[tuple[str, Path]] = []
+
+    def prepare(temporary: Path) -> None:
+        assert temporary.is_file()
+        assert not destination.exists()
+        observed.append(("prepare", temporary))
+
+    def finalize(published: Path) -> None:
+        assert published == destination
+        assert destination.is_file()
+        observed.append(("finalize", published))
+
+    assert (
+        manager.create(
+            destination,
+            prepare_publication=prepare,
+            finalize_publication=finalize,
+        )
+        == destination
+    )
+    assert [phase for phase, _path in observed] == ["prepare", "finalize"]
+    assert observed[0][1] != destination
+
+
 def test_backup_refuses_a_source_database_replacement_during_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
