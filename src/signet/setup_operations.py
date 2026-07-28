@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import stat
 import time
 from collections.abc import Callable, Iterator
@@ -20,7 +21,7 @@ from signet.backup import (
     RestoredBundle,
     remove_private_tree_checked,
 )
-from signet.credential_broker import KeychainSecretStore, SecretReference
+from signet.credential_broker import CredentialError, KeychainSecretStore, SecretReference
 from signet.crypto import PayloadCipher
 from signet.db import LATEST_SCHEMA_VERSION, Database, DatabaseError, MigrationBackupReceipt
 from signet.lifecycle import (
@@ -53,11 +54,15 @@ from signet.service_lifecycle import (
 )
 from signet.setup_platform import (
     ProductionSetupPlatform,
+    ServiceUnitGeneration,
     _managed_tailnet_port,
     _replace_private_file,
+    storage_path_status,
+    storage_status,
     validate_active_database_runtime_ownership,
 )
 from signet.setup_state import (
+    ExecutableIdentity,
     PolicyMode,
     SetupEngine,
     SetupError,
@@ -66,6 +71,7 @@ from signet.setup_state import (
     SetupSpec,
 )
 from signet.staging import StagingStore
+from signet.storage_lifecycle import BACKUPS_HARD_BYTES
 
 
 class SetupOperations:
@@ -97,6 +103,17 @@ class SetupOperations:
         journal = self.store.load()
         try:
             document = journal.spec
+            executable_identity_document = document.get("executable_identity")
+            executable_identity = (
+                ExecutableIdentity(
+                    device=executable_identity_document["device"],
+                    inode=executable_identity_document["inode"],
+                    size=executable_identity_document["size"],
+                    sha256=executable_identity_document["sha256"],
+                )
+                if isinstance(executable_identity_document, dict)
+                else None
+            )
             return SetupSpec(
                 root=Path(document["root"]),
                 public_origin=str(document["public_origin"]),
@@ -105,6 +122,18 @@ class SetupOperations:
                 executable=Path(document["executable"]),
                 open_browser=bool(document["open_browser"]),
                 policy_mode=cast(PolicyMode, document.get("policy_mode", "deny")),
+                data_root=(
+                    Path(str(document["data_root"]))
+                    if document.get("data_root") is not None
+                    else None
+                ),
+                backup_root=(
+                    Path(str(document["backup_root"]))
+                    if document.get("backup_root") is not None
+                    else None
+                ),
+                data_device=cast(int | None, document.get("data_device")),
+                executable_identity=executable_identity,
             )
         except (KeyError, TypeError, ValueError):
             raise SetupError("setup journal specification is invalid") from None
@@ -112,6 +141,7 @@ class SetupOperations:
     def status(self) -> dict[str, Any]:
         journal = self.store.load()
         lifecycle = LifecycleOperationStore(self.root).load_optional()
+        spec = self.spec()
         result: dict[str, Any] = {
             "setup_id": journal.setup_id,
             "setup_status": journal.status,
@@ -120,8 +150,12 @@ class SetupOperations:
             "lifecycle_operation": (
                 None if lifecycle is None else _lifecycle_operation_metadata(lifecycle)
             ),
-            "services": self.platform.service_status(self.spec()),
+            "services": self.platform.service_status(spec),
         }
+        try:
+            result["storage"] = storage_status(spec)
+        except Exception as exc:
+            result["storage"] = {"available": False, "error_kind": type(exc).__name__}
         try:
             config = load_production_config(self.root / "production.json")
             database_path = config.storage.database_path
@@ -131,15 +165,18 @@ class SetupOperations:
                 validate_active_database_runtime_ownership(
                     database_path.parent,
                     setup_id=journal.setup_id,
+                    instance_root=self.root,
+                    require_external_storage=spec.data_root is not None,
                 )
             )
+            database = Database(
+                database_path,
+                expected_parent_identity=expected_parent_identity,
+                expected_identity=expected_identity,
+                expected_lock_identity=expected_lock_identity,
+            )
             production = ProductionStateStore(
-                Database(
-                    database_path,
-                    expected_parent_identity=expected_parent_identity,
-                    expected_identity=expected_identity,
-                    expected_lock_identity=expected_lock_identity,
-                ),
+                database,
                 provider_rollout_enabled=config.provider_rollout.state == "enabled",
             ).status(read_only=True)
             result["provider_rollout"] = config.provider_rollout.state
@@ -165,6 +202,24 @@ class SetupOperations:
                     for name, service in production.services.items()
                 },
             }
+            try:
+                result["metrics"] = {
+                    "available": True,
+                    **_bounded_operational_metrics(
+                        database,
+                        storage=(
+                            result["storage"]
+                            if isinstance(result.get("storage"), dict)
+                            and result["storage"].get("available") is not False
+                            else None
+                        ),
+                    ),
+                }
+            except Exception as exc:
+                result["metrics"] = {
+                    "available": False,
+                    "error_kind": type(exc).__name__,
+                }
         return result
 
     def doctor(self) -> dict[str, Any]:
@@ -219,25 +274,84 @@ class SetupOperations:
                 "connector_count": len(config.connectors),
                 "remediation": "No action required.",
             }
-            checks["secret_references"] = {
-                "ok": True,
-                "verification": "deferred_attended_check",
-                "remediation": (
-                    "Run an attended backup verification before destructive maintenance."
-                ),
-            }
-        services = self.platform.service_status(self.spec())
+            configured_references = tuple(
+                value for value in config.secrets.model_dump().values() if isinstance(value, str)
+            )
+            try:
+                secret_store = KeychainSecretStore()
+                for raw_reference in configured_references:
+                    secret = secret_store.get(SecretReference.parse(raw_reference))
+                    encoded = secret.reveal().encode("utf-8")
+                    if not 32 <= len(encoded) <= 4_096:
+                        raise CredentialError("the configured Keychain secret is unavailable")
+            except Exception as exc:
+                checks["secret_references"] = {
+                    **_failed_check(exc),
+                    "remediation": "Restore the configured secret in the platform secret store.",
+                }
+            else:
+                checks["secret_references"] = {
+                    "ok": True,
+                    "verification": "resolved",
+                    "configured_count": len(configured_references),
+                    "remediation": "No action required.",
+                }
+        spec = self.spec()
+        services = self.platform.service_status(spec)
         checks["services"] = {
             "ok": bool(services) and all(status == "active" for status in services.values()),
             "status": services,
             "remediation": "Review the service plan, then apply a start or restart plan.",
         }
+        try:
+            self.platform.verify_service_health(spec)
+        except Exception as exc:
+            checks["service_health"] = {
+                **_failed_check(exc),
+                "remediation": ("Inspect owned service logs, then apply a reviewed restart plan."),
+            }
+        else:
+            checks["service_health"] = {
+                "ok": True,
+                "remediation": "No action required.",
+            }
+        try:
+            storage = storage_status(spec)
+            policy = storage["policy"]
+            roots = storage["roots"]
+            bounded = {
+                "data": int(policy["database_hard_bytes"]),
+                "attachments": int(policy["attachments_hard_bytes"]),
+                "logs": int(policy["logs_hard_bytes"]),
+                "backups": int(policy["backups_hard_bytes"]),
+                "cache": int(policy["cache_hard_bytes"]),
+                "staging": int(policy["staging_hard_bytes"]),
+            }
+            storage_ok = all(
+                int(item["free_bytes"]) >= int(policy["minimum_reserve_bytes"])
+                for item in roots.values()
+            ) and all(int(roots[name]["usage_bytes"]) <= limit for name, limit in bounded.items())
+        except Exception as exc:
+            checks["storage"] = {
+                **_failed_check(exc),
+                "remediation": "Restore the reviewed storage roots and device identity.",
+            }
+        else:
+            checks["storage"] = {
+                "ok": storage_ok,
+                "status": storage,
+                "remediation": (
+                    "No action required."
+                    if storage_ok
+                    else "Stop new work, free reviewed storage, then rerun doctor."
+                ),
+            }
         checks["hermes_reload"] = {
             "ok": False,
             "manual_action": (
                 "Review each configured MCP entry, then run /reload-mcp in each profile."
             ),
-            "profiles": list(self.spec().hermes_profiles),
+            "profiles": list(spec.hermes_profiles),
         }
         return {
             "healthy": all(
@@ -279,8 +393,9 @@ class SetupOperations:
         if destination is not None and (not destination.is_absolute() or ".." in destination.parts):
             raise SetupError("backup destination must be an absolute lexical path")
         previous_plan_id = self._previous_lifecycle_plan_id()
+        spec = self.spec()
         selected_destination = destination or _default_reviewed_backup_destination(
-            self.root,
+            spec.backup_dir,
             setup_id=journal.setup_id,
             previous_plan_id=previous_plan_id,
         )
@@ -381,10 +496,9 @@ class SetupOperations:
             raise SetupError(
                 "a durable purge checkpoint exists; finish purge before creating another backup"
             )
-        manager = manager or self._backup_manager(journal)
+        spec = self.spec()
         selected = destination or (
-            self.root
-            / "backups"
+            spec.backup_dir
             / (
                 time.strftime("signet-%Y%m%dT%H%M%SZ-", time.gmtime())
                 + secrets.token_hex(4)
@@ -393,6 +507,37 @@ class SetupOperations:
         )
         if not selected.is_absolute() or ".." in selected.parts:
             raise SetupError("backup destination must be an absolute lexical path")
+        report = storage_status(spec)
+        roots = report["roots"]
+        policy = report["policy"]
+        estimated_bytes = max(
+            int(roots["data"]["usage_bytes"])
+            + int(roots["attachments"]["usage_bytes"])
+            + int(roots["staging"]["usage_bytes"]),
+            64 * 1024**2,
+        )
+        disk_usage_provider = getattr(
+            self.platform,
+            "disk_usage_provider",
+            shutil.disk_usage,
+        )
+        destination_status = storage_path_status(
+            selected.parent,
+            disk_usage_provider=disk_usage_provider,
+            include_usage=False,
+        )
+        backups_hard_bytes = int(policy["backups_hard_bytes"])
+        owned_backup_bytes = (
+            int(roots["backups"]["usage_bytes"]) if selected.is_relative_to(spec.backup_dir) else 0
+        )
+        if (
+            estimated_bytes > backups_hard_bytes
+            or owned_backup_bytes + estimated_bytes > backups_hard_bytes
+            or int(destination_status["free_bytes"]) - estimated_bytes
+            < int(policy["minimum_reserve_bytes"])
+        ):
+            raise SetupError("backup storage budget would exceed the reviewed hard limit")
+        manager = manager or self._backup_manager(journal)
         try:
             return manager.create(
                 selected,
@@ -646,7 +791,7 @@ class SetupOperations:
     def plan_upgrade(self) -> LifecyclePlan:
         journal = self._completed_journal()
         spec = self.spec()
-        services = self.platform.service_status(spec)
+        services, unit_generation = self._review_upgrade_services(spec)
         tailscale_port = _managed_tailnet_port(spec)
         validate_service_snapshot(
             services,
@@ -664,6 +809,7 @@ class SetupOperations:
                 "previous_lifecycle_plan_id": self._previous_lifecycle_plan_id(),
                 "tailscale_serve_port": tailscale_port,
                 "services": dict(sorted(services.items())),
+                "service_unit_generation": unit_generation,
                 "schema_version": schema_version,
                 "target_schema_version": LATEST_SCHEMA_VERSION,
             },
@@ -821,6 +967,8 @@ class SetupOperations:
             validate_active_database_runtime_ownership(
                 manager.database.path.parent,
                 setup_id=plan.setup_id,
+                instance_root=self.root,
+                require_external_storage=self.spec().data_root is not None,
             )
         )
         source_device, source_inode = source_identity
@@ -964,7 +1112,8 @@ class SetupOperations:
         spec: SetupSpec,
     ) -> bool:
         before = service_observation(plan)
-        current = self.platform.service_status(spec)
+        generation = _upgrade_service_unit_generation(plan)
+        current = self._upgrade_service_status(spec, generation)
         validate_service_snapshot(
             current,
             allow_mixed=True,
@@ -974,9 +1123,10 @@ class SetupOperations:
         prior_active = set(local_service_states(before).values()) == {"active"}
         if prior_active:
             if set(local_service_states(current).values()) != {"inactive"}:
-                self._stop_and_verify_services(spec)
+                self._stop_and_verify_services(spec, generation)
         elif current != before:
             raise SetupError("interrupted upgrade changed the reviewed inactive service state")
+        self._migrate_upgrade_service_units(spec, generation)
         return prior_active
 
     def _recover_reviewed_upgrade_services(
@@ -985,7 +1135,8 @@ class SetupOperations:
         spec: SetupSpec,
     ) -> None:
         before = service_observation(plan)
-        current = self.platform.service_status(spec)
+        generation = _upgrade_service_unit_generation(plan)
+        current = self._upgrade_service_status(spec, generation)
         validate_service_snapshot(
             current,
             allow_mixed=True,
@@ -996,11 +1147,13 @@ class SetupOperations:
         if not prior_active:
             if current != before:
                 raise SetupError("completed upgrade changed the reviewed inactive service state")
+            self._migrate_upgrade_service_units(spec, generation)
             return
         if current == before:
             self.platform.verify_service_health(spec)
             return
-        self._stop_and_verify_services(spec)
+        self._stop_and_verify_services(spec, generation)
+        self._migrate_upgrade_service_units(spec, generation)
         self._restart_services_after_upgrade(spec)
 
     def upgrade(self) -> dict[str, Any]:
@@ -1013,8 +1166,8 @@ class SetupOperations:
         if reviewed_plan is None:
             self.platform.preflight(spec)
         SetupEngine(self.store, self.platform).validate_private_paths(spec, journal=journal)
-        initial_status = self.platform.service_status(spec)
         if reviewed_plan is None:
+            initial_status, unit_generation = self._review_upgrade_services(spec)
             local_services = local_service_states(initial_status)
             if len(local_services) != 2 or any(
                 state not in {"active", "inactive"} for state in local_services.values()
@@ -1026,6 +1179,8 @@ class SetupOperations:
             services_quiesced = False
         else:
             _require_upgrade_target(reviewed_plan)
+            unit_generation = _upgrade_service_unit_generation(reviewed_plan)
+            initial_status = self._upgrade_service_status(spec, unit_generation)
             prior_active, services_quiesced = _reviewed_upgrade_service_state(
                 reviewed_plan,
                 initial_status,
@@ -1041,13 +1196,14 @@ class SetupOperations:
                 self.platform.preflight(spec)
             if prior_active and not services_quiesced:
                 stop_attempted = True
-                self._stop_and_verify_services(spec)
+                self._stop_and_verify_services(spec, unit_generation)
+            self._migrate_upgrade_service_units(spec, unit_generation)
             manager = self._backup_manager(journal)
             recovery_directory.mkdir(mode=0o700, exist_ok=True)
             ensure_private_directory(recovery_directory)
             _fsync_directory(recovery_directory.parent)
             database = manager.database
-            expected_database_path = (spec.root / "data" / "signet.db").absolute()
+            expected_database_path = (spec.data_dir / "signet.db").absolute()
             if database.path != expected_database_path:
                 raise SetupError("upgrade backup manager targets the wrong database")
             with database.read_only() as connection:
@@ -1128,16 +1284,21 @@ class SetupOperations:
                         )
             if stop_attempted and migration_receipt is None:
                 try:
+                    self._migrate_upgrade_service_units(spec, unit_generation)
                     self._restart_services_after_upgrade(spec)
-                except BaseException as recovery_exc:
-                    if isinstance(exc, Exception):
-                        exc.add_note(
-                            "The pre-upgrade service state could not be restored; Signet may be "
-                            "partially stopped."
-                        )
-                    raise SetupError(
-                        "upgrade failed before migration, and services could not be safely resumed"
-                    ) from recovery_exc
+                except BaseException:
+                    try:
+                        self._restart_upgrade_source_services(spec, unit_generation)
+                    except BaseException as source_recovery_exc:
+                        if isinstance(exc, Exception):
+                            exc.add_note(
+                                "The pre-upgrade service state could not be restored; Signet may "
+                                "be partially stopped."
+                            )
+                        raise SetupError(
+                            "upgrade failed before migration, and services could not be safely "
+                            "resumed"
+                        ) from source_recovery_exc
             if isinstance(exc, (BackupError, ProductionAssemblyError)):
                 raise SetupError(str(exc)) from exc
             raise
@@ -1160,9 +1321,21 @@ class SetupOperations:
             "provider_rollout": assembly.config.provider_rollout.state,
         }
 
-    def _stop_and_verify_services(self, spec: SetupSpec) -> None:
-        self.platform.manage_services(spec, "stop")
-        stopped = self.platform.service_status(spec)
+    def _stop_and_verify_services(
+        self,
+        spec: SetupSpec,
+        unit_generation: ServiceUnitGeneration,
+    ) -> None:
+        stop = self._concrete_upgrade_service_method("stop_upgrade_services")
+        if stop is None:
+            self.platform.manage_services(spec, "stop")
+        else:
+            stop(
+                spec,
+                source_generation=unit_generation,
+                allow_migrated=True,
+            )
+        stopped = self._upgrade_service_status(spec, unit_generation)
         local_services = {
             name: state for name, state in stopped.items() if not name.startswith("tailscale:")
         }
@@ -1170,6 +1343,82 @@ class SetupOperations:
             state != "inactive" for state in local_services.values()
         ):
             raise SetupError("upgrade requires every Signet service to be inactive")
+
+    def _review_upgrade_services(
+        self,
+        spec: SetupSpec,
+    ) -> tuple[dict[str, str], ServiceUnitGeneration]:
+        review = self._concrete_upgrade_service_method("review_upgrade_services")
+        if review is None:
+            return self.platform.service_status(spec), "current"
+        return cast(
+            tuple[dict[str, str], ServiceUnitGeneration],
+            review(spec),
+        )
+
+    def _upgrade_service_status(
+        self,
+        spec: SetupSpec,
+        unit_generation: ServiceUnitGeneration,
+    ) -> dict[str, str]:
+        status = self._concrete_upgrade_service_method("upgrade_service_status")
+        if status is None:
+            return self.platform.service_status(spec)
+        return cast(
+            dict[str, str],
+            status(
+                spec,
+                source_generation=unit_generation,
+                allow_migrated=True,
+            ),
+        )
+
+    def _migrate_upgrade_service_units(
+        self,
+        spec: SetupSpec,
+        unit_generation: ServiceUnitGeneration,
+    ) -> None:
+        migrate = self._concrete_upgrade_service_method("migrate_upgrade_service_units")
+        if migrate is not None:
+            migrate(
+                spec,
+                source_generation=unit_generation,
+                allow_migrated=True,
+            )
+
+    def _restart_upgrade_source_services(
+        self,
+        spec: SetupSpec,
+        unit_generation: ServiceUnitGeneration,
+    ) -> None:
+        start = self._concrete_upgrade_service_method("start_upgrade_services")
+        if start is None:
+            self._restart_services_after_upgrade(spec)
+            return
+        start(
+            spec,
+            source_generation=unit_generation,
+            allow_migrated=True,
+        )
+        started = self._upgrade_service_status(spec, unit_generation)
+        local_services = {
+            name: state for name, state in started.items() if not name.startswith("tailscale:")
+        }
+        if (
+            len(local_services) != 2
+            or any(state != "active" for state in local_services.values())
+            or any(state != "active" for state in started.values())
+        ):
+            raise SetupError("pre-upgrade Signet services did not resume")
+        self.platform.verify_service_health(spec)
+
+    def _concrete_upgrade_service_method(self, name: str) -> Callable[..., Any] | None:
+        if (
+            getattr(type(self.platform), "service_status", None)
+            is not ProductionSetupPlatform.service_status
+        ):
+            return None
+        return cast(Callable[..., Any] | None, getattr(self.platform, name, None))
 
     def _restart_services_after_upgrade(self, spec: SetupSpec) -> None:
         try:
@@ -1294,7 +1543,7 @@ class SetupOperations:
             incomplete_install = (
                 journal.status != "uninstalled" and not all_non_service_steps_completed
             )
-            database_path = self.root / "data" / "signet.db"
+            database_path = spec.data_dir / "signet.db"
             if journal.purge_backup is None and incomplete_install and not database_path.exists():
                 removable = [
                     record.name
@@ -1625,13 +1874,16 @@ class SetupOperations:
 
     def _current_schema_version(self) -> int:
         journal = self._completed_journal()
-        database_path = self.root / "data" / "signet.db"
+        selected = self.spec()
+        database_path = selected.data_dir / "signet.db"
         if database_path.is_symlink() or not database_path.is_file():
             raise SetupError("upgrade planning requires the owned production database")
         expected_identity, expected_lock_identity, expected_parent_identity = (
             validate_active_database_runtime_ownership(
                 database_path.parent,
                 setup_id=journal.setup_id,
+                instance_root=self.root,
+                require_external_storage=selected.data_root is not None,
             )
         )
         database = Database(
@@ -1946,7 +2198,8 @@ class SetupOperations:
             attachment_secret = secret_store.get(attachment_reference)
         except Exception as exc:
             raise SetupError("backup recovery secrets are unavailable") from exc
-        database_path = self.root / "data" / "signet.db"
+        selected = self.spec()
+        database_path = selected.data_dir / "signet.db"
         ownership_marker = database_path.parent / ".signet-database-ownership.json"
         expected_identity = None
         expected_lock_identity = None
@@ -1964,6 +2217,8 @@ class SetupOperations:
             ) = validate_active_database_runtime_ownership(
                 database_path.parent,
                 setup_id=journal.setup_id,
+                instance_root=self.root,
+                require_external_storage=selected.data_root is not None,
             )
         database = Database(
             database_path,
@@ -1981,6 +2236,7 @@ class SetupOperations:
             database,
             staging=staging,
             encryption_key=encryption_key,
+            max_bundle_bytes=BACKUPS_HARD_BYTES,
             key_identity_resolver=lambda reference: secret_store.get(
                 SecretReference.parse(reference)
             ).reveal(),
@@ -2017,14 +2273,14 @@ def _backup_destination(plan: LifecyclePlan) -> Path:
 
 
 def _default_reviewed_backup_destination(
-    root: Path,
+    backup_root: Path,
     *,
     setup_id: str,
     previous_plan_id: str | None,
 ) -> Path:
     chain = previous_plan_id or "initial"
     suffix = hashlib.sha256(f"{setup_id}:{chain}:backup-v1".encode()).hexdigest()[:16]
-    return (root / "backups" / f"reviewed-{suffix}.signet-backup").absolute()
+    return (backup_root / f"reviewed-{suffix}.signet-backup").absolute()
 
 
 def _lifecycle_effect_receipt_path(root: Path, record: LifecycleOperationRecord) -> Path:
@@ -2267,6 +2523,14 @@ def _require_upgrade_target(plan: LifecyclePlan) -> None:
     target = plan.observed.get("target_schema_version")
     if not isinstance(target, int) or isinstance(target, bool) or target != LATEST_SCHEMA_VERSION:
         raise SetupError("upgrade target no longer matches the reviewed schema version")
+    _upgrade_service_unit_generation(plan)
+
+
+def _upgrade_service_unit_generation(plan: LifecyclePlan) -> ServiceUnitGeneration:
+    generation = plan.observed.get("service_unit_generation")
+    if generation not in {"current", "resource_limits_predecessor"}:
+        raise SetupError("reviewed upgrade service-unit generation is invalid")
+    return cast(ServiceUnitGeneration, generation)
 
 
 def _reviewed_upgrade_service_state(
@@ -2653,3 +2917,82 @@ def _write_private_json(path: Path, document: dict[str, Any]) -> None:
 
 def _failed_check(exc: Exception) -> dict[str, Any]:
     return {"ok": False, "error_kind": type(exc).__name__}
+
+
+def _bounded_operational_metrics(
+    database: Database,
+    *,
+    storage: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Read bounded, non-secret operator counters from an initialized runtime."""
+
+    with database.read_only() as connection:
+        schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        request_rows = connection.execute(
+            """
+            SELECT state, count(*) AS count
+            FROM approval_requests GROUP BY state ORDER BY state LIMIT 32
+            """
+        ).fetchall()
+        reconciliation = connection.execute(
+            """
+            SELECT count(*) AS pending,
+                   coalesce(sum(reconciliation_attempt_count), 0) AS attempts
+            FROM execution_attempts WHERE phase = 'outcome_unknown'
+            """
+        ).fetchone()
+        notifications = connection.execute(
+            """
+            SELECT count(*) AS pending, coalesce(max(attempts), 0) AS max_attempts
+            FROM notification_outbox WHERE delivered_at IS NULL
+            """
+        ).fetchone()
+        service_rows = connection.execute(
+            """
+            SELECT service_name, state, updated_at
+            FROM production_services ORDER BY service_name LIMIT 32
+            """
+        ).fetchall()
+    storage_metrics: dict[str, dict[str, int]] = {}
+    if storage is not None:
+        policy = storage.get("policy")
+        roots = storage.get("roots")
+        if isinstance(policy, dict) and isinstance(roots, dict):
+            for name, policy_name in (
+                ("data", "database_hard_bytes"),
+                ("attachments", "attachments_hard_bytes"),
+                ("backups", "backups_hard_bytes"),
+                ("logs", "logs_hard_bytes"),
+                ("cache", "cache_hard_bytes"),
+                ("staging", "staging_hard_bytes"),
+            ):
+                item = roots.get(name)
+                limit = policy.get(policy_name)
+                if not isinstance(item, dict) or not isinstance(limit, int):
+                    continue
+                usage = int(item["usage_bytes"])
+                storage_metrics[name] = {
+                    "usage_bytes": usage,
+                    "budget_headroom_bytes": limit - usage,
+                    "free_bytes": int(item["free_bytes"]),
+                }
+    return {
+        "schema_version": schema_version,
+        "requests_by_state": {str(row["state"]): int(row["count"]) for row in request_rows},
+        "reconciliation": {
+            "pending": int(reconciliation["pending"]),
+            "attempts": int(reconciliation["attempts"]),
+        },
+        "notification_outbox": {
+            "pending": int(notifications["pending"]),
+            "max_attempts": int(notifications["max_attempts"]),
+        },
+        "workers": {
+            str(row["service_name"]): {
+                "state": str(row["state"]),
+                "updated_at": int(row["updated_at"]),
+            }
+            for row in service_rows
+        },
+        "storage": storage_metrics,
+    }

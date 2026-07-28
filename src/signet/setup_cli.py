@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
+import hmac
 import json
+import os
 import re
 import shlex
-import shutil
+import stat
 import subprocess
 import sys
 import webbrowser
@@ -15,17 +18,39 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO, cast
 
+from signet.canonical import canonical_json
 from signet.lifecycle import lifecycle_recovery_directory, setup_lifecycle_lock
+from signet.private_paths import (
+    PrivatePathError,
+    open_directory_with_stable_ancestry,
+    require_no_acl_grants,
+)
 from signet.provider_setup import ProviderSetupOperations
 from signet.setup_operations import SetupOperations
-from signet.setup_platform import ProductionSetupPlatform
+from signet.setup_platform import (
+    ProductionSetupPlatform,
+    render_launchd_services,
+    render_setup_configuration_files,
+    render_systemd_services,
+    setup_configuration_targets,
+)
 from signet.setup_state import (
+    ExecutableIdentity,
     PolicyMode,
     SetupEngine,
     SetupError,
     SetupJournalStore,
     SetupPlan,
     SetupSpec,
+)
+from signet.storage_lifecycle import (
+    ATTACHMENTS_HARD_BYTES,
+    BACKUPS_HARD_BYTES,
+    CACHE_HARD_BYTES,
+    DATABASE_HARD_BYTES,
+    LOGS_HARD_BYTES,
+    MINIMUM_FREE_BYTES,
+    STAGING_HARD_BYTES,
 )
 
 _SETUP_COMMANDS = frozenset(
@@ -44,6 +69,8 @@ _SETUP_COMMANDS = frozenset(
         "production",
     }
 )
+_SETUP_PLAN_ID_PLACEHOLDER = "{reviewed-setup-plan-id}"
+_SETUP_ID_PLACEHOLDER = "{reviewed-setup-id}"
 
 
 def add_setup_parsers(subcommands: Any) -> None:
@@ -65,12 +92,18 @@ def add_setup_parsers(subcommands: Any) -> None:
         choices=("deny", "direct", "approval", "approval_with_edit"),
         help="default policy mode (default: deny)",
     )
-    setup.add_argument(
+    setup_mode = setup.add_mutually_exclusive_group()
+    setup_mode.add_argument(
         "--plan",
         action="store_true",
         help="print the read-only setup plan and exit",
     )
-    setup.add_argument(
+    setup_mode.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed setup plan",
+    )
+    setup_mode.add_argument(
         "--rollback",
         action="store_true",
         help="after destructive confirmation, resume rollback of applied steps",
@@ -84,6 +117,21 @@ def add_setup_parsers(subcommands: Any) -> None:
         "--no-open-browser",
         action="store_true",
         help="print the exact owner URL without opening a browser",
+    )
+    setup.add_argument(
+        "--data-root",
+        type=Path,
+        help="pre-created private data directory, optionally on an external local SSD",
+    )
+    setup.add_argument(
+        "--data-device",
+        type=int,
+        help="reviewed st_dev identity for --data-root (auto-discovered when omitted)",
+    )
+    setup.add_argument(
+        "--backup-root",
+        type=Path,
+        help="pre-created private backup directory outside the default setup root",
     )
     setup.add_argument("--executable", help=argparse.SUPPRESS)
 
@@ -301,10 +349,8 @@ def run_setup_command(
         store = SetupJournalStore(root)
         spec = _setup_spec(args, store)
         engine = SetupEngine(store, selected_platform)
-        if args.plan and args.rollback:
-            raise ValueError("--plan and --rollback cannot be combined")
+        plan = engine.plan(spec)
         if args.plan:
-            plan = engine.plan(spec)
             _emit(_setup_plan_document(plan), output)
             return 0
         if args.rollback:
@@ -318,12 +364,23 @@ def run_setup_command(
             )
             _emit(rollback_document, output)
             return 0
-        _emit(_setup_plan_document(engine.plan(spec)), output)
-        _require_confirmation(
-            args.yes,
-            input_fn,
-            "Apply the reviewed automatic steps, then continue with the labelled human ceremonies?",
-        )
+        if args.apply is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", args.apply) is None:
+                raise SetupError("setup plan ID must be a lowercase SHA-256 digest")
+            if not hmac.compare_digest(args.apply, _setup_plan_id(plan)):
+                raise SetupError("setup plan no longer matches; print and review a new plan")
+            if spec.executable_identity is None:
+                raise SetupError("the installed signet executable must exist before apply")
+        else:
+            if spec.executable_identity is None:
+                raise SetupError("the installed signet executable must exist before apply")
+            _emit(_setup_plan_document(plan), output)
+            _require_confirmation(
+                args.yes,
+                input_fn,
+                "Apply the reviewed automatic steps, then continue with the labelled "
+                "human ceremonies?",
+            )
         with setup_lifecycle_lock(lifecycle_recovery_directory(root)):
             journal = engine.apply(spec)
         output(
@@ -414,17 +471,200 @@ def run_setup_command(
     else:  # pragma: no cover - parser and main dispatch are closed over this set
         raise SetupError("unsupported setup command")
     _emit(document, output)
+    if args.command == "doctor" and document.get("healthy") is not True:
+        return 1
     return 0
 
 
 def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
+    payload = _setup_plan_payload(plan)
+    plan_id = hashlib.sha256(canonical_json(payload)).hexdigest()
+    document = {"plan_id": plan_id, **payload}
+    document["next_commands"] = [_setup_apply_command(plan.spec, plan_id)]
+    return document
+
+
+def _setup_plan_id(plan: SetupPlan) -> str:
+    return hashlib.sha256(canonical_json(_setup_plan_payload(plan))).hexdigest()
+
+
+def _runtime_closure_document() -> dict[str, Any]:
+    interpreter, interpreter_identity = _reviewed_executable(_absolute_path(sys.executable))
+    if interpreter_identity is None:
+        raise SetupError("the bound Python interpreter is unavailable")
+    package_root = Path(__file__).resolve(strict=True).parent
+    try:
+        root_descriptor = open_directory_with_stable_ancestry(package_root)
+    except PrivatePathError as exc:
+        raise SetupError("the installed Signet package has unsafe ancestry") from exc
+    else:
+        os.close(root_descriptor)
+
+    def package_paths() -> tuple[Path, ...]:
+        paths: list[Path] = []
+        try:
+            candidates = sorted(package_root.rglob("*"))
+        except OSError as exc:
+            raise SetupError("the installed Signet package inventory is unavailable") from exc
+        for path in candidates:
+            relative = path.relative_to(package_root)
+            if "__pycache__" in relative.parts or path.suffix in {".pyc", ".pyo"}:
+                continue
+            if path.is_symlink():
+                raise SetupError("the installed Signet package contains a symlink")
+            if path.is_file():
+                paths.append(path)
+        return tuple(paths)
+
+    selected_paths = package_paths()
+    if not selected_paths:
+        raise SetupError("the installed Signet package inventory is empty")
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    inventory: list[dict[str, int | str]] = []
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    for path in selected_paths:
+        parent_descriptor = -1
+        descriptor = -1
+        try:
+            parent_descriptor = open_directory_with_stable_ancestry(path.parent)
+            before = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+            opened = os.fstat(descriptor)
+            require_no_acl_grants(descriptor)
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            current = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except (OSError, PrivatePathError, RuntimeError, ValueError) as exc:
+            raise SetupError("the installed Signet package changed during review") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+        identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_gid,
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid not in {0, current_uid}
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) & 0o022
+            or identity
+            != (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            or identity
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            or identity
+            != (
+                current.st_dev,
+                current.st_ino,
+                current.st_mode,
+                current.st_uid,
+                current.st_gid,
+                current.st_nlink,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )
+        ):
+            raise SetupError("the installed Signet package changed during review")
+        inventory.append(
+            {
+                "path": path.relative_to(package_root).as_posix(),
+                "size": opened.st_size,
+                "sha256": digest.hexdigest(),
+            }
+        )
+    if package_paths() != selected_paths:
+        raise SetupError("the installed Signet package inventory changed during review")
+    return {
+        "interpreter": {"path": str(interpreter), **interpreter_identity.document()},
+        "package_root": str(package_root),
+        "package_file_count": len(inventory),
+        "package_sha256": hashlib.sha256(canonical_json(inventory)).hexdigest(),
+    }
+
+
+def _setup_plan_payload(plan: SetupPlan) -> dict[str, Any]:
     spec = plan.spec
     automatic_steps = [step.name for step in plan.steps if step.name != "owner_bootstrap"]
+    executable: dict[str, int | str] = {"path": str(spec.executable)}
+    if spec.executable_identity is not None:
+        executable.update(spec.executable_identity.document())
+    launchd = render_launchd_services(spec, active=True)
+    systemd = render_systemd_services(spec, active=True)
+    config_path, policy_path = setup_configuration_targets(spec)
+    configuration = render_setup_configuration_files(
+        spec,
+        setup_id=_SETUP_ID_PLACEHOLDER,
+    )
     return {
+        "setup_spec_digest": spec.digest,
         "root": str(spec.root),
         "owner_setup_url": f"{spec.public_origin}/setup",
         "provider_rollout": plan.provider_rollout,
         "policy_mode": spec.policy_mode,
+        "data_root": str(spec.data_dir),
+        "data_device": spec.data_device,
+        "backup_root": str(spec.backup_dir),
+        "executable": executable,
+        "runtime_closure": _runtime_closure_document(),
+        "storage_limits": {
+            "attachments_hard_bytes": ATTACHMENTS_HARD_BYTES,
+            "backups_hard_bytes": BACKUPS_HARD_BYTES,
+            "cache_hard_bytes": CACHE_HARD_BYTES,
+            "database_hard_bytes": DATABASE_HARD_BYTES,
+            "logs_hard_bytes": LOGS_HARD_BYTES,
+            "minimum_free_bytes": MINIMUM_FREE_BYTES,
+            "staging_hard_bytes": STAGING_HARD_BYTES,
+        },
+        "configuration_files": [
+            str(config_path),
+            str(policy_path),
+        ],
+        "configuration_effects": {
+            str(path): {
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "setup_id_normalized": path == config_path,
+            }
+            for path, content in configuration.items()
+        },
+        "service_effects": {
+            "launchd": {
+                name: {"sha256": hashlib.sha256(content).hexdigest()}
+                for name, content in launchd.items()
+            },
+            "systemd": {name: {"content": content} for name, content in systemd.items()},
+        },
         "hermes_profiles": list(spec.hermes_profiles),
         "steps": [step.name for step in plan.steps],
         "automatic_steps": automatic_steps,
@@ -438,15 +678,51 @@ def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
             "live_send",
         ],
         "destructive_actions": [],
+        "rollback": {
+            "command": shlex.join(("signet", "setup", "--rollback", "--root", str(spec.root))),
+            "preserves": ["verified_backups"],
+        },
+        "next_commands": [_setup_apply_command(spec, _SETUP_PLAN_ID_PLACEHOLDER)],
         "browser_will_open": spec.open_browser,
         "gateway_restart": False,
     }
+
+
+def _setup_apply_command(spec: SetupSpec, plan_id: str) -> str:
+    command = [
+        "signet",
+        "setup",
+        "--root",
+        str(spec.root),
+        "--origin",
+        spec.public_origin,
+        "--owner",
+        spec.owner_user_id,
+    ]
+    for profile in spec.hermes_profiles:
+        command.extend(("--profile", profile))
+    command.extend(("--policy-mode", spec.policy_mode, "--executable", str(spec.executable)))
+    if spec.data_dir != spec.root / "data":
+        command.extend(("--data-root", str(spec.data_dir)))
+    if spec.data_device is not None:
+        command.extend(("--data-device", str(spec.data_device)))
+    if spec.backup_dir != spec.root / "backups":
+        command.extend(("--backup-root", str(spec.backup_dir)))
+    if not spec.open_browser:
+        command.append("--no-open-browser")
+    command.extend(("--apply", plan_id))
+    return shlex.join(command)
 
 
 def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec:
     existing = store.load_optional()
     if existing is not None:
         document = existing.spec
+        executable, executable_identity = _reviewed_executable(
+            _absolute_path(args.executable)
+            if args.executable is not None
+            else Path(document["executable"])
+        )
         return SetupSpec(
             root=Path(document["root"]),
             public_origin=args.origin or str(document["public_origin"]),
@@ -456,42 +732,123 @@ def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec
                 if args.profiles is not None
                 else tuple(str(profile) for profile in document["hermes_profiles"])
             ),
-            executable=(
-                _absolute_path(args.executable)
-                if args.executable is not None
-                else Path(document["executable"])
-            ),
+            executable=executable,
+            executable_identity=executable_identity,
             open_browser=(False if args.no_open_browser else bool(document["open_browser"])),
             policy_mode=cast(
                 PolicyMode,
                 args.policy_mode or document.get("policy_mode", "deny"),
             ),
+            data_root=(
+                _absolute_path(args.data_root)
+                if args.data_root is not None
+                else (
+                    Path(str(document["data_root"]))
+                    if document.get("data_root") is not None
+                    else None
+                )
+            ),
+            backup_root=(
+                _absolute_path(args.backup_root)
+                if args.backup_root is not None
+                else (
+                    Path(str(document["backup_root"]))
+                    if document.get("backup_root") is not None
+                    else None
+                )
+            ),
+            data_device=(
+                args.data_device
+                if args.data_device is not None
+                else cast(int | None, document.get("data_device"))
+            ),
         )
     origin = args.origin or _discover_tailscale_origin()
     owner = args.owner or "user:owner"
     profiles = tuple(args.profiles or _discover_hermes_profiles())
-    executable_text = args.executable or shutil.which("signet")
-    if executable_text is None:
-        raise ValueError("the installed signet executable is not on PATH")
+    executable_text = args.executable or _runtime_signet_launcher()
+    data_root = _absolute_path(args.data_root) if args.data_root is not None else None
+    data_device = args.data_device
+    if data_root is not None and data_device is None:
+        try:
+            data_device = data_root.stat().st_dev
+        except OSError as exc:
+            raise ValueError("--data-root must exist before its device can be reviewed") from exc
+    executable, executable_identity = _reviewed_executable(_absolute_path(Path(executable_text)))
     return SetupSpec(
         root=_absolute_path(args.root),
         public_origin=origin,
         owner_user_id=owner,
         hermes_profiles=profiles,
-        executable=_absolute_path(Path(executable_text)),
+        executable=executable,
+        executable_identity=executable_identity,
         open_browser=not args.no_open_browser,
         policy_mode=cast(PolicyMode, args.policy_mode or "deny"),
+        data_root=data_root,
+        backup_root=(_absolute_path(args.backup_root) if args.backup_root is not None else None),
+        data_device=data_device,
+    )
+
+
+def _runtime_signet_launcher() -> Path:
+    """Select the launcher installed beside this process's bound interpreter."""
+
+    launcher = _absolute_path(sys.executable).with_name("signet")
+    if not launcher.exists():
+        raise ValueError(
+            "the installed signet executable is not beside the running Python interpreter"
+        )
+    return launcher
+
+
+def _reviewed_executable(path: Path | str) -> tuple[Path, ExecutableIdentity | None]:
+    """Resolve convenience launchers and bind an existing executable's exact bytes."""
+
+    selected = _absolute_path(path)
+    try:
+        resolved = selected.resolve(strict=True)
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+    except FileNotFoundError:
+        return selected, None
+    except OSError as exc:
+        raise ValueError("the installed signet executable is unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("the installed signet executable changed during review")
+    return resolved, ExecutableIdentity(
+        device=before.st_dev,
+        inode=before.st_ino,
+        size=before.st_size,
+        sha256=digest.hexdigest(),
     )
 
 
 def _discover_tailscale_origin() -> str:
     try:
-        result = subprocess.run(
+        result = ProductionSetupPlatform._execute_reviewed_command(
             ["tailscale", "status", "--json"],
+            command_runner=subprocess.run,
             text=True,
             capture_output=True,
             check=False,
             timeout=10,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            cwd="/",
         )
         document = json.loads(result.stdout) if result.returncode == 0 else {}
         dns_name = document.get("Self", {}).get("DNSName")
@@ -607,12 +964,12 @@ def _run_production_service(
     *,
     runner: Callable[..., Any] | None,
 ) -> int:
+    config_path = _absolute_path(args.config)
+    component = args.production_command.removeprefix("serve-")
     import uvicorn
 
     from signet.production import create_owned_production_service
 
-    config_path = _absolute_path(args.config)
-    component = args.production_command.removeprefix("serve-")
     config, application = create_owned_production_service(
         config_path,
         component=component,

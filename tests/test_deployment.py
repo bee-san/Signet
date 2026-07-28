@@ -228,6 +228,32 @@ def test_persistent_authentication_revalidates_a_concurrent_revocation(
         registry.authenticate(f"Bearer {issued.token}", alias="approvals")
 
 
+def test_bound_token_issue_rolls_back_when_durable_binding_is_interrupted(
+    tmp_path: Path,
+) -> None:
+    _, config = initialized_config(tmp_path)
+    registry = SQLiteTokenRegistry(
+        Database(config.database_path),
+        allowed_principals=config.allowed_principals,
+        clock=lambda: 100,
+    )
+    observed_token_ids: list[str] = []
+
+    def interrupt_binding(token_id: str) -> None:
+        observed_token_ids.append(token_id)
+        raise KeyboardInterrupt("injected snapshot binding interruption")
+
+    with pytest.raises(KeyboardInterrupt, match="snapshot binding interruption"):
+        registry.issue_bound(
+            "profile:hermes",
+            {"approvals"},
+            before_commit=interrupt_binding,
+        )
+
+    assert len(observed_token_ids) == 1
+    assert registry.metadata(observed_token_ids[0]) is None
+
+
 def test_persistent_registry_revocation_and_rotation_are_immediate(tmp_path: Path) -> None:
     _, config = initialized_config(tmp_path)
     registry = SQLiteTokenRegistry(

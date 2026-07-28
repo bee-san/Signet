@@ -352,14 +352,27 @@ def current_caller() -> CallerPrincipal:
     return principal
 
 
-def gateway_principal_provider(user_id: str) -> Callable[[], GatewayPrincipal]:
-    """Bind an injected human TOTP owner to the active caller namespace."""
+def gateway_principal_provider(
+    user_id: str | Mapping[str, str],
+) -> Callable[[], GatewayPrincipal]:
+    """Bind each authenticated MCP caller namespace to its durable human user."""
 
     if not user_id:
         raise RuntimeAssemblyError("the approvals surface requires a human user ID")
+    user_by_namespace = dict(user_id) if isinstance(user_id, Mapping) else None
+    if user_by_namespace is not None and any(
+        not key or not value for key, value in user_by_namespace.items()
+    ):
+        raise RuntimeAssemblyError("MCP caller-to-user bindings must be nonempty")
 
     def provide() -> GatewayPrincipal:
-        return GatewayPrincipal(namespace=current_caller().namespace, user_id=user_id)
+        caller = current_caller()
+        selected_user = (
+            user_id if user_by_namespace is None else user_by_namespace.get(caller.namespace)
+        )
+        if not isinstance(selected_user, str):
+            raise RuntimeAssemblyError("the authenticated MCP caller has no human user binding")
+        return GatewayPrincipal(namespace=caller.namespace, user_id=selected_user)
 
     return provide
 

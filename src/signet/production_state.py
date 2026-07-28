@@ -115,49 +115,95 @@ class ProductionStateStore:
                     rollout_state=opposite_rollout,
                 )
                 attachment_inventory_predecessors = {
-                    _legacy_production_config_digest(config),
-                    _rollout_preparation_base_digest(config),
+                    digest
+                    for without_instance_root in (False, True)
+                    for digest in (
+                        _legacy_production_config_digest(
+                            config,
+                            without_instance_root=without_instance_root,
+                        ),
+                        _rollout_preparation_base_digest(
+                            config,
+                            without_instance_root=without_instance_root,
+                        ),
+                    )
                 }
                 compatible_digests = {
                     transition_digest,
-                    _pre_identity_hardening_production_config_digest(config),
-                    _pre_identity_hardening_production_config_digest(
+                    _pre_instance_root_production_config_digest(config),
+                    _pre_instance_root_production_config_digest(
                         config,
                         rollout_state=opposite_rollout,
                     ),
                     *attachment_inventory_predecessors,
                 }
-                if not config.caller_principals:
-                    callerless_attachment_predecessors = {
-                        _legacy_production_config_digest(
-                            config,
-                            without_caller_principals=True,
-                        ),
-                        _rollout_preparation_base_digest(
-                            config,
-                            without_caller_principals=True,
-                        ),
-                    }
-                    attachment_inventory_predecessors.update(callerless_attachment_predecessors)
+                for without_instance_root in (False, True):
                     compatible_digests.update(
                         {
-                            _pre_caller_principals_production_config_digest(config),
-                            _pre_caller_principals_production_config_digest(
+                            _pre_caller_user_binding_production_config_digest(
                                 config,
+                                without_instance_root=without_instance_root,
+                            ),
+                            _pre_caller_user_binding_production_config_digest(
+                                config,
+                                without_instance_root=without_instance_root,
                                 rollout_state=opposite_rollout,
                             ),
                             _pre_identity_hardening_production_config_digest(
                                 config,
-                                without_caller_principals=True,
+                                without_instance_root=without_instance_root,
                             ),
                             _pre_identity_hardening_production_config_digest(
                                 config,
-                                without_caller_principals=True,
+                                without_instance_root=without_instance_root,
                                 rollout_state=opposite_rollout,
                             ),
-                            *callerless_attachment_predecessors,
                         }
                     )
+                if not config.caller_principals:
+                    callerless_attachment_predecessors = {
+                        digest
+                        for without_instance_root in (False, True)
+                        for digest in (
+                            _legacy_production_config_digest(
+                                config,
+                                without_caller_principals=True,
+                                without_instance_root=without_instance_root,
+                            ),
+                            _rollout_preparation_base_digest(
+                                config,
+                                without_caller_principals=True,
+                                without_instance_root=without_instance_root,
+                            ),
+                        )
+                    }
+                    attachment_inventory_predecessors.update(callerless_attachment_predecessors)
+                    for without_instance_root in (False, True):
+                        compatible_digests.update(
+                            {
+                                _pre_caller_principals_production_config_digest(
+                                    config,
+                                    without_instance_root=without_instance_root,
+                                ),
+                                _pre_caller_principals_production_config_digest(
+                                    config,
+                                    without_instance_root=without_instance_root,
+                                    rollout_state=opposite_rollout,
+                                ),
+                                _pre_identity_hardening_production_config_digest(
+                                    config,
+                                    without_caller_principals=True,
+                                    without_instance_root=without_instance_root,
+                                ),
+                                _pre_identity_hardening_production_config_digest(
+                                    config,
+                                    without_caller_principals=True,
+                                    without_instance_root=without_instance_root,
+                                    rollout_state=opposite_rollout,
+                                ),
+                            }
+                        )
+                    compatible_digests.update(callerless_attachment_predecessors)
                 if setup["config_digest"] not in compatible_digests:
                     raise ProductionStateError(
                         "staged production config differs from durable state"
@@ -204,29 +250,45 @@ class ProductionStateStore:
                 if established_rows:
                     raise ProductionStateError("durable production setup state is unavailable")
 
-            owners = connection.execute("SELECT user_id FROM production_users").fetchall()
+            users = connection.execute(
+                "SELECT user_id, role, state FROM production_users ORDER BY user_id"
+            ).fetchall()
+            owners = [row for row in users if row["role"] == "owner"]
             if setup is not None and (
                 len(owners) != 1 or owners[0]["user_id"] != config.owner_user_id
             ):
                 raise ProductionStateError("durable production owner differs from configured owner")
-            if setup is None and owners:
+            if setup is None and users:
                 raise ProductionStateError("durable production owner differs from configured owner")
-            authenticator_owners = connection.execute(
-                "SELECT user_id FROM auth_users ORDER BY user_id"
-            ).fetchall()
-            if authenticator_owners and (
-                len(authenticator_owners) != 1
-                or authenticator_owners[0]["user_id"] != config.owner_user_id
-            ):
+            authorized_users = {
+                str(row["user_id"]) for row in users if row["state"] in {"staged", "active"}
+            }
+            if setup is None:
+                authorized_users.add(config.owner_user_id)
+            authenticator_users = {
+                str(row["user_id"])
+                for row in connection.execute(
+                    "SELECT user_id FROM auth_users ORDER BY user_id"
+                ).fetchall()
+            }
+            unauthorized_auth_users = authenticator_users - authorized_users
+            if unauthorized_auth_users:
                 raise ProductionStateError(
-                    "durable authenticator owner differs from configured owner"
+                    "durable authenticator user is not an authorized production user"
+                )
+            caller_users = {
+                principal.user_id or config.owner_user_id for principal in config.caller_principals
+            }
+            if caller_users - authorized_users:
+                raise ProductionStateError(
+                    "production MCP caller is bound to an unauthorized production user"
                 )
 
             connection.execute(
                 """
                 INSERT OR IGNORE INTO production_users(
-                    user_id, state, created_at, updated_at
-                ) VALUES (?, 'staged', ?, ?)
+                    user_id, role, state, created_at, updated_at
+                ) VALUES (?, 'owner', 'staged', ?, ?)
                 """,
                 (config.owner_user_id, now, now),
             )
@@ -296,12 +358,12 @@ class ProductionStateStore:
             changed = connection.execute(
                 """
                 UPDATE production_services SET state = ?, updated_at = ?
-                WHERE service_name = 'maintenance' AND service_kind = 'maintenance'
+                WHERE service_name = 'maintenance'
                 """,
                 (state, now),
             ).rowcount
             if changed != 1:
-                raise ProductionStateError("production maintenance service is unavailable")
+                raise ProductionStateError("production worker service inventory is unavailable")
             connection.execute(
                 """
                 UPDATE production_setup_state
@@ -313,6 +375,58 @@ class ProductionStateStore:
                     now,
                 ),
             )
+
+    def record_storage_state(self, *, ready: bool, now: int) -> None:
+        if not isinstance(ready, bool):
+            raise ValueError("production storage readiness is invalid")
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("production storage state time is invalid")
+        with self.database.transaction() as connection:
+            setup = connection.execute(
+                "SELECT capability_status_json FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()
+            if setup is None:
+                raise ProductionStateError("production setup state is unavailable")
+            capabilities = self._parse_capabilities(setup["capability_status_json"])
+            capabilities["storage_ready"] = ready
+            connection.execute(
+                """
+                UPDATE production_setup_state
+                SET capability_status_json = ?, updated_at = ?
+                WHERE state_id = 1
+                """,
+                (
+                    json.dumps(capabilities, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
+
+    def record_worker_component_states(
+        self,
+        state: Literal["ready", "blocked", "stopped"],
+        *,
+        enabled_services: frozenset[str],
+        now: int,
+    ) -> None:
+        known_services = frozenset({"delivery", "reconciliation", "retention", "notifications"})
+        if not isinstance(enabled_services, frozenset) or not enabled_services <= known_services:
+            raise ValueError("production worker component inventory is invalid")
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("production worker component state time is invalid")
+        with self.database.transaction() as connection:
+            for service_name in sorted(known_services):
+                component_state = state if service_name in enabled_services else "blocked"
+                changed = connection.execute(
+                    """
+                    UPDATE production_services SET state = ?, updated_at = ?
+                    WHERE service_name = ? AND service_kind = 'worker'
+                    """,
+                    (component_state, now, service_name),
+                ).rowcount
+                if changed != 1:
+                    raise ProductionStateError(
+                        "production worker component inventory is unavailable"
+                    )
 
     def record_provider_state(
         self,
@@ -1006,6 +1120,21 @@ def production_config_digest(
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
 
+def _pre_instance_root_production_config_digest(
+    config: ProductionConfig,
+    *,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
+) -> str:
+    """Reconstruct a config digest emitted before instance-root binding."""
+
+    document = config.model_dump(mode="json")
+    document.pop("instance_root")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
 def _connector_config_digest(document: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
@@ -1013,12 +1142,34 @@ def _connector_config_digest(document: dict[str, Any]) -> str:
 def _pre_caller_principals_production_config_digest(
     config: ProductionConfig,
     *,
+    without_instance_root: bool = False,
     rollout_state: Literal["disabled", "enabled"] | None = None,
 ) -> str:
     """Reconstruct the digest emitted before caller authorization joined the config."""
 
     document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
     document.pop("caller_principals")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _pre_caller_user_binding_production_config_digest(
+    config: ProductionConfig,
+    *,
+    without_instance_root: bool = False,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
+) -> str:
+    """Reconstruct the digest emitted before callers recorded their human user."""
+
+    document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
+    for principal in document["caller_principals"]:
+        principal.pop("user_id", None)
     if rollout_state is not None:
         document["provider_rollout"]["state"] = rollout_state
         document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
@@ -1029,11 +1180,14 @@ def _pre_identity_hardening_production_config_digest(
     config: ProductionConfig,
     *,
     without_caller_principals: bool = False,
+    without_instance_root: bool = False,
     rollout_state: Literal["disabled", "enabled"] | None = None,
 ) -> str:
     """Reconstruct the immediately preceding provider-config document shape."""
 
     document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
     if without_caller_principals:
         document.pop("caller_principals")
     if rollout_state is not None:
@@ -1059,10 +1213,13 @@ def _legacy_production_config_digest(
     config: ProductionConfig,
     *,
     without_caller_principals: bool = False,
+    without_instance_root: bool = False,
 ) -> str:
     """Reconstruct the pre-SP17 digest while allowing only new rollout fields to change."""
 
     document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
     if without_caller_principals:
         document.pop("caller_principals")
     document["storage"].pop("attachment_staging_dir", None)
@@ -1089,10 +1246,13 @@ def _rollout_preparation_base_digest(
     config: ProductionConfig,
     *,
     without_caller_principals: bool = False,
+    without_instance_root: bool = False,
 ) -> str:
     """Reconstruct the disabled digest emitted before rollout prerequisites were staged."""
 
     document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
     if without_caller_principals:
         document.pop("caller_principals")
     document["storage"]["attachment_staging_dir"] = None

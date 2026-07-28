@@ -63,6 +63,7 @@ def test_installed_wheel_setup_interruption_resume_rerun_and_conflict_refusal(
         ],
         check=False,
         capture_output=True,
+        env={**os.environ, "UV_LINK_MODE": "copy"},
         text=True,
         timeout=180,
     )

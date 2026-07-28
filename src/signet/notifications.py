@@ -434,6 +434,10 @@ class PushDeliveryError(RuntimeError):
     pass
 
 
+class PushTransportUnavailable(PushDeliveryError):
+    """The configured transport is intentionally unavailable; do not penalize endpoints."""
+
+
 @dataclass(frozen=True, slots=True)
 class NotificationReport:
     attempted: int
@@ -442,6 +446,8 @@ class NotificationReport:
     attempted_subscription_ids: tuple[str, ...] = ()
     delivered_subscription_ids: tuple[str, ...] = ()
     failed_subscription_ids: tuple[str, ...] = ()
+    deferred: int = 0
+    deferred_subscription_ids: tuple[str, ...] = ()
 
 
 class NotificationDispatcher:
@@ -483,9 +489,12 @@ class NotificationDispatcher:
         payload = message.payload()
         delivered_ids: list[str] = []
         failed_ids: list[str] = []
+        deferred_ids: list[str] = []
         for subscription in subscriptions:
             try:
                 await self._transport.send(subscription, payload)
+            except PushTransportUnavailable:
+                deferred_ids.append(subscription.subscription_id)
             except Exception:
                 failed_ids.append(subscription.subscription_id)
                 await _run_sync(
@@ -505,11 +514,13 @@ class NotificationDispatcher:
             attempted=len(subscriptions),
             delivered=len(delivered_ids),
             failed=len(failed_ids),
+            deferred=len(deferred_ids),
             attempted_subscription_ids=tuple(
                 subscription.subscription_id for subscription in subscriptions
             ),
             delivered_subscription_ids=tuple(delivered_ids),
             failed_subscription_ids=tuple(failed_ids),
+            deferred_subscription_ids=tuple(deferred_ids),
         )
 
 

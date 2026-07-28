@@ -6,7 +6,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import sys
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -40,6 +40,8 @@ from signet.setup_platform import (
     _remove_exact_owned_file,
     _remove_hermes_config,
     _remove_profile_environment,
+    _render_predecessor_launchd_services,
+    _render_predecessor_systemd_services,
     _replace_private_file,
     browser_assisted_setup,
     render_launchd_services,
@@ -48,6 +50,7 @@ from signet.setup_platform import (
 )
 from signet.setup_state import (
     SETUP_STEPS,
+    ExecutableIdentity,
     SetupEngine,
     SetupError,
     SetupJournal,
@@ -113,14 +116,39 @@ def _mock_purge_backup_manager(
 
 
 def spec(root: Path, *, profiles: tuple[str, ...] = ("personal", "work")) -> SetupSpec:
+    executable = root.parent / "packaged-runtime" / "bin" / "signet"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
     return SetupSpec(
         root=root,
         public_origin="https://signet.tailnet.example",
         owner_user_id="user:owner",
         hermes_profiles=profiles,
-        executable=Path("/opt/signet/bin/signet"),
+        executable=executable,
         open_browser=True,
     )
+
+
+def _command_signature(command: list[str]) -> list[str]:
+    return [Path(command[0]).name.lower(), *command[1:]]
+
+
+@pytest.fixture(autouse=True)
+def _reviewed_system_command_fixtures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_root = tmp_path / "reviewed-system-commands"
+    command_root.mkdir(mode=0o700)
+    candidates: dict[str, tuple[Path, ...]] = {}
+    for name in ("launchctl", "systemctl", "tailscale"):
+        executable = command_root / name
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+        candidates[name] = (executable,)
+    monkeypatch.setattr(setup_platform, "_REVIEWED_COMMAND_CANDIDATES", candidates)
+    monkeypatch.setattr(setup_platform, "_REVIEWED_COMMAND_OWNER_UID", os.geteuid())
 
 
 def test_plan_is_read_only_and_defaults_providers_to_disabled(tmp_path: Path) -> None:
@@ -137,13 +165,34 @@ def test_plan_is_read_only_and_defaults_providers_to_disabled(tmp_path: Path) ->
     assert config["caller_principals"] == [
         {
             "namespace": "profile:personal",
+            "user_id": "user:owner",
             "allowed_aliases": ["approvals", "fastmail", "whatsapp"],
         },
         {
             "namespace": "profile:work",
+            "user_id": "user:owner",
             "allowed_aliases": ["approvals", "fastmail", "whatsapp"],
         },
     ]
+
+
+def test_setup_journal_adds_reviewed_executable_identity_on_legacy_resume(
+    tmp_path: Path,
+) -> None:
+    identity = ExecutableIdentity(device=1, inode=2, size=3, sha256="a" * 64)
+    selected = replace(spec(tmp_path / "legacy-executable-journal"), executable_identity=identity)
+    store = SetupJournalStore(selected.root)
+    engine = SetupEngine(store, FakePlatform())
+    engine.apply(selected)
+    journal = store.load()
+    journal.spec.pop("executable_identity")
+    journal.spec_digest = selected.legacy_executable_identity_digest()
+    store.save(journal)
+
+    resumed = engine.apply(selected)
+
+    assert resumed.spec["executable_identity"] == identity.document()
+    assert resumed.spec_digest == selected.digest
 
 
 def test_journal_read_refuses_a_path_replacement_race(
@@ -2124,6 +2173,8 @@ def test_no_open_browser_outputs_the_private_claim_handoff_without_opening() -> 
     assert output == [
         "Owner setup URL: https://signet.tailnet.example/setup",
         f"Private owner setup capability file: {handoff}",
+        "The one-time capability expires after 10 minutes. If it expires, rerun the same "
+        "signet setup command to issue a replacement without losing enrollment progress.",
     ]
     assert "secret-capability-value" not in "\n".join(output)
 
@@ -2293,12 +2344,64 @@ def test_browser_assisted_setup_prints_exact_url_before_opening_without_printing
         "sbc1.secret-capability-value",
         output=output,
         opener=opener,
+        handoff_path=Path("/private/setup-owner-capability"),
     )
 
     assert events[0] == ("output", "Owner setup URL: https://signet.tailnet.example/setup")
-    assert events[1][0] == "open"
-    assert events[1][1].startswith("https://signet.tailnet.example/setup#bootstrap=")
-    assert "secret-capability-value" not in events[0][1]
+    assert events[1] == (
+        "output",
+        "Private owner setup capability file: /private/setup-owner-capability",
+    )
+    assert events[2] == (
+        "output",
+        "The one-time capability expires after 10 minutes. If it expires, rerun the same "
+        "signet setup command to issue a replacement without losing enrollment progress.",
+    )
+    assert events[3] == ("open", "https://signet.tailnet.example/setup")
+    assert all("secret-capability-value" not in value for _kind, value in events)
+
+
+def test_service_manager_commands_use_absolute_paths_and_a_minimal_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reviewed_systemctl = tmp_path / "commands" / "systemctl"
+    reviewed_systemctl.parent.mkdir(mode=0o700)
+    reviewed_systemctl.write_bytes(b"#!/bin/sh\nexit 0\n")
+    reviewed_systemctl.chmod(0o700)
+    monkeypatch.setattr(
+        setup_platform,
+        "_REVIEWED_COMMAND_CANDIDATES",
+        {"systemctl": (reviewed_systemctl,)},
+    )
+    monkeypatch.setenv("PYTHONPATH", "/tmp/attacker")
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/tmp/attacker.dylib")
+    monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", "/tmp/attacker.json")
+
+    environment = ProductionSetupPlatform._service_manager_environment()
+
+    assert environment["LANG"] == environment["LC_ALL"] == "C"
+    assert "PYTHONPATH" not in environment
+    assert "DYLD_INSERT_LIBRARIES" not in environment
+    assert "SIGNET_PRODUCTION_CONFIG" not in environment
+    assert environment["PATH"] == "/usr/bin:/bin"
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    ProductionSetupPlatform(command_runner=run)._run_checked(
+        ["systemctl", "--user", "daemon-reload"],
+        "systemd reload failed",
+    )
+
+    command, kwargs = calls[0]
+    assert Path(command[0]).is_absolute()
+    assert Path(command[0]).name == "systemctl"
+    assert kwargs["env"] == environment
+    assert kwargs["cwd"] == "/"
 
 
 def test_service_rollback_failure_preserves_owned_units(
@@ -2449,10 +2552,10 @@ def test_service_plans_use_installed_executable_and_remain_inert(tmp_path: Path)
     systemd = render_systemd_services(selected)
 
     assert set(launchd) == {"ai.hermes.signet.mcp.plist", "ai.hermes.signet.web.plist"}
-    assert all(b"/opt/signet/bin/signet" in value for value in launchd.values())
+    assert all(str(selected.executable).encode() in value for value in launchd.values())
     assert all(b"RunAtLoad" in value and b"<false/>" in value for value in launchd.values())
     assert set(systemd) == {"signet-mcp.service", "signet-web.service"}
-    assert all("/opt/signet/bin/signet production serve-" in value for value in systemd.values())
+    assert all(f"{selected.executable} production serve-" in value for value in systemd.values())
     assert all("WantedBy" not in value for value in systemd.values())
 
 
@@ -2523,18 +2626,18 @@ def test_service_install_management_status_and_rollback_are_platform_native(
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal services_active
         commands.append(command)
-        if command[0] == "launchctl":
+        if _command_signature(command)[0] == "launchctl":
             environment = kwargs.get("env")
             assert isinstance(environment, dict)
             assert environment["LC_ALL"] == "C"
             assert environment["LANG"] == "C"
-        if command[:2] == ["launchctl", "bootstrap"] or "enable" in command:
+        if _command_signature(command)[:2] == ["launchctl", "bootstrap"] or "enable" in command:
             services_active = True
-        elif command[:2] == ["launchctl", "bootout"] or "disable" in command:
+        elif _command_signature(command)[:2] == ["launchctl", "bootout"] or "disable" in command:
             services_active = False
-        elif command[:2] == ["launchctl", "kickstart"] or "restart" in command:
+        elif _command_signature(command)[:2] == ["launchctl", "kickstart"] or "restart" in command:
             services_active = True
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             label = command[-1].rsplit("/", 1)[-1]
             uid = command[-1].split("/", 2)[1]
             return subprocess.CompletedProcess(
@@ -2590,9 +2693,15 @@ def test_service_install_management_status_and_rollback_are_platform_native(
         target = home / "Library" / "LaunchAgents"
         assert not (target / "ai.hermes.signet.mcp.plist").exists()
         assert not (target / "ai.hermes.signet.web.plist").exists()
-        assert any(command[:2] == ["launchctl", "bootstrap"] for command in commands)
-        assert any(command[:2] == ["launchctl", "bootout"] for command in commands)
-        assert any(command[:2] == ["launchctl", "kickstart"] for command in commands)
+        assert any(
+            _command_signature(command)[:2] == ["launchctl", "bootstrap"] for command in commands
+        )
+        assert any(
+            _command_signature(command)[:2] == ["launchctl", "bootout"] for command in commands
+        )
+        assert any(
+            _command_signature(command)[:2] == ["launchctl", "kickstart"] for command in commands
+        )
     else:
         target = home / ".config" / "systemd" / "user"
         assert not (target / "signet-mcp.service").exists()
@@ -2659,7 +2768,7 @@ def test_launchd_service_stop_retry_tolerates_an_already_stopped_unit(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         nonlocal bootouts
-        if command[:2] == ["launchctl", "bootout"]:
+        if _command_signature(command)[:2] == ["launchctl", "bootout"]:
             bootouts += 1
             if bootouts == 1:
                 return subprocess.CompletedProcess(command, 3, "", "No such process")
@@ -3827,9 +3936,9 @@ def test_service_status_maps_tailscale_execution_failures_to_unavailable(
             path.chmod(0o600)
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        if command[0] == "tailscale":
+        if _command_signature(command)[0] == "tailscale":
             raise subprocess.TimeoutExpired(command, 15)
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -3846,6 +3955,236 @@ def test_service_status_maps_tailscale_execution_failures_to_unavailable(
     assert all(
         value == "active" for name, value in status.items() if not name.startswith("tailscale:")
     )
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+@pytest.mark.parametrize("initial_state", ["active", "inactive"])
+def test_upgrade_migrates_only_the_reviewed_predecessor_units_while_quiesced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+    initial_state: str,
+) -> None:
+    home = ensure_private_directory(tmp_path / "home")
+    selected = replace(
+        spec(tmp_path / f"upgrade-predecessor-{platform_name}-{initial_state}"),
+        public_origin="https://example.com",
+    )
+    plan_dir = ensure_private_directory(selected.root / "services")
+    if platform_name == "darwin":
+        target = ensure_private_directory(home / "Library" / "LaunchAgents")
+        predecessor = _render_predecessor_launchd_services(selected, active=True)
+        current = render_launchd_services(selected, active=True)
+    else:
+        target = ensure_private_directory(home / ".config" / "systemd" / "user")
+        predecessor = {
+            name: content.encode("utf-8")
+            for name, content in _render_predecessor_systemd_services(
+                selected,
+                active=True,
+            ).items()
+        }
+        current = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+    for name, content in predecessor.items():
+        for path in (plan_dir / name, target / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+
+    states = dict.fromkeys(predecessor, initial_state)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        signature = _command_signature(command)
+        commands.append(signature)
+        if signature[:2] == ["launchctl", "print"]:
+            label = signature[-1].rsplit("/", 1)[-1]
+            name = f"{label}.plist"
+            if states[name] == "active":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    f"{signature[-1]} = {{\n\tstate = running\n}}\n",
+                    "",
+                )
+            uid = signature[-1].split("/", 2)[1]
+            return subprocess.CompletedProcess(
+                command,
+                113,
+                "",
+                f'Bad request.\nCould not find service "{label}" in domain for user gui: {uid}',
+            )
+        if signature[:2] == ["launchctl", "bootout"]:
+            label = signature[-1].rsplit("/", 1)[-1]
+            states[f"{label}.plist"] = "inactive"
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if signature[:2] == ["launchctl", "bootstrap"]:
+            states[Path(signature[-1]).name] = "active"
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "is-active" in signature:
+            name = signature[-1]
+            state = states[name]
+            return subprocess.CompletedProcess(
+                command,
+                0 if state == "active" else 3,
+                f"{state}\n",
+                "",
+            )
+        if "stop" in signature:
+            for name in states:
+                states[name] = "inactive"
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "start" in signature:
+            for name in states:
+                states[name] = "active"
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if signature[-1] == "daemon-reload":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(signature)
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    platform = ProductionSetupPlatform(command_runner=run)
+
+    assert set(platform.service_status(selected).values()) == {"missing_or_changed"}
+    command_count = len(commands)
+    with pytest.raises(SetupError):
+        platform.manage_services(selected, "stop")
+    assert len(commands) == command_count
+
+    reviewed, generation = platform.review_upgrade_services(selected)
+    assert set(reviewed.values()) == {initial_state}
+    assert generation == "resource_limits_predecessor"
+    if initial_state == "active":
+        platform.stop_upgrade_services(
+            selected,
+            source_generation=generation,
+            allow_migrated=False,
+        )
+
+    original_replace = setup_platform._replace_private_file
+    replacement_states: list[set[str]] = []
+
+    def replace_while_quiesced(path: Path, content: bytes, **kwargs: object) -> None:
+        replacement_states.append(set(states.values()))
+        original_replace(path, content, **kwargs)
+
+    monkeypatch.setattr(setup_platform, "_replace_private_file", replace_while_quiesced)
+    platform.migrate_upgrade_service_units(
+        selected,
+        source_generation=generation,
+        allow_migrated=False,
+    )
+    assert replacement_states and set.union(*replacement_states) == {"inactive"}
+    assert all(
+        path.read_bytes() == current[name]
+        for name in current
+        for path in (plan_dir / name, target / name)
+    )
+
+    if initial_state == "active":
+        platform.manage_services(selected, "start")
+    assert set(platform.service_status(selected).values()) == {initial_state}
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+def test_upgrade_planning_rejects_arbitrary_unit_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+) -> None:
+    home = ensure_private_directory(tmp_path / "home")
+    selected = replace(
+        spec(tmp_path / f"upgrade-drift-{platform_name}"),
+        public_origin="https://example.com",
+    )
+    plan_dir = ensure_private_directory(selected.root / "services")
+    if platform_name == "darwin":
+        target = ensure_private_directory(home / "Library" / "LaunchAgents")
+        predecessor = _render_predecessor_launchd_services(selected, active=True)
+    else:
+        target = ensure_private_directory(home / ".config" / "systemd" / "user")
+        predecessor = {
+            name: content.encode("utf-8")
+            for name, content in _render_predecessor_systemd_services(
+                selected,
+                active=True,
+            ).items()
+        }
+    for name, content in predecessor.items():
+        for path in (plan_dir / name, target / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+    changed = plan_dir / next(iter(predecessor))
+    changed.write_bytes(changed.read_bytes() + b"# unrelated drift\n")
+
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "active\n", "")
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    platform = ProductionSetupPlatform(command_runner=run)
+
+    with pytest.raises(SetupError, match="changed or foreign"):
+        platform.review_upgrade_services(selected)
+    assert commands == []
+    assert "missing_or_changed" in platform.service_status(selected).values()
+
+
+def test_upgrade_reloads_systemd_when_a_retry_already_has_current_units(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = ensure_private_directory(tmp_path / "home")
+    selected = replace(
+        spec(tmp_path / "upgrade-current-systemd"),
+        public_origin="https://example.com",
+    )
+    plan_dir = ensure_private_directory(selected.root / "services")
+    target = ensure_private_directory(home / ".config" / "systemd" / "user")
+    current = {
+        name: content.encode("utf-8")
+        for name, content in render_systemd_services(selected, active=True).items()
+    }
+    for name, content in current.items():
+        for path in (plan_dir / name, target / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        signature = _command_signature(command)
+        commands.append(signature)
+        if "is-active" in signature:
+            return subprocess.CompletedProcess(command, 3, "inactive\n", "")
+        if signature[-1] == "daemon-reload":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(signature)
+
+    monkeypatch.setattr(setup_platform.sys, "platform", "linux")
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(
+        setup_platform,
+        "_replace_private_file",
+        lambda *args, **kwargs: pytest.fail("current units must not be replaced"),
+    )
+    platform = ProductionSetupPlatform(command_runner=run)
+
+    reviewed, generation = platform.review_upgrade_services(selected)
+    assert set(reviewed.values()) == {"inactive"}
+    assert generation == "current"
+    platform.migrate_upgrade_service_units(
+        selected,
+        source_generation=generation,
+        allow_migrated=True,
+    )
+
+    assert ["systemctl", "--user", "daemon-reload"] in commands
 
 
 @pytest.mark.parametrize("platform_name", ["darwin", "linux"])
@@ -3881,7 +4220,7 @@ def test_service_entrypoints_refuse_units_without_ownership_plans(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -3921,7 +4260,7 @@ def test_launchd_start_paths_require_exact_target_bound_already_bootstrapped(
     )
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        assert command[:2] == ["launchctl", "bootstrap"]
+        assert _command_signature(command)[:2] == ["launchctl", "bootstrap"]
         environment = kwargs.get("env")
         assert isinstance(environment, dict)
         assert environment["LANG"] == environment["LC_ALL"] == "C"
@@ -4091,7 +4430,7 @@ def test_service_rollback_preserves_owned_units_when_manager_response_is_inconcl
             assert isinstance(environment, dict)
             assert environment["LC_ALL"] == "C"
             assert environment["LANG"] == "C"
-        if command[:2] == ["launchctl", "bootout"] or "disable" in command:
+        if _command_signature(command)[:2] == ["launchctl", "bootout"] or "disable" in command:
             if failure_stage == "stop":
                 detail = (
                     "service manager could not find service registry"
@@ -4100,7 +4439,7 @@ def test_service_rollback_preserves_owned_units_when_manager_response_is_inconcl
                 )
                 return subprocess.CompletedProcess(command, 1, "", detail)
             return subprocess.CompletedProcess(command, 0, "", "")
-        if command[:2] == ["launchctl", "print"] or "is-active" in command:
+        if _command_signature(command)[:2] == ["launchctl", "print"] or "is-active" in command:
             if failure_stage == "stop":
                 if platform_name == "darwin":
                     label = command[-1].rsplit("/", 1)[-1]
@@ -4144,13 +4483,13 @@ def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         nonlocal bootouts
-        if command[:2] == ["launchctl", "bootout"]:
+        if _command_signature(command)[:2] == ["launchctl", "bootout"]:
             bootouts += 1
             if bootouts == 2:
                 return subprocess.CompletedProcess(command, 1, "", "stop failed")
             if bootouts == 3:
                 return subprocess.CompletedProcess(command, 3, "", "No such process")
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             label = command[-1].rsplit("/", 1)[-1]
             uid = command[-1].split("/", 2)[1]
             return subprocess.CompletedProcess(
@@ -4196,7 +4535,7 @@ def test_launchd_rollback_retry_uses_the_verified_label_after_target_deletion(
     bootouts: list[list[str]] = []
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        if command[:2] == ["launchctl", "bootout"]:
+        if _command_signature(command)[:2] == ["launchctl", "bootout"]:
             bootouts.append(command)
             if len(command) == 4:
                 return subprocess.CompletedProcess(
@@ -4212,7 +4551,7 @@ def test_launchd_rollback_retry_uses_the_verified_label_after_target_deletion(
                 "",
                 f'Could not find service "{label}" in domain for user gui: {uid}',
             )
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             uid, label = command[-1].split("/", 2)[1:]
             return subprocess.CompletedProcess(
                 command,
@@ -4281,13 +4620,7 @@ def test_preflight_resolves_the_hermes_default_profile_to_the_hermes_home(
     hermes_home = tmp_path / ".hermes"
     profiles_root = hermes_home / "profiles"
     profiles_root.mkdir(parents=True, mode=0o700)
-    selected = SetupSpec(
-        root=tmp_path / "signet",
-        public_origin="https://signet.example",
-        owner_user_id="user:owner",
-        hermes_profiles=("default",),
-        executable=Path(sys.executable).resolve(),
-    )
+    selected = spec(tmp_path / "signet", profiles=("default",))
 
     ProductionSetupPlatform(hermes_home=profiles_root)._apply_preflight(
         selected,
@@ -5327,11 +5660,31 @@ def test_hermes_apply_binds_an_issued_token_to_its_rollback_snapshot(
         token = "sgt_0000000000000001." + "x" * 43
 
     class Registry:
+        issue_count = 0
+
         @staticmethod
-        def issue(namespace: str, aliases: set[str]) -> Issued:
+        def issue_bound(
+            namespace: str,
+            aliases: set[str],
+            *,
+            before_commit: Callable[[str], None],
+        ) -> Issued:
             assert namespace == "profile:work"
             assert aliases == {"approvals", "fastmail", "whatsapp"}
+            Registry.issue_count += 1
+            before_commit("0000000000000001")
             return Issued()
+
+        @staticmethod
+        def authenticate(authorization: str, *, alias: str) -> Any:
+            assert authorization == f"Bearer {Issued.token}"
+            assert alias == "approvals"
+            return type("Principal", (), {"namespace": "profile:work"})()
+
+        @staticmethod
+        def metadata(token_id: str) -> Any:
+            assert token_id == "0000000000000001"
+            return type("Metadata", (), {"revoked_at": None})()
 
         @staticmethod
         def revoke(token_id: str) -> None:
@@ -5355,6 +5708,14 @@ def test_hermes_apply_binds_an_issued_token_to_its_rollback_snapshot(
     )
     assert snapshot is not None
     assert snapshot[3] == "0000000000000001"
+    applied_config = (profile / "config.yaml").read_bytes()
+    applied_environment = (profile / ".env").read_bytes()
+
+    platform._apply_hermes_profiles(selected, setup_id)
+
+    assert Registry.issue_count == 1
+    assert (profile / "config.yaml").read_bytes() == applied_config
+    assert (profile / ".env").read_bytes() == applied_environment
     environment = profile / ".env"
     environment.write_bytes(environment.read_bytes() + b"FOREIGN_EDIT=changed\n")
     environment.chmod(0o600)
@@ -5470,6 +5831,11 @@ def test_hermes_apply_preserves_snapshot_when_prior_token_revocation_is_unconfir
     )
 
     class Registry:
+        @staticmethod
+        def metadata(token_id: str) -> Any:
+            assert token_id == "00000000000000aa"
+            return type("Metadata", (), {"revoked_at": None})()
+
         @staticmethod
         def revoke(token_id: str) -> None:
             assert token_id == "00000000000000aa"
@@ -5880,7 +6246,7 @@ def test_tailnet_private_route_rejects_foreground_funnel_permission() -> None:
     )
 
 
-def test_tailnet_apply_rejects_ambiguous_private_route_types_after_mutation(
+def test_tailnet_apply_preserves_ambiguous_private_route_types_after_mutation(
     tmp_path: Path,
 ) -> None:
     selected = SetupSpec(
@@ -5898,7 +6264,7 @@ def test_tailnet_apply_rejects_ambiguous_private_route_types_after_mutation(
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
         commands.append(command)
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -5915,12 +6281,16 @@ def test_tailnet_apply_rejects_ambiguous_private_route_types_after_mutation(
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
     platform = ProductionSetupPlatform(command_runner=run)
-    with pytest.raises(SetupError, match="did not match the requested private route"):
+    with pytest.raises(SetupError, match="refusing failed-apply rollback"):
         platform._apply_tailnet_route(selected)
 
     assert any("--bg" in command for command in commands)
-    assert any(command[-1] == "off" for command in commands)
-    assert state["serve"] == {}
+    assert not any(command[-1] == "off" for command in commands)
+    assert state["serve"] == {
+        "TCP": {"8443": {"HTTPS": 1}},
+        "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+        "AllowFunnel": {host_port: "true"},
+    }
     assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
 
 
@@ -6049,7 +6419,7 @@ def test_tailnet_apply_resume_rejects_unreceipted_configuration_drift(
     assert not any("--bg" in command for command in commands)
 
 
-def test_tailnet_apply_rejects_concurrent_route_drift_after_mutation(tmp_path: Path) -> None:
+def test_tailnet_apply_preserves_concurrent_route_drift_after_mutation(tmp_path: Path) -> None:
     selected = SetupSpec(
         root=tmp_path / "tailnet-apply-drift",
         public_origin="https://signet.example.ts.net:8443",
@@ -6063,7 +6433,7 @@ def test_tailnet_apply_rejects_concurrent_route_drift_after_mutation(tmp_path: P
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6090,9 +6460,13 @@ def test_tailnet_apply_rejects_concurrent_route_drift_after_mutation(tmp_path: P
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
     platform = ProductionSetupPlatform(command_runner=run)
-    with pytest.raises(SetupError, match="changed concurrently"):
+    with pytest.raises(SetupError, match="refusing failed-apply rollback"):
         platform._apply_tailnet_route(selected)
 
+    assert state["serve"]["TCP"] == {
+        "8443": {"HTTPS": True},
+        "9443": {"HTTPS": True},
+    }
     assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
 
 
@@ -6114,7 +6488,7 @@ def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
         commands.append(command)
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6158,7 +6532,7 @@ def test_tailnet_route_normalizes_absent_and_empty_serve_states(tmp_path: Path) 
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6202,7 +6576,7 @@ def test_tailnet_rollback_resumes_after_restoring_the_pre_setup_snapshot(
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
         commands.append(command)
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6258,7 +6632,7 @@ def test_tailnet_rollback_verifies_the_exact_pre_setup_snapshot(tmp_path: Path) 
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6313,13 +6687,7 @@ def test_real_purge_holds_the_database_write_fence_through_deletion(
         path = profile_directory / name
         path.write_bytes(content)
         path.chmod(0o600)
-    selected = SetupSpec(
-        root=tmp_path / "fenced-purge",
-        public_origin="https://signet.tailnet.example",
-        owner_user_id="user:owner",
-        hermes_profiles=("personal",),
-        executable=Path("/bin/echo"),
-    )
+    selected = spec(tmp_path / "fenced-purge", profiles=("personal",))
 
     rollback_errors: list[tuple[str, str]] = []
 
@@ -6429,13 +6797,7 @@ def test_real_platform_builds_a_provider_disabled_production_assembly(
             del spec
             assert getattr(self, "services_active", True)
 
-    selected = SetupSpec(
-        root=tmp_path / "owned-root",
-        public_origin="https://signet.tailnet.example",
-        owner_user_id="user:owner",
-        hermes_profiles=("personal", "work"),
-        executable=Path("/bin/echo"),
-    )
+    selected = spec(tmp_path / "owned-root")
     output: list[str] = []
     external_calls: list[list[str]] = []
 
@@ -6458,6 +6820,7 @@ def test_real_platform_builds_a_provider_disabled_production_assembly(
     assert journal.status == "completed"
     assert external_calls == []
     assert any("did not restart the gateway" in message for message in output)
+    assert any("hermes -p work mcp test signet_work" in message for message in output)
     assert any("/reload-mcp" in message for message in output)
     config_path = selected.root / "production.json"
     config = load_production_config(config_path)

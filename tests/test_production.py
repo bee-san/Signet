@@ -64,6 +64,7 @@ from signet.production_connectors import (
 from signet.production_state import ProductionStateError, production_config_digest
 from signet.setup_platform import ProductionSetupPlatform
 from signet.setup_state import SetupEngine, SetupError, SetupJournalStore, SetupSpec
+from signet.storage_lifecycle import StoragePolicyError
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
@@ -287,6 +288,48 @@ def test_production_config_digest_migrates_only_the_empty_caller_principal_prede
             secret_store=_secret_store(),
             components=frozenset(),
         )
+
+
+def test_production_config_digest_migrates_caller_human_binding(
+    tmp_path: Path,
+) -> None:
+    payload = _production_payload(tmp_path)
+    payload["caller_principals"] = [
+        {
+            "namespace": "profile:work",
+            "user_id": "user:owner",
+            "allowed_aliases": ["approvals"],
+        }
+    ]
+    config = ProductionConfig.model_validate(payload)
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor["caller_principals"][0].pop("user_id")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+
+    migrated = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+
+    with migrated.database.read() as connection:
+        assert connection.execute(
+            "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+        ).fetchone()["config_digest"] == production_config_digest(config)
 
 
 def test_production_config_digest_composes_empty_callers_with_legacy_predecessor(
@@ -1473,7 +1516,7 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     assembly = build_production_runtime(config, secret_store=secret_store, clock=lambda: 123)
     status = assembly.status()
 
-    assert status.schema_version == 19
+    assert status.schema_version == 20
     assert assembly.authenticators.list_factors(config.owner_user_id) == ()
     assert status.setup_status == "staged"
     assert status.ready is False
@@ -1524,6 +1567,42 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     assert assembly.workers.healthy is False
     assert set(assembly.provider_clients) == {"mail"}
     assert isinstance(assembly.provider_clients["mail"], ProductionDisabledProviderClient)
+
+
+def test_production_health_identity_uses_the_instance_root_with_external_data(
+    tmp_path: Path,
+) -> None:
+    instance_root = tmp_path / "instance"
+    instance_root.mkdir(mode=0o700)
+    payload = _production_payload(instance_root)
+    original_policy = Path(str(payload["policy_path"]))
+    policy_path = instance_root / "policy.yaml"
+    policy_path.write_bytes(original_policy.read_bytes())
+    policy_path.chmod(0o600)
+    external_data = tmp_path / "external-data"
+    external_data.mkdir(mode=0o700)
+    payload["instance_root"] = str(instance_root)
+    payload["policy_path"] = str(policy_path)
+    payload["storage"]["data_dir"] = str(external_data)
+    config = ProductionConfig.model_validate(payload)
+    secret_store = _secret_store()
+    challenge = "test-health-challenge-value-0123456789"
+    expected_identity = production_instance_identity(instance_root)
+
+    assembly = build_production_runtime(config, secret_store=secret_store, clock=lambda: 123)
+    assert assembly.web is not None
+    response = TestClient(
+        assembly.web,
+        base_url="https://signet.example.test",
+    ).get("/healthz", headers={"X-Signet-Health-Challenge": challenge})
+
+    assert response.headers["X-Signet-Instance"] == expected_identity
+    assert response.headers["X-Signet-Health-Proof"] == production_health_proof(
+        secret_store.get(SecretReference.parse(config.secrets.session_secret_ref)).reveal(),
+        identity=expected_identity,
+        component="web",
+        challenge=challenge,
+    )
 
 
 def test_disabled_runtime_requires_atomic_reviewed_connector_identity_rotation(
@@ -1877,7 +1956,10 @@ def test_production_runtime_refuses_to_rebind_a_historical_auth_owner(
             ("user:historical-owner", 100),
         )
 
-    with pytest.raises(ProductionAssemblyError, match="authenticator owner differs"):
+    with pytest.raises(
+        ProductionAssemblyError,
+        match="authenticator user is not an authorized production user",
+    ):
         build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
 
 
@@ -1891,6 +1973,7 @@ def test_production_config_digest_composes_rollout_and_identity_predecessors(
         components=frozenset(),
     )
     predecessor = config.model_dump(mode="json")
+    predecessor.pop("instance_root")
     predecessor["provider_rollout"]["state"] = "enabled"
     predecessor["capabilities"]["live_providers_ready"] = True
     for connector in predecessor["connectors"].values():
@@ -1990,10 +2073,77 @@ def test_production_runtime_refuses_deleted_durable_identity_rows(
         build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 124)
 
 
-@pytest.mark.asyncio
-async def test_production_maintenance_worker_has_explicit_lifecycle(tmp_path: Path) -> None:
+def test_production_runtime_accepts_a_durable_approver_user(
+    tmp_path: Path,
+) -> None:
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
     assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO production_users(user_id, role, state, created_at, updated_at)
+            VALUES ('user:approver', 'approver', 'active', 124, 124)
+            """
+        )
+        connection.execute(
+            "INSERT INTO auth_users(user_id, created_at) VALUES ('user:approver', 124)"
+        )
+
+    rebuilt = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 125)
+
+    with rebuilt.database.read() as connection:
+        users = connection.execute(
+            "SELECT user_id, role FROM production_users ORDER BY user_id"
+        ).fetchall()
+    assert [(row["user_id"], row["role"]) for row in users] == [
+        ("user:approver", "approver"),
+        (config.owner_user_id, "owner"),
+    ]
+
+
+def test_production_runtime_refuses_a_disabled_durable_owner(tmp_path: Path) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_users SET state = 'disabled' WHERE user_id = ?",
+            (config.owner_user_id,),
+        )
+
+    with pytest.raises(
+        ProductionAssemblyError,
+        match="not an authorized production user",
+    ):
+        build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 124)
+
+
+@pytest.mark.asyncio
+async def test_production_maintenance_worker_has_explicit_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    notification_runs: list[tuple[int, int]] = []
+    expiry_schedules: list[tuple[str, int]] = []
+    digest_schedules: list[tuple[str, int]] = []
+
+    async def run_notifications(*, now: int, limit: int) -> None:
+        notification_runs.append((now, limit))
+
+    assert assembly.workers._notifications is not None
+    assert assembly.workers._notification_outbox is not None
+    monkeypatch.setattr(assembly.workers._notifications, "run_due", run_notifications)
+    monkeypatch.setattr(
+        assembly.workers._notification_outbox,
+        "schedule_approaching_expiry",
+        lambda *, user_id, now: expiry_schedules.append((user_id, now)),
+    )
+    monkeypatch.setattr(
+        assembly.workers._notification_outbox,
+        "schedule_daily_digest",
+        lambda *, user_id, now: digest_schedules.append((user_id, now)),
+    )
 
     await assembly.workers.run_once(now=124)
     stop = asyncio.Event()
@@ -2002,6 +2152,149 @@ async def test_production_maintenance_worker_has_explicit_lifecycle(tmp_path: Pa
 
     assert assembly.workers.running is False
     assert assembly.workers.healthy is False
+    assert expiry_schedules == [(config.owner_user_id, 124)]
+    assert digest_schedules == [(config.owner_user_id, 124)]
+    assert notification_runs == [(124, 32)]
+    services = assembly.status().services
+    assert services["notifications"].state == "stopped"
+    assert services["retention"].state == "blocked"
+    assert services["delivery"].state == "blocked"
+    assert services["reconciliation"].state == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_storage_block_does_not_terminate_the_shared_production_worker_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_time = 123
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        clock=lambda: current_time,
+    )
+    calls: list[str] = []
+    storage_attempts = 0
+
+    async def dispatch(request_id: str, **_kwargs: Any) -> None:
+        calls.append(f"delivery:{request_id}")
+
+    async def reconcile(request_id: str, **_kwargs: Any) -> None:
+        calls.append(f"reconciliation:{request_id}")
+
+    def retain(**_kwargs: Any) -> None:
+        calls.append("retention")
+
+    async def notify(**_kwargs: Any) -> None:
+        calls.append("notifications")
+
+    def maintain_storage() -> Mapping[str, Any]:
+        nonlocal storage_attempts
+        storage_attempts += 1
+        calls.append("storage")
+        if storage_attempts == 1:
+            raise StoragePolicyError("owned logs exceed their hard storage limit")
+        return {}
+
+    notification_outbox = SimpleNamespace(
+        schedule_approaching_expiry=lambda **_kwargs: 0,
+        schedule_daily_digest=lambda **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_delivery",
+        SimpleNamespace(dispatch=dispatch),
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_reconciliation",
+        SimpleNamespace(
+            due_request_ids=lambda **_kwargs: ("request:reconciliation",),
+            reconcile_once=reconcile,
+        ),
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_retention",
+        SimpleNamespace(run_due=retain),
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_notifications",
+        SimpleNamespace(run_due=notify),
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_notification_outbox",
+        notification_outbox,
+    )
+    monkeypatch.setattr(assembly.workers, "_storage_maintenance", maintain_storage)
+    monkeypatch.setattr(
+        assembly.workers,
+        "_due_delivery_request_ids",
+        lambda _now: ("request:delivery",),
+    )
+    enabled_workers = frozenset({"delivery", "reconciliation", "retention", "notifications"})
+    assembly.state.record_worker_component_states(
+        "ready",
+        enabled_services=enabled_workers,
+        now=current_time,
+    )
+    assembly.state.record_worker_state("ready", ready=True, now=current_time)
+    assembly.state.record_service_state(
+        "mcp",
+        "ready",
+        capability="mcp_ready",
+        ready=True,
+        now=current_time,
+    )
+    assert assembly.web is not None
+    assert assembly.mcp is not None
+    health = TestClient(assembly.web, base_url=config.public_origin)
+    mcp_health = TestClient(assembly.mcp.app, base_url="http://127.0.0.1:8789")
+
+    current_time += 1
+    await assembly.workers.run_once(now=current_time)
+
+    blocked = assembly.status()
+    assert storage_attempts == 1
+    assert calls == [
+        "delivery:request:delivery",
+        "reconciliation:request:reconciliation",
+        "retention",
+        "storage",
+        "notifications",
+    ]
+    assert "storage_ready" in blocked.missing_prerequisites
+    assert "workers_ready" not in blocked.missing_prerequisites
+    assert blocked.services["maintenance"].state == "ready"
+    assert all(blocked.services[name].state == "ready" for name in enabled_workers)
+    assert health.get("/healthz").status_code == 503
+    assert mcp_health.get("/healthz").status_code == 503
+    assert mcp_health.get("/readyz").status_code == 503
+
+    current_time += 1
+    await assembly.workers.run_once(now=current_time)
+
+    recovered = assembly.status()
+    assert storage_attempts == 2
+    assert (
+        calls
+        == [
+            "delivery:request:delivery",
+            "reconciliation:request:reconciliation",
+            "retention",
+            "storage",
+            "notifications",
+        ]
+        * 2
+    )
+    assert "storage_ready" not in recovered.missing_prerequisites
+    assert all(recovered.services[name].state == "ready" for name in enabled_workers)
+    assert health.get("/healthz").status_code == 200
+    assert mcp_health.get("/healthz").status_code == 200
+    assert mcp_health.get("/readyz").status_code == 200
 
 
 @pytest.mark.asyncio

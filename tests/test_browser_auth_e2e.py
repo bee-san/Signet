@@ -649,7 +649,9 @@ def _remove_with_passkey(page: Page, target: str, credential_id: str) -> None:
     card.get_by_role("button", name="Confirm removal with passkey").click()
 
 
-def test_setup_private_url_claims_and_removes_bootstrap_fragment(tmp_path: Path) -> None:
+def test_setup_fragment_is_scrubbed_without_consuming_a_bootstrap_capability(
+    tmp_path: Path,
+) -> None:
     with _served_browser_auth(tmp_path) as live, sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         context = browser.new_context(ignore_https_errors=True)
@@ -657,8 +659,15 @@ def test_setup_private_url_claims_and_removes_bootstrap_fragment(tmp_path: Path)
         try:
             page.goto(f"{live.origin}/setup#bootstrap={live.bootstrap_capability}")
 
-            expect(page.get_by_role("heading", name="1. Create your password")).to_be_visible()
-            assert page.url == f"{live.origin}/setup"
+            expect(page.get_by_role("heading", name="Set up Signet")).to_be_visible()
+            expect(
+                page.get_by_text(
+                    "Open the private owner setup capability file printed by signet setup, "
+                    "copy the one-time value, and paste it below before it expires."
+                )
+            ).to_be_visible()
+            expect(page.get_by_label("One-time bootstrap capability")).to_have_value("")
+            expect(page).to_have_url(f"{live.origin}/setup")
             assert live.bootstrap_capability not in page.url
         finally:
             context.close()
@@ -838,7 +847,9 @@ def test_setup_totp_resume_treats_verified_response_loss_as_success(tmp_path: Pa
             page.locator('[data-totp-enrollment] input[name="proof"]').fill(pyotp.TOTP(key).at(NOW))
             page.locator("[data-totp-enrollment] button").click()
 
-            expect(page.locator("[data-auth-status]")).to_contain_text("Failed to fetch")
+            expect(page.locator("[data-auth-status]")).to_contain_text(
+                "Connection lost. Your progress is saved"
+            )
             assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')")
 
             page.unroute("**/setup/totp/verify")
@@ -902,7 +913,9 @@ def test_setup_passkey_resume_treats_verified_response_loss_as_success(tmp_path:
             page.route("**/setup/passkeys/complete", drop_completed_response)
             page.get_by_role("button", name="Create passkey").click()
 
-            expect(page.locator("[data-auth-status]")).to_contain_text("Failed to fetch")
+            expect(page.locator("[data-auth-status]")).to_contain_text(
+                "Connection lost. Your progress is saved"
+            )
             assert page.evaluate("() => localStorage.getItem('signet-setup-ceremony-v1')")
 
             page.unroute("**/setup/passkeys/complete")
@@ -978,7 +991,9 @@ def test_totp_only_management_is_accessible_and_resumes_without_provider_effects
                 pyotp.TOTP(secondary).at(live.clock[0])
             )
             page.get_by_role("button", name="Verify new TOTP").click()
-            expect(page.locator("[data-auth-status]")).to_contain_text("Failed")
+            expect(page.locator("[data-auth-status]")).to_contain_text(
+                "Connection lost. Your progress is saved"
+            )
             assert set(_active_factors(live.database)) == {"Primary TOTP", "Secondary TOTP"}
             page.unroute("**/authenticators/enroll/finalize")
             page.reload()
@@ -1009,7 +1024,9 @@ def test_totp_only_management_is_accessible_and_resumes_without_provider_effects
             with page.expect_response("**/authenticators/enroll/resume") as resumed_passkey:
                 page.reload()
             assert resumed_passkey.value.status == 200, resumed_passkey.value.text()
-            expect(page.locator("[data-auth-status]")).to_contain_text("Failed")
+            expect(page.locator("[data-auth-status]")).to_contain_text(
+                "Connection lost. Your progress is saved"
+            )
             page.unroute("**/authenticators/enroll/finalize")
             with page.expect_response("**/authenticators/enroll/resume") as finalized_passkey:
                 page.reload()

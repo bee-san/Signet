@@ -160,7 +160,7 @@ move data to an external drive.
 | SQLite database + WAL | `.../data` | service account, `0700` dir / `0600` files | hard cap: 1 GiB | Includes the live schema and write-ahead log. |
 | Attachments | `.../data/attachments` | service account, `0700` dir / `0600` files | soft cap: 4 GiB, hard cap: 8 GiB | Attachments must be purged per retention rules. |
 | Backups | `.../backups` | service account, `0700` dir / `0600` files | soft cap: 4 GiB, hard cap: 8 GiB on internal storage | External backup roots require an explicit verified path. |
-| Logs | `.../logs` | service account, `0700` dir / `0600` files | 512 MiB total | Rotate at about 25 MiB per file with a small fixed generation count. |
+| Logs | `.../logs` | service account, `0700` dir / `0600` files | 512 MiB total | Rename atomically at about 25 MiB; never truncate an active writer or overwrite an existing rotation. |
 | Browser assets and caches | `.../browser` and `.../cache` | service account, `0700` dir / `0600` files | 1 GiB total | Includes service-worker assets, icon cache, and optional browser test assets. |
 | Installed code/runtime | release package root | read-only release ownership | bounded by release artifact size | Not counted against mutable data budgets. |
 
@@ -191,6 +191,10 @@ world-writable, and that the budget policy still leaves headroom.
 - Hermes profile routes are managed as fragments, not by replacing unrelated profile
   content. A rerun must preserve any unrelated routes and only update the Signet
   owned fragment.
+- Every production caller principal records a canonical human `user_id`. The durable
+  production-user role (`owner` or `approver`) authorizes browser access, notification
+  targeting, and the MCP approval identity consistently; unknown or disabled users
+  fail startup validation.
 - Route changes should prefer Hermes `/reload-mcp`. A gateway restart is a separate
   explicit approval step and not the default outcome.
 - Tailscale Serve may expose the web listener privately, but it must never be used to
@@ -231,7 +235,9 @@ Suggested metrics surface:
 ### Logs
 
 - keep separate logs per process or worker;
-- rotate each log at a fixed size before the total log root grows without bound;
+- atomically rename each log at a fixed size; if a prior rotation may still have an
+  open writer, fail closed and require a reviewed service restart/archive rather than
+  truncate or overwrite it;
 - redact request bodies and secrets at the source;
 - prefer structured log records with request ID, worker name, and state class;
 - do not log raw profile tokens, provider credentials, or full request payloads.

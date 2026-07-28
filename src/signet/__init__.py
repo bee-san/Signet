@@ -1,3 +1,8 @@
 """Signet MCP human approval gateway."""
 
-__version__ = "0.1.0b1"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("signet-gateway")
+except PackageNotFoundError:  # pragma: no cover - source tree without installation metadata
+    __version__ = "0+unknown"

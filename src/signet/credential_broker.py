@@ -227,6 +227,26 @@ class SQLiteTokenRegistry(TokenRegistry):
             self._allowed_principals = MappingProxyType(principals)
 
     def issue(self, namespace: str, allowed_aliases: Iterable[str]) -> IssuedToken:
+        return self._issue(namespace, allowed_aliases, before_commit=None)
+
+    def issue_bound(
+        self,
+        namespace: str,
+        allowed_aliases: Iterable[str],
+        *,
+        before_commit: Callable[[str], None],
+    ) -> IssuedToken:
+        """Issue a token only if its caller-owned durable binding succeeds first."""
+
+        return self._issue(namespace, allowed_aliases, before_commit=before_commit)
+
+    def _issue(
+        self,
+        namespace: str,
+        allowed_aliases: Iterable[str],
+        *,
+        before_commit: Callable[[str], None] | None,
+    ) -> IssuedToken:
         selected_namespace = _validate_machine_namespace(namespace)
         aliases = _validate_machine_aliases(allowed_aliases)
         self._require_configured_principal(selected_namespace, aliases)
@@ -250,6 +270,8 @@ class SQLiteTokenRegistry(TokenRegistry):
                             now,
                         ),
                     )
+                    if before_commit is not None:
+                        before_commit(issued.token_id)
                 return issued
             except IntegrityError:
                 continue

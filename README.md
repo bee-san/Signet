@@ -82,7 +82,9 @@ signet setup
 
 Setup prints the automatic safe steps, human ceremonies, deferred provider proofs,
 and destructive-action set before confirmation. `signet setup --plan` exits after
-that read-only review. Configure only the provider you use after setup completes:
+that read-only review and emits the exact `signet setup --apply PLAN_ID` command.
+`signet --version` reports the installed distribution version. Configure only the
+provider you use after setup completes:
 
 ```console
 signet provider setup fastmail --from you@example.com --to you@example.com

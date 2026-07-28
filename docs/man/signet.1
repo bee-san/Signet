@@ -30,7 +30,10 @@ Setup refuses ambiguous or foreign resources rather than adopting them.
 .SH SETUP OPTIONS
 .TP
 .B --plan
-Print a read-only JSON plan.
+Print a read-only JSON plan with the exact next apply command.
+.TP
+.BI --apply " PLAN_ID"
+Apply the exact setup plan ID emitted by --plan.
 .TP
 .BI --origin " HTTPS_ORIGIN"
 Use one canonical private HTTPS origin. If omitted, derive
@@ -46,6 +49,17 @@ profiles under ~/.hermes/profiles.
 .BI --policy-mode " MODE"
 Select the initial policy mode: deny, direct, approval, or approval_with_edit.
 Default: deny.
+.TP
+.BI --data-root " ABSOLUTE_DIRECTORY"
+Use a pre-created empty mode-0700 local directory instead of ROOT/data. The setup
+plan records and validates its filesystem device identity.
+.TP
+.BI --data-device " INTEGER"
+Require the external data root to remain on this exact filesystem device. If omitted
+with --data-root, setup reads the current device number and includes it in the plan.
+.TP
+.BI --backup-root " ABSOLUTE_DIRECTORY"
+Use a pre-created empty mode-0700 local directory instead of ROOT/backups.
 .TP
 .B --yes
 Confirm a reviewed plan non-interactively.
@@ -71,6 +85,7 @@ Print persisted setup, service, and production readiness metadata without secret
 .TP
 .B signet doctor
 Check journal, config, keyring references, service definitions, and Hermes entries.
+Exit 1 if any completed check is unhealthy.
 .TP
 .B signet verify
 Report fail-closed filesystem, database, service, route, Hermes, provider, and backup
@@ -124,21 +139,27 @@ written to private profile environment files and are never printed or accepted o
 argv. Review the entries, enable approvals and configured providers, then run
 /reload-mcp in that profile. Signet never restarts the Hermes gateway.
 .SH BROWSER SETUP
-The public /setup URL is printed before browser launch. The one-time capability is
-placed in a URL fragment, removed from browser history before submission, retained in
-the operating-system keyring for crash recovery, and omitted from the setup journal
-and normal output. Password setup supports multiple named TOTP and passkey
-authenticators; passkeys require a real browser ceremony at the final HTTPS origin.
+The public /setup URL is printed before browser launch. The one-time capability never
+crosses the browser opener or appears in a URL. It is retained in the operating-system
+keyring and a private mode-0600 handoff file; paste it into the setup form. It expires
+after ten minutes, and rerunning the same setup command safely replaces an expired
+ceremony. Password setup supports multiple named TOTP and passkey authenticators;
+passkeys require a real browser ceremony at the final HTTPS origin.
 .SH RECOVERY AND EXIT STATUS
 Setup and lifecycle applies persist atomic journals or receipts. After interruption,
 run signet status and signet doctor, correct the reported condition, and rerun the same
 setup command or exact reviewed lifecycle PLAN_ID. Conflicting specifications and
 foreign owner markers are refused rather than adopted or overwritten.
 .PP
+Status and doctor include redacted storage usage, free-space warnings, hard-limit
+checks, and the effective data and backup device identities. Setup and backup fail
+closed before the configured write reserve or backup cap is exhausted.
+.PP
 Exit status 0 means the requested read-only operation, plan, or apply completed. Exit
-status 2 means invalid input, declined confirmation, safety refusal, conflict, or
-incomplete work; stderr includes a redacted recovery command. A signal interruption
-may use the shell's signal status.
+status 1 means doctor completed and found an unhealthy check. Exit status 2 means
+invalid input, declined confirmation, safety refusal, conflict, or incomplete work;
+stderr includes a redacted recovery command. A signal interruption may use the shell's
+signal status.
 .SH FILES
 .TP
 .I ~/.local/share/signet/.setup-journal.json

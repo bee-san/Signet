@@ -74,7 +74,13 @@ from signet.gateway_tools import (
 )
 from signet.mcp_mirror import AliasToolSurface, SchemaMirror
 from signet.models import InvalidTransition, ReconciliationRejected, RequestState
-from signet.notifications import SQLitePushRepository
+from signet.notification_outbox import NotificationOutboxWorker, SQLiteNotificationOutbox
+from signet.notifications import (
+    NotificationDispatcher,
+    PushSubscription,
+    PushTransportUnavailable,
+    SQLitePushRepository,
+)
 from signet.policy import PolicyEngine, PolicySnapshot, parse_policy_yaml
 from signet.policy_persistence import (
     PolicyPersistenceError,
@@ -110,6 +116,7 @@ from signet.staging import (
     read_verified_descriptor,
 )
 from signet.state_machine import ApprovalStateMachine
+from signet.storage_lifecycle import StorageMaintenance, StoragePolicyError
 from signet.totp import SQLiteTotpCredentialRepository, TotpVerifier
 from signet.totp_enrollment import TotpEnrollmentService
 from signet.web import CsrfManager, WebSettings, create_web_app
@@ -192,6 +199,18 @@ class ProductionDisabledProviderClient:
         raise AssertionError("blocked production provider returned unexpectedly")
 
 
+class ProductionDisabledPushTransport:
+    """Fail closed if an unexpected live subscription reaches disabled push delivery."""
+
+    async def send(
+        self,
+        subscription: PushSubscription,
+        payload: Mapping[str, str | int],
+    ) -> None:
+        del subscription, payload
+        raise PushTransportUnavailable("browser push delivery is not configured")
+
+
 class ProductionSummaryProvider:
     def __init__(self, reviewer: EncryptedPayloadReviewer) -> None:
         self._reviewer = reviewer
@@ -229,7 +248,11 @@ class ProductionWorkers:
         delivery: DeliveryDispatcher | None = None,
         reconciliation: ReconciliationCoordinator | None = None,
         retention: RetentionManager | None = None,
+        notifications: NotificationOutboxWorker | None = None,
+        notification_outbox: SQLiteNotificationOutbox | None = None,
+        notification_user_ids: tuple[str, ...] = (),
         provider_sessions: ProviderSessionPool | None = None,
+        storage_maintenance: Callable[[], Mapping[str, Any]] | None = None,
         interval_seconds: float = 5.0,
     ) -> None:
         if interval_seconds < 0.1 or interval_seconds > 300:
@@ -242,13 +265,23 @@ class ProductionWorkers:
             provider_sessions is None
         ):
             raise ValueError("production provider worker dependencies must be complete")
-        if (delivery is not None or retention is not None) and database is None:
-            raise ValueError("production provider workers require the database")
+        if (
+            delivery is not None or retention is not None or notifications is not None
+        ) and database is None:
+            raise ValueError("production background workers require the database")
+        if (notifications is None) != (notification_outbox is None) or (
+            notification_user_ids and notification_outbox is None
+        ):
+            raise ValueError("production notification worker dependencies must be complete")
         self._database = database
         self._delivery = delivery
         self._reconciliation = reconciliation
         self._retention = retention
+        self._notifications = notifications
+        self._notification_outbox = notification_outbox
+        self._notification_user_ids = notification_user_ids
         self._provider_sessions = provider_sessions
+        self._storage_maintenance = storage_maintenance
         self._interval_seconds = interval_seconds
         self._heartbeat_lease_seconds = max(1, math.ceil(interval_seconds * 3))
         self._running = False
@@ -267,6 +300,36 @@ class ProductionWorkers:
     @property
     def heartbeat_lease_seconds(self) -> int:
         return self._heartbeat_lease_seconds
+
+    def _record_worker_state(
+        self,
+        state: Literal["ready", "blocked", "stopped"],
+        *,
+        ready: bool,
+        now: int,
+    ) -> None:
+        enabled_services = {"notifications"} if self._notifications is not None else set()
+        if self._retention is not None:
+            enabled_services.add("retention")
+        if self._delivery is not None:
+            enabled_services.update(("delivery", "reconciliation"))
+        components = frozenset(enabled_services)
+        if ready:
+            # Publish detailed readiness before the aggregate capability so an
+            # interrupted heartbeat remains fail closed.
+            self._state.record_worker_component_states(
+                state,
+                enabled_services=components,
+                now=now,
+            )
+            self._state.record_worker_state(state, ready=ready, now=now)
+        else:
+            self._state.record_worker_state(state, ready=ready, now=now)
+            self._state.record_worker_component_states(
+                state,
+                enabled_services=components,
+                now=now,
+            )
 
     async def wait_started(self) -> None:
         """Wait until startup is ready or has failed and begun unwinding."""
@@ -288,6 +351,8 @@ class ProductionWorkers:
         stop: asyncio.Event | None = None,
     ) -> None:
         selected_now = self._maintenance_time(now)
+        storage_checked = False
+        storage_blocked = False
         try:
             await self._policy_promotions.publish_pending(now=selected_now)
             await _run_sync(self._approvals.sweep_expired, now=selected_now, limit=100)
@@ -327,15 +392,46 @@ class ProductionWorkers:
                     now=self._maintenance_time(),
                     limit=100,
                 )
+            if self._storage_maintenance is not None and (stop is None or not stop.is_set()):
+                storage_checked = True
+                try:
+                    await _run_sync(self._storage_maintenance)
+                except StoragePolicyError:
+                    storage_blocked = True
+                    self._state.record_storage_state(
+                        ready=False,
+                        now=self._maintenance_time(now),
+                    )
+            if self._notifications is not None and (stop is None or not stop.is_set()):
+                if self._notification_outbox is None:
+                    raise AssertionError("notification worker is missing its outbox")
+                notification_now = self._maintenance_time(now)
+                for user_id in self._notification_user_ids:
+                    await _run_sync(
+                        self._notification_outbox.schedule_approaching_expiry,
+                        user_id=user_id,
+                        now=notification_now,
+                    )
+                    await _run_sync(
+                        self._notification_outbox.schedule_daily_digest,
+                        user_id=user_id,
+                        now=notification_now,
+                    )
+                await self._notifications.run_due(now=notification_now, limit=32)
             completed_now = self._maintenance_time(now)
         except BaseException:
             self._healthy = False
             if self._running:
-                self._state.record_worker_state("blocked", ready=False, now=selected_now)
+                self._record_worker_state("blocked", ready=False, now=selected_now)
             raise
+        if storage_checked and not storage_blocked:
+            self._state.record_storage_state(
+                ready=True,
+                now=completed_now,
+            )
         if self._running:
             self._healthy = True
-            self._state.record_worker_state("ready", ready=True, now=completed_now)
+            self._record_worker_state("ready", ready=True, now=completed_now)
 
     def _due_delivery_request_ids(self, now: int) -> tuple[str, ...]:
         if self._database is None:
@@ -379,7 +475,7 @@ class ProductionWorkers:
         provider_stack = AsyncExitStack()
         try:
             selected_now = self._maintenance_time()
-            self._state.record_worker_state("blocked", ready=False, now=selected_now)
+            self._record_worker_state("blocked", ready=False, now=selected_now)
             await provider_stack.__aenter__()
             if self._provider_sessions is not None:
                 await provider_stack.enter_async_context(self._provider_sessions.run())
@@ -390,7 +486,7 @@ class ProductionWorkers:
                 )
             await _run_sync(self._approvals.recover_startup, now=self._maintenance_time())
             self._healthy = True
-            self._state.record_worker_state("ready", ready=True, now=self._maintenance_time())
+            self._record_worker_state("ready", ready=True, now=self._maintenance_time())
             self._startup_complete.set()
             while not stop.is_set():
                 await self.run_once(stop=stop)
@@ -403,7 +499,7 @@ class ProductionWorkers:
             self._healthy = False
             self._startup_error = exc
             self._startup_complete.set()
-            self._state.record_worker_state("blocked", ready=False, now=self._maintenance_time())
+            self._record_worker_state("blocked", ready=False, now=self._maintenance_time())
             raise
         finally:
             self._running = False
@@ -420,9 +516,7 @@ class ProductionWorkers:
                     )
             if not failed:
                 self._healthy = False
-                self._state.record_worker_state(
-                    "stopped", ready=False, now=self._maintenance_time()
-                )
+                self._record_worker_state("stopped", ready=False, now=self._maintenance_time())
 
 
 @dataclass(frozen=True, slots=True)
@@ -657,7 +751,9 @@ def build_production_runtime(
         config,
         secret_store,
     )
-    health_identity = production_instance_identity(config.storage.data_dir.parent)
+    health_identity = production_instance_identity(
+        config.instance_root or config.storage.data_dir.parent
+    )
     health_secret = secret_values["session_secret_ref"].reveal()
 
     def health_prover(component: Literal["mcp", "web"]) -> Callable[[str], str]:
@@ -787,10 +883,11 @@ def build_production_runtime(
         **reviewer_provider_adapters,
         (tool_access.downstream_alias, tool_access.tool_name): cast(ApprovalAdapter, tool_access),
     }
+    human_roles = _production_human_roles(database, config.owner_user_id)
     approvals = ApprovalStateMachine(
         database,
         capabilities=capabilities,
-        notification_user_id=config.owner_user_id,
+        notification_user_ids=tuple(human_roles),
         admission_limits=QueueAdmissionLimits(
             queue_limit=1_000,
             origin_pending_limit=500,
@@ -882,7 +979,13 @@ def build_production_runtime(
     )
     gateway_surface = GatewayToolSurface(
         tools=gateway_tools,
-        principal_provider=gateway_principal_provider(config.owner_user_id),
+        principal_provider=gateway_principal_provider(
+            {
+                principal.namespace: principal.user_id or config.owner_user_id
+                for principal in config.caller_principals
+            }
+            or config.owner_user_id
+        ),
     )
     token_registry = SQLiteTokenRegistry(
         database,
@@ -891,9 +994,12 @@ def build_production_runtime(
     runtime_states: list[ProductionStateStore] = []
 
     def mcp_readiness() -> bool:
-        return bool(
-            runtime_states
-            and runtime_states[0].status().services["mcp"].state == "ready"
+        if not runtime_states:
+            return False
+        status = runtime_states[0].status()
+        return (
+            status.services["mcp"].state == "ready"
+            and "storage_ready" not in status.missing_prerequisites
             and (provider_sessions is None or provider_sessions.active)
         )
 
@@ -939,6 +1045,7 @@ def build_production_runtime(
             approvals=approvals,
             reviewer=reviewer,
             policy_promotions=policy_promotions,
+            authorized_users=human_roles,
             clock=now,
         )
         if "web" in components
@@ -1013,20 +1120,40 @@ def build_production_runtime(
             reviewed_tools=reviewed_reconciliation_tools,
         )
 
+    storage_root = config.policy_path.parent
+    storage_maintenance = (
+        StorageMaintenance(
+            storage_root,
+            data_dir=config.storage.data_dir,
+            attachment_roots=config.storage.attachment_source_roots,
+        ).run_once
+        if (storage_root / "logs").is_dir() and (storage_root / "cache").is_dir()
+        else None
+    )
+    notification_outbox = SQLiteNotificationOutbox(database)
+    notification_worker = NotificationOutboxWorker(
+        notification_outbox,
+        NotificationDispatcher(SQLitePushRepository(database), ProductionDisabledPushTransport()),
+        worker_id="production:notifications",
+    )
     workers = ProductionWorkers(
         approvals=approvals,
         policy_promotions=policy_promotions,
         state=state,
         clock=now,
-        database=database if delivery is not None or retention is not None else None,
+        database=database,
         delivery=delivery,
         reconciliation=reconciliation,
         retention=retention,
+        notifications=notification_worker,
+        notification_outbox=notification_outbox,
+        notification_user_ids=tuple(human_roles),
         provider_sessions=provider_sessions,
+        storage_maintenance=storage_maintenance,
     )
     if mcp is not None and provider_sessions is not None:
         _attach_provider_lifespan(mcp.app, provider_sessions, state, now)
-    if web is not None and (provider_sessions is not None or retention is not None):
+    if web is not None:
         _attach_production_worker_lifespan(web, workers)
 
     def production_health_probe() -> bool:
@@ -1035,6 +1162,7 @@ def build_production_runtime(
         heartbeat_age = now() - maintenance.updated_at
         return (
             maintenance.state == "ready"
+            and "storage_ready" not in status.missing_prerequisites
             and "workers_ready" not in status.missing_prerequisites
             and (provider_sessions is None or provider_sessions.active)
             and 0 <= heartbeat_age <= workers.heartbeat_lease_seconds
@@ -1145,6 +1273,7 @@ def _assemble_production_web(
     approvals: ApprovalStateMachine,
     reviewer: EncryptedPayloadReviewer,
     policy_promotions: SQLitePolicyPromotionBoundary,
+    authorized_users: Mapping[str, str],
     clock: Callable[[], int],
 ) -> FastAPI:
     sessions = SessionManager(
@@ -1202,6 +1331,7 @@ def _assemble_production_web(
     backend = PersistentWebBackend(
         database,
         authorized_user_id=config.owner_user_id,
+        authorized_users=authorized_users,
         sessions=sessions,
         passwords=passwords,
         totp=totp,
@@ -1227,6 +1357,43 @@ def _assemble_production_web(
     )
     web.add_middleware(TrustedProxySourceMiddleware)
     return web
+
+
+def _production_human_roles(database: Database, owner_user_id: str) -> dict[str, str]:
+    users: dict[str, str] = {}
+    with database.read() as connection:
+        setup_exists = (
+            connection.execute("SELECT 1 FROM production_setup_state WHERE state_id = 1").fetchone()
+            is not None
+        )
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(production_users)").fetchall()
+        }
+        if "role" in columns:
+            rows = connection.execute(
+                """
+                SELECT user_id, role FROM production_users
+                WHERE state IN ('staged', 'active')
+                ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, user_id
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT user_id, 'owner' AS role FROM production_users
+                WHERE state IN ('staged', 'active') ORDER BY user_id
+                """
+            ).fetchall()
+    if not setup_exists:
+        users[owner_user_id] = "owner"
+    for row in rows:
+        users[str(row["user_id"])] = str(row["role"])
+    if setup_exists and owner_user_id not in users:
+        raise ProductionAssemblyError(
+            "durable production owner is not an authorized production user"
+        )
+    return users
 
 
 def _snapshot_pre_migration_backup(backup_dir: Path) -> PreMigrationBackup:
@@ -1269,7 +1436,11 @@ def _service_inventory(
             config.web_host,
             config.web_port,
         ),
-        ProductionServiceRecord("maintenance", "maintenance", "blocked"),
+        ProductionServiceRecord(
+            "maintenance",
+            "maintenance",
+            "blocked",
+        ),
         ProductionServiceRecord("delivery", "worker", "blocked"),
         ProductionServiceRecord("reconciliation", "worker", "blocked"),
         ProductionServiceRecord("retention", "worker", "blocked"),
@@ -1381,6 +1552,11 @@ def _owned_runtime_database(config_path: Path) -> tuple[ProductionConfig, Databa
         validate_active_database_runtime_ownership(
             config.storage.database_path.parent,
             setup_id=journal.setup_id,
+            instance_root=config.instance_root or config_path.parent,
+            require_external_storage=(
+                config.instance_root is not None
+                and config.storage.data_dir != config.instance_root / "data"
+            ),
         )
     )
     return config, Database(

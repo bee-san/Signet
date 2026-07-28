@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
-from collections.abc import Mapping
+import sqlite3
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from signet import notification_outbox as notification_outbox_module
+from signet.admission import QueueAdmissionLimits
 from signet.db import Database
 from signet.models import EnqueueRequest
 from signet.notification_outbox import (
@@ -22,6 +27,7 @@ from signet.notifications import (
     PushMessage,
     PushSubscription,
 )
+from signet.production import ProductionDisabledPushTransport
 from signet.state_machine import ApprovalStateMachine
 
 NOW = 1_900_000_000
@@ -297,6 +303,59 @@ async def test_worker_retries_only_failed_devices_and_never_loses_total_outage(
     assert [item[0] for item in deliveries] == ["push_ok", "push_retry"]
 
 
+@pytest.mark.asyncio
+async def test_disabled_production_push_defers_without_disabling_subscriptions(
+    database: Database,
+) -> None:
+    repository = InMemoryPushRepository()
+    repository.save(
+        PushSubscription(
+            subscription_id="push_preserved",
+            user_id="human",
+            endpoint="https://push.example.test/preserved",
+            p256dh=_encoded(b"\x04" + b"p" * 64),
+            auth=_encoded(b"a" * 16),
+            device_label="Preserved device",
+            categories=frozenset(),
+            created_at=NOW,
+        )
+    )
+    outbox = SQLiteNotificationOutbox(database)
+    outbox.enqueue(
+        dedupe_key="new_pending:push-disabled",
+        user_id="human",
+        message=PushMessage(
+            NotificationKind.NEW_PENDING,
+            service="Fastmail",
+            action="send_email",
+        ),
+        created_at=NOW,
+    )
+    worker = NotificationOutboxWorker(
+        outbox,
+        NotificationDispatcher(repository, ProductionDisabledPushTransport()),
+        worker_id="push-disabled-worker",
+        retry_base_seconds=5,
+    )
+
+    now = NOW
+    for attempt in range(6):
+        report = await worker.run_due(now=now)
+        assert (report.delivered, report.deferred) == (0, 1)
+        now += 5 * (1 << attempt)
+
+    preserved = repository.get("push_preserved")
+    assert preserved is not None
+    assert preserved.failure_count == 0
+    assert preserved.disabled_at is None
+    with database.read() as connection:
+        intent = connection.execute(
+            "SELECT delivered_at, last_error FROM notification_outbox"
+        ).fetchone()
+    assert intent["delivered_at"] is None
+    assert intent["last_error"] == "push_transport_unavailable"
+
+
 def test_expiry_and_daily_schedulers_are_idempotent(database: Database) -> None:
     machine = ApprovalStateMachine(database)
     machine.enqueue(_request("req_DueSoon", expires_at=NOW + 30))
@@ -331,6 +390,265 @@ def test_expiry_and_daily_schedulers_are_idempotent(database: Database) -> None:
         intent for intent in claimed if intent.message.kind is NotificationKind.DAILY_DIGEST
     )
     assert digest.message.count == 2
+
+
+def test_expiry_scheduler_paginates_independently_for_every_user(database: Database) -> None:
+    machine = ApprovalStateMachine(database)
+    machine.enqueue(_request("req_DueFirst", expires_at=NOW + 30))
+    machine.enqueue(_request("req_DueSecond", expires_at=NOW + 45))
+    outbox = SQLiteNotificationOutbox(database)
+
+    for user_id in ("user:owner", "user:approver"):
+        assert (
+            outbox.schedule_approaching_expiry(
+                user_id=user_id,
+                now=NOW,
+                horizon_seconds=60,
+                limit=1,
+            )
+            == 1
+        )
+        assert (
+            outbox.schedule_approaching_expiry(
+                user_id=user_id,
+                now=NOW,
+                horizon_seconds=60,
+                limit=1,
+            )
+            == 1
+        )
+        assert (
+            outbox.schedule_approaching_expiry(
+                user_id=user_id,
+                now=NOW,
+                horizon_seconds=60,
+                limit=1,
+            )
+            == 0
+        )
+
+    claimed = outbox.claim_due(worker_id="scheduler-pagination-test", now=NOW)
+    expiry_intents = [
+        intent for intent in claimed if intent.message.kind is NotificationKind.APPROACHING_EXPIRY
+    ]
+    assert len(expiry_intents) == 4
+    assert {intent.user_id for intent in expiry_intents} == {"user:owner", "user:approver"}
+
+
+def test_expiry_scheduler_honors_legacy_dedupe_for_its_original_recipient(
+    database: Database,
+) -> None:
+    machine = ApprovalStateMachine(database)
+    machine.enqueue(_request("req_LegacyExpiry", expires_at=NOW + 30))
+    outbox = SQLiteNotificationOutbox(database)
+    outbox.enqueue(
+        dedupe_key="approaching_expiry:req_LegacyExpiry:1",
+        user_id="user:owner",
+        message=PushMessage(
+            NotificationKind.APPROACHING_EXPIRY,
+            service="fastmail",
+            action="send_email",
+        ),
+        request_id="req_LegacyExpiry",
+        created_at=NOW,
+    )
+
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 0
+    )
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:approver",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 1
+    )
+
+
+def test_expiry_scheduler_bounds_dedupe_keys_for_long_valid_request_ids(
+    database: Database,
+) -> None:
+    request_id = "r" * 450
+    ApprovalStateMachine(database).enqueue(_request(request_id, expires_at=NOW + 30))
+    outbox = SQLiteNotificationOutbox(database)
+
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 1
+    )
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 0
+    )
+    with database.read() as connection:
+        dedupe_key = str(
+            connection.execute(
+                "SELECT dedupe_key FROM notification_outbox WHERE kind = 'approaching_expiry'"
+            ).fetchone()[0]
+        )
+    assert len(dedupe_key) <= 512
+
+
+def test_expiry_scheduler_disambiguates_overlapping_legacy_namespaces(
+    database: Database,
+) -> None:
+    user_id = "user:owner"
+    user_hash = hashlib.sha256(user_id.encode()).hexdigest()
+    legacy_request_id = f"{user_hash}:req_Other"
+    machine = ApprovalStateMachine(database)
+    machine.enqueue(_request(legacy_request_id, expires_at=NOW + 30))
+    machine.enqueue(_request("req_Other", expires_at=NOW + 30))
+    outbox = SQLiteNotificationOutbox(database)
+    outbox.enqueue(
+        dedupe_key=f"approaching_expiry:{legacy_request_id}:1",
+        user_id=user_id,
+        message=PushMessage(
+            NotificationKind.APPROACHING_EXPIRY,
+            service="fastmail",
+            action="send_email",
+        ),
+        request_id=legacy_request_id,
+        created_at=NOW,
+    )
+
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id=user_id,
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 1
+    )
+    with database.read() as connection:
+        request_ids = {
+            str(row["request_id"])
+            for row in connection.execute(
+                "SELECT request_id FROM notification_outbox WHERE kind = 'approaching_expiry'"
+            ).fetchall()
+        }
+    assert request_ids == {legacy_request_id, "req_Other"}
+
+
+def test_expiry_scheduler_v2_namespace_cannot_collide_with_legacy_request_ids(
+    database: Database,
+) -> None:
+    user_id = "user:owner"
+    target_request_id = "req_Target"
+    target_key = notification_outbox_module._expiry_dedupe_key(user_id, target_request_id, 1)
+    digest = target_key.split(":")[-2]
+    legacy_request_id = f"v2:{digest}"
+    legacy_key = f"approaching_expiry:{legacy_request_id}:1"
+    assert target_key != legacy_key
+    machine = ApprovalStateMachine(database)
+    machine.enqueue(_request(legacy_request_id, expires_at=NOW + 30))
+    machine.enqueue(_request(target_request_id, expires_at=NOW + 30))
+    outbox = SQLiteNotificationOutbox(database)
+    outbox.enqueue(
+        dedupe_key=legacy_key,
+        user_id=user_id,
+        message=PushMessage(
+            NotificationKind.APPROACHING_EXPIRY,
+            service="fastmail",
+            action="send_email",
+        ),
+        request_id=legacy_request_id,
+        created_at=NOW,
+    )
+
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id=user_id,
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 1
+    )
+    with database.read() as connection:
+        target_rows = int(
+            connection.execute(
+                "SELECT count(*) FROM notification_outbox WHERE request_id = ?",
+                (target_request_id,),
+            ).fetchone()[0]
+        )
+    assert target_rows == 1
+
+
+def test_expiry_scheduler_excludes_existing_v2_rows_before_bounded_pagination(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine = ApprovalStateMachine(
+        database,
+        admission_limits=QueueAdmissionLimits(
+            queue_limit=300,
+            origin_pending_limit=300,
+            tool_pending_limit=300,
+            minimum_free_bytes=0,
+        ),
+    )
+    for index in range(257):
+        machine.enqueue(_request(f"req_Existing{index:03d}", expires_at=NOW + 30))
+    outbox = SQLiteNotificationOutbox(database)
+    transaction_count = 0
+    original_transaction = database.transaction
+
+    @contextmanager
+    def counting_transaction() -> Iterator[sqlite3.Connection]:
+        nonlocal transaction_count
+        transaction_count += 1
+        with original_transaction() as connection:
+            yield connection
+
+    monkeypatch.setattr(database, "transaction", counting_transaction)
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+            limit=1_000,
+        )
+        == 257
+    )
+    assert transaction_count == 2
+
+    machine.enqueue(_request("req_ZLater", expires_at=NOW + 30))
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+            limit=1,
+        )
+        == 1
+    )
+
+    def unexpected_enqueue(*_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("existing v2 rows must be excluded by the bounded query")
+
+    monkeypatch.setattr(notification_outbox_module, "enqueue_notification", unexpected_enqueue)
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+            limit=1,
+        )
+        == 0
+    )
 
 
 def test_state_enqueue_and_notification_intent_commit_or_rollback_together(

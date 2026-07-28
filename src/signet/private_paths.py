@@ -96,6 +96,39 @@ def revalidate_directory_identity(
     return current.path
 
 
+def open_directory_with_stable_ancestry(path: Path) -> int:
+    """Open one canonical directory without following or trusting unstable path edges.
+
+    The caller owns the returned descriptor and must close it. The final
+    directory's relationship to a selected child remains caller-specific.
+    """
+
+    selected = Path(path)
+    try:
+        encoded = os.fsencode(selected)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise PrivatePathError("directory path contains an invalid component") from exc
+    if not selected.is_absolute() or not encoded or b"\x00" in encoded or ".." in selected.parts:
+        raise PrivatePathError("directory path must be absolute and canonical")
+    descriptor = -1
+    try:
+        descriptor = _open_with_stable_ancestry(selected, create=False)
+        before = selected.lstat()
+        resolved = selected.resolve(strict=True)
+        opened = os.fstat(descriptor)
+        if resolved != selected or not _same_directory(before, opened):
+            raise PrivatePathError("directory ancestry is unavailable or unsafe")
+        return descriptor
+    except PrivatePathError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise PrivatePathError("directory ancestry is unavailable or unsafe") from exc
+
+
 def require_no_acl_grants(descriptor: int) -> None:
     """Reject macOS ALLOW entries while preserving ACLs that only restrict access."""
 

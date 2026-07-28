@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import inspect
 import json
@@ -92,6 +93,7 @@ class ApprovalStateMachine:
         web_session_idle_timeout: int = 30 * 60,
         capabilities: ProofCapability | None = None,
         notification_user_id: str | None = None,
+        notification_user_ids: tuple[str, ...] | None = None,
         admission_limits: QueueAdmissionLimits | None = None,
         free_space_provider: Callable[[str], int] | None = None,
     ) -> None:
@@ -108,13 +110,18 @@ class ApprovalStateMachine:
         if free_space_provider is not None and not callable(free_space_provider):
             raise TypeError("free-space provider must be callable")
         self._free_space_provider = free_space_provider or _filesystem_free_bytes
-        self._notification_user_id = (
-            canonical_user_id(notification_user_id) if notification_user_id is not None else None
+        if notification_user_id is not None and notification_user_ids is not None:
+            raise ValueError("notification users must use one configuration form")
+        selected_notification_users = notification_user_ids or (
+            (notification_user_id,) if notification_user_id is not None else ()
+        )
+        self._notification_user_ids = tuple(
+            dict.fromkeys(canonical_user_id(user_id) for user_id in selected_notification_users)
         )
 
     @property
     def notifications_enabled(self) -> bool:
-        return self._notification_user_id is not None
+        return bool(self._notification_user_ids)
 
     def enqueue(
         self,
@@ -2310,16 +2317,20 @@ class ApprovalStateMachine:
         now: int,
         dedupe_key: str,
     ) -> None:
-        if self._notification_user_id is None:
-            return
-        enqueue_notification(
-            connection,
-            dedupe_key=dedupe_key,
-            user_id=self._notification_user_id,
-            message=PushMessage(kind, service=service, action=action),
-            request_id=request_id,
-            created_at=now,
-        )
+        for index, user_id in enumerate(self._notification_user_ids):
+            selected_dedupe_key = (
+                dedupe_key
+                if index == 0
+                else f"{dedupe_key}:{hashlib.sha256(user_id.encode('utf-8')).hexdigest()[:12]}"
+            )
+            enqueue_notification(
+                connection,
+                dedupe_key=selected_dedupe_key,
+                user_id=user_id,
+                message=PushMessage(kind, service=service, action=action),
+                request_id=request_id,
+                created_at=now,
+            )
 
     @staticmethod
     def _event(

@@ -3,15 +3,27 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import signet.production as production_module
+import signet.setup_cli as setup_cli
+import signet.setup_platform as setup_platform
+import signet.setup_state as setup_state
 from signet.app import _parser, main
-from signet.setup_cli import _discover_hermes_profiles, run_setup_command, setup_error_message
+from signet.canonical import canonical_json
+from signet.setup_cli import (
+    _SETUP_PLAN_ID_PLACEHOLDER,
+    _discover_hermes_profiles,
+    _discover_tailscale_origin,
+    run_setup_command,
+    setup_error_message,
+)
 from signet.setup_platform import render_production_config
 from signet.setup_state import SETUP_STEPS, SetupError, SetupSpec
 
@@ -33,6 +45,36 @@ class FakePlatform:
         del spec, setup_id
 
 
+def test_runtime_closure_digest_tracks_the_package_and_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "signet"
+    package.mkdir(mode=0o700)
+    module = package / "setup_cli.py"
+    module.write_text("VERSION = 1\n", encoding="utf-8")
+    module.chmod(0o600)
+    monkeypatch.setattr(setup_cli, "__file__", str(module))
+
+    before = setup_cli._runtime_closure_document()
+    module.write_text("VERSION = 2\n", encoding="utf-8")
+    after = setup_cli._runtime_closure_document()
+
+    assert before["package_root"] == str(package)
+    assert before["package_file_count"] == 1
+    assert before["package_sha256"] != after["package_sha256"]
+    assert before["interpreter"]["path"] == str(Path(setup_cli.sys.executable).resolve())
+    assert len(str(before["interpreter"]["sha256"])) == 64
+
+
+def _installed_test_executable(tmp_path: Path) -> Path:
+    executable = tmp_path / "bin" / "signet"
+    executable.parent.mkdir(mode=0o700)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    return executable
+
+
 def test_profile_discovery_includes_the_hermes_default_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -43,6 +85,43 @@ def test_profile_discovery_includes_the_hermes_default_profile(
     monkeypatch.setenv("HOME", str(home))
 
     assert _discover_hermes_profiles() == ["default", "work"]
+
+
+def test_origin_discovery_uses_an_absolute_command_and_clean_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reviewed_tailscale = tmp_path / "commands" / "tailscale"
+    reviewed_tailscale.parent.mkdir(mode=0o700)
+    reviewed_tailscale.write_bytes(b"#!/bin/sh\nexit 0\n")
+    reviewed_tailscale.chmod(0o700)
+    monkeypatch.setattr(
+        setup_platform,
+        "_REVIEWED_COMMAND_CANDIDATES",
+        {"tailscale": (reviewed_tailscale,)},
+    )
+    monkeypatch.setattr(setup_platform, "_REVIEWED_COMMAND_OWNER_UID", os.geteuid())
+    observed: dict[str, Any] = {}
+
+    def run(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        observed.update(command=command, **kwargs)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"Self": {"DNSName": "node.example.ts.net."}}),
+        )
+
+    monkeypatch.setenv("PYTHONPATH", "/tmp/hostile")
+    monkeypatch.setattr("signet.setup_cli.subprocess.run", run)
+
+    assert _discover_tailscale_origin() == "https://node.example.ts.net:8443"
+    assert Path(observed["command"][0]).is_absolute()
+    assert Path(observed["command"][0]).name.casefold() == "tailscale"
+    assert observed["env"] == {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+    assert observed["cwd"] == "/"
 
 
 @pytest.mark.parametrize(
@@ -89,8 +168,8 @@ def test_top_level_help_documents_plan_defaults_and_stable_exit_codes() -> None:
     assert "manage plan, apply, roll back, or inspect Signet services" in help_text
     assert "backup plan or apply a verified encrypted backup" in help_text
     assert (
-        "Exit status: 0 on success; 2 for invalid input, safety refusal, or incomplete work"
-        in help_text
+        "Exit status: 0 on success; 1 when doctor finds unhealthy checks; 2 for invalid input, "
+        "safety refusal, or incomplete work" in help_text
     )
 
 
@@ -250,6 +329,9 @@ def test_setup_plan_is_json_and_does_not_create_state(tmp_path: Path) -> None:
     document = json.loads("\n".join(output))
     assert document["provider_rollout"] == "disabled"
     assert document["policy_mode"] == "approval"
+    assert document["data_root"] == str(root / "data")
+    assert document["backup_root"] == str(root / "backups")
+    assert document["data_device"] is None
     assert document["steps"] == list(SETUP_STEPS)
     assert document["owner_setup_url"] == "https://signet.example/setup"
     assert document["automatic_steps"] == list(SETUP_STEPS[:-1])
@@ -262,7 +344,423 @@ def test_setup_plan_is_json_and_does_not_create_state(tmp_path: Path) -> None:
         "read_only_discovery",
         "live_send",
     ]
+    assert document["next_commands"] == [
+        f"signet setup --root {root} --origin https://signet.example --owner user:owner "
+        "--profile personal --policy-mode approval --executable /opt/signet/bin/signet "
+        f"--apply {document['plan_id']}"
+    ]
     assert not root.exists()
+
+
+def test_setup_apply_requires_the_exact_reviewed_plan_id(tmp_path: Path) -> None:
+    args = _parser().parse_args(
+        [
+            "setup",
+            "--root",
+            str(tmp_path / "signet"),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            "/opt/signet/bin/signet",
+            "--apply",
+            "0" * 64,
+        ]
+    )
+
+    with pytest.raises(SetupError, match="plan no longer matches"):
+        run_setup_command(args, output=lambda _: None, platform=FakePlatform())
+
+    args.apply = "é" * 64
+    with pytest.raises(SetupError, match="plan ID must be"):
+        run_setup_command(args, output=lambda _: None, platform=FakePlatform())
+
+
+@pytest.mark.parametrize(
+    "changed_effect",
+    ("service", "configuration", "steps", "executable_identity"),
+)
+def test_setup_apply_rejects_changed_displayed_plan_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_effect: str,
+) -> None:
+    root = tmp_path / "signet"
+    executable = _installed_test_executable(tmp_path)
+    parser = _parser()
+    common = [
+        "--root",
+        str(root),
+        "--origin",
+        "https://signet.example",
+        "--profile",
+        "personal",
+        "--executable",
+        str(executable),
+    ]
+    plan_output: list[str] = []
+    assert (
+        run_setup_command(
+            parser.parse_args(["setup", "--plan", *common]),
+            output=plan_output.append,
+            platform=FakePlatform(),
+        )
+        == 0
+    )
+    plan_id = json.loads(plan_output[-1])["plan_id"]
+
+    if changed_effect == "service":
+        original = setup_cli.render_systemd_services
+
+        def changed_services(
+            selected: SetupSpec,
+            *,
+            active: bool = False,
+        ) -> dict[str, str]:
+            rendered = original(selected, active=active)
+            rendered["signet-web.service"] += "# reviewed effect changed\n"
+            return rendered
+
+        monkeypatch.setattr(setup_cli, "render_systemd_services", changed_services)
+    elif changed_effect == "configuration":
+        original_configuration = setup_cli.render_setup_configuration_files
+
+        def changed_configuration(
+            selected: SetupSpec,
+            *,
+            setup_id: str,
+        ) -> dict[Path, bytes]:
+            rendered = original_configuration(selected, setup_id=setup_id)
+            config_path, _policy_path = setup_cli.setup_configuration_targets(selected)
+            rendered[config_path] += b" "
+            return rendered
+
+        monkeypatch.setattr(
+            setup_cli,
+            "render_setup_configuration_files",
+            changed_configuration,
+        )
+    elif changed_effect == "steps":
+        monkeypatch.setattr(
+            setup_state,
+            "SETUP_STEPS",
+            ("preflight-v2", *setup_state.SETUP_STEPS[1:]),
+        )
+    else:
+        executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+
+    platform = FakePlatform()
+    with pytest.raises(SetupError, match="plan no longer matches"):
+        run_setup_command(
+            parser.parse_args(["setup", *common, "--apply", plan_id]),
+            output=lambda _: None,
+            platform=platform,
+        )
+
+    assert platform.applied == []
+    assert not root.exists()
+    assert not (root.parent / f"{root.name}-recovery").exists()
+
+
+def test_setup_plan_binds_browser_behavior_separately_from_the_setup_spec(
+    tmp_path: Path,
+) -> None:
+    parser = _parser()
+    common = [
+        "setup",
+        "--plan",
+        "--root",
+        str(tmp_path / "signet"),
+        "--origin",
+        "https://signet.example",
+        "--profile",
+        "personal",
+        "--executable",
+        "/opt/signet/bin/signet",
+    ]
+    opened_output: list[str] = []
+    closed_output: list[str] = []
+
+    assert (
+        run_setup_command(
+            parser.parse_args(common),
+            output=opened_output.append,
+            platform=FakePlatform(),
+        )
+        == 0
+    )
+    assert (
+        run_setup_command(
+            parser.parse_args([*common, "--no-open-browser"]),
+            output=closed_output.append,
+            platform=FakePlatform(),
+        )
+        == 0
+    )
+    opened = json.loads(opened_output[-1])
+    closed = json.loads(closed_output[-1])
+
+    assert opened["setup_spec_digest"] == closed["setup_spec_digest"]
+    assert opened["plan_id"] != closed["plan_id"]
+
+
+def test_setup_apply_accepts_the_recomputed_complete_plan_payload(tmp_path: Path) -> None:
+    root = tmp_path / "signet"
+    parser = _parser()
+    common = [
+        "--root",
+        str(root),
+        "--origin",
+        "https://signet.example",
+        "--profile",
+        "personal",
+        "--executable",
+        str(_installed_test_executable(tmp_path)),
+    ]
+    output: list[str] = []
+    assert (
+        run_setup_command(
+            parser.parse_args(["setup", "--plan", *common]),
+            output=output.append,
+            platform=FakePlatform(),
+        )
+        == 0
+    )
+    plan_id = json.loads(output[-1])["plan_id"]
+    platform = FakePlatform()
+
+    assert (
+        run_setup_command(
+            parser.parse_args(["setup", *common, "--apply", plan_id]),
+            output=lambda _: None,
+            platform=platform,
+        )
+        == 0
+    )
+    assert platform.applied == list(SETUP_STEPS)
+
+
+def test_setup_apply_rejects_an_unbound_missing_executable(tmp_path: Path) -> None:
+    root = tmp_path / "signet"
+    executable = tmp_path / "missing-signet"
+    parser = _parser()
+    plan_args = parser.parse_args(
+        [
+            "setup",
+            "--plan",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            str(executable),
+        ]
+    )
+    output: list[str] = []
+    assert run_setup_command(plan_args, output=output.append, platform=FakePlatform()) == 0
+    plan_id = json.loads("\n".join(output))["plan_id"]
+    apply_args = parser.parse_args(
+        [
+            "setup",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            str(executable),
+            "--apply",
+            plan_id,
+        ]
+    )
+
+    with pytest.raises(SetupError, match="must exist before apply"):
+        run_setup_command(apply_args, output=lambda _: None, platform=FakePlatform())
+
+    assert not root.exists()
+
+
+def test_setup_plan_records_external_storage_paths_and_device(tmp_path: Path) -> None:
+    root = tmp_path / "signet"
+    data_root = tmp_path / "external-data"
+    backup_root = tmp_path / "external-backups"
+    data_root.mkdir(mode=0o700)
+    backup_root.mkdir(mode=0o700)
+    args = _parser().parse_args(
+        [
+            "setup",
+            "--plan",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            "/opt/signet/bin/signet",
+            "--data-root",
+            str(data_root),
+            "--backup-root",
+            str(backup_root),
+        ]
+    )
+    output: list[str] = []
+
+    assert run_setup_command(args, output=output.append, platform=FakePlatform()) == 0
+    document = json.loads("\n".join(output))
+    assert document["data_root"] == str(data_root)
+    assert document["backup_root"] == str(backup_root)
+    assert document["data_device"] == data_root.stat().st_dev
+
+
+def test_setup_plan_resolves_a_pipx_launcher_and_binds_reviewable_effects(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "signet"
+    environment = tmp_path / "pipx" / "venvs" / "signet-gateway"
+    executable = environment / "bin" / "signet"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    launcher = tmp_path / "pipx" / "bin" / "signet"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(executable)
+    args = _parser().parse_args(
+        [
+            "setup",
+            "--plan",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            str(launcher),
+        ]
+    )
+    output: list[str] = []
+
+    assert run_setup_command(args, output=output.append, platform=FakePlatform()) == 0
+    document = json.loads("\n".join(output))
+
+    assert document["setup_spec_digest"] != document["plan_id"]
+    payload = dict(document)
+    plan_id = payload.pop("plan_id")
+    apply_command = shlex.split(payload["next_commands"][0])
+    assert apply_command[-2:] == ["--apply", plan_id]
+    apply_command[-1] = _SETUP_PLAN_ID_PLACEHOLDER
+    payload["next_commands"] = [shlex.join(apply_command)]
+    assert hashlib.sha256(canonical_json(payload)).hexdigest() == plan_id
+    assert document["executable"] == {
+        "path": str(executable.resolve()),
+        "device": executable.stat().st_dev,
+        "inode": executable.stat().st_ino,
+        "size": executable.stat().st_size,
+        "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+    }
+    assert document["storage_limits"] == {
+        "attachments_hard_bytes": 8 * 1024**3,
+        "backups_hard_bytes": 8 * 1024**3,
+        "cache_hard_bytes": 1024**3,
+        "database_hard_bytes": 1024**3,
+        "logs_hard_bytes": 512 * 1024**2,
+        "minimum_free_bytes": 1024**3 + 100 * 1024**2 + 25 * 1024**2,
+        "staging_hard_bytes": 50 * 1024**2,
+    }
+    assert set(document["service_effects"]) == {"launchd", "systemd"}
+    assert all(
+        "WantedBy=default.target" in effect["content"]
+        for effect in document["service_effects"]["systemd"].values()
+    )
+    assert document["configuration_files"] == [
+        str(root / "production.json"),
+        str(root / "policy.yaml"),
+    ]
+    assert set(document["configuration_effects"]) == set(document["configuration_files"])
+    assert (
+        document["configuration_effects"][str(root / "production.json")]["setup_id_normalized"]
+        is True
+    )
+    assert (
+        document["configuration_effects"][str(root / "policy.yaml")]["setup_id_normalized"] is False
+    )
+    assert document["rollback"] == {
+        "command": shlex.join(("signet", "setup", "--rollback", "--root", str(root))),
+        "preserves": ["verified_backups"],
+    }
+
+
+def test_setup_plan_derives_launcher_from_runtime_without_trusting_ambient_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_bin = tmp_path / "runtime" / "bin"
+    runtime_bin.mkdir(parents=True)
+    python = runtime_bin / "python"
+    python.write_bytes(b"runtime python")
+    python.chmod(0o700)
+    executable = runtime_bin / "signet"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+
+    hostile_bin = tmp_path / "hostile" / "bin"
+    hostile_bin.mkdir(parents=True)
+    hostile_executable = hostile_bin / "signet"
+    hostile_executable.write_bytes(b"#!/bin/sh\nexit 99\n")
+    hostile_executable.chmod(0o700)
+    monkeypatch.setattr("signet.setup_cli.sys.executable", str(python))
+    monkeypatch.setenv("PATH", str(hostile_bin))
+
+    args = _parser().parse_args(
+        [
+            "setup",
+            "--plan",
+            "--root",
+            str(tmp_path / "signet"),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+        ]
+    )
+    output: list[str] = []
+
+    assert run_setup_command(args, output=output.append, platform=FakePlatform()) == 0
+
+    document = json.loads(output[-1])
+    assert document["executable"]["path"] == str(executable)
+    assert document["executable"]["sha256"] == hashlib.sha256(executable.read_bytes()).hexdigest()
+
+
+def test_setup_plan_quotes_a_rollback_root_with_spaces(tmp_path: Path) -> None:
+    root = tmp_path / "root with spaces"
+    args = _parser().parse_args(
+        [
+            "setup",
+            "--plan",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            "/opt/signet/bin/signet",
+        ]
+    )
+    output: list[str] = []
+
+    assert run_setup_command(args, output=output.append, platform=FakePlatform()) == 0
+
+    document = json.loads(output[-1])
+    assert document["rollback"]["command"] == shlex.join(
+        ("signet", "setup", "--rollback", "--root", str(root))
+    )
 
 
 def test_setup_resume_restores_selected_policy_mode(tmp_path: Path) -> None:
@@ -281,7 +779,7 @@ def test_setup_resume_restores_selected_policy_mode(tmp_path: Path) -> None:
             "--policy-mode",
             "approval_with_edit",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
@@ -307,7 +805,7 @@ def test_setup_resume_merges_explicit_policy_with_persisted_spec(tmp_path: Path)
             "--policy-mode",
             "approval",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
@@ -341,7 +839,7 @@ def test_setup_resume_treats_pre_policy_journal_as_deny(tmp_path: Path) -> None:
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
@@ -349,6 +847,50 @@ def test_setup_resume_treats_pre_policy_journal_as_deny(tmp_path: Path) -> None:
     journal_path = root / ".setup-journal.json"
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     journal["spec"].pop("policy_mode")
+    digest_document = dict(journal["spec"])
+    digest_document.pop("open_browser")
+    legacy_digest = hashlib.sha256(
+        json.dumps(
+            digest_document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    journal["spec_digest"] = legacy_digest
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    owner_path = root / ".setup-owner.json"
+    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    owner["spec_digest"] = legacy_digest
+    owner_path.write_text(json.dumps(owner), encoding="utf-8")
+
+    resume_args = _parser().parse_args(["setup", "--yes", "--no-open-browser", "--root", str(root)])
+    assert run_setup_command(resume_args, output=lambda _: None, platform=platform) == 0
+
+
+def test_setup_resume_accepts_pre_storage_root_journal(tmp_path: Path) -> None:
+    root = tmp_path / "signet"
+    platform = FakePlatform()
+    apply_args = _parser().parse_args(
+        [
+            "setup",
+            "--yes",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            str(_installed_test_executable(tmp_path)),
+        ]
+    )
+    assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
+
+    journal_path = root / ".setup-journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    for field in ("data_root", "backup_root", "data_device"):
+        journal["spec"].pop(field)
     digest_document = dict(journal["spec"])
     digest_document.pop("open_browser")
     legacy_digest = hashlib.sha256(
@@ -387,7 +929,7 @@ def test_setup_apply_is_resumable_and_prints_reload_instruction(tmp_path: Path) 
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     output: list[str] = []
@@ -418,7 +960,7 @@ def test_setup_rollback_routes_database_removal_through_verified_purge(
             "--profile",
             "work",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
@@ -591,7 +1133,7 @@ def test_setup_apply_requires_confirmation_without_yes(tmp_path: Path) -> None:
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
 
@@ -616,7 +1158,7 @@ def test_setup_apply_prints_review_boundaries_before_confirmation(tmp_path: Path
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     events: list[tuple[str, str]] = []
@@ -666,7 +1208,7 @@ def test_authenticator_management_prints_exact_url_before_browser_open(tmp_path:
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(setup_args, output=lambda _: None, platform=platform) == 0
@@ -730,7 +1272,7 @@ def test_setup_failure_uses_stable_exit_code_and_actionable_redacted_recovery(
                 "--profile",
                 "personal",
                 "--executable",
-                "/opt/signet/bin/signet",
+                str(_installed_test_executable(tmp_path)),
             ]
         )
 
@@ -777,6 +1319,41 @@ def test_parent_traversal_setup_root_is_a_stable_usage_error(
 
     assert exited.value.code == 2
     assert "paths must be absolute lexical paths without '..'" in capsys.readouterr().err
+
+
+def test_doctor_returns_nonzero_when_any_check_is_unhealthy(tmp_path: Path) -> None:
+    class UnhealthyOperations:
+        def doctor(self) -> dict[str, object]:
+            return {
+                "healthy": False,
+                "checks": {
+                    "services": {
+                        "ok": False,
+                        "remediation": "Apply the reviewed restart plan.",
+                    }
+                },
+            }
+
+    args = _parser().parse_args(["doctor", "--root", str(tmp_path)])
+    output: list[str] = []
+
+    assert (
+        run_setup_command(
+            args,
+            output=output.append,
+            operations_factory=lambda *_args, **_kwargs: UnhealthyOperations(),
+        )
+        == 1
+    )
+    assert json.loads(output[-1])["healthy"] is False
+
+
+def test_installed_cli_reports_distribution_version(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exited:
+        main(["--version"])
+
+    assert exited.value.code == 0
+    assert capsys.readouterr().out == "signet 0.1.0b1\n"
 
 
 def test_internal_production_service_uses_installed_factory_and_restores_environment(
@@ -857,7 +1434,7 @@ def test_completed_setup_rollback_creates_backup_first(tmp_path: Path) -> None:
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
             "--yes",
         ]
     )

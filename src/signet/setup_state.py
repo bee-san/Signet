@@ -63,6 +63,34 @@ class SetupError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutableIdentity:
+    """Non-secret executable identity bound into a reviewed setup specification."""
+
+    device: int
+    inode: int
+    size: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in (self.device, self.inode, self.size)
+            )
+            or re.fullmatch(r"[0-9a-f]{64}", self.sha256) is None
+        ):
+            raise ValueError("Signet executable identity is invalid")
+
+    def document(self) -> dict[str, int | str]:
+        return {
+            "device": self.device,
+            "inode": self.inode,
+            "size": self.size,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class SetupSpec:
     root: Path
     public_origin: str
@@ -71,6 +99,10 @@ class SetupSpec:
     executable: Path
     open_browser: bool = True
     policy_mode: PolicyMode = "deny"
+    data_root: Path | None = None
+    backup_root: Path | None = None
+    data_device: int | None = None
+    executable_identity: ExecutableIdentity | None = None
 
     def __post_init__(self) -> None:
         if not self.root.is_absolute() or ".." in self.root.parts:
@@ -93,9 +125,35 @@ class SetupSpec:
             raise ValueError("setup requires unique valid Hermes profile names")
         if self.policy_mode not in {"deny", "direct", "approval", "approval_with_edit"}:
             raise ValueError("unsupported setup policy mode")
+        for label, path in (("data", self.data_root), ("backup", self.backup_root)):
+            if path is not None and (not path.is_absolute() or ".." in path.parts):
+                raise ValueError(f"setup {label} root must be an absolute lexical path")
+        if self.data_root is None and self.data_device is not None:
+            raise ValueError("setup data device identity requires an explicit data root")
+        if self.data_root is not None and (
+            not isinstance(self.data_device, int)
+            or isinstance(self.data_device, bool)
+            or self.data_device <= 0
+        ):
+            raise ValueError("an explicit data root requires its verified device identity")
+        storage_paths = (
+            self.data_dir,
+            self.backup_dir,
+            self.root / "restore",
+            self.root / "staging",
+            self.root / "attachments",
+            self.root / "cache",
+            self.root / "logs",
+        )
+        if len(set(storage_paths)) != len(storage_paths) or any(
+            left.is_relative_to(right) or right.is_relative_to(left)
+            for index, left in enumerate(storage_paths)
+            for right in storage_paths[index + 1 :]
+        ):
+            raise ValueError("setup storage roots must be distinct and non-overlapping")
 
     def document(self) -> dict[str, Any]:
-        return {
+        document: dict[str, Any] = {
             "root": str(self.root),
             "public_origin": self.public_origin,
             "owner_user_id": self.owner_user_id,
@@ -103,7 +161,21 @@ class SetupSpec:
             "executable": str(self.executable),
             "open_browser": self.open_browser,
             "policy_mode": self.policy_mode,
+            "data_root": None if self.data_root is None else str(self.data_root),
+            "backup_root": None if self.backup_root is None else str(self.backup_root),
+            "data_device": self.data_device,
         }
+        if self.executable_identity is not None:
+            document["executable_identity"] = self.executable_identity.document()
+        return document
+
+    @property
+    def data_dir(self) -> Path:
+        return self.data_root or self.root / "data"
+
+    @property
+    def backup_dir(self) -> Path:
+        return self.backup_root or self.root / "backups"
 
     @property
     def digest(self) -> str:
@@ -133,11 +205,88 @@ class SetupSpec:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @property
+    def legacy_storage_digest(self) -> str:
+        document = self.document()
+        document.pop("open_browser")
+        for field in ("data_root", "backup_root", "data_device"):
+            document.pop(field)
+        encoded = json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @property
+    def legacy_deny_storage_digest(self) -> str:
+        document = self.document()
+        document.pop("open_browser")
+        for field in ("policy_mode", "data_root", "backup_root", "data_device"):
+            document.pop(field)
+        encoded = json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def legacy_executable_identity_digest(self, *extra_fields: str) -> str:
+        document = self.document()
+        document.pop("open_browser")
+        document.pop("executable_identity", None)
+        for field in extra_fields:
+            document.pop(field)
+        encoded = json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class SetupPlanStep:
     name: str
     status: Literal["planned"] = "planned"
+
+
+def _accepted_spec_digests(spec: SetupSpec) -> set[str]:
+    accepted = {spec.digest}
+    uses_default_storage = (
+        spec.data_root is None and spec.backup_root is None and spec.data_device is None
+    )
+    if uses_default_storage:
+        accepted.add(spec.legacy_storage_digest)
+    if spec.policy_mode == "deny":
+        accepted.add(spec.legacy_deny_digest)
+        if uses_default_storage:
+            accepted.add(spec.legacy_deny_storage_digest)
+    if spec.executable_identity is not None:
+        accepted.add(spec.legacy_executable_identity_digest())
+        if uses_default_storage:
+            accepted.add(
+                spec.legacy_executable_identity_digest(
+                    "data_root",
+                    "backup_root",
+                    "data_device",
+                )
+            )
+        if spec.policy_mode == "deny":
+            accepted.add(spec.legacy_executable_identity_digest("policy_mode"))
+            if uses_default_storage:
+                accepted.add(
+                    spec.legacy_executable_identity_digest(
+                        "policy_mode",
+                        "data_root",
+                        "backup_root",
+                        "data_device",
+                    )
+                )
+    return accepted
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,9 +372,7 @@ class SetupJournalStore:
             raise SetupError("setup root is owned by a different setup specification")
         if self.owner_path.exists():
             owner = self._read_document(self.owner_path, label="setup owner marker")
-            accepted_digests = {spec.digest}
-            if spec.policy_mode == "deny":
-                accepted_digests.add(spec.legacy_deny_digest)
+            accepted_digests = _accepted_spec_digests(spec)
             expected_owners = (
                 {"version": 1, "setup_id": setup_id, "spec_digest": digest}
                 for digest in accepted_digests
@@ -249,9 +396,7 @@ class SetupJournalStore:
         if not self.owner_path.exists():
             return None
         owner = self._read_document(self.owner_path, label="setup owner marker")
-        accepted_digests = {spec.digest}
-        if spec.policy_mode == "deny":
-            accepted_digests.add(spec.legacy_deny_digest)
+        accepted_digests = _accepted_spec_digests(spec)
         setup_id = owner.get("setup_id")
         if (
             set(owner) != {"version", "setup_id", "spec_digest"}
@@ -428,10 +573,11 @@ class SetupJournalStore:
             or intent.get("version") != 1
             or not isinstance(setup_id, str)
             or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", setup_id) is None
-            or spec_digest != spec.digest
+            or spec_digest not in _accepted_spec_digests(spec)
         ):
             raise SetupError("setup owner creation intent is invalid")
-        temporary_name = self._owner_temporary_name(setup_id, spec.digest)
+        assert isinstance(spec_digest, str)
+        temporary_name = self._owner_temporary_name(setup_id, spec_digest)
         encoded_owner = self._encoded_document(intent)
         root_identity = require_private_directory_identity(self.root)
         parent_descriptor = -1
@@ -973,6 +1119,10 @@ class SetupEngine:
             journal.purge_backup = None
             self.store.save(journal)
         self.validate_private_paths(spec, journal=journal)
+        if journal.spec.get("executable_identity") is None and spec.executable_identity is not None:
+            journal.spec = spec.document()
+            journal.spec_digest = spec.digest
+            self.store.save(journal)
         if journal.status == "completed":
             try:
                 self.platform.apply("owner_bootstrap", spec, journal.setup_id)
@@ -1175,11 +1325,14 @@ class SetupEngine:
         persisted = dict(journal.spec)
         persisted.pop("open_browser", None)
         persisted.setdefault("policy_mode", "deny")
+        persisted.setdefault("data_root", None)
+        persisted.setdefault("backup_root", None)
+        persisted.setdefault("data_device", None)
         requested = spec.document()
         requested.pop("open_browser")
-        accepted_digests = {spec.digest}
-        if spec.policy_mode == "deny":
-            accepted_digests.add(spec.legacy_deny_digest)
+        if "executable_identity" not in persisted and "executable_identity" in requested:
+            persisted["executable_identity"] = requested["executable_identity"]
+        accepted_digests = _accepted_spec_digests(spec)
         if journal.spec_digest not in accepted_digests or persisted != requested:
             raise SetupError("setup journal belongs to a different setup specification")
 
