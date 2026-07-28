@@ -2099,6 +2099,22 @@ def test_production_runtime_accepts_a_durable_approver_user(
     ]
 
 
+def test_production_runtime_refuses_a_disabled_durable_owner(tmp_path: Path) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_users SET state = 'disabled' WHERE user_id = ?",
+            (config.owner_user_id,),
+        )
+
+    with pytest.raises(
+        ProductionAssemblyError,
+        match="not an authorized production user",
+    ):
+        build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 124)
+
+
 @pytest.mark.asyncio
 async def test_production_maintenance_worker_has_explicit_lifecycle(
     tmp_path: Path,

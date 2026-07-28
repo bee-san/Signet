@@ -222,7 +222,8 @@ class ProductionStateStore:
             authorized_users = {
                 str(row["user_id"]) for row in users if row["state"] in {"staged", "active"}
             }
-            authorized_users.add(config.owner_user_id)
+            if setup is None:
+                authorized_users.add(config.owner_user_id)
             authenticator_users = {
                 str(row["user_id"])
                 for row in connection.execute(

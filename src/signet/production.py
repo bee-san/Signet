@@ -1316,8 +1316,14 @@ def _assemble_production_web(
 
 
 def _production_human_roles(database: Database, owner_user_id: str) -> dict[str, str]:
-    users = {owner_user_id: "owner"}
+    users: dict[str, str] = {}
     with database.read() as connection:
+        setup_exists = (
+            connection.execute(
+                "SELECT 1 FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()
+            is not None
+        )
         columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(production_users)").fetchall()
@@ -1337,8 +1343,14 @@ def _production_human_roles(database: Database, owner_user_id: str) -> dict[str,
                 WHERE state IN ('staged', 'active') ORDER BY user_id
                 """
             ).fetchall()
+    if not setup_exists:
+        users[owner_user_id] = "owner"
     for row in rows:
         users[str(row["user_id"])] = str(row["role"])
+    if setup_exists and owner_user_id not in users:
+        raise ProductionAssemblyError(
+            "durable production owner is not an authorized production user"
+        )
     return users
 
 
