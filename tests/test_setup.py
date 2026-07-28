@@ -49,6 +49,7 @@ from signet.setup_platform import (
 )
 from signet.setup_state import (
     SETUP_STEPS,
+    ExecutableIdentity,
     SetupEngine,
     SetupError,
     SetupJournal,
@@ -128,6 +129,10 @@ def spec(root: Path, *, profiles: tuple[str, ...] = ("personal", "work")) -> Set
     )
 
 
+def _command_signature(command: list[str]) -> list[str]:
+    return [Path(command[0]).name.lower(), *command[1:]]
+
+
 def test_plan_is_read_only_and_defaults_providers_to_disabled(tmp_path: Path) -> None:
     selected = spec(tmp_path / "signet")
     plan = SetupEngine(SetupJournalStore(selected.root), FakePlatform()).plan(selected)
@@ -142,13 +147,34 @@ def test_plan_is_read_only_and_defaults_providers_to_disabled(tmp_path: Path) ->
     assert config["caller_principals"] == [
         {
             "namespace": "profile:personal",
+            "user_id": "user:owner",
             "allowed_aliases": ["approvals", "fastmail", "whatsapp"],
         },
         {
             "namespace": "profile:work",
+            "user_id": "user:owner",
             "allowed_aliases": ["approvals", "fastmail", "whatsapp"],
         },
     ]
+
+
+def test_setup_journal_adds_reviewed_executable_identity_on_legacy_resume(
+    tmp_path: Path,
+) -> None:
+    identity = ExecutableIdentity(device=1, inode=2, size=3, sha256="a" * 64)
+    selected = replace(spec(tmp_path / "legacy-executable-journal"), executable_identity=identity)
+    store = SetupJournalStore(selected.root)
+    engine = SetupEngine(store, FakePlatform())
+    engine.apply(selected)
+    journal = store.load()
+    journal.spec.pop("executable_identity")
+    journal.spec_digest = selected.legacy_executable_identity_digest()
+    store.save(journal)
+
+    resumed = engine.apply(selected)
+
+    assert resumed.spec["executable_identity"] == identity.document()
+    assert resumed.spec_digest == selected.digest
 
 
 def test_journal_read_refuses_a_path_replacement_race(
@@ -2129,6 +2155,8 @@ def test_no_open_browser_outputs_the_private_claim_handoff_without_opening() -> 
     assert output == [
         "Owner setup URL: https://signet.tailnet.example/setup",
         f"Private owner setup capability file: {handoff}",
+        "The one-time capability expires after 10 minutes. If it expires, rerun the same "
+        "signet setup command to issue a replacement without losing enrollment progress.",
     ]
     assert "secret-capability-value" not in "\n".join(output)
 
@@ -2298,12 +2326,54 @@ def test_browser_assisted_setup_prints_exact_url_before_opening_without_printing
         "sbc1.secret-capability-value",
         output=output,
         opener=opener,
+        handoff_path=Path("/private/setup-owner-capability"),
     )
 
     assert events[0] == ("output", "Owner setup URL: https://signet.tailnet.example/setup")
-    assert events[1][0] == "open"
-    assert events[1][1].startswith("https://signet.tailnet.example/setup#bootstrap=")
-    assert "secret-capability-value" not in events[0][1]
+    assert events[1] == (
+        "output",
+        "Private owner setup capability file: /private/setup-owner-capability",
+    )
+    assert events[2] == (
+        "output",
+        "The one-time capability expires after 10 minutes. If it expires, rerun the same "
+        "signet setup command to issue a replacement without losing enrollment progress.",
+    )
+    assert events[3] == ("open", "https://signet.tailnet.example/setup")
+    assert all("secret-capability-value" not in value for _kind, value in events)
+
+
+def test_service_manager_commands_use_absolute_paths_and_a_minimal_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONPATH", "/tmp/attacker")
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/tmp/attacker.dylib")
+    monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", "/tmp/attacker.json")
+
+    environment = ProductionSetupPlatform._service_manager_environment()
+
+    assert environment["LANG"] == environment["LC_ALL"] == "C"
+    assert "PYTHONPATH" not in environment
+    assert "DYLD_INSERT_LIBRARIES" not in environment
+    assert "SIGNET_PRODUCTION_CONFIG" not in environment
+    assert environment["PATH"] == "/usr/bin:/bin"
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    ProductionSetupPlatform(command_runner=run)._run_checked(
+        ["systemctl", "--user", "daemon-reload"],
+        "systemd reload failed",
+    )
+
+    command, kwargs = calls[0]
+    assert Path(command[0]).is_absolute()
+    assert Path(command[0]).name == "systemctl"
+    assert kwargs["env"] == environment
+    assert kwargs["cwd"] == "/"
 
 
 def test_service_rollback_failure_preserves_owned_units(
@@ -2528,18 +2598,18 @@ def test_service_install_management_status_and_rollback_are_platform_native(
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal services_active
         commands.append(command)
-        if command[0] == "launchctl":
+        if _command_signature(command)[0] == "launchctl":
             environment = kwargs.get("env")
             assert isinstance(environment, dict)
             assert environment["LC_ALL"] == "C"
             assert environment["LANG"] == "C"
-        if command[:2] == ["launchctl", "bootstrap"] or "enable" in command:
+        if _command_signature(command)[:2] == ["launchctl", "bootstrap"] or "enable" in command:
             services_active = True
-        elif command[:2] == ["launchctl", "bootout"] or "disable" in command:
+        elif _command_signature(command)[:2] == ["launchctl", "bootout"] or "disable" in command:
             services_active = False
-        elif command[:2] == ["launchctl", "kickstart"] or "restart" in command:
+        elif _command_signature(command)[:2] == ["launchctl", "kickstart"] or "restart" in command:
             services_active = True
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             label = command[-1].rsplit("/", 1)[-1]
             uid = command[-1].split("/", 2)[1]
             return subprocess.CompletedProcess(
@@ -2595,9 +2665,15 @@ def test_service_install_management_status_and_rollback_are_platform_native(
         target = home / "Library" / "LaunchAgents"
         assert not (target / "ai.hermes.signet.mcp.plist").exists()
         assert not (target / "ai.hermes.signet.web.plist").exists()
-        assert any(command[:2] == ["launchctl", "bootstrap"] for command in commands)
-        assert any(command[:2] == ["launchctl", "bootout"] for command in commands)
-        assert any(command[:2] == ["launchctl", "kickstart"] for command in commands)
+        assert any(
+            _command_signature(command)[:2] == ["launchctl", "bootstrap"] for command in commands
+        )
+        assert any(
+            _command_signature(command)[:2] == ["launchctl", "bootout"] for command in commands
+        )
+        assert any(
+            _command_signature(command)[:2] == ["launchctl", "kickstart"] for command in commands
+        )
     else:
         target = home / ".config" / "systemd" / "user"
         assert not (target / "signet-mcp.service").exists()
@@ -2664,7 +2740,7 @@ def test_launchd_service_stop_retry_tolerates_an_already_stopped_unit(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         nonlocal bootouts
-        if command[:2] == ["launchctl", "bootout"]:
+        if _command_signature(command)[:2] == ["launchctl", "bootout"]:
             bootouts += 1
             if bootouts == 1:
                 return subprocess.CompletedProcess(command, 3, "", "No such process")
@@ -3832,9 +3908,9 @@ def test_service_status_maps_tailscale_execution_failures_to_unavailable(
             path.chmod(0o600)
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        if command[0] == "tailscale":
+        if _command_signature(command)[0] == "tailscale":
             raise subprocess.TimeoutExpired(command, 15)
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -3886,7 +3962,7 @@ def test_service_entrypoints_refuse_units_without_ownership_plans(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -3926,7 +4002,7 @@ def test_launchd_start_paths_require_exact_target_bound_already_bootstrapped(
     )
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        assert command[:2] == ["launchctl", "bootstrap"]
+        assert _command_signature(command)[:2] == ["launchctl", "bootstrap"]
         environment = kwargs.get("env")
         assert isinstance(environment, dict)
         assert environment["LANG"] == environment["LC_ALL"] == "C"
@@ -4096,7 +4172,7 @@ def test_service_rollback_preserves_owned_units_when_manager_response_is_inconcl
             assert isinstance(environment, dict)
             assert environment["LC_ALL"] == "C"
             assert environment["LANG"] == "C"
-        if command[:2] == ["launchctl", "bootout"] or "disable" in command:
+        if _command_signature(command)[:2] == ["launchctl", "bootout"] or "disable" in command:
             if failure_stage == "stop":
                 detail = (
                     "service manager could not find service registry"
@@ -4105,7 +4181,7 @@ def test_service_rollback_preserves_owned_units_when_manager_response_is_inconcl
                 )
                 return subprocess.CompletedProcess(command, 1, "", detail)
             return subprocess.CompletedProcess(command, 0, "", "")
-        if command[:2] == ["launchctl", "print"] or "is-active" in command:
+        if _command_signature(command)[:2] == ["launchctl", "print"] or "is-active" in command:
             if failure_stage == "stop":
                 if platform_name == "darwin":
                     label = command[-1].rsplit("/", 1)[-1]
@@ -4149,13 +4225,13 @@ def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         nonlocal bootouts
-        if command[:2] == ["launchctl", "bootout"]:
+        if _command_signature(command)[:2] == ["launchctl", "bootout"]:
             bootouts += 1
             if bootouts == 2:
                 return subprocess.CompletedProcess(command, 1, "", "stop failed")
             if bootouts == 3:
                 return subprocess.CompletedProcess(command, 3, "", "No such process")
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             label = command[-1].rsplit("/", 1)[-1]
             uid = command[-1].split("/", 2)[1]
             return subprocess.CompletedProcess(
@@ -4201,7 +4277,7 @@ def test_launchd_rollback_retry_uses_the_verified_label_after_target_deletion(
     bootouts: list[list[str]] = []
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        if command[:2] == ["launchctl", "bootout"]:
+        if _command_signature(command)[:2] == ["launchctl", "bootout"]:
             bootouts.append(command)
             if len(command) == 4:
                 return subprocess.CompletedProcess(
@@ -4217,7 +4293,7 @@ def test_launchd_rollback_retry_uses_the_verified_label_after_target_deletion(
                 "",
                 f'Could not find service "{label}" in domain for user gui: {uid}',
             )
-        if command[:2] == ["launchctl", "print"]:
+        if _command_signature(command)[:2] == ["launchctl", "print"]:
             uid, label = command[-1].split("/", 2)[1:]
             return subprocess.CompletedProcess(
                 command,
@@ -5936,7 +6012,7 @@ def test_tailnet_apply_preserves_ambiguous_private_route_types_after_mutation(
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
         commands.append(command)
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6105,7 +6181,7 @@ def test_tailnet_apply_preserves_concurrent_route_drift_after_mutation(tmp_path:
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6160,7 +6236,7 @@ def test_tailnet_route_is_adopted_only_when_free_and_rolled_back_exactly(
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
         commands.append(command)
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6204,7 +6280,7 @@ def test_tailnet_route_normalizes_absent_and_empty_serve_states(tmp_path: Path) 
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6248,7 +6324,7 @@ def test_tailnet_rollback_resumes_after_restoring_the_pre_setup_snapshot(
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
         commands.append(command)
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {
@@ -6304,7 +6380,7 @@ def test_tailnet_rollback_verifies_the_exact_pre_setup_snapshot(tmp_path: Path) 
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
-        if command[:3] == ["tailscale", "serve", "status"]:
+        if _command_signature(command)[:3] == ["tailscale", "serve", "status"]:
             payload = state["serve"]
         elif "--bg" in command:
             state["serve"] = {

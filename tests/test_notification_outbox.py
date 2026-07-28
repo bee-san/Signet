@@ -22,6 +22,7 @@ from signet.notifications import (
     PushMessage,
     PushSubscription,
 )
+from signet.production import ProductionDisabledPushTransport
 from signet.state_machine import ApprovalStateMachine
 
 NOW = 1_900_000_000
@@ -295,6 +296,59 @@ async def test_worker_retries_only_failed_devices_and_never_loses_total_outage(
         ).fetchall()
     assert row["delivered_at"] == NOW + 5
     assert [item[0] for item in deliveries] == ["push_ok", "push_retry"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_production_push_defers_without_disabling_subscriptions(
+    database: Database,
+) -> None:
+    repository = InMemoryPushRepository()
+    repository.save(
+        PushSubscription(
+            subscription_id="push_preserved",
+            user_id="human",
+            endpoint="https://push.example.test/preserved",
+            p256dh=_encoded(b"\x04" + b"p" * 64),
+            auth=_encoded(b"a" * 16),
+            device_label="Preserved device",
+            categories=frozenset(),
+            created_at=NOW,
+        )
+    )
+    outbox = SQLiteNotificationOutbox(database)
+    outbox.enqueue(
+        dedupe_key="new_pending:push-disabled",
+        user_id="human",
+        message=PushMessage(
+            NotificationKind.NEW_PENDING,
+            service="Fastmail",
+            action="send_email",
+        ),
+        created_at=NOW,
+    )
+    worker = NotificationOutboxWorker(
+        outbox,
+        NotificationDispatcher(repository, ProductionDisabledPushTransport()),
+        worker_id="push-disabled-worker",
+        retry_base_seconds=5,
+    )
+
+    now = NOW
+    for attempt in range(6):
+        report = await worker.run_due(now=now)
+        assert (report.delivered, report.deferred) == (0, 1)
+        now += 5 * (1 << attempt)
+
+    preserved = repository.get("push_preserved")
+    assert preserved is not None
+    assert preserved.failure_count == 0
+    assert preserved.disabled_at is None
+    with database.read() as connection:
+        intent = connection.execute(
+            "SELECT delivered_at, last_error FROM notification_outbox"
+        ).fetchone()
+    assert intent["delivered_at"] is None
+    assert intent["last_error"] == "push_transport_unavailable"
 
 
 def test_expiry_and_daily_schedulers_are_idempotent(database: Database) -> None:

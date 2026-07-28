@@ -289,6 +289,48 @@ def test_production_config_digest_migrates_only_the_empty_caller_principal_prede
         )
 
 
+def test_production_config_digest_migrates_caller_human_binding(
+    tmp_path: Path,
+) -> None:
+    payload = _production_payload(tmp_path)
+    payload["caller_principals"] = [
+        {
+            "namespace": "profile:work",
+            "user_id": "user:owner",
+            "allowed_aliases": ["approvals"],
+        }
+    ]
+    config = ProductionConfig.model_validate(payload)
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor["caller_principals"][0].pop("user_id")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+
+    migrated = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+
+    with migrated.database.read() as connection:
+        assert connection.execute(
+            "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+        ).fetchone()["config_digest"] == production_config_digest(config)
+
+
 def test_production_config_digest_composes_empty_callers_with_legacy_predecessor(
     tmp_path: Path,
 ) -> None:
@@ -1473,7 +1515,7 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     assembly = build_production_runtime(config, secret_store=secret_store, clock=lambda: 123)
     status = assembly.status()
 
-    assert status.schema_version == 19
+    assert status.schema_version == 20
     assert assembly.authenticators.list_factors(config.owner_user_id) == ()
     assert status.setup_status == "staged"
     assert status.ready is False
@@ -1913,7 +1955,10 @@ def test_production_runtime_refuses_to_rebind_a_historical_auth_owner(
             ("user:historical-owner", 100),
         )
 
-    with pytest.raises(ProductionAssemblyError, match="authenticator owner differs"):
+    with pytest.raises(
+        ProductionAssemblyError,
+        match="authenticator user is not an authorized production user",
+    ):
         build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
 
 
@@ -2024,6 +2069,34 @@ def test_production_runtime_refuses_deleted_durable_identity_rows(
 
     with pytest.raises(ProductionAssemblyError, match="durable production"):
         build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 124)
+
+
+def test_production_runtime_accepts_a_durable_approver_user(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO production_users(user_id, role, state, created_at, updated_at)
+            VALUES ('user:approver', 'approver', 'active', 124, 124)
+            """
+        )
+        connection.execute(
+            "INSERT INTO auth_users(user_id, created_at) VALUES ('user:approver', 124)"
+        )
+
+    rebuilt = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 125)
+
+    with rebuilt.database.read() as connection:
+        users = connection.execute(
+            "SELECT user_id, role FROM production_users ORDER BY user_id"
+        ).fetchall()
+    assert [(row["user_id"], row["role"]) for row in users] == [
+        ("user:approver", "approver"),
+        (config.owner_user_id, "owner"),
+    ]
 
 
 @pytest.mark.asyncio

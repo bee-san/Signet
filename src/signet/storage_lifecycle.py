@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import os
-import secrets
 import shutil
 import stat
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +13,7 @@ from typing import Any
 from signet.private_paths import (
     DirectoryIdentity,
     PrivatePathError,
+    rename_entry_no_replace,
     require_private_directory_identity,
     revalidate_directory_identity,
 )
@@ -138,11 +137,11 @@ class StorageMaintenance:
             self._require_private_file(metadata, label="log")
             if metadata.st_size <= self.log_file_bytes:
                 continue
-            self._copy_truncate(path, metadata)
+            self._rotate_by_rename(path, metadata)
             rotated += 1
         return rotated
 
-    def _copy_truncate(self, path: Path, expected: os.stat_result) -> None:
+    def _rotate_by_rename(self, path: Path, expected: os.stat_result) -> None:
         directory_fd = os.open(
             path.parent,
             os.O_RDONLY
@@ -151,13 +150,13 @@ class StorageMaintenance:
             | getattr(os, "O_CLOEXEC", 0),
         )
         source_fd = -1
-        temporary_fd = -1
-        temporary_name = f".{path.name}.rotate-{secrets.token_hex(8)}"
+        replacement_fd = -1
+        renamed = False
         rotated_name = f"{path.name}.1"
         try:
             source_fd = os.open(
                 path.name,
-                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=directory_fd,
             )
             current = os.fstat(source_fd)
@@ -168,10 +167,23 @@ class StorageMaintenance:
             ):
                 raise StoragePolicyError("owned log changed before rotation")
             self._require_private_file(current, label="log")
-            start = max(0, current.st_size - self.log_file_bytes)
-            retained = os.pread(source_fd, self.log_file_bytes, start)
-            temporary_fd = os.open(
-                temporary_name,
+            try:
+                os.stat(rotated_name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise StoragePolicyError(
+                    "owned rotated log must be archived after its writer restarts"
+                )
+            rename_entry_no_replace(
+                directory_fd,
+                path.name,
+                directory_fd,
+                rotated_name,
+            )
+            renamed = True
+            replacement_fd = os.open(
+                path.name,
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
@@ -180,38 +192,27 @@ class StorageMaintenance:
                 0o600,
                 dir_fd=directory_fd,
             )
-            view = memoryview(retained)
-            while view:
-                written = os.write(temporary_fd, view)
-                if written <= 0:
-                    raise OSError("short rotated log write")
-                view = view[written:]
-            os.fsync(temporary_fd)
-            os.close(temporary_fd)
-            temporary_fd = -1
-            try:
-                previous = os.stat(rotated_name, dir_fd=directory_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                self._require_private_file(previous, label="rotated log")
-                os.unlink(rotated_name, dir_fd=directory_fd)
-            os.replace(
-                temporary_name,
-                rotated_name,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-            )
+            os.fchmod(replacement_fd, 0o600)
+            os.fsync(replacement_fd)
             os.fsync(directory_fd)
-            os.ftruncate(source_fd, 0)
-            os.fsync(source_fd)
+        except BaseException:
+            if renamed:
+                try:
+                    rename_entry_no_replace(
+                        directory_fd,
+                        rotated_name,
+                        directory_fd,
+                        path.name,
+                    )
+                    os.fsync(directory_fd)
+                except (OSError, PrivatePathError):
+                    pass
+            raise
         finally:
-            if temporary_fd >= 0:
-                os.close(temporary_fd)
+            if replacement_fd >= 0:
+                os.close(replacement_fd)
             if source_fd >= 0:
                 os.close(source_fd)
-            with suppress(FileNotFoundError):
-                os.unlink(temporary_name, dir_fd=directory_fd)
             os.close(directory_fd)
 
     def _prune_cache(self, cache: Path) -> int:

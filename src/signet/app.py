@@ -11,6 +11,7 @@ from typing import Literal
 
 import uvicorn
 
+from signet import __version__
 from signet.credential_broker import CredentialError
 from signet.db import Database, DatabaseError
 from signet.demo import DemoError, add_demo_parser, run_demo_command
@@ -82,9 +83,12 @@ def main(
         return
     if is_setup_command(args.command):
         try:
-            run_setup_command(args, runner=runner or uvicorn.run)
+            exit_code = run_setup_command(args, runner=runner or uvicorn.run)
         except (CredentialError, DatabaseError, SetupError, ValueError) as exc:
+            sys.stdout.flush()
             parser.error(setup_error_message(args, exc))
+        if exit_code:
+            raise SystemExit(exit_code)
         return
     if args.command == "bootstrap":
         from signet.authenticator_management import KeychainTotpSecretProvisioner
@@ -174,11 +178,13 @@ def _parser() -> argparse.ArgumentParser:
             "packaged command. Mutation commands print a plan or require an exact reviewed plan."
         ),
         epilog=(
-            "Exit status: 0 on success; 2 for invalid input, safety refusal, or incomplete work. "
+            "Exit status: 0 on success; 1 when doctor finds unhealthy checks; 2 for invalid "
+            "input, safety refusal, or incomplete work. "
             "An interrupted command may use the shell's signal status. Run signet status and "
             "signet doctor before resuming the exact command."
         ),
     )
+    parser.add_argument("--version", action="version", version=f"signet {__version__}")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     mcp = subcommands.add_parser("serve-mcp", help="serve an assembled local MCP app")

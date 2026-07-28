@@ -80,9 +80,11 @@ the main setup root, and validates both markers plus the data device on every re
 Do not move, copy, or hand-edit these markers. The data and backup roots must remain
 canonically disjoint from each other and from staging and restore roots.
 
-Planning is read-only. The JSON plan names every step, effective data and backup roots,
-the bound data device, profiles, final owner URL, disabled provider state, browser
-behavior, and the fact that Hermes will not be restarted. It separates
+Planning is read-only. The JSON plan binds the canonical executable path, file identity
+and digest, service-definition digests, storage limits, configuration targets, every
+step, effective data and backup roots, the bound data device, profiles, final owner URL,
+disabled provider state, browser behavior, and the fact that Hermes will not be
+restarted. It emits an exact `next_commands` apply command and separates
 `automatic_steps`, `human_ceremonies`,
 `deferred_provider_proof`, and `destructive_actions` so manual authentication,
 post-setup provider proof, and an empty destructive set are explicit before apply.
@@ -98,7 +100,9 @@ signet setup \
   --profile work
 ```
 
-For a reviewed non-interactive invocation, add `--yes`. Setup records an atomic,
+For a separately reviewed invocation, run the exact `signet setup ... --apply PLAN_ID`
+command emitted by the plan. `--yes` is only for the one-process flow that prints the
+plan immediately before applying it. Setup records an atomic,
 mode-0600 journal at `ROOT/.setup-journal.json`. Re-running the same command resumes at
 the first incomplete step; completed steps are not replayed. A different root,
 origin, owner, executable, profile set, or policy mode is refused rather than adopted.
@@ -128,8 +132,11 @@ The launchd agents and systemd user units keep MCP and browser HTTP in separate
 loopback processes. The web process owns the bounded delivery, reconciliation,
 retention, storage-maintenance, and notification lifecycle workers. Generated units
 set restart throttles, file-descriptor/task limits, and memory limits without placing
-credentials in argv or environment. On launchd, worker maintenance copy-truncates each
-owned log at 25 MiB and keeps one 25 MiB rotation; systemd uses the user journal.
+credentials in argv or environment. On launchd, worker maintenance atomically renames
+an oversized owned log without truncating its open writer, then creates a private new
+active path. It never overwrites an existing rotation; a second rotation fails closed
+until a reviewed service restart and archival confirms the old descriptor is closed.
+Systemd uses the user journal.
 Disposable cache files are pruned oldest-first above 1 GiB. Encrypted staging already
 has its own 50 MiB admission limit. The aggregate owned-log and backup limits are
 512 MiB and 8 GiB respectively; backup creation refuses to start when the reviewed
@@ -148,10 +155,12 @@ processes on the same filesystem.
 ## Owner browser ceremony
 
 Signet prints the exact non-secret `https://…/setup` URL before asking the operating
-system to open the private capability URL. The capability is carried in a URL
-fragment, removed from browser history before it is submitted, retained only in the
-OS keyring for crash recovery, and never written to the setup journal or normal
-output.
+system to open it. The capability never crosses the browser opener or appears in a URL.
+It is retained in the OS keyring and a mode-0600 private handoff file whose path, but not
+contents, is printed. Paste it into the setup form. The capability expires after ten
+minutes; rerunning the same setup command safely replaces an expired unclaimed or stale
+claimed ceremony without replaying completed automatic steps or losing enrolled
+factors.
 
 If browser opening is cancelled or unavailable, resume without opening it:
 
@@ -366,8 +375,9 @@ automatic steps. A conflicting specification or foreign marker is refused rather
 adopted or overwritten.
 
 Exit status is stable for automation: `0` means the requested read-only operation,
-plan, or apply completed; `2` means invalid input, declined confirmation, safety
-refusal, conflict, or incomplete work. Stderr includes a redacted recovery command.
+plan, or apply completed; `1` means `doctor` completed and found an unhealthy check;
+`2` means invalid input, declined confirmation, safety refusal, conflict, or incomplete
+work. Stderr includes a redacted recovery command.
 An interrupted process may use the shell's signal status. Never infer success from
 partial stdout; inspect the exit status and `signet status`.
 

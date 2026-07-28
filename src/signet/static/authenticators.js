@@ -56,19 +56,8 @@
 
   const csrf = () => document.querySelector('meta[name="csrf-token"]')?.content || "";
 
-  const claimForm = document.querySelector('form[action="/setup/claim"]');
-  if (claimForm && window.location.hash.startsWith("#bootstrap=")) {
-    const encoded = window.location.hash.slice("#bootstrap=".length);
+  if (window.location.hash) {
     window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
-    try {
-      const field = claimForm.querySelector('input[name="capability"]');
-      if (field) {
-        field.value = decodeURIComponent(encoded);
-        claimForm.requestSubmit();
-      }
-    } catch (_error) {
-      // Leave the ordinary attended claim form available for a malformed handoff URL.
-    }
   }
 
   const announce = (message, failed = false) => {
@@ -79,6 +68,13 @@
     region.setAttribute("role", failed ? "alert" : "status");
     region.setAttribute("aria-live", failed ? "assertive" : "polite");
     if (failed) region.focus();
+  };
+
+  const friendlyError = (error, fallback) => {
+    if (error instanceof TypeError && /failed to fetch/i.test(error.message || "")) {
+      return "Connection lost. Your progress is saved; reconnect and reload to resume.";
+    }
+    return error?.message || fallback;
   };
 
   const post = async (url, payload) => {
@@ -229,7 +225,7 @@
       window.location.hash = "review";
       window.location.reload();
     } catch (error) {
-      announce(error.message || "Passkey setup failed.", true);
+      announce(friendlyError(error, "Passkey setup failed."), true);
       button.disabled = false;
     }
   });
@@ -255,7 +251,7 @@
       announce("Passkey added. Returning to sign in.");
       window.location.assign(result.redirect_url);
     } catch (error) {
-      announce(error.message || "Passkey setup failed.", true);
+      announce(friendlyError(error, "Passkey setup failed."), true);
       button.disabled = false;
     }
   });
@@ -278,7 +274,7 @@
         showTotpEnrollment(form, issued);
         announce("TOTP key ready. Enter the current code from the new authenticator.");
       } catch (error) {
-        announce(error.message || "TOTP setup failed.", true);
+        announce(friendlyError(error, "TOTP setup failed."), true);
         button.disabled = false;
       }
     });
@@ -317,7 +313,7 @@
         announce("TOTP added. Returning to sign in.");
         window.location.assign(result.redirect_url);
       } catch (error) {
-        announce(error.message || "TOTP verification failed.", true);
+        announce(friendlyError(error, "TOTP verification failed."), true);
         button.disabled = false;
       }
     });
@@ -340,7 +336,7 @@
       announce("Authenticator updated. Returning to sign in.");
       window.location.assign(result.redirect_url);
     } catch (error) {
-      announce(error.message || "Passkey confirmation failed.", true);
+      announce(friendlyError(error, "Passkey confirmation failed."), true);
       selected.disabled = false;
     }
   });
@@ -375,7 +371,7 @@
         window.location.reload();
       } catch (error) {
         if (error.discardCeremony) clearSetupCeremony(state);
-        announce(error.message || "The saved passkey setup can no longer be resumed.", true);
+        announce(friendlyError(error, "The saved passkey setup can no longer be resumed."), true);
       }
       return;
     }
@@ -396,7 +392,7 @@
       announce("TOTP setup resumed. Enter the current code from the new authenticator.");
     } catch (error) {
       if (error.discardCeremony) clearSetupCeremony(state);
-      announce(error.message || "The saved TOTP setup can no longer be resumed.", true);
+      announce(friendlyError(error, "The saved TOTP setup can no longer be resumed."), true);
     }
   };
 
@@ -432,7 +428,7 @@
       }
     } catch (error) {
       if (error.discardCeremony) clearManagementCeremony(state);
-      announce(error.message || "Authenticator enrollment status is unavailable.", true);
+      announce(friendlyError(error, "Authenticator enrollment status is unavailable."), true);
       return;
     }
     if (state.kind === "passkey") {
@@ -460,7 +456,7 @@
         window.location.assign(result.redirect_url);
       } catch (error) {
         if (error.discardCeremony) clearManagementCeremony(state);
-        announce(error.message || "The saved passkey setup can no longer be resumed.", true);
+        announce(friendlyError(error, "The saved passkey setup can no longer be resumed."), true);
       }
       return;
     }
@@ -486,7 +482,7 @@
       announce("TOTP setup resumed. Enter the current code from the new authenticator.");
     } catch (error) {
       if (error.discardCeremony) clearManagementCeremony(state);
-      announce(error.message || "The saved TOTP setup can no longer be resumed.", true);
+      announce(friendlyError(error, "The saved TOTP setup can no longer be resumed."), true);
     }
   };
 

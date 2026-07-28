@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
+import hmac
 import json
+import os
 import re
 import shlex
-import shutil
+import stat
 import subprocess
 import sys
 import webbrowser
@@ -18,14 +21,28 @@ from typing import Any, TextIO, cast
 from signet.lifecycle import lifecycle_recovery_directory, setup_lifecycle_lock
 from signet.provider_setup import ProviderSetupOperations
 from signet.setup_operations import SetupOperations
-from signet.setup_platform import ProductionSetupPlatform
+from signet.setup_platform import (
+    ProductionSetupPlatform,
+    render_launchd_services,
+    render_systemd_services,
+)
 from signet.setup_state import (
+    ExecutableIdentity,
     PolicyMode,
     SetupEngine,
     SetupError,
     SetupJournalStore,
     SetupPlan,
     SetupSpec,
+)
+from signet.storage_lifecycle import (
+    ATTACHMENTS_HARD_BYTES,
+    BACKUPS_HARD_BYTES,
+    CACHE_HARD_BYTES,
+    DATABASE_HARD_BYTES,
+    LOGS_HARD_BYTES,
+    MINIMUM_FREE_BYTES,
+    STAGING_HARD_BYTES,
 )
 
 _SETUP_COMMANDS = frozenset(
@@ -65,12 +82,18 @@ def add_setup_parsers(subcommands: Any) -> None:
         choices=("deny", "direct", "approval", "approval_with_edit"),
         help="default policy mode (default: deny)",
     )
-    setup.add_argument(
+    setup_mode = setup.add_mutually_exclusive_group()
+    setup_mode.add_argument(
         "--plan",
         action="store_true",
         help="print the read-only setup plan and exit",
     )
-    setup.add_argument(
+    setup_mode.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed setup plan",
+    )
+    setup_mode.add_argument(
         "--rollback",
         action="store_true",
         help="after destructive confirmation, resume rollback of applied steps",
@@ -316,10 +339,8 @@ def run_setup_command(
         store = SetupJournalStore(root)
         spec = _setup_spec(args, store)
         engine = SetupEngine(store, selected_platform)
-        if args.plan and args.rollback:
-            raise ValueError("--plan and --rollback cannot be combined")
+        plan = engine.plan(spec)
         if args.plan:
-            plan = engine.plan(spec)
             _emit(_setup_plan_document(plan), output)
             return 0
         if args.rollback:
@@ -333,12 +354,23 @@ def run_setup_command(
             )
             _emit(rollback_document, output)
             return 0
-        _emit(_setup_plan_document(engine.plan(spec)), output)
-        _require_confirmation(
-            args.yes,
-            input_fn,
-            "Apply the reviewed automatic steps, then continue with the labelled human ceremonies?",
-        )
+        if args.apply is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", args.apply) is None:
+                raise SetupError("setup plan ID must be a lowercase SHA-256 digest")
+            if not hmac.compare_digest(args.apply, plan.spec.digest):
+                raise SetupError("setup plan no longer matches; print and review a new plan")
+            if spec.executable_identity is None:
+                raise SetupError("the installed signet executable must exist before apply")
+        else:
+            if spec.executable_identity is None:
+                raise SetupError("the installed signet executable must exist before apply")
+            _emit(_setup_plan_document(plan), output)
+            _require_confirmation(
+                args.yes,
+                input_fn,
+                "Apply the reviewed automatic steps, then continue with the labelled "
+                "human ceremonies?",
+            )
         with setup_lifecycle_lock(lifecycle_recovery_directory(root)):
             journal = engine.apply(spec)
         output(
@@ -429,13 +461,22 @@ def run_setup_command(
     else:  # pragma: no cover - parser and main dispatch are closed over this set
         raise SetupError("unsupported setup command")
     _emit(document, output)
+    if args.command == "doctor" and document.get("healthy") is not True:
+        return 1
     return 0
 
 
 def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
     spec = plan.spec
     automatic_steps = [step.name for step in plan.steps if step.name != "owner_bootstrap"]
+    executable: dict[str, int | str] = {"path": str(spec.executable)}
+    if spec.executable_identity is not None:
+        executable.update(spec.executable_identity.document())
+    launchd = render_launchd_services(spec, active=True)
+    systemd = render_systemd_services(spec, active=True)
     return {
+        "plan_id": spec.digest,
+        "setup_spec_digest": spec.digest,
         "root": str(spec.root),
         "owner_setup_url": f"{spec.public_origin}/setup",
         "provider_rollout": plan.provider_rollout,
@@ -443,6 +484,27 @@ def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
         "data_root": str(spec.data_dir),
         "data_device": spec.data_device,
         "backup_root": str(spec.backup_dir),
+        "executable": executable,
+        "storage_limits": {
+            "attachments_hard_bytes": ATTACHMENTS_HARD_BYTES,
+            "backups_hard_bytes": BACKUPS_HARD_BYTES,
+            "cache_hard_bytes": CACHE_HARD_BYTES,
+            "database_hard_bytes": DATABASE_HARD_BYTES,
+            "logs_hard_bytes": LOGS_HARD_BYTES,
+            "minimum_free_bytes": MINIMUM_FREE_BYTES,
+            "staging_hard_bytes": STAGING_HARD_BYTES,
+        },
+        "configuration_files": [
+            str(spec.root / "production.json"),
+            str(spec.root / "policy.yaml"),
+        ],
+        "service_effects": {
+            "launchd": {
+                name: {"sha256": hashlib.sha256(content).hexdigest()}
+                for name, content in launchd.items()
+            },
+            "systemd": {name: {"content": content} for name, content in systemd.items()},
+        },
         "hermes_profiles": list(spec.hermes_profiles),
         "steps": [step.name for step in plan.steps],
         "automatic_steps": automatic_steps,
@@ -456,15 +518,51 @@ def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
             "live_send",
         ],
         "destructive_actions": [],
+        "rollback": {
+            "command": shlex.join(("signet", "setup", "--rollback", "--root", str(spec.root))),
+            "preserves": ["verified_backups"],
+        },
+        "next_commands": [_setup_apply_command(spec)],
         "browser_will_open": spec.open_browser,
         "gateway_restart": False,
     }
+
+
+def _setup_apply_command(spec: SetupSpec) -> str:
+    command = [
+        "signet",
+        "setup",
+        "--root",
+        str(spec.root),
+        "--origin",
+        spec.public_origin,
+        "--owner",
+        spec.owner_user_id,
+    ]
+    for profile in spec.hermes_profiles:
+        command.extend(("--profile", profile))
+    command.extend(("--policy-mode", spec.policy_mode, "--executable", str(spec.executable)))
+    if spec.data_dir != spec.root / "data":
+        command.extend(("--data-root", str(spec.data_dir)))
+    if spec.data_device is not None:
+        command.extend(("--data-device", str(spec.data_device)))
+    if spec.backup_dir != spec.root / "backups":
+        command.extend(("--backup-root", str(spec.backup_dir)))
+    if not spec.open_browser:
+        command.append("--no-open-browser")
+    command.extend(("--apply", spec.digest))
+    return shlex.join(command)
 
 
 def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec:
     existing = store.load_optional()
     if existing is not None:
         document = existing.spec
+        executable, executable_identity = _reviewed_executable(
+            _absolute_path(args.executable)
+            if args.executable is not None
+            else Path(document["executable"])
+        )
         return SetupSpec(
             root=Path(document["root"]),
             public_origin=args.origin or str(document["public_origin"]),
@@ -474,11 +572,8 @@ def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec
                 if args.profiles is not None
                 else tuple(str(profile) for profile in document["hermes_profiles"])
             ),
-            executable=(
-                _absolute_path(args.executable)
-                if args.executable is not None
-                else Path(document["executable"])
-            ),
+            executable=executable,
+            executable_identity=executable_identity,
             open_browser=(False if args.no_open_browser else bool(document["open_browser"])),
             policy_mode=cast(
                 PolicyMode,
@@ -511,9 +606,7 @@ def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec
     origin = args.origin or _discover_tailscale_origin()
     owner = args.owner or "user:owner"
     profiles = tuple(args.profiles or _discover_hermes_profiles())
-    executable_text = args.executable or shutil.which("signet")
-    if executable_text is None:
-        raise ValueError("the installed signet executable is not on PATH")
+    executable_text = args.executable or _runtime_signet_launcher()
     data_root = _absolute_path(args.data_root) if args.data_root is not None else None
     data_device = args.data_device
     if data_root is not None and data_device is None:
@@ -521,12 +614,14 @@ def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec
             data_device = data_root.stat().st_dev
         except OSError as exc:
             raise ValueError("--data-root must exist before its device can be reviewed") from exc
+    executable, executable_identity = _reviewed_executable(_absolute_path(Path(executable_text)))
     return SetupSpec(
         root=_absolute_path(args.root),
         public_origin=origin,
         owner_user_id=owner,
         hermes_profiles=profiles,
-        executable=_absolute_path(Path(executable_text)),
+        executable=executable,
+        executable_identity=executable_identity,
         open_browser=not args.no_open_browser,
         policy_mode=cast(PolicyMode, args.policy_mode or "deny"),
         data_root=data_root,
@@ -535,14 +630,64 @@ def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec
     )
 
 
+def _runtime_signet_launcher() -> Path:
+    """Select the launcher installed beside this process's bound interpreter."""
+
+    launcher = _absolute_path(sys.executable).with_name("signet")
+    if not launcher.exists():
+        raise ValueError(
+            "the installed signet executable is not beside the running Python interpreter"
+        )
+    return launcher
+
+
+def _reviewed_executable(path: Path | str) -> tuple[Path, ExecutableIdentity | None]:
+    """Resolve convenience launchers and bind an existing executable's exact bytes."""
+
+    selected = _absolute_path(path)
+    try:
+        resolved = selected.resolve(strict=True)
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+    except FileNotFoundError:
+        return selected, None
+    except OSError as exc:
+        raise ValueError("the installed signet executable is unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("the installed signet executable changed during review")
+    return resolved, ExecutableIdentity(
+        device=before.st_dev,
+        inode=before.st_ino,
+        size=before.st_size,
+        sha256=digest.hexdigest(),
+    )
+
+
 def _discover_tailscale_origin() -> str:
     try:
         result = subprocess.run(
-            ["tailscale", "status", "--json"],
+            ProductionSetupPlatform._reviewed_command(["tailscale", "status", "--json"]),
             text=True,
             capture_output=True,
             check=False,
             timeout=10,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            cwd="/",
         )
         document = json.loads(result.stdout) if result.returncode == 0 else {}
         dns_name = document.get("Self", {}).get("DNSName")

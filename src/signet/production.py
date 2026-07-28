@@ -77,8 +77,8 @@ from signet.models import InvalidTransition, ReconciliationRejected, RequestStat
 from signet.notification_outbox import NotificationOutboxWorker, SQLiteNotificationOutbox
 from signet.notifications import (
     NotificationDispatcher,
-    PushDeliveryError,
     PushSubscription,
+    PushTransportUnavailable,
     SQLitePushRepository,
 )
 from signet.policy import PolicyEngine, PolicySnapshot, parse_policy_yaml
@@ -208,7 +208,7 @@ class ProductionDisabledPushTransport:
         payload: Mapping[str, str | int],
     ) -> None:
         del subscription, payload
-        raise PushDeliveryError("browser push delivery is not configured")
+        raise PushTransportUnavailable("browser push delivery is not configured")
 
 
 class ProductionSummaryProvider:
@@ -846,10 +846,11 @@ def build_production_runtime(
         **reviewer_provider_adapters,
         (tool_access.downstream_alias, tool_access.tool_name): cast(ApprovalAdapter, tool_access),
     }
+    human_roles = _production_human_roles(database, config.owner_user_id)
     approvals = ApprovalStateMachine(
         database,
         capabilities=capabilities,
-        notification_user_id=config.owner_user_id,
+        notification_user_ids=tuple(human_roles),
         admission_limits=QueueAdmissionLimits(
             queue_limit=1_000,
             origin_pending_limit=500,
@@ -941,7 +942,13 @@ def build_production_runtime(
     )
     gateway_surface = GatewayToolSurface(
         tools=gateway_tools,
-        principal_provider=gateway_principal_provider(config.owner_user_id),
+        principal_provider=gateway_principal_provider(
+            {
+                principal.namespace: principal.user_id or config.owner_user_id
+                for principal in config.caller_principals
+            }
+            or config.owner_user_id
+        ),
     )
     token_registry = SQLiteTokenRegistry(
         database,
@@ -998,6 +1005,7 @@ def build_production_runtime(
             approvals=approvals,
             reviewer=reviewer,
             policy_promotions=policy_promotions,
+            authorized_users=human_roles,
             clock=now,
         )
         if "web" in components
@@ -1221,6 +1229,7 @@ def _assemble_production_web(
     approvals: ApprovalStateMachine,
     reviewer: EncryptedPayloadReviewer,
     policy_promotions: SQLitePolicyPromotionBoundary,
+    authorized_users: Mapping[str, str],
     clock: Callable[[], int],
 ) -> FastAPI:
     sessions = SessionManager(
@@ -1278,6 +1287,7 @@ def _assemble_production_web(
     backend = PersistentWebBackend(
         database,
         authorized_user_id=config.owner_user_id,
+        authorized_users=authorized_users,
         sessions=sessions,
         passwords=passwords,
         totp=totp,
@@ -1303,6 +1313,33 @@ def _assemble_production_web(
     )
     web.add_middleware(TrustedProxySourceMiddleware)
     return web
+
+
+def _production_human_roles(database: Database, owner_user_id: str) -> dict[str, str]:
+    users = {owner_user_id: "owner"}
+    with database.read() as connection:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(production_users)").fetchall()
+        }
+        if "role" in columns:
+            rows = connection.execute(
+                """
+                SELECT user_id, role FROM production_users
+                WHERE state IN ('staged', 'active')
+                ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, user_id
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT user_id, 'owner' AS role FROM production_users
+                WHERE state IN ('staged', 'active') ORDER BY user_id
+                """
+            ).fetchall()
+    for row in rows:
+        users[str(row["user_id"])] = str(row["role"])
+    return users
 
 
 def _snapshot_pre_migration_backup(backup_dir: Path) -> PreMigrationBackup:

@@ -446,6 +446,7 @@ def assemble(
     staging: StagingStore | None = None,
     execution_scope: ExecutionScope | None = None,
     durable_sqlite_drafts: bool = False,
+    authorized_users: dict[str, str] | None = None,
 ) -> BackendBundle:
     database.initialize()
     selected_drafts = drafts or DraftBacking()
@@ -519,6 +520,7 @@ def assemble(
     backend = WebBackend(
         database,
         authorized_user_id=USER_ID,
+        authorized_users=authorized_users,
         sessions=sessions,
         passwords=passwords,
         totp=totp,
@@ -544,6 +546,17 @@ def assemble(
         selected_drafts,
         selected_promotions,
     )
+
+
+def test_web_backend_authorizes_all_durable_human_roles(tmp_path: Path) -> None:
+    selected = assemble(
+        Database(tmp_path / "multi-user.sqlite3"),
+        authorized_users={USER_ID: "owner", "user:approver": "approver"},
+    )
+
+    assert selected.backend._is_authorized_user(USER_ID)
+    assert selected.backend._is_authorized_user("user:approver")
+    assert not selected.backend._is_authorized_user("user:disabled")
 
 
 @pytest.fixture
@@ -2234,12 +2247,12 @@ def test_schema_13_privacy_maintenance_is_restart_safe_after_each_fault(
         )
     assert backups == [12]
     with bundle.database.read() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
         assert (
             connection.execute(
-                "SELECT count(*) FROM schema_meta WHERE migration_id BETWEEN 13 AND 19"
+                "SELECT count(*) FROM schema_meta WHERE migration_id BETWEEN 13 AND 20"
             ).fetchone()[0]
-            == 7
+            == 8
         )
 
     # Both privacy migrations are committed, so recovery must not repeat a backup.

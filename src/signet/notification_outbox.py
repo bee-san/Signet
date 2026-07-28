@@ -400,12 +400,16 @@ class NotificationOutboxWorker:
                 )
                 deferred += 1
             else:
-                if report.failed:
+                if report.failed or report.deferred:
                     deferred_intent = await _run_sync(
                         self.outbox.defer,
                         intent,
                         now=now,
-                        error_code="push_delivery_incomplete",
+                        error_code=(
+                            "push_transport_unavailable"
+                            if report.deferred and not report.failed
+                            else "push_delivery_incomplete"
+                        ),
                         retry_delay=self._retry_delay(intent.attempts),
                         delivered_subscription_ids=report.delivered_subscription_ids,
                     )

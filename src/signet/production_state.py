@@ -120,6 +120,11 @@ class ProductionStateStore:
                 }
                 compatible_digests = {
                     transition_digest,
+                    _pre_caller_user_binding_production_config_digest(config),
+                    _pre_caller_user_binding_production_config_digest(
+                        config,
+                        rollout_state=opposite_rollout,
+                    ),
                     _pre_identity_hardening_production_config_digest(config),
                     _pre_identity_hardening_production_config_digest(
                         config,
@@ -204,29 +209,44 @@ class ProductionStateStore:
                 if established_rows:
                     raise ProductionStateError("durable production setup state is unavailable")
 
-            owners = connection.execute("SELECT user_id FROM production_users").fetchall()
+            users = connection.execute(
+                "SELECT user_id, role, state FROM production_users ORDER BY user_id"
+            ).fetchall()
+            owners = [row for row in users if row["role"] == "owner"]
             if setup is not None and (
                 len(owners) != 1 or owners[0]["user_id"] != config.owner_user_id
             ):
                 raise ProductionStateError("durable production owner differs from configured owner")
-            if setup is None and owners:
+            if setup is None and users:
                 raise ProductionStateError("durable production owner differs from configured owner")
-            authenticator_owners = connection.execute(
-                "SELECT user_id FROM auth_users ORDER BY user_id"
-            ).fetchall()
-            if authenticator_owners and (
-                len(authenticator_owners) != 1
-                or authenticator_owners[0]["user_id"] != config.owner_user_id
-            ):
+            authorized_users = {
+                str(row["user_id"]) for row in users if row["state"] in {"staged", "active"}
+            }
+            authorized_users.add(config.owner_user_id)
+            authenticator_users = {
+                str(row["user_id"])
+                for row in connection.execute(
+                    "SELECT user_id FROM auth_users ORDER BY user_id"
+                ).fetchall()
+            }
+            unauthorized_auth_users = authenticator_users - authorized_users
+            if unauthorized_auth_users:
                 raise ProductionStateError(
-                    "durable authenticator owner differs from configured owner"
+                    "durable authenticator user is not an authorized production user"
+                )
+            caller_users = {
+                principal.user_id or config.owner_user_id for principal in config.caller_principals
+            }
+            if caller_users - authorized_users:
+                raise ProductionStateError(
+                    "production MCP caller is bound to an unauthorized production user"
                 )
 
             connection.execute(
                 """
                 INSERT OR IGNORE INTO production_users(
-                    user_id, state, created_at, updated_at
-                ) VALUES (?, 'staged', ?, ?)
+                    user_id, role, state, created_at, updated_at
+                ) VALUES (?, 'owner', 'staged', ?, ?)
                 """,
                 (config.owner_user_id, now, now),
             )
@@ -1046,6 +1066,22 @@ def _pre_caller_principals_production_config_digest(
 
     document = config.model_dump(mode="json")
     document.pop("caller_principals")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _pre_caller_user_binding_production_config_digest(
+    config: ProductionConfig,
+    *,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
+) -> str:
+    """Reconstruct the digest emitted before callers recorded their human user."""
+
+    document = config.model_dump(mode="json")
+    for principal in document["caller_principals"]:
+        principal.pop("user_id", None)
     if rollout_state is not None:
         document["provider_rollout"]["state"] = rollout_state
         document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"

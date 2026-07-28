@@ -674,6 +674,7 @@ class WebBackend:
         action_drafts: ActionDraftRepository,
         policy_promotions: PolicyPromotionBoundary,
         pushes: PushRepository,
+        authorized_users: Mapping[str, str] | None = None,
         max_audit_entries: int = 1_000,
         max_decision_entries: int = 100,
         max_queue_entries: int = _MAX_QUEUE_PAGE_SIZE,
@@ -685,10 +686,22 @@ class WebBackend:
     ) -> None:
         if max_audit_entries <= 0 or max_audit_entries > 10_000:
             raise ValueError("audit read limit is invalid")
+        selected_users = authorized_users or {authorized_user_id: "owner"}
+        if not isinstance(selected_users, Mapping) or not selected_users:
+            raise ValueError("authorized web user ID is invalid") from None
         try:
-            self._authorized_user_id = canonical_user_id(authorized_user_id)
+            normalized_owner = canonical_user_id(authorized_user_id)
+            normalized_users = {
+                canonical_user_id(user_id): role for user_id, role in selected_users.items()
+            }
         except (InvalidCredentials, TypeError, ValueError):
             raise ValueError("authorized web user ID is invalid") from None
+        if (
+            any(role not in {"owner", "approver"} for role in normalized_users.values())
+            or normalized_users.get(normalized_owner) != "owner"
+        ):
+            raise ValueError("authorized web user role is invalid")
+        self._authorized_user_ids = tuple(sorted(normalized_users))
         if max_decision_entries <= 0 or max_decision_entries > 1_000:
             raise ValueError("decision read limit is invalid")
         if max_queue_entries <= 0 or max_queue_entries > _MAX_QUEUE_PAGE_SIZE:
@@ -1974,7 +1987,10 @@ class WebBackend:
             selected = canonical_user_id(user_id)
         except (InvalidCredentials, TypeError, ValueError):
             return False
-        return hmac.compare_digest(selected, self._authorized_user_id)
+        return any(
+            hmac.compare_digest(selected, authorized_user_id)
+            for authorized_user_id in self._authorized_user_ids
+        )
 
     def _require_ui_principal(self, principal: SessionPrincipal) -> None:
         if (

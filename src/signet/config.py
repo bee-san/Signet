@@ -451,6 +451,7 @@ class ProductionCallerPrincipal(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     namespace: str
+    user_id: str | None = None
     allowed_aliases: tuple[
         Literal["approvals", "fastmail", "whatsapp"],
         ...,
@@ -461,6 +462,13 @@ class ProductionCallerPrincipal(BaseModel):
     def namespace_is_profile_scoped(cls, value: str) -> str:
         if re.fullmatch(r"profile:[a-z][a-z0-9-]{0,63}", value) is None:
             raise ValueError("production caller namespace must identify one Hermes profile")
+        return value
+
+    @field_validator("user_id")
+    @classmethod
+    def user_is_canonical(cls, value: str | None) -> str | None:
+        if value is not None and canonical_user_id(value) != value:
+            raise ValueError("production caller user_id must be canonical")
         return value
 
     @field_validator("allowed_aliases")

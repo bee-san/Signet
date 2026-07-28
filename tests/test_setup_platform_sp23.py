@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import plistlib
 import shutil
 import stat
@@ -17,7 +18,7 @@ from signet.setup_platform import (
     render_production_config,
     render_systemd_services,
 )
-from signet.setup_state import SetupError, SetupSpec
+from signet.setup_state import ExecutableIdentity, SetupError, SetupSpec
 
 
 def spec(root: Path, **changes: Any) -> SetupSpec:
@@ -241,7 +242,7 @@ def test_service_install_revalidates_the_packaged_runtime_after_preflight(
     platform = ProductionSetupPlatform()
     platform._apply_private_paths(selected, "setup_0123456789abcdef")
 
-    def reject_replaced_runtime(_path: Path) -> None:
+    def reject_replaced_runtime(_path: Path, _identity: ExecutableIdentity | None = None) -> None:
         raise SetupError("runtime changed after preflight")
 
     monkeypatch.setattr(setup_platform, "_require_packaged_runtime", reject_replaced_runtime)
@@ -383,3 +384,41 @@ def test_preflight_rejects_an_editable_source_tree_runtime(
 
     with pytest.raises(SetupError, match="editable or source-tree"):
         platform._apply_preflight(selected, "setup_0123456789abcdef")
+
+
+def test_preflight_rejects_reviewed_executable_drift_and_symlinked_ancestors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_environment = tmp_path / "runtime"
+    executable = real_environment / "bin" / "signet"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    metadata = executable.stat()
+    identity = ExecutableIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        size=metadata.st_size,
+        sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+    )
+    platform = ProductionSetupPlatform()
+    monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
+    monkeypatch.setattr(platform, "_verify_configured_storage_roots", lambda _spec: None)
+    monkeypatch.setattr(platform, "_verify_storage_capacity", lambda _spec: {})
+
+    executable.write_bytes(b"#!/bin/sh\nexit 1\n")
+    with pytest.raises(SetupError, match="identity changed after review"):
+        platform._apply_preflight(
+            spec(tmp_path / "drifted", executable=executable, executable_identity=identity),
+            "setup_0123456789abcdef",
+        )
+
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    linked_environment = tmp_path / "linked-runtime"
+    linked_environment.symlink_to(real_environment, target_is_directory=True)
+    with pytest.raises(SetupError, match="symlinked ancestor"):
+        platform._apply_preflight(
+            spec(tmp_path / "linked", executable=linked_environment / "bin" / "signet"),
+            "setup_0123456789abcdef",
+        )

@@ -18,7 +18,7 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 
 from signet.app import _supported_platform, main
-from signet.credential_broker import IssuedToken, TokenRegistry
+from signet.credential_broker import CallerPrincipal, IssuedToken, TokenRegistry
 from signet.gateway_tools import GatewayPrincipal, GatewayToolSurface
 from signet.mcp_mirror import AliasToolSurface, InvocationIdentity, SchemaMirror
 from signet.policy import parse_policy
@@ -590,6 +590,28 @@ async def test_approvals_surface_is_stateless_and_uses_active_profile(auth: Auth
     assert harness.gateway_tools.principals == [
         GatewayPrincipal(namespace="profile:one", user_id="human:one")
     ]
+
+
+def test_approval_identity_uses_the_authenticated_callers_human_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller = CallerPrincipal(
+        namespace="profile:work",
+        allowed_aliases=frozenset({"approvals"}),
+        token_id="token_0123456789abcdef",
+    )
+    monkeypatch.setattr("signet.runtime.current_caller", lambda: caller)
+    provide = gateway_principal_provider(
+        {
+            "profile:personal": "user:owner",
+            "profile:work": "user:approver",
+        }
+    )
+
+    assert provide() == GatewayPrincipal(
+        namespace="profile:work",
+        user_id="user:approver",
+    )
 
 
 @pytest.mark.asyncio

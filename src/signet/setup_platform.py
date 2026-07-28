@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal, cast
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import keyring
 import yaml
@@ -57,7 +57,7 @@ from signet.production import (
     create_production_assembly,
     load_production_config,
 )
-from signet.setup_state import SetupError, SetupJournalStore, SetupSpec
+from signet.setup_state import ExecutableIdentity, SetupError, SetupJournalStore, SetupSpec
 from signet.storage_lifecycle import (
     ATTACHMENTS_HARD_BYTES,
     BACKUPS_HARD_BYTES,
@@ -168,6 +168,7 @@ def render_production_config(spec: SetupSpec, *, setup_id: str) -> dict[str, Any
         "caller_principals": [
             {
                 "namespace": f"profile:{profile}",
+                "user_id": spec.owner_user_id,
                 "allowed_aliases": list(_PRODUCTION_MCP_ALIASES),
             }
             for profile in spec.hermes_profiles
@@ -246,17 +247,17 @@ def browser_assisted_setup(
 ) -> None:
     public_url = f"{public_origin}/setup"
     output(f"Owner setup URL: {public_url}")
+    if bootstrap_value is not None:
+        if handoff_path is None:
+            raise SetupError("browser setup requires a private capability handoff file")
+        output(f"Private owner setup capability file: {handoff_path}")
+        output(
+            "The one-time capability expires after 10 minutes. If it expires, rerun the same "
+            "signet setup command to issue a replacement without losing enrollment progress."
+        )
     if not open_browser:
-        if bootstrap_value is not None:
-            if handoff_path is None:
-                raise SetupError("the private owner setup handoff path is unavailable")
-            output(f"Private owner setup capability file: {handoff_path}")
         return
-    if bootstrap_value is None:
-        private_url = public_url
-    else:
-        private_url = f"{public_url}#bootstrap={quote(bootstrap_value, safe='')}"
-    if not opener(private_url):
+    if not opener(public_url):
         raise SetupError("the browser did not accept the owner setup URL")
 
 
@@ -311,18 +312,45 @@ def _runtime_site_packages(executable: Path) -> tuple[Path, ...]:
     return tuple(sorted(path for path in candidates if path.is_dir() and not path.is_symlink()))
 
 
-def _require_packaged_runtime(executable: Path) -> None:
+def _require_packaged_runtime(
+    executable: Path,
+    expected_identity: ExecutableIdentity | None = None,
+) -> None:
     try:
         metadata = executable.lstat()
         resolved = executable.resolve(strict=True)
     except OSError as exc:
         raise SetupError("the installed Signet executable is unavailable") from exc
     if (
-        executable.is_symlink()
+        resolved != executable
+        or executable.is_symlink()
         or not stat.S_ISREG(metadata.st_mode)
         or not os.access(executable, os.X_OK)
+        or metadata.st_uid not in {0, os.geteuid()}
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
-        raise SetupError("the installed Signet executable is unavailable or unsafe")
+        raise SetupError(
+            "the installed Signet executable is unavailable, unsafe, or has a symlinked ancestor"
+        )
+    if expected_identity is not None:
+        try:
+            digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            current = executable.stat()
+        except OSError as exc:
+            raise SetupError("the installed Signet executable identity is unavailable") from exc
+        if (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            digest,
+        ) != (
+            expected_identity.device,
+            expected_identity.inode,
+            expected_identity.size,
+            expected_identity.sha256,
+        ):
+            raise SetupError("the installed Signet executable identity changed after review")
     for ancestor in resolved.parents:
         if (ancestor / "pyproject.toml").is_file() and (ancestor / "src" / "signet").is_dir():
             raise SetupError(
@@ -389,6 +417,7 @@ def storage_path_status(
     path: Path,
     *,
     disk_usage_provider: Callable[[Path], Any] = shutil.disk_usage,
+    include_usage: bool = True,
 ) -> dict[str, Any]:
     """Return non-secret capacity metadata for one exact destination filesystem."""
 
@@ -398,7 +427,7 @@ def storage_path_status(
     return {
         "path": str(path),
         "exists": path.exists() and path.is_dir() and not path.is_symlink(),
-        "usage_bytes": _tree_usage_bytes(path),
+        "usage_bytes": _tree_usage_bytes(path) if include_usage else 0,
         "device": metadata.st_dev,
         "free_bytes": int(usage.free),
         "total_bytes": int(usage.total),
@@ -437,7 +466,55 @@ class ProductionSetupPlatform:
 
     @staticmethod
     def _service_manager_environment() -> dict[str, str]:
-        return {**os.environ, "LANG": "C", "LC_ALL": "C"}
+        environment = {
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+        for name in (
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "TMPDIR",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ):
+            value = os.environ.get(name)
+            if value:
+                environment[name] = value
+        return environment
+
+    @staticmethod
+    def _reviewed_command(command: list[str]) -> list[str]:
+        if not command or not command[0] or Path(command[0]).name != command[0]:
+            raise SetupError("external setup command is not a reviewed system command")
+        candidates: dict[str, tuple[Path, ...]] = {
+            "launchctl": (Path("/bin/launchctl"),),
+            "systemctl": (Path("/usr/bin/systemctl"), Path("/bin/systemctl")),
+            "tailscale": (
+                Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
+                Path("/opt/homebrew/bin/tailscale"),
+                Path("/usr/local/bin/tailscale"),
+                Path("/usr/bin/tailscale"),
+            ),
+        }
+        available = candidates.get(command[0])
+        if available is None:
+            raise SetupError("external setup command is not a reviewed system command")
+        selected = next(
+            (
+                candidate
+                for candidate in available
+                if candidate.is_file() and not candidate.is_symlink()
+            ),
+            available[0],
+        )
+        return [str(selected), *command[1:]]
+
+    def _run_command(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        kwargs["env"] = self._service_manager_environment()
+        kwargs.setdefault("cwd", "/")
+        return self.command_runner(self._reviewed_command(command), **kwargs)
 
     @classmethod
     def _launchd_result_means_already_loaded(
@@ -656,7 +733,7 @@ class ProductionSetupPlatform:
                 if action == "stop":
                     self._stop_launchd_unit(command)
                     continue
-                result = self.command_runner(
+                result = self._run_command(
                     command,
                     text=True,
                     capture_output=True,
@@ -698,7 +775,7 @@ class ProductionSetupPlatform:
                     result[label] = "missing_or_changed"
                     continue
                 try:
-                    status = self.command_runner(
+                    status = self._run_command(
                         ["launchctl", "print", f"gui/{uid}/{label}"],
                         text=True,
                         capture_output=True,
@@ -726,7 +803,7 @@ class ProductionSetupPlatform:
                     result[name] = "missing_or_changed"
                     continue
                 try:
-                    status = self.command_runner(
+                    status = self._run_command(
                         ["systemctl", "--user", "is-active", name],
                         text=True,
                         capture_output=True,
@@ -787,7 +864,7 @@ class ProductionSetupPlatform:
             or stat.S_IMODE(metadata.st_mode) & 0o022
         ):
             raise SetupError("the installed Signet executable is not a reviewed executable file")
-        _require_packaged_runtime(spec.executable)
+        _require_packaged_runtime(spec.executable, spec.executable_identity)
         if sys.platform == "linux":
             try:
                 render_systemd_services(spec)
@@ -1584,7 +1661,7 @@ class ProductionSetupPlatform:
 
     def _apply_services(self, spec: SetupSpec, setup_id: str) -> None:
         del setup_id
-        _require_packaged_runtime(spec.executable)
+        _require_packaged_runtime(spec.executable, spec.executable_identity)
         plan_dir = spec.root / "services"
         self._preflight_tailnet_route(spec)
         if sys.platform == "darwin":
@@ -1612,7 +1689,7 @@ class ProductionSetupPlatform:
             uid = os.getuid()
             for name in rendered:
                 path = target / name
-                result = self.command_runner(
+                result = self._run_command(
                     ["launchctl", "bootstrap", f"gui/{uid}", str(path)],
                     text=True,
                     capture_output=True,
@@ -1679,7 +1756,7 @@ class ProductionSetupPlatform:
                 self._stop_launchd_unit(["launchctl", "bootout", f"gui/{uid}/{label}"])
             for name in rendered:
                 label = name.removesuffix(".plist")
-                status = self.command_runner(
+                status = self._run_command(
                     ["launchctl", "print", f"gui/{uid}/{label}"],
                     text=True,
                     capture_output=True,
@@ -1720,7 +1797,7 @@ class ProductionSetupPlatform:
             for name in rendered_text:
                 self._stop_systemd_units(["systemctl", "--user", "disable", "--now", name])
             for name in rendered_text:
-                status = self.command_runner(
+                status = self._run_command(
                     ["systemctl", "--user", "is-active", name],
                     text=True,
                     capture_output=True,
@@ -2053,7 +2130,7 @@ class ProductionSetupPlatform:
 
     def _tailscale_json(self, command: list[str], message: str) -> Any:
         try:
-            result = self.command_runner(
+            result = self._run_command(
                 command,
                 text=True,
                 capture_output=True,
@@ -2462,7 +2539,7 @@ class ProductionSetupPlatform:
                 if not _bootstrap_claim_is_current(assembly.database, now=now):
                     raise
                 capability = None
-        if capability is not None and not spec.open_browser:
+        if capability is not None:
             _replace_private_file(
                 handoff_path,
                 capability.encode("utf-8") + b"\n",
@@ -2473,7 +2550,7 @@ class ProductionSetupPlatform:
                 keyring.set_password(_SERVICE_NAME, account, capability)
             except Exception as exc:
                 raise SetupError("the browser setup handoff could not be stored") from exc
-        if (spec.open_browser or capability is None) and handoff_exists:
+        if capability is None and handoff_exists:
             if handoff_capability is None:  # pragma: no cover - validated above
                 raise AssertionError("browser bootstrap handoff validation was incomplete")
             _remove_exact_owned_file(
@@ -2521,7 +2598,7 @@ class ProductionSetupPlatform:
         timeout_seconds: float | None = None,
     ) -> None:
         try:
-            result = self.command_runner(
+            result = self._run_command(
                 command,
                 text=True,
                 capture_output=True,
@@ -2534,7 +2611,7 @@ class ProductionSetupPlatform:
             raise SetupError(message)
 
     def _stop_systemd_units(self, command: list[str]) -> None:
-        result = self.command_runner(
+        result = self._run_command(
             command,
             text=True,
             capture_output=True,
@@ -2567,7 +2644,7 @@ class ProductionSetupPlatform:
             raise SetupError("systemd could not stop Signet")
 
     def _stop_launchd_unit(self, command: list[str]) -> None:
-        result = self.command_runner(
+        result = self._run_command(
             command,
             text=True,
             capture_output=True,

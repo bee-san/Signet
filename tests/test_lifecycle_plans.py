@@ -4,7 +4,7 @@ import hashlib
 import json
 import shutil
 import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -17,7 +17,13 @@ from signet.db import LATEST_SCHEMA_VERSION, Database
 from signet.lifecycle import LifecycleOperationStore, LifecyclePlan
 from signet.setup_operations import SetupOperations
 from signet.setup_platform import render_production_config
-from signet.setup_state import SetupEngine, SetupError, SetupJournalStore, SetupSpec
+from signet.setup_state import (
+    ExecutableIdentity,
+    SetupEngine,
+    SetupError,
+    SetupJournalStore,
+    SetupSpec,
+)
 
 
 @dataclass
@@ -164,6 +170,15 @@ def replace_installed_setup(
     replacement_setup_id = SetupJournalStore(selected.root).load().setup_id
     assert replacement_setup_id != previous_setup_id
     return replacement_setup_id
+
+
+def test_lifecycle_spec_preserves_the_reviewed_executable_identity(tmp_path: Path) -> None:
+    operations, platform, selected = installed_operations(tmp_path)
+    identity = ExecutableIdentity(device=1, inode=2, size=3, sha256="a" * 64)
+    selected = replace(selected, executable_identity=identity)
+    replace_installed_setup(operations, platform, selected)
+
+    assert operations.spec().executable_identity == identity
 
 
 def test_service_plan_is_read_only_and_refuses_unknown_service_or_serve_state(
@@ -407,6 +422,47 @@ def test_backup_and_restore_plans_are_read_only_and_bind_the_encrypted_bundle(
     )
     with pytest.raises(SetupError, match="no longer matches observed state"):
         operations.apply_restore(restore["plan_id"], bundle)
+
+
+def test_custom_backup_destination_ignores_unrelated_parent_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations, _, _ = installed_operations(tmp_path)
+    destination = tmp_path / "home" / "signet-backup.signet-backup"
+    destination.parent.mkdir(mode=0o700)
+    gibibyte = 1024**3
+
+    monkeypatch.setattr(SetupEngine, "validate_private_paths", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        setup_operations,
+        "storage_status",
+        lambda _spec: {
+            "roots": {
+                "data": {"usage_bytes": 1024},
+                "attachments": {"usage_bytes": 1024},
+                "staging": {"usage_bytes": 1024},
+                "backups": {"usage_bytes": 1024},
+            },
+            "policy": {
+                "backups_hard_bytes": 8 * gibibyte,
+                "minimum_reserve_bytes": gibibyte,
+            },
+        },
+    )
+
+    def destination_status(_path: Path, *, include_usage: bool, **_kwargs: Any) -> dict[str, int]:
+        assert include_usage is False
+        return {"usage_bytes": 9 * gibibyte, "free_bytes": 10 * gibibyte}
+
+    monkeypatch.setattr(setup_operations, "storage_path_status", destination_status)
+    monkeypatch.setattr(operations, "_production_key_references", lambda: ())
+
+    class RecordingManager:
+        def create(self, selected: Path, **_kwargs: Any) -> Path:
+            return write_fake_backup(selected)
+
+    assert operations._backup(destination, manager=cast(Any, RecordingManager())) == destination
 
 
 def test_reviewed_backup_apply_is_not_repeated(
@@ -966,7 +1022,7 @@ def test_reviewed_upgrade_apply_is_not_repeated(
         nonlocal calls
         calls += 1
         assert reviewed_plan is not None
-        return {"schema_version": 19, "backup": "/private/verified-backup"}
+        return {"schema_version": 20, "backup": "/private/verified-backup"}
 
     monkeypatch.setattr(operations, "_upgrade", upgrade)
     plan = operations.plan_upgrade()
@@ -974,7 +1030,7 @@ def test_reviewed_upgrade_apply_is_not_repeated(
     first = operations.apply_upgrade(plan.plan_id)
     second = operations.apply_upgrade(plan.plan_id)
 
-    assert first == second == {"schema_version": 19, "backup": "/private/verified-backup"}
+    assert first == second == {"schema_version": 20, "backup": "/private/verified-backup"}
     assert calls == 1
 
 
@@ -992,7 +1048,7 @@ def test_reviewed_upgrade_apply_resumes_after_an_interrupted_runner(
         assert reviewed_plan is not None
         if calls == 1:
             raise KeyboardInterrupt("injected upgrade interruption")
-        return {"schema_version": 19, "backup": "/private/verified-backup"}
+        return {"schema_version": 20, "backup": "/private/verified-backup"}
 
     monkeypatch.setattr(operations, "_upgrade", upgrade)
     plan = operations.plan_upgrade()
@@ -1013,7 +1069,7 @@ def test_reviewed_upgrade_adopts_a_completed_migration_after_receipt_publication
     operations, _, _ = installed_operations(tmp_path)
     monkeypatch.setattr(operations, "_current_schema_version", lambda: 18)
     result = {
-        "schema_version": 19,
+        "schema_version": 20,
         "backup": "/private/verified-backup",
         "upgrade_receipt": "/private/verified-upgrade-receipt",
     }
@@ -1243,7 +1299,7 @@ def test_reviewed_upgrade_replays_pending_assembly_at_the_target_schema(
         "state": "backup_verified_migration_pending",
         "observed_schema_version": 18,
     }
-    monkeypatch.setattr(operations, "_current_schema_version", lambda: 19)
+    monkeypatch.setattr(operations, "_current_schema_version", lambda: 20)
     monkeypatch.setattr(
         operations,
         "_reviewed_upgrade_recovery",
@@ -1261,7 +1317,7 @@ def test_reviewed_upgrade_replays_pending_assembly_at_the_target_schema(
             "artifact_sha256": "a" * 64,
         },
     )
-    result = {"schema_version": 19, "backup": str(backup)}
+    result = {"schema_version": 20, "backup": str(backup)}
     continuations = 0
 
     def continue_upgrade(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -1355,7 +1411,7 @@ def test_upgrade_resume_preserves_reviewed_services_and_schema_target(
         True,
     )
 
-    monkeypatch.setattr(setup_operations, "LATEST_SCHEMA_VERSION", 20)
+    monkeypatch.setattr(setup_operations, "LATEST_SCHEMA_VERSION", 21)
     with pytest.raises(SetupError, match="target no longer matches"):
         operations.apply_upgrade(plan.plan_id)
     assert calls == 1
@@ -1380,7 +1436,7 @@ def test_reviewed_upgrade_apply_holds_the_lifecycle_lock_while_running(
                 operations.apply_upgrade(plan.plan_id)
             except SetupError as exc:
                 nested_errors.append(str(exc))
-        return {"schema_version": 19, "backup": "/private/verified-backup"}
+        return {"schema_version": 20, "backup": "/private/verified-backup"}
 
     monkeypatch.setattr(operations, "_upgrade", upgrade)
 

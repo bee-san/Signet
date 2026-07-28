@@ -61,6 +61,7 @@ from signet.setup_platform import (
     validate_active_database_runtime_ownership,
 )
 from signet.setup_state import (
+    ExecutableIdentity,
     PolicyMode,
     SetupEngine,
     SetupError,
@@ -101,6 +102,17 @@ class SetupOperations:
         journal = self.store.load()
         try:
             document = journal.spec
+            executable_identity_document = document.get("executable_identity")
+            executable_identity = (
+                ExecutableIdentity(
+                    device=executable_identity_document["device"],
+                    inode=executable_identity_document["inode"],
+                    size=executable_identity_document["size"],
+                    sha256=executable_identity_document["sha256"],
+                )
+                if isinstance(executable_identity_document, dict)
+                else None
+            )
             return SetupSpec(
                 root=Path(document["root"]),
                 public_origin=str(document["public_origin"]),
@@ -120,6 +132,7 @@ class SetupOperations:
                     else None
                 ),
                 data_device=cast(int | None, document.get("data_device")),
+                executable_identity=executable_identity,
             )
         except (KeyError, TypeError, ValueError):
             raise SetupError("setup journal specification is invalid") from None
@@ -510,11 +523,17 @@ class SetupOperations:
         destination_status = storage_path_status(
             selected.parent,
             disk_usage_provider=disk_usage_provider,
+            include_usage=False,
         )
-        if int(destination_status["usage_bytes"]) + estimated_bytes > int(
-            policy["backups_hard_bytes"]
-        ) or int(destination_status["free_bytes"]) - estimated_bytes < int(
-            policy["minimum_reserve_bytes"]
+        backups_hard_bytes = int(policy["backups_hard_bytes"])
+        owned_backup_bytes = (
+            int(roots["backups"]["usage_bytes"]) if selected.is_relative_to(spec.backup_dir) else 0
+        )
+        if (
+            estimated_bytes > backups_hard_bytes
+            or owned_backup_bytes + estimated_bytes > backups_hard_bytes
+            or int(destination_status["free_bytes"]) - estimated_bytes
+            < int(policy["minimum_reserve_bytes"])
         ):
             raise SetupError("backup storage budget would exceed the reviewed hard limit")
         manager = manager or self._backup_manager(journal)

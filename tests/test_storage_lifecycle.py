@@ -1,13 +1,38 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import signet.setup_platform as setup_platform
+from signet.setup_platform import storage_path_status
 from signet.storage_lifecycle import StorageMaintenance, StoragePolicyError
 
 
-def test_storage_maintenance_copy_truncates_logs_and_keeps_one_generation(
+def test_storage_path_status_can_skip_unrelated_usage_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination_parent = tmp_path / "external"
+    destination_parent.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        setup_platform,
+        "_tree_usage_bytes",
+        lambda _path: pytest.fail("free-space checks must not traverse unrelated files"),
+    )
+
+    status = storage_path_status(
+        destination_parent,
+        disk_usage_provider=lambda _path: SimpleNamespace(free=2048, total=4096),
+        include_usage=False,
+    )
+
+    assert status["usage_bytes"] == 0
+    assert status["free_bytes"] == 2048
+
+
+def test_storage_maintenance_rotates_logs_without_losing_concurrent_appends(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "signet"
@@ -25,11 +50,13 @@ def test_storage_maintenance_copy_truncates_logs_and_keeps_one_generation(
         logs_hard_bytes=96,
         cache_hard_bytes=64,
     )
-    report = maintenance.run_once()
+    with active.open("ab", buffering=0) as writer:
+        report = maintenance.run_once()
+        writer.write(b"concurrent")
 
     assert active.read_bytes() == b""
-    assert (logs / "workers.log.1").read_bytes() == b"a" * 32
-    assert report["logs_bytes"] == 32
+    assert (logs / "workers.log.1").read_bytes() == b"a" * 80 + b"concurrent"
+    assert report["logs_bytes"] == 80
     assert report["rotated_logs"] == 1
 
 
