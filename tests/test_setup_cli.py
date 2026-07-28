@@ -45,6 +45,28 @@ class FakePlatform:
         del spec, setup_id
 
 
+def test_runtime_closure_digest_tracks_the_package_and_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "signet"
+    package.mkdir(mode=0o700)
+    module = package / "setup_cli.py"
+    module.write_text("VERSION = 1\n", encoding="utf-8")
+    module.chmod(0o600)
+    monkeypatch.setattr(setup_cli, "__file__", str(module))
+
+    before = setup_cli._runtime_closure_document()
+    module.write_text("VERSION = 2\n", encoding="utf-8")
+    after = setup_cli._runtime_closure_document()
+
+    assert before["package_root"] == str(package)
+    assert before["package_file_count"] == 1
+    assert before["package_sha256"] != after["package_sha256"]
+    assert before["interpreter"]["path"] == str(Path(setup_cli.sys.executable).resolve())
+    assert len(str(before["interpreter"]["sha256"])) == 64
+
+
 def _installed_test_executable(tmp_path: Path) -> Path:
     executable = tmp_path / "bin" / "signet"
     executable.parent.mkdir(mode=0o700)

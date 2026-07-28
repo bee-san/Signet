@@ -20,6 +20,11 @@ from typing import Any, TextIO, cast
 
 from signet.canonical import canonical_json
 from signet.lifecycle import lifecycle_recovery_directory, setup_lifecycle_lock
+from signet.private_paths import (
+    PrivatePathError,
+    open_directory_with_stable_ancestry,
+    require_no_acl_grants,
+)
 from signet.provider_setup import ProviderSetupOperations
 from signet.setup_operations import SetupOperations
 from signet.setup_platform import (
@@ -483,6 +488,132 @@ def _setup_plan_id(plan: SetupPlan) -> str:
     return hashlib.sha256(canonical_json(_setup_plan_payload(plan))).hexdigest()
 
 
+def _runtime_closure_document() -> dict[str, Any]:
+    interpreter, interpreter_identity = _reviewed_executable(_absolute_path(sys.executable))
+    if interpreter_identity is None:
+        raise SetupError("the bound Python interpreter is unavailable")
+    package_root = Path(__file__).resolve(strict=True).parent
+    try:
+        root_descriptor = open_directory_with_stable_ancestry(package_root)
+    except PrivatePathError as exc:
+        raise SetupError("the installed Signet package has unsafe ancestry") from exc
+    else:
+        os.close(root_descriptor)
+
+    def package_paths() -> tuple[Path, ...]:
+        paths: list[Path] = []
+        try:
+            candidates = sorted(package_root.rglob("*"))
+        except OSError as exc:
+            raise SetupError("the installed Signet package inventory is unavailable") from exc
+        for path in candidates:
+            relative = path.relative_to(package_root)
+            if "__pycache__" in relative.parts or path.suffix in {".pyc", ".pyo"}:
+                continue
+            if path.is_symlink():
+                raise SetupError("the installed Signet package contains a symlink")
+            if path.is_file():
+                paths.append(path)
+        return tuple(paths)
+
+    selected_paths = package_paths()
+    if not selected_paths:
+        raise SetupError("the installed Signet package inventory is empty")
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    inventory: list[dict[str, int | str]] = []
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    for path in selected_paths:
+        parent_descriptor = -1
+        descriptor = -1
+        try:
+            parent_descriptor = open_directory_with_stable_ancestry(path.parent)
+            before = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+            opened = os.fstat(descriptor)
+            require_no_acl_grants(descriptor)
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            current = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except (OSError, PrivatePathError, RuntimeError, ValueError) as exc:
+            raise SetupError("the installed Signet package changed during review") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+        identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_gid,
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid not in {0, current_uid}
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) & 0o022
+            or identity
+            != (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            or identity
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            or identity
+            != (
+                current.st_dev,
+                current.st_ino,
+                current.st_mode,
+                current.st_uid,
+                current.st_gid,
+                current.st_nlink,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )
+        ):
+            raise SetupError("the installed Signet package changed during review")
+        inventory.append(
+            {
+                "path": path.relative_to(package_root).as_posix(),
+                "size": opened.st_size,
+                "sha256": digest.hexdigest(),
+            }
+        )
+    if package_paths() != selected_paths:
+        raise SetupError("the installed Signet package inventory changed during review")
+    return {
+        "interpreter": {"path": str(interpreter), **interpreter_identity.document()},
+        "package_root": str(package_root),
+        "package_file_count": len(inventory),
+        "package_sha256": hashlib.sha256(canonical_json(inventory)).hexdigest(),
+    }
+
+
 def _setup_plan_payload(plan: SetupPlan) -> dict[str, Any]:
     spec = plan.spec
     automatic_steps = [step.name for step in plan.steps if step.name != "owner_bootstrap"]
@@ -506,6 +637,7 @@ def _setup_plan_payload(plan: SetupPlan) -> dict[str, Any]:
         "data_device": spec.data_device,
         "backup_root": str(spec.backup_dir),
         "executable": executable,
+        "runtime_closure": _runtime_closure_document(),
         "storage_limits": {
             "attachments_hard_bytes": ATTACHMENTS_HARD_BYTES,
             "backups_hard_bytes": BACKUPS_HARD_BYTES,
