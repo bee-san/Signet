@@ -160,7 +160,13 @@ def build_reproducibly(
     ):
         first = Path(first_raw)
         second = Path(second_raw)
-        command = [uv_executable, "build", f"--{kind}", "--no-sources"]
+        command = [
+            uv_executable,
+            "build",
+            "--no-cache",
+            f"--{kind}",
+            "--no-sources",
+        ]
         source_argument = str(source)
         _run(
             [*command, "--out-dir", str(first), source_argument],
@@ -192,7 +198,13 @@ def build_reproducibly(
             raise ReproducibleBuildError("refusing to replace existing release output")
         shutil.copyfile(first_artifact, destination)
 
-    uv_version = _run([uv_executable, "--version"], cwd=repository, environment=environment)
+    uv_output = _run(
+        [uv_executable, "--version"], cwd=repository, environment=environment
+    )
+    uv_match = re.match(r"^uv (\d+\.\d+\.\d+)(?:\s|$)", uv_output)
+    if uv_match is None or uv_match.group(1) != "0.11.28":
+        raise ReproducibleBuildError(f"release build requires uv 0.11.28; found {uv_output}")
+    uv_version = f"uv {uv_match.group(1)}"
     evidence: dict[str, object] = {
         "artifact": destination.name,
         "build_kind": kind,

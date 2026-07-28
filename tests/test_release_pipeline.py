@@ -10,7 +10,6 @@ import zipfile
 from email.parser import BytesParser
 from email.policy import compat32
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -260,6 +259,7 @@ packages = ["src/evidence_demo"]
     assert evidence["sha256"] == evidence["rebuild_sha256"]
     assert re.fullmatch(r"[0-9a-f]{64}", str(evidence["sha256"]))
     assert evidence["source_sha"] == source_sha
+    assert evidence["uv"] == "uv 0.11.28"
 
     (package / "__init__.py").write_text("VALUE = 2\n", encoding="utf-8")
     with pytest.raises(error, match="tracked changes"):
@@ -278,7 +278,7 @@ packages = ["src/evidence_demo"]
 
 def test_built_artifacts_contain_production_assets_and_metadata(tmp_path: Path) -> None:
     built = subprocess.run(  # nosec B603 B607
-        ["uv", "build", "--no-sources", "--out-dir", str(tmp_path)],
+        ["uv", "build", "--no-cache", "--no-sources", "--out-dir", str(tmp_path)],
         cwd=ROOT,
         check=False,
         capture_output=True,
