@@ -387,6 +387,49 @@ def test_expiry_and_daily_schedulers_are_idempotent(database: Database) -> None:
     assert digest.message.count == 2
 
 
+def test_expiry_scheduler_paginates_independently_for_every_user(database: Database) -> None:
+    machine = ApprovalStateMachine(database)
+    machine.enqueue(_request("req_DueFirst", expires_at=NOW + 30))
+    machine.enqueue(_request("req_DueSecond", expires_at=NOW + 45))
+    outbox = SQLiteNotificationOutbox(database)
+
+    for user_id in ("user:owner", "user:approver"):
+        assert (
+            outbox.schedule_approaching_expiry(
+                user_id=user_id,
+                now=NOW,
+                horizon_seconds=60,
+                limit=1,
+            )
+            == 1
+        )
+        assert (
+            outbox.schedule_approaching_expiry(
+                user_id=user_id,
+                now=NOW,
+                horizon_seconds=60,
+                limit=1,
+            )
+            == 1
+        )
+        assert (
+            outbox.schedule_approaching_expiry(
+                user_id=user_id,
+                now=NOW,
+                horizon_seconds=60,
+                limit=1,
+            )
+            == 0
+        )
+
+    claimed = outbox.claim_due(worker_id="scheduler-pagination-test", now=NOW)
+    expiry_intents = [
+        intent for intent in claimed if intent.message.kind is NotificationKind.APPROACHING_EXPIRY
+    ]
+    assert len(expiry_intents) == 4
+    assert {intent.user_id for intent in expiry_intents} == {"user:owner", "user:approver"}
+
+
 def test_state_enqueue_and_notification_intent_commit_or_rollback_together(
     database: Database,
 ) -> None:

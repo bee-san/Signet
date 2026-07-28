@@ -284,23 +284,29 @@ class SQLiteNotificationOutbox:
         if limit <= 0 or limit > 10_000:
             raise ValueError("expiry notification limit is invalid")
         inserted = 0
+        dedupe_prefix = f"approaching_expiry:{hashlib.sha256(user_id.encode()).hexdigest()}:"
         with self.database.transaction() as connection:
             rows = connection.execute(
                 """
-                SELECT request_id, downstream_alias, tool_name, current_version
-                FROM approval_requests
-                WHERE state = 'pending_approval' AND expires_at > ? AND expires_at <= ?
-                ORDER BY expires_at, request_id LIMIT ?
+                SELECT request.request_id, request.downstream_alias,
+                       request.tool_name, request.current_version
+                FROM approval_requests AS request
+                WHERE request.state = 'pending_approval'
+                  AND request.expires_at > ? AND request.expires_at <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM notification_outbox AS outbox
+                      WHERE outbox.dedupe_key =
+                            ? || request.request_id || ':' || request.current_version
+                  )
+                ORDER BY request.expires_at, request.request_id LIMIT ?
                 """,
-                (now, now + horizon_seconds, limit),
+                (now, now + horizon_seconds, dedupe_prefix, limit),
             ).fetchall()
             for row in rows:
                 inserted += int(
                     enqueue_notification(
                         connection,
-                        dedupe_key=(
-                            f"approaching_expiry:{row['request_id']}:{row['current_version']}"
-                        ),
+                        dedupe_key=(f"{dedupe_prefix}{row['request_id']}:{row['current_version']}"),
                         user_id=user_id,
                         message=PushMessage(
                             NotificationKind.APPROACHING_EXPIRY,
