@@ -225,6 +225,8 @@ class BackupBundleManager:
         *,
         created_at: int | None = None,
         required_key_references: tuple[str, ...] = (),
+        prepare_publication: Callable[[Path], None] | None = None,
+        finalize_publication: Callable[[Path], None] | None = None,
     ) -> Path:
         requested = _absolute_backup_path(
             destination,
@@ -360,6 +362,12 @@ class BackupBundleManager:
             _require_private_backup_file(temporary, expected=temporary_identity)
             if destination.exists() or destination.is_symlink():
                 raise BackupError("backup destination already exists")
+            if prepare_publication is not None:
+                prepare_publication(temporary)
+                _require_unchanged_backup_directory(parent_identity)
+                _require_private_backup_file(temporary, expected=temporary_identity)
+                if destination.exists() or destination.is_symlink():
+                    raise BackupError("backup destination appeared during publication preparation")
             try:
                 _rename_backup_no_replace(temporary, destination)
                 publication_observed = True
@@ -386,6 +394,10 @@ class BackupBundleManager:
             except BaseException as exc:
                 raise _backup_publication_unknown() from exc
             publication_durable = True
+            if finalize_publication is not None:
+                finalize_publication(destination)
+                _require_unchanged_backup_directory(parent_identity)
+                _require_private_backup_file(destination, expected=published_identity)
             return destination
         except BaseException as exc:
             operation_error = exc
@@ -435,7 +447,14 @@ class BackupBundleManager:
                         "not be confirmed; inspect the backup parent before continuing"
                     ) from cleanup_errors[0]
 
-    def restore(self, bundle: Path, destination_root: Path) -> RestoredBundle:
+    def restore(
+        self,
+        bundle: Path,
+        destination_root: Path,
+        *,
+        prepare_publication: Callable[[RestoredBundle, Path], None] | None = None,
+        finalize: Callable[[RestoredBundle], None] | None = None,
+    ) -> RestoredBundle:
         bundle = _absolute_backup_path(
             bundle,
             message="backup bundle path is unavailable or unsafe",
@@ -465,7 +484,12 @@ class BackupBundleManager:
                     maximum_bytes=self.max_bundle_bytes,
                 )
                 archive.seek(0)
-                restored = self._restore_archive(archive, destination_root)
+                restored = self._restore_archive(
+                    archive,
+                    destination_root,
+                    prepare_publication=prepare_publication,
+                    finalize=finalize,
+                )
         except BaseException as operation_error:
             try:
                 os.close(descriptor)
@@ -517,27 +541,37 @@ class BackupBundleManager:
         self,
         archive: BinaryIO,
         destination_root: Path,
+        *,
+        prepare_publication: Callable[[RestoredBundle, Path], None] | None = None,
+        finalize: Callable[[RestoredBundle], None] | None = None,
     ) -> RestoredBundle:
         destination_root = _absolute_backup_path(
             destination_root,
             message="backup restore destination path is unavailable or unsafe",
         )
-        destination_root, parent_identity, root_identity = _create_restore_root(destination_root)
+        if destination_root.exists() or destination_root.is_symlink():
+            raise BackupError("restore destination must not already exist")
+        staging_root = destination_root.with_name(
+            f".{destination_root.name}.restore-{secrets.token_urlsafe(12)}"
+        )
+        staging_root, parent_identity, root_identity = _create_restore_root(staging_root)
+        published = False
+        cleanup_identity = root_identity
         try:
             with zipfile.ZipFile(archive, mode="r") as zipped:
-                _extract_archive(zipped, destination_root)
-            attachments_root = destination_root / "attachments"
+                _extract_archive(zipped, staging_root)
+            attachments_root = staging_root / "attachments"
             try:
                 ensure_private_directory(attachments_root)
             except PrivatePathError as exc:
                 raise BackupError("restored attachment directory is unsafe") from exc
             _fsync_directory(attachments_root)
-            _fsync_directory(destination_root)
-            manifest_path = destination_root / "manifest.json"
+            _fsync_directory(staging_root)
+            manifest_path = staging_root / "manifest.json"
             manifest = _read_json_file(manifest_path)
             if not isinstance(manifest, dict) or manifest.get("format") not in {2, 3}:
                 raise BackupError("backup manifest format is unsupported")
-            database_path = destination_root / "approvals.sqlite3"
+            database_path = staging_root / "approvals.sqlite3"
             if _file_hash(database_path) != manifest.get("database_sha256"):
                 raise BackupError("backup database hash does not match the manifest")
             Database.verify_snapshot(database_path)
@@ -547,33 +581,91 @@ class BackupBundleManager:
                 )
             if manifest.get("schema_version") != snapshot_schema_version:
                 raise BackupError("backup manifest schema version differs from the snapshot")
-            self._relocate_restored_attachments(destination_root, database_path, manifest)
+            self._relocate_restored_attachments(
+                staging_root,
+                database_path,
+                manifest,
+                published_destination=destination_root,
+            )
             Database.verify_snapshot(database_path)
-            self._verify_restored_attachments(destination_root, database_path, manifest)
-            current_root = require_private_directory_identity(destination_root)
+            self._verify_restored_attachments(
+                staging_root,
+                database_path,
+                manifest,
+                published_destination=destination_root,
+            )
+            current_root = require_private_directory_identity(staging_root)
             if not root_identity.same_object(current_root):
                 raise BackupError("private restore tree identity changed")
-            _fsync_directory(destination_root)
+            _fsync_directory(staging_root)
             parent = revalidate_directory_identity(parent_identity, private=False)
             _fsync_directory(parent)
             revalidate_directory_identity(parent_identity, private=False)
-            current_root = require_private_directory_identity(destination_root)
+            current_root = require_private_directory_identity(staging_root)
             if not root_identity.same_object(current_root):
                 raise BackupError("private restore tree identity changed")
-            return RestoredBundle(
-                root=destination_root,
+            staged = RestoredBundle(
+                root=staging_root,
                 database_path=database_path,
                 attachments_root=attachments_root,
                 manifest=manifest,
                 root_identity=root_identity,
                 parent_identity=parent_identity,
             )
+            if prepare_publication is not None:
+                prepare_publication(staged, destination_root)
+                revalidate_directory_identity(root_identity, private=True)
+                _fsync_directory(staging_root)
+                revalidate_directory_identity(root_identity, private=True)
+            if destination_root.exists() or destination_root.is_symlink():
+                raise BackupError("backup restore destination appeared before publication")
+            try:
+                _rename_restore_no_replace(staging_root, destination_root)
+                published = True
+            except BaseException:
+                try:
+                    current_root = require_private_directory_identity(staging_root)
+                except PrivatePathError:
+                    published = True
+                else:
+                    if not root_identity.same_object(current_root):
+                        published = True
+                raise
+            cleanup_identity = DirectoryIdentity(
+                path=destination_root,
+                device=root_identity.device,
+                inode=root_identity.inode,
+                owner_uid=root_identity.owner_uid,
+            )
+            parent = revalidate_directory_identity(parent_identity, private=False)
+            _fsync_directory(parent)
+            revalidate_directory_identity(parent_identity, private=False)
+            current_root = require_private_directory_identity(destination_root)
+            if not cleanup_identity.same_object(current_root):
+                raise BackupError("published restore tree identity changed")
+            restored = RestoredBundle(
+                root=destination_root,
+                database_path=destination_root / database_path.name,
+                attachments_root=destination_root / attachments_root.name,
+                manifest=manifest,
+                root_identity=cleanup_identity,
+                parent_identity=parent_identity,
+            )
+            if finalize is not None:
+                finalize(restored)
+                revalidate_directory_identity(cleanup_identity, private=True)
+                parent = revalidate_directory_identity(parent_identity, private=False)
+                _fsync_directory(destination_root)
+                _fsync_directory(parent)
+                revalidate_directory_identity(parent_identity, private=False)
+                revalidate_directory_identity(cleanup_identity, private=True)
+            return restored
         except BaseException:
             try:
                 remove_private_tree_checked(
-                    destination_root,
+                    destination_root if published else staging_root,
                     parent_identity=parent_identity,
-                    tree_identity=root_identity,
+                    tree_identity=cleanup_identity,
                 )
             except BaseException as cleanup_error:
                 raise BackupCleanupStateUnknown(
@@ -794,6 +886,8 @@ class BackupBundleManager:
         destination: Path,
         database_path: Path,
         manifest: dict[str, Any],
+        *,
+        published_destination: Path | None = None,
     ) -> None:
         expected = _attachment_manifest(manifest)
         connection = sqlite3.connect(str(database_path), isolation_level=None)
@@ -817,7 +911,9 @@ class BackupBundleManager:
                 item = expected.get(record.opaque_id)
                 if item is None:
                     raise BackupError("backup attachment manifest is incomplete")
-                path = destination.joinpath(*PurePosixPath(item["archive_path"]).parts)
+                relative_path = PurePosixPath(item["archive_path"]).parts
+                path = destination.joinpath(*relative_path)
+                published_path = (published_destination or destination).joinpath(*relative_path)
                 restored_record = _record_with_path(record, path)
                 if row["consumed_request_id"] != item[
                     "consumed_request_id"
@@ -839,7 +935,7 @@ class BackupBundleManager:
                         format_version=(3 if "detection_source" in item else 2),
                     ),
                 )
-                relocations.append((record, path))
+                relocations.append((record, published_path))
 
             connection.execute("BEGIN IMMEDIATE")
             has_staged_catalog = _table_has_column(connection, "staged_objects", "attachment_id")
@@ -916,6 +1012,8 @@ class BackupBundleManager:
         destination: Path,
         database_path: Path,
         manifest: dict[str, Any],
+        *,
+        published_destination: Path | None = None,
     ) -> None:
         expected = _attachment_manifest(manifest)
         _verify_key_reference_manifest(database_path, manifest)
@@ -934,8 +1032,11 @@ class BackupBundleManager:
             if item is None:
                 raise BackupError("backup attachment manifest is incomplete")
             path = destination.joinpath(*PurePosixPath(item["archive_path"]).parts)
+            published_path = (published_destination or destination).joinpath(
+                *PurePosixPath(item["archive_path"]).parts
+            )
             if (
-                record.path != path
+                record.path != published_path
                 or row["consumed_request_id"] != item["consumed_request_id"]
                 or not _record_matches_manifest(record, item)
             ):
@@ -1106,6 +1207,14 @@ def _encrypt_archive_to_path(
 
 
 def _rename_backup_no_replace(source: Path, destination: Path) -> None:
+    _rename_path_no_replace(source, destination)
+
+
+def _rename_restore_no_replace(source: Path, destination: Path) -> None:
+    _rename_path_no_replace(source, destination)
+
+
+def _rename_path_no_replace(source: Path, destination: Path) -> None:
     try:
         library = ctypes.CDLL(None, use_errno=True)
         if sys.platform == "linux":

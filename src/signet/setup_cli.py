@@ -5,19 +5,28 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
-import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO, cast
 
+from signet.lifecycle import lifecycle_recovery_directory, setup_lifecycle_lock
 from signet.provider_setup import ProviderSetupOperations
-from signet.setup_operations import SetupOperations, setup_lifecycle_lock
+from signet.setup_operations import SetupOperations
 from signet.setup_platform import ProductionSetupPlatform
-from signet.setup_state import PolicyMode, SetupEngine, SetupError, SetupJournalStore, SetupSpec
+from signet.setup_state import (
+    PolicyMode,
+    SetupEngine,
+    SetupError,
+    SetupJournalStore,
+    SetupPlan,
+    SetupSpec,
+)
 
 _SETUP_COMMANDS = frozenset(
     {
@@ -25,10 +34,12 @@ _SETUP_COMMANDS = frozenset(
         "manage",
         "status",
         "doctor",
+        "verify",
         "backup",
         "restore",
         "upgrade",
         "uninstall",
+        "authenticators",
         "provider",
         "production",
     }
@@ -38,7 +49,7 @@ _SETUP_COMMANDS = frozenset(
 def add_setup_parsers(subcommands: Any) -> None:
     setup = subcommands.add_parser(
         "setup",
-        help="plan or apply a resumable private Signet installation",
+        help="print, apply, resume, or roll back a private installation plan",
     )
     _root_argument(setup)
     setup.add_argument("--origin", help="canonical private HTTPS origin")
@@ -54,8 +65,16 @@ def add_setup_parsers(subcommands: Any) -> None:
         choices=("deny", "direct", "approval", "approval_with_edit"),
         help="default policy mode (default: deny)",
     )
-    setup.add_argument("--plan", action="store_true", help="print a read-only setup plan")
-    setup.add_argument("--rollback", action="store_true", help="resume rollback of applied steps")
+    setup.add_argument(
+        "--plan",
+        action="store_true",
+        help="print the read-only setup plan and exit",
+    )
+    setup.add_argument(
+        "--rollback",
+        action="store_true",
+        help="after destructive confirmation, resume rollback of applied steps",
+    )
     setup.add_argument(
         "--yes",
         action="store_true",
@@ -70,10 +89,21 @@ def add_setup_parsers(subcommands: Any) -> None:
 
     manage = subcommands.add_parser(
         "manage",
-        help="start, stop, restart, or inspect Signet services",
+        help="manage plan, apply, roll back, or inspect Signet services",
     )
     _root_argument(manage)
     manage.add_argument("action", choices=("start", "stop", "restart", "status"))
+    manage_mode = manage.add_mutually_exclusive_group()
+    manage_mode.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed service plan",
+    )
+    manage_mode.add_argument(
+        "--rollback",
+        metavar="PLAN_ID",
+        help="resume rollback of the exact reviewed service plan",
+    )
 
     status = subcommands.add_parser("status", help="show persisted setup and runtime status")
     _root_argument(status)
@@ -81,24 +111,50 @@ def add_setup_parsers(subcommands: Any) -> None:
     doctor = subcommands.add_parser("doctor", help="run non-secret installation diagnostics")
     _root_argument(doctor)
 
-    backup = subcommands.add_parser("backup", help="create a verified encrypted backup")
+    verify = subcommands.add_parser(
+        "verify",
+        help="classify automatic checks, human ceremonies, and deferred provider proof",
+    )
+    _root_argument(verify)
+
+    backup = subcommands.add_parser(
+        "backup",
+        help="backup plan or apply a verified encrypted backup",
+    )
     _root_argument(backup)
     backup.add_argument("--destination", type=Path)
+    backup.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed backup plan",
+    )
 
-    restore = subcommands.add_parser("restore", help="verify and stage an encrypted backup")
+    restore = subcommands.add_parser(
+        "restore",
+        help="restore plan or apply verification into a new staging root",
+    )
     _root_argument(restore)
     restore.add_argument("bundle", type=Path)
+    restore.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed restore plan",
+    )
 
     upgrade = subcommands.add_parser(
         "upgrade",
-        help="back up data and apply installed-package schema upgrades",
+        help="upgrade plan or apply a backed-up installed-package migration",
     )
     _root_argument(upgrade)
-    upgrade.add_argument("--yes", action="store_true")
+    upgrade.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed upgrade plan",
+    )
 
     uninstall = subcommands.add_parser(
         "uninstall",
-        help="remove service and Hermes integration while preserving data",
+        help="uninstall plan or apply exact service and Hermes removal",
     )
     _root_argument(uninstall)
     uninstall.add_argument(
@@ -106,7 +162,34 @@ def add_setup_parsers(subcommands: Any) -> None:
         action="store_true",
         help="back up, then remove owned data and secrets",
     )
-    uninstall.add_argument("--yes", action="store_true")
+    uninstall.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact reviewed uninstall or purge plan",
+    )
+
+    authenticators = subcommands.add_parser(
+        "authenticators",
+        help="open named passkey and TOTP management",
+    )
+    authenticator_commands = authenticators.add_subparsers(
+        dest="authenticator_command",
+        required=True,
+    )
+    authenticator_open = authenticator_commands.add_parser(
+        "open",
+        help="open named passkey and TOTP enrollment in the authenticated browser",
+        description=(
+            "Print the exact private URL, then open authenticated browser management for "
+            "named passkey and TOTP enrollment. Credential material never crosses the CLI."
+        ),
+    )
+    _root_argument(authenticator_open)
+    authenticator_open.add_argument(
+        "--no-open-browser",
+        action="store_true",
+        help="print the exact management URL without opening a browser",
+    )
 
     provider = subcommands.add_parser(
         "provider",
@@ -168,6 +251,7 @@ def run_setup_command(
     runner: Callable[..., Any] | None = None,
     secret_input_fn: Callable[[str], str] = getpass.getpass,
     stdin: TextIO | None = None,
+    browser_opener: Callable[[str], bool] = webbrowser.open,
 ) -> int:
     selected_platform = platform or ProductionSetupPlatform(output=output)
     if args.command == "production":
@@ -185,7 +269,7 @@ def run_setup_command(
             _require_confirmation(
                 args.yes,
                 input_fn,
-                "Configure Fastmail, send one test email, and enable it?",
+                "LIVE PROVIDER PROOF — configure Fastmail, send one test email, and enable it?",
             )
             token = (
                 (stdin or sys.stdin).readline().rstrip("\r\n")
@@ -203,7 +287,8 @@ def run_setup_command(
             _require_confirmation(
                 args.yes,
                 input_fn,
-                "Download verified wacli if needed, pair WhatsApp, send one test, and enable it?",
+                "HUMAN CEREMONY + LIVE PROVIDER PROOF — download verified wacli if needed, "
+                "pair WhatsApp, send one test, and enable it?",
             )
             recipient = args.recipient or input_fn("WhatsApp test recipient: ").strip()
             provider_result = providers.setup_whatsapp(
@@ -220,44 +305,26 @@ def run_setup_command(
             raise ValueError("--plan and --rollback cannot be combined")
         if args.plan:
             plan = engine.plan(spec)
-            _emit(
-                {
-                    "setup_id": plan.setup_id,
-                    "root": str(spec.root),
-                    "owner_setup_url": f"{spec.public_origin}/setup",
-                    "provider_rollout": plan.provider_rollout,
-                    "policy_mode": spec.policy_mode,
-                    "hermes_profiles": list(spec.hermes_profiles),
-                    "steps": [step.name for step in plan.steps],
-                    "automatic_steps": [step.name for step in plan.steps[:-1]],
-                    "human_ceremonies": [
-                        "owner_authentication_enrollment",
-                        "hermes_mcp_review_and_reload",
-                    ],
-                    "deferred_provider_proof": [
-                        "credential_configuration",
-                        "read_only_discovery",
-                        "live_send",
-                    ],
-                    "browser_will_open": spec.open_browser,
-                    "gateway_restart": False,
-                },
-                output,
-            )
+            _emit(_setup_plan_document(plan), output)
             return 0
         if args.rollback:
             _require_confirmation(
                 args.yes,
                 input_fn,
-                "Back up and roll back all setup-owned Signet resources?",
+                "DESTRUCTIVE — back up and roll back all setup-owned Signet resources?",
             )
             rollback_document = operations_factory(root, platform=selected_platform).uninstall(
                 purge=True
             )
             _emit(rollback_document, output)
             return 0
-        _require_confirmation(args.yes, input_fn, "Apply this setup plan?")
-        with setup_lifecycle_lock(root):
+        _emit(_setup_plan_document(engine.plan(spec)), output)
+        _require_confirmation(
+            args.yes,
+            input_fn,
+            "Apply the reviewed automatic steps, then continue with the labelled human ceremonies?",
+        )
+        with setup_lifecycle_lock(lifecycle_recovery_directory(root)):
             journal = engine.apply(spec)
         output(
             "Review the generated MCP entry, then run /reload-mcp in each selected Hermes profile; "
@@ -275,44 +342,105 @@ def run_setup_command(
         return 0
 
     operations = operations_factory(root, platform=selected_platform)
+    if args.command == "authenticators":
+        management_url = f"{operations.spec().public_origin}/authenticators"
+        output(
+            "HUMAN CEREMONY — named passkey and TOTP management requires your "
+            "authenticated browser."
+        )
+        output(f"Authenticator management URL: {management_url}")
+        opened = False
+        if not args.no_open_browser:
+            opened = bool(browser_opener(management_url))
+            if not opened:
+                raise SetupError(
+                    "the browser did not accept the authenticator management URL; "
+                    "rerun with --no-open-browser and open the printed private URL"
+                )
+        _emit(
+            {
+                "authenticator_management_url": management_url,
+                "browser_opened": opened,
+                "credential_material_in_cli": False,
+                "enrollment": ["named_passkey", "named_totp"],
+            },
+            output,
+        )
+        return 0
     document: dict[str, Any]
     if args.command == "manage":
-        document = (
-            operations.status() if args.action == "status" else operations.manage(args.action)
-        )
+        if args.action == "status":
+            if args.apply is not None or args.rollback is not None:
+                raise ValueError("manage status cannot apply or roll back a plan")
+            document = operations.status()
+        elif args.rollback is not None:
+            document = operations.rollback_service_plan(args.rollback)
+        elif args.apply is not None:
+            document = operations.apply_service_plan(args.action, args.apply)
+        else:
+            document = operations.plan_services(args.action).document()
     elif args.command == "status":
         document = operations.status()
     elif args.command == "doctor":
         document = operations.doctor()
+    elif args.command == "verify":
+        document = operations.verify()
     elif args.command == "backup":
         destination = _absolute_path(args.destination) if args.destination is not None else None
-        document = {"backup": str(operations.backup(destination))}
+        document = (
+            operations.apply_backup(args.apply, destination)
+            if args.apply is not None
+            else operations.plan_backup(destination).document()
+        )
     elif args.command == "restore":
-        restored = operations.restore(_absolute_path(args.bundle))
-        document = {
-            "restored_to": str(restored.root),
-            "database": str(restored.database_path),
-            "activated": False,
-        }
+        bundle = _absolute_path(args.bundle)
+        document = (
+            operations.apply_restore(args.apply, bundle)
+            if args.apply is not None
+            else operations.plan_restore(bundle).document()
+        )
     elif args.command == "upgrade":
-        _require_confirmation(
-            args.yes,
-            input_fn,
-            "Create a backup and apply installed schema upgrades?",
+        document = (
+            operations.apply_upgrade(args.apply)
+            if args.apply is not None
+            else operations.plan_upgrade().document()
         )
-        document = operations.upgrade()
     elif args.command == "uninstall":
-        prompt = (
-            "Back up and purge all setup-owned Signet data?"
-            if args.purge
-            else "Remove Signet services and Hermes integration while preserving data?"
+        document = (
+            operations.apply_uninstall(args.apply, purge=args.purge)
+            if args.apply is not None
+            else operations.plan_uninstall(purge=args.purge).document()
         )
-        _require_confirmation(args.yes, input_fn, prompt)
-        document = operations.uninstall(purge=args.purge)
     else:  # pragma: no cover - parser and main dispatch are closed over this set
         raise SetupError("unsupported setup command")
     _emit(document, output)
     return 0
+
+
+def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
+    spec = plan.spec
+    automatic_steps = [step.name for step in plan.steps if step.name != "owner_bootstrap"]
+    return {
+        "root": str(spec.root),
+        "owner_setup_url": f"{spec.public_origin}/setup",
+        "provider_rollout": plan.provider_rollout,
+        "policy_mode": spec.policy_mode,
+        "hermes_profiles": list(spec.hermes_profiles),
+        "steps": [step.name for step in plan.steps],
+        "automatic_steps": automatic_steps,
+        "human_ceremonies": [
+            "owner_authentication_enrollment",
+            "hermes_mcp_review_and_reload",
+        ],
+        "deferred_provider_proof": [
+            "credential_configuration",
+            "read_only_discovery",
+            "live_send",
+        ],
+        "destructive_actions": [],
+        "browser_will_open": spec.open_browser,
+        "gateway_restart": False,
+    }
 
 
 def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec:
@@ -412,6 +540,53 @@ def _absolute_path(path: Path | str) -> Path:
     return selected.absolute()
 
 
+def setup_error_message(args: argparse.Namespace, error: Exception) -> str:
+    """Return a redacted, command-specific recovery message for stable CLI exit 2."""
+
+    message = str(error)
+    root_value = getattr(args, "root", Path.home() / ".local" / "share" / "signet")
+    try:
+        root = _absolute_path(root_value)
+    except ValueError:
+        return message
+    quoted_root = shlex.quote(str(root))
+    status_command = f"signet status --root {quoted_root}"
+    if "different setup specification" in message:
+        return (
+            f"{message}\nRefused to adopt or overwrite foreign or conflicting setup state. "
+            f"Recovery: run {status_command}, compare the recorded root/origin/owner/profiles, "
+            "and choose a separate empty --root if this installation is not the intended one."
+        )
+    if args.command == "setup":
+        return (
+            f"{message}\nRecovery: run {status_command}; correct the reported condition, then "
+            "rerun the same signet setup command to resume. Review signet setup --rollback "
+            f"--root {quoted_root} before reversing owned changes."
+        )
+    if args.command == "provider":
+        return (
+            f"{message}\nRecovery: run {status_command} and signet provider status --root "
+            f"{quoted_root}; correct credential, discovery, or live-proof readiness, then rerun "
+            "the same provider command."
+        )
+    if args.command == "authenticators":
+        return (
+            f"{message}\nRecovery: run {status_command}; then run signet authenticators open "
+            f"--no-open-browser --root {quoted_root} and open the printed private URL."
+        )
+    if args.command in {"status", "doctor", "verify"}:
+        return f"{message}\nRecovery: correct the reported read-only check and rerun the command."
+    if args.command == "production":
+        return (
+            f"{message}\nRecovery: run {status_command}, inspect the user service-manager logs, "
+            "and repair the installed assembly before restarting the exact component."
+        )
+    return (
+        f"{message}\nRecovery: run {status_command}; inspect the lifecycle_operation receipt, "
+        "then rerun only the exact reviewed command and PLAN_ID shown by status."
+    )
+
+
 def _require_confirmation(
     confirmed: bool,
     input_fn: Callable[[str], str],
@@ -434,33 +609,26 @@ def _run_production_service(
 ) -> int:
     import uvicorn
 
-    from signet.production import load_production_config
+    from signet.production import create_owned_production_service
 
     config_path = _absolute_path(args.config)
-    config = load_production_config(config_path)
     component = args.production_command.removeprefix("serve-")
+    config, application = create_owned_production_service(
+        config_path,
+        component=component,
+    )
     if component == "mcp":
-        factory = "signet.production:create_production_mcp_app_from_environment"
         host, port = config.mcp_host, config.mcp_port
     else:
-        factory = "signet.production:create_production_web_app_from_environment"
         host, port = config.web_host, config.web_port
     selected_runner = runner or uvicorn.run
-    previous = os.environ.get("SIGNET_PRODUCTION_CONFIG")
-    os.environ["SIGNET_PRODUCTION_CONFIG"] = str(config_path)
-    try:
-        selected_runner(
-            factory,
-            factory=True,
-            host=host,
-            port=port,
-            server_header=False,
-            limit_concurrency=args.limit_concurrency,
-            proxy_headers=False,
-        )
-    finally:
-        if previous is None:
-            os.environ.pop("SIGNET_PRODUCTION_CONFIG", None)
-        else:
-            os.environ["SIGNET_PRODUCTION_CONFIG"] = previous
+    selected_runner(
+        application,
+        factory=False,
+        host=host,
+        port=port,
+        server_header=False,
+        limit_concurrency=args.limit_concurrency,
+        proxy_headers=False,
+    )
     return 0

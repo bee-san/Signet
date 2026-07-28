@@ -9,10 +9,11 @@ from typing import Any
 
 import pytest
 
-from signet.app import _parser
-from signet.setup_cli import _discover_hermes_profiles, run_setup_command
+import signet.production as production_module
+from signet.app import _parser, main
+from signet.setup_cli import _discover_hermes_profiles, run_setup_command, setup_error_message
 from signet.setup_platform import render_production_config
-from signet.setup_state import SETUP_STEPS, SetupSpec
+from signet.setup_state import SETUP_STEPS, SetupError, SetupSpec
 
 
 class FakePlatform:
@@ -46,7 +47,17 @@ def test_profile_discovery_includes_the_hermes_default_profile(
 
 @pytest.mark.parametrize(
     "command",
-    ["setup", "manage", "status", "doctor", "backup", "restore", "upgrade", "uninstall"],
+    [
+        "setup",
+        "manage",
+        "status",
+        "doctor",
+        "verify",
+        "backup",
+        "restore",
+        "upgrade",
+        "uninstall",
+    ],
 )
 def test_parser_exposes_setup_lifecycle_commands(command: str) -> None:
     parser = _parser()
@@ -70,6 +81,17 @@ def test_parser_exposes_setup_lifecycle_commands(command: str) -> None:
     else:
         args = parser.parse_args([command])
     assert args.command == command
+
+
+def test_top_level_help_documents_plan_defaults_and_stable_exit_codes() -> None:
+    help_text = " ".join(_parser().format_help().split())
+
+    assert "manage plan, apply, roll back, or inspect Signet services" in help_text
+    assert "backup plan or apply a verified encrypted backup" in help_text
+    assert (
+        "Exit status: 0 on success; 2 for invalid input, safety refusal, or incomplete work"
+        in help_text
+    )
 
 
 def test_parser_and_dispatch_expose_simple_provider_workflows(tmp_path: Path) -> None:
@@ -432,6 +454,13 @@ def test_lifecycle_commands_dispatch_to_operations_without_mutating_setup_state(
 ) -> None:
     calls: list[tuple[str, object]] = []
 
+    class Plan:
+        def __init__(self, plan_id: str) -> None:
+            self.plan_id = plan_id
+
+        def document(self) -> dict[str, str]:
+            return {"plan_id": self.plan_id}
+
     class Operations:
         def status(self) -> dict[str, str]:
             calls.append(("status", None))
@@ -441,27 +470,56 @@ def test_lifecycle_commands_dispatch_to_operations_without_mutating_setup_state(
             calls.append(("doctor", None))
             return {"healthy": True}
 
-        def backup(self, destination: Path | None = None) -> Path:
-            calls.append(("backup", destination))
-            return tmp_path / "backup.signet-backup"
+        def verify(self) -> dict[str, bool]:
+            calls.append(("verify", None))
+            return {"verified": True}
 
-        def restore(self, bundle: Path) -> object:
-            calls.append(("restore", bundle))
-            return type(
-                "Restored",
-                (),
-                {
-                    "root": tmp_path / "restore",
-                    "database_path": tmp_path / "restore" / "signet.sqlite3",
-                },
-            )()
+        def plan_backup(self, destination: Path | None = None) -> Plan:
+            calls.append(("plan_backup", destination))
+            return Plan("backup-plan")
 
-        def upgrade(self) -> dict[str, int]:
-            calls.append(("upgrade", None))
+        def apply_backup(
+            self,
+            plan_id: str,
+            destination: Path | None = None,
+        ) -> dict[str, str]:
+            calls.append(("apply_backup", (plan_id, destination)))
+            return {"backup": str(tmp_path / "backup.signet-backup")}
+
+        def plan_restore(self, bundle: Path) -> Plan:
+            calls.append(("plan_restore", bundle))
+            return Plan("restore-plan")
+
+        def apply_restore(self, plan_id: str, bundle: Path) -> dict[str, object]:
+            calls.append(("apply_restore", (plan_id, bundle)))
+            return {"restored_to": str(tmp_path / "restore"), "activated": False}
+
+        def plan_services(self, action: str) -> Plan:
+            calls.append(("plan_services", action))
+            return Plan("service-plan")
+
+        def apply_service_plan(self, action: str, plan_id: str) -> dict[str, str]:
+            calls.append(("apply_service_plan", (action, plan_id)))
+            return {"action": action}
+
+        def rollback_service_plan(self, plan_id: str) -> dict[str, str]:
+            calls.append(("rollback_service_plan", plan_id))
+            return {"action": "rollback"}
+
+        def plan_upgrade(self) -> Plan:
+            calls.append(("plan_upgrade", None))
+            return Plan("upgrade-plan")
+
+        def apply_upgrade(self, plan_id: str) -> dict[str, int]:
+            calls.append(("apply_upgrade", plan_id))
             return {"schema_version": 1}
 
-        def uninstall(self, *, purge: bool = False) -> dict[str, bool]:
-            calls.append(("uninstall", purge))
+        def plan_uninstall(self, *, purge: bool = False) -> Plan:
+            calls.append(("plan_uninstall", purge))
+            return Plan("purge-plan" if purge else "uninstall-plan")
+
+        def apply_uninstall(self, plan_id: str, *, purge: bool = False) -> dict[str, bool]:
+            calls.append(("apply_uninstall", (plan_id, purge)))
             return {"purged": purge}
 
     def factory(root: Path, platform: Any) -> Operations:
@@ -473,10 +531,25 @@ def test_lifecycle_commands_dispatch_to_operations_without_mutating_setup_state(
     commands = (
         ["status", "--root", str(tmp_path)],
         ["doctor", "--root", str(tmp_path)],
+        ["verify", "--root", str(tmp_path)],
         ["backup", "--root", str(tmp_path)],
         ["restore", "--root", str(tmp_path), str(tmp_path / "bundle")],
-        ["upgrade", "--root", str(tmp_path), "--yes"],
-        ["uninstall", "--root", str(tmp_path), "--yes"],
+        ["manage", "--root", str(tmp_path), "stop"],
+        ["upgrade", "--root", str(tmp_path)],
+        ["uninstall", "--root", str(tmp_path), "--purge"],
+        ["backup", "--root", str(tmp_path), "--apply", "backup-plan"],
+        [
+            "restore",
+            "--root",
+            str(tmp_path),
+            str(tmp_path / "bundle"),
+            "--apply",
+            "restore-plan",
+        ],
+        ["manage", "--root", str(tmp_path), "stop", "--apply", "service-plan"],
+        ["manage", "--root", str(tmp_path), "stop", "--rollback", "service-plan"],
+        ["upgrade", "--root", str(tmp_path), "--apply", "upgrade-plan"],
+        ["uninstall", "--root", str(tmp_path), "--apply", "uninstall-plan"],
     )
     for command in commands:
         assert (
@@ -491,10 +564,18 @@ def test_lifecycle_commands_dispatch_to_operations_without_mutating_setup_state(
     assert [name for name, _ in calls] == [
         "status",
         "doctor",
-        "backup",
-        "restore",
-        "upgrade",
-        "uninstall",
+        "verify",
+        "plan_backup",
+        "plan_restore",
+        "plan_services",
+        "plan_upgrade",
+        "plan_uninstall",
+        "apply_backup",
+        "apply_restore",
+        "apply_service_plan",
+        "rollback_service_plan",
+        "apply_upgrade",
+        "apply_uninstall",
     ]
     assert not (tmp_path / ".setup-journal.json").exists()
 
@@ -523,6 +604,181 @@ def test_setup_apply_requires_confirmation_without_yes(tmp_path: Path) -> None:
         )
 
 
+def test_setup_apply_prints_review_boundaries_before_confirmation(tmp_path: Path) -> None:
+    root = tmp_path / "signet"
+    args = _parser().parse_args(
+        [
+            "setup",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            "/opt/signet/bin/signet",
+        ]
+    )
+    events: list[tuple[str, str]] = []
+
+    with pytest.raises(ValueError, match="confirmation"):
+        run_setup_command(
+            args,
+            output=lambda value: events.append(("output", value)),
+            input_fn=lambda prompt: events.append(("prompt", prompt)) or "no",
+            platform=FakePlatform(),
+        )
+
+    plan = json.loads(events[0][1])
+    assert "setup_id" not in plan
+    assert plan["automatic_steps"] == list(SETUP_STEPS[:-1])
+    assert plan["human_ceremonies"] == [
+        "owner_authentication_enrollment",
+        "hermes_mcp_review_and_reload",
+    ]
+    assert plan["deferred_provider_proof"] == [
+        "credential_configuration",
+        "read_only_discovery",
+        "live_send",
+    ]
+    assert plan["destructive_actions"] == []
+    assert events[1] == (
+        "prompt",
+        "Apply the reviewed automatic steps, then continue with the labelled human ceremonies? "
+        "[y/N] ",
+    )
+    assert not root.exists()
+
+
+def test_authenticator_management_prints_exact_url_before_browser_open(tmp_path: Path) -> None:
+    root = tmp_path / "signet"
+    platform = FakePlatform()
+    parser = _parser()
+    setup_args = parser.parse_args(
+        [
+            "setup",
+            "--yes",
+            "--no-open-browser",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            "/opt/signet/bin/signet",
+        ]
+    )
+    assert run_setup_command(setup_args, output=lambda _: None, platform=platform) == 0
+
+    events: list[tuple[str, str]] = []
+    args = parser.parse_args(["authenticators", "open", "--root", str(root)])
+
+    assert (
+        run_setup_command(
+            args,
+            output=lambda value: events.append(("output", value)),
+            platform=platform,
+            browser_opener=lambda value: events.append(("open", value)) or True,
+        )
+        == 0
+    )
+
+    assert events[0] == (
+        "output",
+        "HUMAN CEREMONY — named passkey and TOTP management requires your authenticated browser.",
+    )
+    assert events[1] == (
+        "output",
+        "Authenticator management URL: https://signet.example/authenticators",
+    )
+    assert events[2] == ("open", "https://signet.example/authenticators")
+    assert json.loads(events[3][1]) == {
+        "authenticator_management_url": "https://signet.example/authenticators",
+        "browser_opened": True,
+        "credential_material_in_cli": False,
+        "enrollment": ["named_passkey", "named_totp"],
+    }
+
+
+def test_setup_failure_uses_stable_exit_code_and_actionable_redacted_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailingPlatform(FakePlatform):
+        def __init__(self, *, output: object) -> None:
+            del output
+
+        def apply(self, step: str, spec: object, setup_id: str) -> None:
+            if step == "database":
+                raise RuntimeError("private bearer material must not escape")
+            super().apply(step, spec, setup_id)
+
+    monkeypatch.setattr("signet.setup_cli.ProductionSetupPlatform", FailingPlatform)
+    root = tmp_path / "signet"
+    with pytest.raises(SystemExit) as failure:
+        main(
+            [
+                "setup",
+                "--yes",
+                "--no-open-browser",
+                "--root",
+                str(root),
+                "--origin",
+                "https://signet.example",
+                "--profile",
+                "personal",
+                "--executable",
+                "/opt/signet/bin/signet",
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert failure.value.code == 2
+    assert "Recovery:" in captured.err
+    assert f"signet status --root {root}" in captured.err
+    assert "rerun the same signet setup command to resume" in captured.err
+    assert "private bearer material" not in captured.err
+
+
+def test_recovery_messages_name_only_commands_that_apply_to_the_failed_operation(
+    tmp_path: Path,
+) -> None:
+    parser = _parser()
+    root = tmp_path / "signet"
+
+    provider = setup_error_message(
+        parser.parse_args(["provider", "status", "--root", str(root)]),
+        SetupError("provider unavailable"),
+    )
+    assert "signet provider status" in provider
+    assert "PLAN_ID" not in provider
+
+    authenticators = setup_error_message(
+        parser.parse_args(["authenticators", "open", "--root", str(root)]),
+        SetupError("browser unavailable"),
+    )
+    assert "signet authenticators open --no-open-browser" in authenticators
+    assert "PLAN_ID" not in authenticators
+
+    lifecycle = setup_error_message(
+        parser.parse_args(["backup", "--root", str(root)]),
+        SetupError("backup unavailable"),
+    )
+    assert "PLAN_ID" in lifecycle
+
+
+def test_parent_traversal_setup_root_is_a_stable_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        main(["status", "--root", "../signet"])
+
+    assert exited.value.code == 2
+    assert "paths must be absolute lexical paths without '..'" in capsys.readouterr().err
+
+
 def test_internal_production_service_uses_installed_factory_and_restores_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -546,17 +802,41 @@ def test_internal_production_service_uses_installed_factory_and_restores_environ
     )
     config.chmod(0o600)
     captured: dict[str, Any] = {}
+    service_app = object()
 
-    def runner(app: str, **kwargs: Any) -> None:
-        captured.update(app=app, config=os.environ["SIGNET_PRODUCTION_CONFIG"], **kwargs)
+    def build_service(config_path: Path, *, component: str) -> tuple[Any, object]:
+        assert component == "web"
+        selected = production_module.load_production_config(config_path)
+        replacement_payload = json.loads(config_path.read_text(encoding="utf-8"))
+        replacement_payload["web_host"] = "127.0.0.9"
+        replacement_payload["web_port"] = 9999
+        replacement = config_path.with_name("production-replaced.json")
+        replacement.write_text(json.dumps(replacement_payload), encoding="utf-8")
+        replacement.chmod(0o600)
+        replacement.replace(config_path)
+        return selected, service_app
+
+    monkeypatch.setattr(
+        production_module,
+        "create_owned_production_service",
+        build_service,
+        raising=False,
+    )
+
+    def runner(app: object, **kwargs: Any) -> None:
+        captured.update(
+            app=app,
+            config=os.environ.get("SIGNET_PRODUCTION_CONFIG"),
+            **kwargs,
+        )
 
     monkeypatch.delenv("SIGNET_PRODUCTION_CONFIG", raising=False)
     args = _parser().parse_args(["production", "serve-web", "--config", str(config)])
 
     assert run_setup_command(args, runner=runner) == 0
-    assert captured["app"] == "signet.production:create_production_web_app_from_environment"
-    assert captured["factory"] is True
-    assert captured["config"] == str(config)
+    assert captured["app"] is service_app
+    assert captured["factory"] is False
+    assert captured["config"] is None
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8790
     assert "SIGNET_PRODUCTION_CONFIG" not in os.environ

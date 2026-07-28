@@ -73,12 +73,18 @@ browser sessions, webhooks, or other paths that bypass Signet. See
 
 ## Packaged setup
 
-Install the beta, create the private service, then configure the provider you use:
+With Python 3.12 selected for `pipx`, install the beta and run the one-command setup:
 
 ```console
-python3.12 -m pip install 'signet-gateway==0.1.0b1'
-signet setup --plan --profile personal --profile work
-signet setup --profile personal --profile work
+pipx install signet-gateway
+signet setup
+```
+
+Setup prints the automatic safe steps, human ceremonies, deferred provider proofs,
+and destructive-action set before confirmation. `signet setup --plan` exits after
+that read-only review. Configure only the provider you use after setup completes:
+
+```console
 signet provider setup fastmail --from you@example.com --to you@example.com
 signet provider status
 ```
@@ -91,9 +97,12 @@ configured alias they affect.
 
 The default private origin is the current Tailscale node on HTTPS 8443. Review the
 generated Hermes entries, enable approvals and the providers you configured, then
-run `/reload-mcp`; Signet never restarts Hermes itself. See
+run `/reload-mcp`; Signet never restarts Hermes itself. Use
+`signet authenticators open` to print the exact private URL before opening named
+passkey/TOTP management. See
 [`docs/setup.md`](docs/setup.md) for prerequisites, browser setup, backup/restore,
-upgrade, uninstall, and rollback.
+reviewed Hermes testing, crash recovery, plan/apply lifecycle commands, stable exit
+codes, upgrade, uninstall, and rollback.
 
 ## Development
 

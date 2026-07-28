@@ -248,6 +248,101 @@ class ProductionSetupPlatform:
         self.command_runner = command_runner
         self._database_override: Database | None = None
 
+    @staticmethod
+    def _output_lines(output: str | None) -> tuple[str, ...]:
+        return tuple(line.strip() for line in (output or "").splitlines() if line.strip())
+
+    @classmethod
+    def _command_output_lines(
+        cls,
+        result: subprocess.CompletedProcess[str],
+    ) -> tuple[str, ...]:
+        return cls._output_lines(result.stdout) + cls._output_lines(result.stderr)
+
+    @staticmethod
+    def _service_manager_environment() -> dict[str, str]:
+        return {**os.environ, "LANG": "C", "LC_ALL": "C"}
+
+    @classmethod
+    def _launchd_result_means_already_loaded(
+        cls,
+        result: subprocess.CompletedProcess[str],
+        *,
+        target: Path,
+    ) -> bool:
+        expected_target = str(target)
+        return cls._command_output_lines(result) in {
+            (f"{expected_target}: service already loaded",),
+            (f"{expected_target}: service already bootstrapped",),
+        }
+
+    @classmethod
+    def _launchd_result_means_missing(
+        cls,
+        result: subprocess.CompletedProcess[str],
+        *,
+        label: str,
+        uid: int,
+    ) -> bool:
+        lines = cls._command_output_lines(result)
+        missing_line = f'Could not find service "{label}" in domain for user gui: {uid}'
+        return lines == (missing_line,) or lines == ("Bad request.", missing_line)
+
+    @classmethod
+    def _launchd_service_state(
+        cls,
+        status: subprocess.CompletedProcess[str],
+        *,
+        label: str,
+        uid: int,
+    ) -> Literal["active", "inactive", "unavailable"]:
+        if status.returncode == 0:
+            stdout_lines = tuple(
+                line.strip() for line in (status.stdout or "").splitlines() if line.strip()
+            )
+            expected_header = f"gui/{uid}/{label} = {{"
+            if (
+                not (status.stderr or "").strip()
+                and stdout_lines
+                and stdout_lines[0] == expected_header
+                and stdout_lines[-1] == "}"
+                and stdout_lines.count("state = running") == 1
+            ):
+                return "active"
+            return "unavailable"
+        if cls._launchd_result_means_missing(status, label=label, uid=uid):
+            return "inactive"
+        return "unavailable"
+
+    @classmethod
+    def _systemd_service_state(
+        cls,
+        status: subprocess.CompletedProcess[str],
+        *,
+        unit: str,
+    ) -> Literal["active", "inactive", "unavailable"]:
+        stdout_lines = cls._output_lines(status.stdout)
+        stderr_lines = cls._output_lines(status.stderr)
+        if status.returncode == 0:
+            return "active" if stdout_lines == ("active",) and not stderr_lines else "unavailable"
+        if (
+            status.returncode == 3
+            and stdout_lines in {("inactive",), ("failed",)}
+            and not stderr_lines
+        ):
+            return "inactive"
+        if status.returncode == 4 and stdout_lines == ("inactive",) and not stderr_lines:
+            return "inactive"
+        missing_line = f"Unit {unit} could not be found"
+        named_missing_lines = {(missing_line,), (f"{missing_line}.",)}
+        if (
+            status.returncode == 4
+            and stdout_lines in {(), ("unknown",), ("not-found",)}
+            and stderr_lines in named_missing_lines
+        ):
+            return "inactive"
+        return "unavailable"
+
     @contextmanager
     def use_database(self, database: Database) -> Iterator[None]:
         if self._database_override is not None:
@@ -267,12 +362,15 @@ class ProductionSetupPlatform:
             if database_path.exists() or database_path.is_symlink():
                 raise SetupError("database exists without an active ownership receipt")
             return None
-        database_identity, lock_identity = validate_active_database_runtime_ownership(
-            database_path.parent,
-            setup_id=setup_id,
+        database_identity, lock_identity, parent_identity = (
+            validate_active_database_runtime_ownership(
+                database_path.parent,
+                setup_id=setup_id,
+            )
         )
         return Database(
             database_path,
+            expected_parent_identity=parent_identity,
             expected_identity=database_identity,
             expected_lock_identity=lock_identity,
         )
@@ -302,8 +400,10 @@ class ProductionSetupPlatform:
         if sys.platform == "darwin":
             rendered = render_launchd_services(spec, active=True)
             target = Path.home() / "Library" / "LaunchAgents"
+            plan_dir = spec.root / "services"
             uid = os.getuid()
             for name, content in rendered.items():
+                _require_exact_owned_file(plan_dir / name, content)
                 _require_exact_owned_file(target / name, content)
             for name in rendered:
                 path = target / name
@@ -317,16 +417,26 @@ class ProductionSetupPlatform:
                 if action == "stop":
                     self._stop_launchd_unit(command)
                     continue
-                result = self.command_runner(command, text=True, capture_output=True, check=False)
-                if result.returncode != 0:
-                    message = (result.stderr or "").lower()
-                    if not (action == "start" and "already" in message):
-                        raise SetupError(f"launchd {action} failed for {label}")
+                result = self.command_runner(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=self._service_manager_environment(),
+                )
+                if result.returncode != 0 and not (
+                    action == "start"
+                    and self._launchd_result_means_already_loaded(result, target=path)
+                ):
+                    raise SetupError(f"launchd {action} failed for {label}")
         else:
             rendered = render_systemd_services(spec, active=True)
             target = Path.home() / ".config" / "systemd" / "user"
+            plan_dir = spec.root / "services"
             for name, content in rendered.items():
-                _require_exact_owned_file(target / name, content.encode("utf-8"))
+                encoded = content.encode("utf-8")
+                _require_exact_owned_file(plan_dir / name, encoded)
+                _require_exact_owned_file(target / name, encoded)
             self._run_checked(
                 ["systemctl", "--user", action, *rendered],
                 f"systemd {action} failed for Signet",
@@ -337,38 +447,57 @@ class ProductionSetupPlatform:
         if sys.platform == "darwin":
             rendered = render_launchd_services(spec, active=True)
             target = Path.home() / "Library" / "LaunchAgents"
+            plan_dir = spec.root / "services"
             uid = os.getuid()
             for name, content in rendered.items():
                 path = target / name
                 label = name.removesuffix(".plist")
                 try:
+                    _require_exact_owned_file(plan_dir / name, content)
                     _require_exact_owned_file(path, content)
                 except SetupError:
                     result[label] = "missing_or_changed"
                     continue
-                status = self.command_runner(
-                    ["launchctl", "print", f"gui/{uid}/{label}"],
-                    text=True,
-                    capture_output=True,
-                    check=False,
+                try:
+                    status = self.command_runner(
+                        ["launchctl", "print", f"gui/{uid}/{label}"],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        env=self._service_manager_environment(),
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    result[label] = "unavailable"
+                    continue
+                result[label] = self._launchd_service_state(
+                    status,
+                    label=label,
+                    uid=uid,
                 )
-                result[label] = "active" if status.returncode == 0 else "inactive"
         else:
             rendered = render_systemd_services(spec, active=True)
             target = Path.home() / ".config" / "systemd" / "user"
+            plan_dir = spec.root / "services"
             for name, content in rendered.items():
+                encoded = content.encode("utf-8")
                 try:
-                    _require_exact_owned_file(target / name, content.encode("utf-8"))
+                    _require_exact_owned_file(plan_dir / name, encoded)
+                    _require_exact_owned_file(target / name, encoded)
                 except SetupError:
                     result[name] = "missing_or_changed"
                     continue
-                status = self.command_runner(
-                    ["systemctl", "--user", "is-active", name],
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
-                result[name] = "active" if status.returncode == 0 else "inactive"
+                try:
+                    status = self.command_runner(
+                        ["systemctl", "--user", "is-active", name],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        env=self._service_manager_environment(),
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    result[name] = "unavailable"
+                    continue
+                result[name] = self._systemd_service_state(status, unit=name)
         port = _managed_tailnet_port(spec)
         if port is not None:
             try:
@@ -1163,8 +1292,12 @@ class ProductionSetupPlatform:
                     text=True,
                     capture_output=True,
                     check=False,
+                    env=self._service_manager_environment(),
                 )
-                if result.returncode != 0 and "already" not in (result.stderr or "").lower():
+                if result.returncode != 0 and not self._launchd_result_means_already_loaded(
+                    result,
+                    target=path,
+                ):
                     raise SetupError(f"launchd could not load {name}")
         else:
             rendered_text = render_systemd_services(spec, active=True)
@@ -1217,8 +1350,8 @@ class ProductionSetupPlatform:
                 if plan_exists:
                     _verify_exact_owned_file(plan_path, content)
             for name in rendered:
-                path = target / name
-                self._stop_launchd_unit(["launchctl", "bootout", f"gui/{uid}", str(path)])
+                label = name.removesuffix(".plist")
+                self._stop_launchd_unit(["launchctl", "bootout", f"gui/{uid}/{label}"])
             for name in rendered:
                 label = name.removesuffix(".plist")
                 status = self.command_runner(
@@ -1226,9 +1359,17 @@ class ProductionSetupPlatform:
                     text=True,
                     capture_output=True,
                     check=False,
+                    env=self._service_manager_environment(),
                 )
-                if status.returncode == 0:
+                state = self._launchd_service_state(
+                    status,
+                    label=label,
+                    uid=uid,
+                )
+                if state == "active":
                     raise SetupError("launchd did not quiesce every Signet service")
+                if state == "unavailable":
+                    raise SetupError("launchd service status is unavailable")
             for name, content in rendered.items():
                 path = target / name
                 plan_path = spec.root / "services" / name
@@ -1259,9 +1400,13 @@ class ProductionSetupPlatform:
                     text=True,
                     capture_output=True,
                     check=False,
+                    env=self._service_manager_environment(),
                 )
-                if status.returncode == 0:
+                state = self._systemd_service_state(status, unit=name)
+                if state == "active":
                     raise SetupError("systemd did not quiesce every Signet service")
+                if state == "unavailable":
+                    raise SetupError("systemd service status is unavailable")
             for name, content in rendered_text.items():
                 encoded = content.encode("utf-8")
                 target_path = target / name
@@ -1414,36 +1559,72 @@ class ProductionSetupPlatform:
             )
         if preflight_only:
             return
+        before = _read_owned_json(record_path)
+        if (
+            not isinstance(before, dict)
+            or set(before) != {"format", "serve"}
+            or before.get("format") != 2
+        ):
+            raise SetupError("Tailscale rollback record is invalid")
+        before_serve = _normalize_serve_config(before["serve"])
+        after_content: bytes | None = None
+        try:
+            self._run_checked(
+                ["tailscale", "serve", "--yes", "--bg", f"--https={port}", target],
+                "Tailscale Serve listener could not be installed",
+                timeout_seconds=15.0,
+            )
+            after = _normalize_serve_config(
+                self._tailscale_json(
+                    ["tailscale", "serve", "status", "--json"],
+                    "Tailscale Serve verification failed",
+                )
+            )
+            if not _serve_config_has_private_route(
+                after,
+                host_port=host_port,
+                port=port,
+                target=target,
+            ):
+                raise SetupError(
+                    "Tailscale Serve listener did not match the requested private route"
+                )
+            if (
+                _serve_config_without_private_route(
+                    after,
+                    host_port=host_port,
+                    port=port,
+                    target=target,
+                )
+                != before_serve
+            ):
+                raise SetupError("the Tailscale baseline changed concurrently with setup")
+            after_content = _canonical_json_bytes({"format": 2, "serve": after})
+            _create_or_verify_private_file(after_path, after_content)
+        except SetupError:
+            self._restore_failed_tailnet_apply(host_port=host_port, port=port)
+            if after_content is not None and after_path.exists():
+                _remove_exact_owned_file(after_path, after_content)
+            raise
+
+    def _restore_failed_tailnet_apply(
+        self,
+        *,
+        host_port: str,
+        port: int,
+    ) -> None:
         self._run_checked(
-            ["tailscale", "serve", "--yes", "--bg", f"--https={port}", target],
-            "Tailscale Serve listener could not be installed",
-            timeout_seconds=15.0,
+            ["tailscale", "serve", f"--https={port}", "off"],
+            "Tailscale Serve failed apply could not be rolled back",
         )
-        after = _normalize_serve_config(
+        restored = _normalize_serve_config(
             self._tailscale_json(
                 ["tailscale", "serve", "status", "--json"],
-                "Tailscale Serve verification failed",
+                "Tailscale Serve failed apply rollback verification failed",
             )
         )
-        if not _serve_config_has_private_route(
-            after,
-            host_port=host_port,
-            port=port,
-            target=target,
-        ):
-            raise SetupError("Tailscale Serve listener did not match the requested private route")
-        before = _read_owned_json(record_path)
-        if _serve_config_without_private_route(
-            after,
-            host_port=host_port,
-            port=port,
-            target=target,
-        ) != _normalize_serve_config(before.get("serve")):
-            raise SetupError("the Tailscale baseline changed concurrently with setup")
-        _create_or_verify_private_file(
-            after_path,
-            _canonical_json_bytes({"format": 2, "serve": after}),
-        )
+        if _serve_config_mentions_listener(restored, host_port=host_port, port=port):
+            raise SetupError("Tailscale Serve failed apply left its listener active")
 
     def _rollback_tailnet_route(self, spec: SetupSpec) -> None:
         port = _managed_tailnet_port(spec)
@@ -1514,13 +1695,16 @@ class ProductionSetupPlatform:
         _remove_exact_owned_file(record_path, _canonical_json_bytes(before))
 
     def _tailscale_json(self, command: list[str], message: str) -> Any:
-        result = self.command_runner(
-            command,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=15,
-        )
+        try:
+            result = self.command_runner(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SetupError(message) from exc
         if result.returncode != 0:
             raise SetupError(message)
         try:
@@ -1927,17 +2111,29 @@ class ProductionSetupPlatform:
             text=True,
             capture_output=True,
             check=False,
+            env=self._service_manager_environment(),
         )
-        detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        already_stopped = any(
-            marker in detail
-            for marker in (
-                "is not loaded",
-                "not loaded",
-                "does not exist",
-                "not-found",
-                "no files found",
+        lines = self._command_output_lines(result)
+        escaped_unit = re.escape(command[-1])
+        already_stopped = bool(lines) and all(
+            re.fullmatch(rf"Unit {escaped_unit} (?:is )?not loaded\.?", line) is not None
+            or re.fullmatch(
+                rf"Failed to disable unit: Unit(?: file)? {escaped_unit} does not exist\.?",
+                line,
             )
+            is not None
+            or re.fullmatch(
+                rf"Failed to disable unit, unit {escaped_unit} does not exist\.?",
+                line,
+            )
+            is not None
+            or re.fullmatch(
+                rf"Failed to stop {escaped_unit}: Unit {escaped_unit} not loaded\.?",
+                line,
+            )
+            is not None
+            or re.fullmatch(rf"No files found for {escaped_unit}\.?", line) is not None
+            for line in lines
         )
         if result.returncode != 0 and not already_stopped:
             raise SetupError("systemd could not stop Signet")
@@ -1948,9 +2144,37 @@ class ProductionSetupPlatform:
             text=True,
             capture_output=True,
             check=False,
+            env=self._service_manager_environment(),
         )
-        detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        already_stopped = "no such process" in detail or "could not find service" in detail
+        lines = self._command_output_lines(result)
+        missing_target = False
+        expected_label: str | None = None
+        expected_uid: int | None = None
+        if len(command) == 3:
+            service_target = re.fullmatch(r"gui/(\d+)/([a-zA-Z0-9._-]+)", command[-1])
+            if service_target is not None:
+                expected_uid = int(service_target.group(1))
+                expected_label = service_target.group(2)
+        elif len(command) >= 4:
+            domain = re.fullmatch(r"gui/(\d+)", command[-2])
+            target_name = Path(command[-1]).name
+            if domain is not None and target_name.endswith(".plist"):
+                expected_uid = int(domain.group(1))
+                expected_label = target_name.removesuffix(".plist")
+        if expected_label is not None and expected_uid is not None:
+            missing_target = self._launchd_result_means_missing(
+                result,
+                label=expected_label,
+                uid=expected_uid,
+            )
+        already_stopped = (
+            missing_target
+            or lines == ("No such process",)
+            or (
+                len(lines) == 1
+                and re.fullmatch(r"Boot-out failed: \d+: No such process", lines[0]) is not None
+            )
+        )
         if result.returncode != 0 and not already_stopped:
             raise SetupError("launchd could not stop Signet")
 
@@ -2577,8 +2801,8 @@ def validate_active_database_runtime_ownership(
     data_directory: Path,
     *,
     setup_id: str,
-) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Validate the setup receipt and return the bound database and lock identities."""
+) -> tuple[tuple[int, int], tuple[int, int], DirectoryIdentity]:
+    """Validate the setup receipt and return bound database, lock, and parent identities."""
 
     try:
         data_identity = require_private_directory_identity(data_directory)
@@ -2598,6 +2822,7 @@ def validate_active_database_runtime_ownership(
     return (
         (int(database_identity["device"]), int(database_identity["inode"])),
         (int(lock_identity["device"]), int(lock_identity["inode"])),
+        data_identity,
     )
 
 
@@ -2608,9 +2833,11 @@ def validate_active_database_ownership(
 ) -> tuple[int, int]:
     """Validate the setup receipt and return the bound main-database identity."""
 
-    database_identity, _lock_identity = validate_active_database_runtime_ownership(
-        data_directory,
-        setup_id=setup_id,
+    database_identity, _lock_identity, _parent_identity = (
+        validate_active_database_runtime_ownership(
+            data_directory,
+            setup_id=setup_id,
+        )
     )
     return database_identity
 
@@ -2806,20 +3033,8 @@ def _create_or_verify_private_file(
 
 
 def _require_exact_owned_file(path: Path, content: bytes) -> None:
-    if not path.exists() or path.is_symlink():
+    if _inspect_exact_owned_file(path, content) is None:
         raise SetupError(f"owned resource is unavailable: {path}")
-    try:
-        metadata = path.stat()
-        actual = path.read_bytes()
-    except OSError as exc:
-        raise SetupError(f"owned resource is unavailable: {path}") from exc
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or actual != content
-    ):
-        raise SetupError(f"owned resource changed or is ambiguous: {path}")
 
 
 def _replace_private_file(
@@ -3306,12 +3521,12 @@ def _inspect_exact_owned_file(
     if not path.exists() and not path.is_symlink():
         return None
     descriptor = -1
-    parent_identity = expected_parent_identity or require_owned_directory_identity(path.parent)
-    if expected_parent_identity is not None:
-        try:
+    try:
+        parent_identity = expected_parent_identity or require_owned_directory_identity(path.parent)
+        if expected_parent_identity is not None:
             revalidate_directory_identity(parent_identity, private=parent_private)
-        except PrivatePathError as exc:
-            raise SetupError(f"owned resource parent changed: {path.parent}") from exc
+    except PrivatePathError as exc:
+        raise SetupError(f"owned resource parent changed: {path.parent}") from exc
     try:
         descriptor = os.open(
             path,
@@ -3406,11 +3621,17 @@ def _read_optional_private_file(path: Path) -> bytes:
 
 def _observe_optional_private_file(
     path: Path,
+    *,
+    expected_parent_identity: DirectoryIdentity | None = None,
 ) -> tuple[bool, bytes, tuple[int, int] | None, DirectoryIdentity]:
     try:
-        parent_identity = require_private_directory_identity(path.parent)
+        parent_identity = expected_parent_identity or require_private_directory_identity(
+            path.parent
+        )
+        if path.parent != parent_identity.path:
+            raise PrivatePathError("profile resource parent identity has the wrong path")
         parent_descriptor = os.open(
-            path.parent,
+            parent_identity.path,
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
             | getattr(os, "O_NOFOLLOW", 0)
@@ -3498,13 +3719,23 @@ def _capture_hermes_profile_snapshot(
 ) -> None:
     base = ensure_private_directory(spec.root / "services" / "hermes-profile-snapshots")
     directory = ensure_private_directory(_hermes_snapshot_directory(spec, profile))
+    snapshot_identity = require_private_directory_identity(directory)
+
+    def revalidate_snapshot_directory() -> None:
+        try:
+            revalidate_directory_identity(snapshot_identity, private=True)
+        except PrivatePathError as exc:
+            raise SetupError("Hermes snapshot directory changed during capture") from exc
+
     metadata_path = directory / "metadata.json"
     if metadata_path.exists() or metadata_path.is_symlink():
         snapshot = _read_hermes_profile_snapshot(
             spec,
             profile,
             profile_directory=profile_identity.path,
+            snapshot_identity=snapshot_identity,
         )
+        revalidate_snapshot_directory()
         if snapshot is None:  # pragma: no cover
             raise SetupError("Hermes profile snapshot disappeared during validation")
         if not snapshot[0].same_object(profile_identity):
@@ -3550,9 +3781,12 @@ def _capture_hermes_profile_snapshot(
     }
     if config_exists:
         _create_or_verify_private_file(directory / "config.yaml", config)
+        revalidate_snapshot_directory()
     if environment_exists:
         _create_or_verify_private_file(directory / "environment", environment)
+        revalidate_snapshot_directory()
     _create_or_verify_private_file(metadata_path, _canonical_json_bytes(metadata))
+    revalidate_snapshot_directory()
     if base != directory.parent:  # pragma: no cover - defensive path invariant
         raise SetupError("Hermes snapshot path escaped its private root")
 
@@ -3562,12 +3796,29 @@ def _read_hermes_profile_snapshot(
     profile: str,
     *,
     profile_directory: Path,
+    snapshot_identity: DirectoryIdentity | None = None,
 ) -> tuple[DirectoryIdentity, bytes | None, bytes | None, str | None] | None:
     directory = _hermes_snapshot_directory(spec, profile)
     metadata_path = directory / "metadata.json"
-    if not metadata_path.exists() and not metadata_path.is_symlink():
+    if snapshot_identity is None:
+        if not directory.exists() and not directory.is_symlink():
+            return None
+        try:
+            snapshot_identity = require_private_directory_identity(directory)
+        except PrivatePathError as exc:
+            raise SetupError("Hermes snapshot directory is unavailable or unsafe") from exc
+    elif snapshot_identity.path != directory:
+        raise SetupError("Hermes snapshot directory identity has the wrong path")
+    metadata_exists, metadata_bytes, _, _ = _observe_optional_private_file(
+        metadata_path,
+        expected_parent_identity=snapshot_identity,
+    )
+    if not metadata_exists:
         return None
-    metadata = _read_owned_json(metadata_path)
+    try:
+        metadata = json.loads(metadata_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise SetupError("Hermes profile snapshot metadata is invalid") from exc
     common_keys = {
         "format",
         "profile",
@@ -3620,12 +3871,19 @@ def _read_hermes_profile_snapshot(
         digest = metadata[digest_key]
         if not isinstance(present, bool):
             raise SetupError("Hermes profile snapshot metadata is invalid")
+        exists, encoded, _, _ = _observe_optional_private_file(
+            path,
+            expected_parent_identity=snapshot_identity,
+        )
         if not present:
-            if digest is not None or path.exists() or path.is_symlink():
+            if digest is not None or exists:
                 raise SetupError("Hermes profile snapshot metadata is inconsistent")
             return None
-        encoded = _read_optional_private_file(path)
-        if not isinstance(digest, str) or hashlib.sha256(encoded).hexdigest() != digest:
+        if (
+            not exists
+            or not isinstance(digest, str)
+            or hashlib.sha256(encoded).hexdigest() != digest
+        ):
             raise SetupError("Hermes profile snapshot content changed")
         return encoded
 
@@ -3644,16 +3902,25 @@ def _bind_hermes_snapshot_token(
     profile_directory: Path,
     token_id: str,
 ) -> None:
+    snapshot_directory = _hermes_snapshot_directory(spec, profile)
+    try:
+        snapshot_identity = require_private_directory_identity(snapshot_directory)
+    except PrivatePathError as exc:
+        raise SetupError("Hermes snapshot directory is unavailable or unsafe") from exc
     snapshot = _read_hermes_profile_snapshot(
         spec,
         profile,
         profile_directory=profile_directory,
+        snapshot_identity=snapshot_identity,
     )
     if snapshot is None:
         raise SetupError("Hermes profile token cannot be bound without a setup snapshot")
-    metadata_path = _hermes_snapshot_directory(spec, profile) / "metadata.json"
+    metadata_path = snapshot_directory / "metadata.json"
     metadata_exists, metadata_bytes, metadata_identity, metadata_parent_identity = (
-        _observe_optional_private_file(metadata_path)
+        _observe_optional_private_file(
+            metadata_path,
+            expected_parent_identity=snapshot_identity,
+        )
     )
     if not metadata_exists:
         raise SetupError("Hermes profile snapshot metadata disappeared")
@@ -3686,16 +3953,25 @@ def _clear_hermes_snapshot_token(
     profile_directory: Path,
     token_id: str,
 ) -> None:
+    snapshot_directory = _hermes_snapshot_directory(spec, profile)
+    try:
+        snapshot_identity = require_private_directory_identity(snapshot_directory)
+    except PrivatePathError as exc:
+        raise SetupError("Hermes snapshot directory is unavailable or unsafe") from exc
     snapshot = _read_hermes_profile_snapshot(
         spec,
         profile,
         profile_directory=profile_directory,
+        snapshot_identity=snapshot_identity,
     )
     if snapshot is None or snapshot[3] != token_id:
         raise SetupError("Hermes profile snapshot token binding changed before revocation")
-    metadata_path = _hermes_snapshot_directory(spec, profile) / "metadata.json"
+    metadata_path = snapshot_directory / "metadata.json"
     metadata_exists, metadata_bytes, metadata_identity, metadata_parent_identity = (
-        _observe_optional_private_file(metadata_path)
+        _observe_optional_private_file(
+            metadata_path,
+            expected_parent_identity=snapshot_identity,
+        )
     )
     if not metadata_exists:
         raise SetupError("Hermes profile snapshot metadata disappeared")
@@ -4047,18 +4323,31 @@ def _serve_config_has_private_route(
     tcp = document.get("TCP")
     web = document.get("Web")
     allow_funnel = document.get("AllowFunnel")
-    if not isinstance(tcp, dict) or tcp.get(str(port)) != {"HTTPS": True}:
+    listener = tcp.get(str(port)) if isinstance(tcp, dict) else None
+    if (
+        not isinstance(listener, dict)
+        or set(listener) != {"HTTPS"}
+        or listener.get("HTTPS") is not True
+    ):
         return False
     expected_web = {"Handlers": {"/": {"Proxy": target}}}
     if not isinstance(web, dict) or web.get(host_port) != expected_web:
         return False
     foreground = document.get("Foreground")
-    if isinstance(foreground, dict) and any(
-        _serve_config_mentions_listener(candidate, host_port=host_port, port=port)
-        for candidate in foreground.values()
+    if "Foreground" in document and (
+        not isinstance(foreground, dict)
+        or any(
+            not isinstance(candidate, dict)
+            or _serve_config_mentions_listener(candidate, host_port=host_port, port=port)
+            for candidate in foreground.values()
+        )
     ):
         return False
-    return not (isinstance(allow_funnel, dict) and allow_funnel.get(host_port) is True)
+    if "AllowFunnel" not in document:
+        return True
+    return isinstance(allow_funnel, dict) and (
+        host_port not in allow_funnel or allow_funnel.get(host_port) is False
+    )
 
 
 def _serve_config_without_private_route(
@@ -4085,7 +4374,7 @@ def _serve_config_without_private_route(
         if section not in baseline:
             continue
         values = dict(baseline[section])
-        del values[key]
+        values.pop(key, None)
         if values:
             baseline[section] = values
         else:

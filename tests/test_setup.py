@@ -22,7 +22,11 @@ from signet.browser_auth import BootstrapService
 from signet.config import ProductionConfig, production_instance_identity
 from signet.credential_broker import KeychainSecretStore
 from signet.db import LATEST_SCHEMA_VERSION, Database, MigrationBackupReceipt
-from signet.private_paths import ensure_private_directory, require_private_directory_identity
+from signet.private_paths import (
+    PrivatePathError,
+    ensure_private_directory,
+    require_private_directory_identity,
+)
 from signet.production import (
     ProductionAssemblyError,
     create_production_assembly,
@@ -219,7 +223,7 @@ def test_setup_status_and_doctor_do_not_construct_or_mutate_production_state(
     class StatusPlatform(ProductionSetupPlatform):
         def service_status(self, spec: SetupSpec) -> dict[str, str]:
             del spec
-            return {"signet-mcp": "active", "signet-web": "active"}
+            return {"signet-mcp": "unavailable", "signet-web": "unavailable"}
 
     operations = SetupOperations(selected.root, platform=StatusPlatform())
     result = operations.status()
@@ -231,7 +235,19 @@ def test_setup_status_and_doctor_do_not_construct_or_mutate_production_state(
         if path.is_file()
     }
     assert result["production"]["available"] is False
+    assert result["services"] == {
+        "signet-mcp": "unavailable",
+        "signet-web": "unavailable",
+    }
     assert doctor["checks"]["configuration"]["ok"] is True
+    assert doctor["checks"]["services"] == {
+        "ok": False,
+        "status": {
+            "signet-mcp": "unavailable",
+            "signet-web": "unavailable",
+        },
+        "remediation": "Review the service plan, then apply a start or restart plan.",
+    }
     assert before == after
     assert not (selected.root / "data" / "signet.db").exists()
 
@@ -626,6 +642,75 @@ def test_apply_recovers_owner_marker_temporary_before_its_final_link(
     assert not any(path.name.endswith(".tmp") for path in selected.root.iterdir())
 
 
+def test_apply_recovers_owner_marker_cleanup_crash_in_one_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet-owner-cleanup-crash")
+    store = SetupJournalStore(selected.root)
+    setup_id = "setup_0123456789abcdef"
+    real_unlink = setup_state.os.unlink
+    crashed = False
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_after_cleanup_rename(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal crashed
+        if not crashed and str(path).startswith(f".{store.OWNER_NAME}."):
+            crashed = True
+            raise SimulatedCrash
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(setup_state.os, "unlink", crash_after_cleanup_rename)
+    with pytest.raises(SimulatedCrash):
+        store.prepare(selected, setup_id)
+
+    monkeypatch.setattr(setup_state.os, "unlink", real_unlink)
+    journal = SetupEngine(store, FakePlatform()).apply(selected)
+
+    assert journal.setup_id == setup_id
+    assert store.owner_path.stat().st_nlink == 1
+    assert not (selected.root / store.OWNER_INTENT_NAME).exists()
+    assert not any(path.name.endswith(".tmp") for path in selected.root.iterdir())
+
+
+def test_apply_recovers_owner_marker_after_repeated_cleanup_crashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = spec(tmp_path / "signet-owner-repeated-cleanup-crash")
+    store = SetupJournalStore(selected.root)
+    setup_id = "setup_0123456789abcdef"
+    real_unlink = setup_state.os.unlink
+    crash_count = 0
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_twice_after_cleanup_rename(path: Any, *args: Any, **kwargs: Any) -> None:
+        nonlocal crash_count
+        if crash_count < 2 and str(path).startswith(f".{store.OWNER_NAME}."):
+            crash_count += 1
+            raise SimulatedCrash
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(setup_state.os, "unlink", crash_twice_after_cleanup_rename)
+    with pytest.raises(SimulatedCrash):
+        store.prepare(selected, setup_id)
+    with pytest.raises(SimulatedCrash):
+        SetupEngine(store, FakePlatform()).apply(selected)
+
+    monkeypatch.setattr(setup_state.os, "unlink", real_unlink)
+    journal = SetupEngine(store, FakePlatform()).apply(selected)
+
+    assert crash_count == 2
+    assert journal.setup_id == setup_id
+    assert store.owner_path.stat().st_nlink == 1
+    assert not (selected.root / store.OWNER_INTENT_NAME).exists()
+    assert not any(path.name.endswith(".tmp") for path in selected.root.iterdir())
+
+
 def test_apply_refuses_nonempty_foreign_root(tmp_path: Path) -> None:
     root = tmp_path / "signet"
     root.mkdir()
@@ -721,7 +806,7 @@ def test_public_backup_refuses_to_cross_an_active_lifecycle_epoch(
     )
 
     with (
-        setup_operations.setup_lifecycle_lock(selected.root),
+        operations.lifecycle_lock(),
         pytest.raises(SetupError, match="another setup lifecycle operation"),
     ):
         operations.backup(tmp_path / "locked.signet-backup")
@@ -2435,9 +2520,14 @@ def test_service_install_management_status_and_rollback_are_platform_native(
     commands: list[list[str]] = []
     services_active = False
 
-    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal services_active
         commands.append(command)
+        if command[0] == "launchctl":
+            environment = kwargs.get("env")
+            assert isinstance(environment, dict)
+            assert environment["LC_ALL"] == "C"
+            assert environment["LANG"] == "C"
         if command[:2] == ["launchctl", "bootstrap"] or "enable" in command:
             services_active = True
         elif command[:2] == ["launchctl", "bootout"] or "disable" in command:
@@ -2445,13 +2535,24 @@ def test_service_install_management_status_and_rollback_are_platform_native(
         elif command[:2] == ["launchctl", "kickstart"] or "restart" in command:
             services_active = True
         if command[:2] == ["launchctl", "print"]:
-            return subprocess.CompletedProcess(command, 0 if services_active else 3, "", "")
-        if "is-active" in command:
+            label = command[-1].rsplit("/", 1)[-1]
+            uid = command[-1].split("/", 2)[1]
             return subprocess.CompletedProcess(
                 command,
                 0 if services_active else 3,
-                "active\n" if services_active else "inactive\n",
-                "",
+                (f"{command[-1]} = {{\n\tstate = running\n}}\n" if services_active else ""),
+                ""
+                if services_active
+                else (
+                    f'Bad request.\nCould not find service "{label}" in domain for user gui: {uid}'
+                ),
+            )
+        if "is-active" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0 if services_active else 4,
+                "active\n" if services_active else "unknown\n",
+                "" if services_active else f"Unit {command[-1]} could not be found.",
             )
         return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -2548,11 +2649,12 @@ def test_launchd_service_stop_retry_tolerates_an_already_stopped_unit(
     monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
     selected = replace(spec(tmp_path / "launchd-stop-retry"), public_origin="https://example.com")
     target = ensure_private_directory(home / "Library" / "LaunchAgents")
+    plan_dir = ensure_private_directory(selected.root / "services")
     rendered = render_launchd_services(selected, active=True)
     for name, content in rendered.items():
-        path = target / name
-        path.write_bytes(content)
-        path.chmod(0o600)
+        for path in (target / name, plan_dir / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
     bootouts = 0
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
@@ -3272,9 +3374,19 @@ def test_systemd_rollback_retries_after_reload_failure_and_tolerates_unloaded_un
         nonlocal reloads
         del kwargs
         if "disable" in command:
-            return subprocess.CompletedProcess(command, 1, "", "Unit is not loaded")
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                f"Unit {command[-1]} is not loaded",
+            )
         if "is-active" in command:
-            return subprocess.CompletedProcess(command, 3, "inactive\n", "")
+            return subprocess.CompletedProcess(
+                command,
+                3 if (target / command[-1]).exists() else 4,
+                "inactive\n",
+                "",
+            )
         if command[-1] == "daemon-reload":
             reloads += 1
             return subprocess.CompletedProcess(
@@ -3299,6 +3411,729 @@ def test_systemd_rollback_retries_after_reload_failure_and_tolerates_unloaded_un
     assert all(not (selected.root / "services" / name).exists() for name in rendered)
 
 
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        ("/tmp/com.example.signet.plist: service already loaded", True),
+        ("/tmp/com.example.signet.plist: service already bootstrapped", True),
+        ("/TMP/com.example.signet.plist: service already bootstrapped", False),
+        ("/tmp/com.example.other.plist: service already loaded", False),
+        ("/tmp/com.example.other.plist: service already bootstrapped", False),
+        ("launchctl already failed for an unrelated reason", False),
+        (
+            "/tmp/com.example.signet.plist: service already loaded\n"
+            "service manager connection failed",
+            False,
+        ),
+    ],
+)
+def test_launchd_already_loaded_diagnostics_are_exact_and_target_bound(
+    detail: str,
+    expected: bool,
+) -> None:
+    result = subprocess.CompletedProcess(["launchctl", "bootstrap"], 1, "", detail)
+
+    assert (
+        ProductionSetupPlatform._launchd_result_means_already_loaded(
+            result,
+            target=Path("/tmp/com.example.signet.plist"),
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("manager", "result", "expected"),
+    [
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                0,
+                "gui/501/com.example.signet = {\n\tstate = running\n}\n",
+                "",
+            ),
+            "active",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(["launchctl", "print"], 0, "", ""),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                0,
+                "gui/501/com.example.signet = {\n\tstate = not running\n}\n",
+                "",
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                0,
+                "gui/501/COM.example.signet = {\n\tstate = running\n}\n",
+                "",
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                0,
+                "gui/501/com.example.signet = {\n\tstate = running\n}\n",
+                "Failed to connect to service manager",
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                113,
+                "",
+                "Bad request.\n"
+                'Could not find service "com.example.signet" in domain for user gui: 501',
+            ),
+            "inactive",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                113,
+                "",
+                'Could not find service "COM.example.signet" in domain for user gui: 501',
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                1,
+                "",
+                "Could not find service manager",
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                3,
+                "",
+                "No such process",
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                113,
+                "",
+                'Could not find service "com.example.signet" in domain for user gui: 501\n'
+                "Failed to connect to service manager",
+            ),
+            "unavailable",
+        ),
+        (
+            "launchd",
+            subprocess.CompletedProcess(
+                ["launchctl", "print"],
+                113,
+                "",
+                "Bad request.\n"
+                'Could not find service "com.example.different" in domain for user gui: 501',
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                0,
+                "active\n",
+                "",
+            ),
+            "active",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                0,
+                "",
+                "active\n",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(["systemctl", "is-active"], 0, "", ""),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                0,
+                "active\n",
+                "Failed to connect to bus",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "inactive\n",
+                "",
+            ),
+            "inactive",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "inactive\n",
+                "Failed to connect to bus",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "unknown\n",
+                "Unit signet.service could not be found.",
+            ),
+            "inactive",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "unknown\n",
+                "Unit SIGNET.service could not be found.",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "unknown\n",
+                "Unit different.service could not be found.",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "unknown\n",
+                "",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                4,
+                "unknown\n",
+                "Failed to connect to bus",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                3,
+                "",
+                "inactive\n",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                3,
+                "",
+                "failed\n",
+            ),
+            "unavailable",
+        ),
+        (
+            "systemd",
+            subprocess.CompletedProcess(
+                ["systemctl", "is-active"],
+                3,
+                "inactive\n",
+                "Failed to connect to bus",
+            ),
+            "unavailable",
+        ),
+    ],
+)
+def test_service_status_rejects_prefix_collisions_and_mixed_diagnostics(
+    manager: str,
+    result: subprocess.CompletedProcess[str],
+    expected: str,
+) -> None:
+    if manager == "launchd":
+        actual = ProductionSetupPlatform._launchd_service_state(
+            result,
+            label="com.example.signet",
+            uid=501,
+        )
+    else:
+        actual = ProductionSetupPlatform._systemd_service_state(
+            result,
+            unit="signet.service",
+        )
+    assert actual == expected
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+def test_service_status_maps_service_manager_execution_failures_to_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    selected = replace(
+        spec(tmp_path / f"root-status-exec-{platform_name}"),
+        public_origin="https://example.com",
+    )
+    if platform_name == "darwin":
+        rendered = render_launchd_services(selected, active=True)
+        target = home / "Library" / "LaunchAgents"
+    else:
+        rendered = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+        target = home / ".config" / "systemd" / "user"
+    target.mkdir(parents=True, mode=0o700)
+    target.chmod(0o700)
+    ensure_private_directory(selected.root / "services")
+    for name, content in rendered.items():
+        for path in (target / name, selected.root / "services" / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+
+    assert set(ProductionSetupPlatform(command_runner=run).service_status(selected).values()) == {
+        "unavailable"
+    }
+
+
+def test_exact_owned_file_requirement_rejects_acl_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = ensure_private_directory(tmp_path / "service-plans")
+    path = parent / "signet.service"
+    content = b"owned unit\n"
+    path.write_bytes(content)
+    path.chmod(0o600)
+
+    def reject_acl(_descriptor: int) -> None:
+        raise PrivatePathError("ACL inspection failed")
+
+    monkeypatch.setattr(setup_platform, "require_no_acl_grants", reject_acl)
+
+    with pytest.raises(SetupError, match="could not be inspected"):
+        setup_platform._require_exact_owned_file(path, content)
+
+
+def test_exact_owned_file_requirement_rejects_named_inode_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = ensure_private_directory(tmp_path / "service-plans")
+    path = parent / "signet.service"
+    content = b"owned unit\n"
+    path.write_bytes(content)
+    path.chmod(0o600)
+    original_read = setup_platform._read_owned_descriptor
+
+    def replace_after_descriptor_read(descriptor: int, limit: int) -> bytes:
+        actual = original_read(descriptor, limit)
+        displaced = parent / "signet.service.displaced"
+        path.rename(displaced)
+        path.write_bytes(content)
+        path.chmod(0o600)
+        return actual
+
+    monkeypatch.setattr(
+        setup_platform,
+        "_read_owned_descriptor",
+        replace_after_descriptor_read,
+    )
+
+    with pytest.raises(SetupError, match="changed or foreign"):
+        setup_platform._require_exact_owned_file(path, content)
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+def test_service_status_maps_tailscale_execution_failures_to_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    selected = replace(
+        spec(tmp_path / f"root-tailnet-status-{platform_name}"),
+        public_origin="https://signet.example.ts.net:8443",
+    )
+    if platform_name == "darwin":
+        rendered = render_launchd_services(selected, active=True)
+        target = home / "Library" / "LaunchAgents"
+    else:
+        rendered = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+        target = home / ".config" / "systemd" / "user"
+    target.mkdir(parents=True, mode=0o700)
+    target.chmod(0o700)
+    ensure_private_directory(selected.root / "services")
+    for name, content in rendered.items():
+        for path in (target / name, selected.root / "services" / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[0] == "tailscale":
+            raise subprocess.TimeoutExpired(command, 15)
+        if command[:2] == ["launchctl", "print"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"{command[-1]} = {{\n\tstate = running\n}}\n",
+                "",
+            )
+        return subprocess.CompletedProcess(command, 0, "active\n", "")
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+
+    status = ProductionSetupPlatform(command_runner=run).service_status(selected)
+    assert status["tailscale:8443"] == "unavailable"
+    assert all(
+        value == "active" for name, value in status.items() if not name.startswith("tailscale:")
+    )
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+@pytest.mark.parametrize("operation", ["status", "manage"])
+def test_service_entrypoints_refuse_units_without_ownership_plans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+    operation: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    selected = replace(
+        spec(tmp_path / f"root-ownerless-{platform_name}-{operation}"),
+        public_origin="https://example.com",
+    )
+    if platform_name == "darwin":
+        rendered = render_launchd_services(selected, active=True)
+        target = home / "Library" / "LaunchAgents"
+    else:
+        rendered = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+        target = home / ".config" / "systemd" / "user"
+    target.mkdir(parents=True, mode=0o700)
+    target.chmod(0o700)
+    for name, content in rendered.items():
+        path = target / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if command[:2] == ["launchctl", "print"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"{command[-1]} = {{\n\tstate = running\n}}\n",
+                "",
+            )
+        return subprocess.CompletedProcess(command, 0, "active\n", "")
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    platform = ProductionSetupPlatform(command_runner=run)
+    if operation == "status":
+        assert set(platform.service_status(selected).values()) == {"missing_or_changed"}
+    else:
+        with pytest.raises(SetupError):
+            platform.manage_services(selected, "start")
+    assert commands == []
+
+
+@pytest.mark.parametrize("operation", ["apply", "manage"])
+@pytest.mark.parametrize(
+    ("diagnostic", "succeeds"),
+    [("exact", True), ("wrong_target", False), ("mixed", False)],
+)
+def test_launchd_start_paths_require_exact_target_bound_already_bootstrapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    diagnostic: str,
+    succeeds: bool,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    selected = replace(
+        spec(tmp_path / f"root-launchd-start-{operation}-{diagnostic}"),
+        public_origin="https://example.com",
+    )
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command[:2] == ["launchctl", "bootstrap"]
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        assert environment["LANG"] == environment["LC_ALL"] == "C"
+        target = Path(command[-1])
+        if diagnostic == "exact":
+            detail = f"{target}: service already bootstrapped"
+        elif diagnostic == "wrong_target":
+            detail = f"{target}.other: service already bootstrapped"
+        else:
+            detail = f"{target}: service already bootstrapped\nFailed to connect to service manager"
+        return subprocess.CompletedProcess(command, 5, "", detail)
+
+    monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    platform = ProductionSetupPlatform(command_runner=run)
+    platform._apply_private_paths(selected, "setup-service-test")
+    monkeypatch.setattr(platform, "_wait_for_local_services", lambda selected: None)
+    if operation == "manage":
+        target = home / "Library" / "LaunchAgents"
+        target.mkdir(parents=True, mode=0o700)
+        target.chmod(0o700)
+        for name, content in render_launchd_services(selected, active=True).items():
+            for path in (target / name, selected.root / "services" / name):
+                path.write_bytes(content)
+                path.chmod(0o600)
+
+    def invoke() -> None:
+        if operation == "apply":
+            platform._apply_services(selected, "setup-service-test")
+        else:
+            platform.manage_services(selected, "start")
+
+    if succeeds:
+        invoke()
+    else:
+        with pytest.raises(SetupError, match="launchd"):
+            invoke()
+
+
+@pytest.mark.parametrize(
+    ("manager", "detail"),
+    [
+        ("launchd", "Could not find service manager"),
+        ("launchd", "No such process\nFailed to connect to service manager"),
+        ("systemd", "Unit is not loaded\nFailed to connect to bus"),
+    ],
+)
+def test_service_stop_rejects_prefix_collisions_and_mixed_diagnostics(
+    manager: str,
+    detail: str,
+) -> None:
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", detail)
+
+    platform = ProductionSetupPlatform(command_runner=run)
+    with pytest.raises(SetupError, match=f"{manager} could not stop Signet"):
+        if manager == "launchd":
+            platform._stop_launchd_unit(["launchctl", "bootout"])
+        else:
+            platform._stop_systemd_units(["systemctl", "disable", "--now"])
+
+
+@pytest.mark.parametrize(
+    ("manager", "command", "detail"),
+    [
+        (
+            "launchd",
+            [
+                "launchctl",
+                "bootout",
+                "gui/501",
+                "/tmp/com.example.signet.plist",
+            ],
+            "Bad request.\n"
+            'Could not find service "com.example.different" in domain for user gui: 501',
+        ),
+        (
+            "launchd",
+            [
+                "launchctl",
+                "bootout",
+                "gui/501",
+                "/tmp/com.example.signet.plist",
+            ],
+            'Could not find service "COM.example.signet" in domain for user gui: 501',
+        ),
+        (
+            "systemd",
+            ["systemctl", "--user", "disable", "--now", "signet.service"],
+            "Unit SIGNET.service not loaded.",
+        ),
+        (
+            "systemd",
+            ["systemctl", "--user", "disable", "--now", "signet.service"],
+            "Unit different.service not loaded.",
+        ),
+    ],
+)
+def test_service_stop_rejects_diagnostics_for_a_different_unit(
+    manager: str,
+    command: list[str],
+    detail: str,
+) -> None:
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", detail)
+
+    platform = ProductionSetupPlatform(command_runner=run)
+    with pytest.raises(SetupError, match=f"{manager} could not stop Signet"):
+        if manager == "launchd":
+            platform._stop_launchd_unit(command)
+        else:
+            platform._stop_systemd_units(command)
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Unit signet.service not loaded.",
+        "Failed to stop signet.service: Unit signet.service not loaded.",
+        "Failed to disable unit: Unit file signet.service does not exist.",
+        "Failed to disable unit, unit signet.service does not exist.",
+        "No files found for signet.service.",
+    ],
+)
+def test_systemd_service_stop_accepts_explicit_missing_diagnostics(detail: str) -> None:
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", detail)
+
+    ProductionSetupPlatform(command_runner=run)._stop_systemd_units(
+        ["systemctl", "--user", "disable", "--now", "signet.service"]
+    )
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+@pytest.mark.parametrize("failure_stage", ["stop", "status"])
+def test_service_rollback_preserves_owned_units_when_manager_response_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+    failure_stage: str,
+) -> None:
+    home = ensure_private_directory(tmp_path / "home")
+    selected = replace(
+        spec(tmp_path / f"inconclusive-{platform_name}-status"),
+        public_origin="https://example.com",
+    )
+    ensure_private_directory(selected.root / "services")
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    if platform_name == "darwin":
+        target = ensure_private_directory(home / "Library" / "LaunchAgents")
+        rendered = render_launchd_services(selected, active=True)
+    else:
+        target = ensure_private_directory(home / ".config" / "systemd" / "user")
+        rendered = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+    for name, content in rendered.items():
+        for path in (target / name, selected.root / "services" / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[0] in {"launchctl", "systemctl"}:
+            environment = kwargs.get("env")
+            assert isinstance(environment, dict)
+            assert environment["LC_ALL"] == "C"
+            assert environment["LANG"] == "C"
+        if command[:2] == ["launchctl", "bootout"] or "disable" in command:
+            if failure_stage == "stop":
+                detail = (
+                    "service manager could not find service registry"
+                    if platform_name == "darwin"
+                    else "service manager socket does not exist"
+                )
+                return subprocess.CompletedProcess(command, 1, "", detail)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:2] == ["launchctl", "print"] or "is-active" in command:
+            if failure_stage == "stop":
+                if platform_name == "darwin":
+                    label = command[-1].rsplit("/", 1)[-1]
+                    uid = command[-1].split("/", 2)[1]
+                    return subprocess.CompletedProcess(
+                        command,
+                        113,
+                        "",
+                        "Bad request.\n"
+                        f'Could not find service "{label}" in domain for user gui: {uid}',
+                    )
+                return subprocess.CompletedProcess(command, 3, "inactive\n", "")
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "Failed to connect to service manager",
+            )
+        if command[-1] == "daemon-reload":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(command)
+
+    platform = ProductionSetupPlatform(command_runner=run)
+    expected_error = "could not stop" if failure_stage == "stop" else "status is unavailable"
+    with pytest.raises(SetupError, match=expected_error):
+        platform._rollback_services(selected, "setup-service-test")
+
+    expected_status = "inactive" if failure_stage == "stop" else "unavailable"
+    assert set(platform.service_status(selected).values()) == {expected_status}
+    assert all((target / name).is_file() for name in rendered)
+    assert all((selected.root / "services" / name).is_file() for name in rendered)
+
+
 def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3316,7 +4151,14 @@ def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
             if bootouts == 3:
                 return subprocess.CompletedProcess(command, 3, "", "No such process")
         if command[:2] == ["launchctl", "print"]:
-            return subprocess.CompletedProcess(command, 3, "", "No such process")
+            label = command[-1].rsplit("/", 1)[-1]
+            uid = command[-1].split("/", 2)[1]
+            return subprocess.CompletedProcess(
+                command,
+                113,
+                "",
+                f'Bad request.\nCould not find service "{label}" in domain for user gui: {uid}',
+            )
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
@@ -3343,6 +4185,62 @@ def test_launchd_rollback_stops_every_unit_before_deleting_any_unit(
     for name in rendered:
         assert not (target / name).exists()
         assert not (selected.root / "services" / name).exists()
+
+
+def test_launchd_rollback_retry_uses_the_verified_label_after_target_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    bootouts: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[:2] == ["launchctl", "bootout"]:
+            bootouts.append(command)
+            if len(command) == 4:
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    "",
+                    "Bootstrap failed: 2: No such file or directory",
+                )
+            uid, label = command[-1].split("/", 2)[1:]
+            return subprocess.CompletedProcess(
+                command,
+                113,
+                "",
+                f'Could not find service "{label}" in domain for user gui: {uid}',
+            )
+        if command[:2] == ["launchctl", "print"]:
+            uid, label = command[-1].split("/", 2)[1:]
+            return subprocess.CompletedProcess(
+                command,
+                113,
+                "",
+                f'Could not find service "{label}" in domain for user gui: {uid}',
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    selected = replace(
+        spec(tmp_path / "root-darwin-target-deleted-retry"),
+        public_origin="https://example.com",
+    )
+    platform = ProductionSetupPlatform(command_runner=run)
+    monkeypatch.setattr(platform, "_wait_for_local_services", lambda selected: None)
+    platform._apply_private_paths(selected, "setup-service-test")
+    platform._apply_services(selected, "setup-service-test")
+    rendered = render_launchd_services(selected, active=True)
+    target = home / "Library" / "LaunchAgents"
+    (target / next(iter(rendered))).unlink()
+
+    platform._rollback_services(selected, "setup-service-test")
+
+    assert bootouts and all(len(command) == 3 for command in bootouts)
+    assert all(not (target / name).exists() for name in rendered)
+    assert all(not (selected.root / "services" / name).exists() for name in rendered)
 
 
 def test_launchd_rollback_refuses_a_changed_unit_before_stopping_services(
@@ -4189,9 +5087,9 @@ def test_absent_hermes_rollback_files_stay_bound_to_the_snapshotted_profile(
     real_observe = setup_platform._observe_optional_private_file
     reads = 0
 
-    def swap_after_reads(path: Path) -> Any:
+    def swap_after_reads(path: Path, **kwargs: Any) -> Any:
         nonlocal reads
-        observation = real_observe(path)
+        observation = real_observe(path, **kwargs)
         if path.parent == profile:
             reads += 1
             if reads == 2:
@@ -4282,6 +5180,136 @@ def test_hermes_apply_retry_rejects_drift_outside_the_managed_snapshot(
             environment_exists=True,
             setup_id=setup_id,
         )
+
+
+def test_hermes_snapshot_capture_rejects_a_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(spec(tmp_path / "snapshot-directory-swap"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    profile_identity = require_private_directory_identity(profile)
+    snapshot_directory = setup_platform._hermes_snapshot_directory(selected, "work")
+    displaced = snapshot_directory.parent / f"{snapshot_directory.name}.displaced"
+    real_create = setup_platform._create_or_verify_private_file
+    swapped = False
+
+    def swap_before_first_snapshot_write(path: Path, content: bytes) -> None:
+        nonlocal swapped
+        if not swapped and path.parent == snapshot_directory:
+            snapshot_directory.rename(displaced)
+            ensure_private_directory(snapshot_directory)
+            swapped = True
+        real_create(path, content)
+
+    monkeypatch.setattr(
+        setup_platform,
+        "_create_or_verify_private_file",
+        swap_before_first_snapshot_write,
+    )
+
+    with pytest.raises(SetupError, match="snapshot directory changed during capture"):
+        setup_platform._capture_hermes_profile_snapshot(
+            selected,
+            "work",
+            profile_identity=profile_identity,
+            config=b"model: original\n",
+            environment=b"EXISTING=kept\n",
+            config_exists=True,
+            environment_exists=True,
+        )
+
+    assert swapped is True
+    assert displaced.is_dir()
+
+
+def test_hermes_snapshot_capture_rejects_an_aba_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = replace(spec(tmp_path / "snapshot-directory-aba"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    profile_identity = require_private_directory_identity(profile)
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=profile_identity,
+        config=b"model: original\n",
+        environment=b"",
+        config_exists=True,
+        environment_exists=False,
+    )
+    snapshot_directory = setup_platform._hermes_snapshot_directory(selected, "work")
+    original_directory = snapshot_directory.parent / f"{snapshot_directory.name}.original"
+    alternate_directory = snapshot_directory.parent / f"{snapshot_directory.name}.alternate"
+    shutil.copytree(snapshot_directory, alternate_directory)
+    alternate_config = alternate_directory / "config.yaml"
+    alternate_config.write_bytes(b"model: user-drift\n")
+    alternate_metadata_path = alternate_directory / "metadata.json"
+    alternate_metadata = json.loads(alternate_metadata_path.read_bytes())
+    alternate_metadata["config_sha256"] = hashlib.sha256(alternate_config.read_bytes()).hexdigest()
+    alternate_metadata_path.write_bytes(setup_platform._canonical_json_bytes(alternate_metadata))
+    real_open = setup_platform.os.open
+    real_lstat = Path.lstat
+    alternate_is_published = False
+    raced = False
+
+    def publish_alternate() -> None:
+        nonlocal alternate_is_published, raced
+        snapshot_directory.rename(original_directory)
+        alternate_directory.rename(snapshot_directory)
+        alternate_is_published = True
+        raced = True
+
+    def restore_original() -> None:
+        nonlocal alternate_is_published
+        snapshot_directory.rename(alternate_directory)
+        original_directory.rename(snapshot_directory)
+        alternate_is_published = False
+
+    def swap_while_opening(path: Any, *args: Any, **kwargs: Any) -> int:
+        selected_path = Path(path) if isinstance(path, (str, os.PathLike)) else None
+        if selected_path == snapshot_directory:
+            publish_alternate()
+            try:
+                return real_open(path, *args, **kwargs)
+            finally:
+                restore_original()
+        if selected_path == snapshot_directory / "metadata.json" and not alternate_is_published:
+            publish_alternate()
+        return real_open(path, *args, **kwargs)
+
+    def restore_after_alternate_config_stat(path: Path) -> os.stat_result:
+        metadata = real_lstat(path)
+        if path == snapshot_directory / "config.yaml" and alternate_is_published:
+            restore_original()
+        return metadata
+
+    monkeypatch.setattr(setup_platform.os, "open", swap_while_opening)
+    monkeypatch.setattr(Path, "lstat", restore_after_alternate_config_stat)
+
+    with pytest.raises(
+        SetupError,
+        match=(
+            "snapshot directory changed during capture|"
+            "profile resource parent changed during inspection|"
+            "config changed after its setup snapshot"
+        ),
+    ):
+        setup_platform._capture_hermes_profile_snapshot(
+            selected,
+            "work",
+            profile_identity=profile_identity,
+            config=b"model: user-drift\n",
+            environment=b"",
+            config_exists=True,
+            environment_exists=False,
+            setup_id="setup_0123456789abcdef",
+        )
+
+    assert raced is True
+    assert alternate_is_published is False
+    assert (snapshot_directory / "config.yaml").read_bytes() == b"model: original\n"
 
 
 def test_hermes_apply_binds_an_issued_token_to_its_rollback_snapshot(
@@ -4694,6 +5722,101 @@ def test_hermes_snapshot_token_update_rejects_a_same_content_inode_swap(
     assert (metadata_path.stat().st_dev, metadata_path.stat().st_ino) != before_identity
 
 
+@pytest.mark.parametrize("operation", ("bind", "clear"))
+def test_hermes_snapshot_token_update_rejects_an_aba_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    selected = replace(spec(tmp_path / "snapshot-token-directory-aba"), hermes_profiles=("work",))
+    profile = ensure_private_directory(tmp_path / "profiles" / "work")
+    setup_platform._capture_hermes_profile_snapshot(
+        selected,
+        "work",
+        profile_identity=require_private_directory_identity(profile),
+        config=b"",
+        environment=b"",
+        config_exists=False,
+        environment_exists=False,
+    )
+    token_id = "0000000000000001"
+    if operation == "clear":
+        setup_platform._bind_hermes_snapshot_token(
+            selected,
+            "work",
+            profile_directory=profile,
+            token_id=token_id,
+        )
+    snapshot_directory = setup_platform._hermes_snapshot_directory(selected, "work")
+    original_directory = snapshot_directory.parent / f"{snapshot_directory.name}.original"
+    alternate_directory = snapshot_directory.parent / f"{snapshot_directory.name}.alternate"
+    shutil.copytree(snapshot_directory, alternate_directory)
+    metadata_path = snapshot_directory / "metadata.json"
+    before = metadata_path.read_bytes()
+    real_observe = setup_platform._observe_optional_private_file
+    real_replace = setup_platform._replace_private_file
+    metadata_reads = 0
+    alternate_is_published = False
+    raced = False
+
+    def publish_alternate() -> None:
+        nonlocal alternate_is_published, raced
+        snapshot_directory.rename(original_directory)
+        alternate_directory.rename(snapshot_directory)
+        alternate_is_published = True
+        raced = True
+
+    def restore_original() -> None:
+        nonlocal alternate_is_published
+        snapshot_directory.rename(alternate_directory)
+        original_directory.rename(snapshot_directory)
+        alternate_is_published = False
+
+    def swap_before_update_observation(path: Path, **kwargs: Any) -> Any:
+        nonlocal metadata_reads
+        if path == metadata_path:
+            metadata_reads += 1
+            if metadata_reads == 2:
+                publish_alternate()
+                try:
+                    return real_observe(path, **kwargs)
+                except BaseException:
+                    restore_original()
+                    raise
+        return real_observe(path, **kwargs)
+
+    def restore_after_update(path: Path, content: bytes, **kwargs: Any) -> None:
+        try:
+            real_replace(path, content, **kwargs)
+        finally:
+            if alternate_is_published:
+                restore_original()
+
+    monkeypatch.setattr(
+        setup_platform,
+        "_observe_optional_private_file",
+        swap_before_update_observation,
+    )
+    monkeypatch.setattr(setup_platform, "_replace_private_file", restore_after_update)
+    update = (
+        setup_platform._bind_hermes_snapshot_token
+        if operation == "bind"
+        else setup_platform._clear_hermes_snapshot_token
+    )
+
+    with pytest.raises(SetupError, match="parent changed|directory changed"):
+        update(
+            selected,
+            "work",
+            profile_directory=profile,
+            token_id=token_id,
+        )
+
+    assert raced is True
+    assert alternate_is_published is False
+    assert metadata_path.read_bytes() == before
+
+
 def test_tailnet_rollback_rejects_the_right_target_on_the_wrong_port(
     tmp_path: Path,
 ) -> None:
@@ -4747,6 +5870,107 @@ def test_tailnet_private_route_rejects_foreground_funnel_permission() -> None:
                 "AllowFunnel": {host_port: True},
             }
         },
+    }
+
+    assert not setup_platform._serve_config_has_private_route(
+        serve,
+        host_port=host_port,
+        port=8443,
+        target="http://127.0.0.1:8790",
+    )
+
+
+def test_tailnet_apply_rejects_ambiguous_private_route_types_after_mutation(
+    tmp_path: Path,
+) -> None:
+    selected = SetupSpec(
+        root=tmp_path / "ambiguous-tailnet-route",
+        public_origin="https://signet.example.ts.net:8443",
+        owner_user_id="user:owner",
+        hermes_profiles=("work",),
+        executable=Path("/bin/echo"),
+    )
+    ensure_private_directory(selected.root / "services")
+    host_port = "signet.example.ts.net:8443"
+    state: dict[str, Any] = {"serve": {}}
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        commands.append(command)
+        if command[:3] == ["tailscale", "serve", "status"]:
+            payload = state["serve"]
+        elif "--bg" in command:
+            state["serve"] = {
+                "TCP": {"8443": {"HTTPS": 1}},
+                "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+                "AllowFunnel": {host_port: "true"},
+            }
+            payload = {}
+        elif command[-1] == "off":
+            state["serve"] = {}
+            payload = {}
+        else:  # pragma: no cover - protects the fake boundary
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    platform = ProductionSetupPlatform(command_runner=run)
+    with pytest.raises(SetupError, match="did not match the requested private route"):
+        platform._apply_tailnet_route(selected)
+
+    assert any("--bg" in command for command in commands)
+    assert any(command[-1] == "off" for command in commands)
+    assert state["serve"] == {}
+    assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected_baseline"),
+    [
+        pytest.param({}, {}, id="absent"),
+        pytest.param({"AllowFunnel": {}}, {}, id="empty"),
+        pytest.param(
+            {"AllowFunnel": {"other.example.ts.net:443": False}},
+            {"AllowFunnel": {"other.example.ts.net:443": False}},
+            id="unrelated",
+        ),
+    ],
+)
+def test_tailnet_private_route_removal_handles_every_accepted_funnel_shape(
+    extra: dict[str, Any],
+    expected_baseline: dict[str, Any],
+) -> None:
+    host_port = "signet.example.ts.net:8443"
+    serve = {
+        "TCP": {"8443": {"HTTPS": True}},
+        "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+        **extra,
+    }
+
+    assert setup_platform._serve_config_has_private_route(
+        serve,
+        host_port=host_port,
+        port=8443,
+        target="http://127.0.0.1:8790",
+    )
+    assert (
+        setup_platform._serve_config_without_private_route(
+            serve,
+            host_port=host_port,
+            port=8443,
+            target="http://127.0.0.1:8790",
+        )
+        == expected_baseline
+    )
+
+
+@pytest.mark.parametrize("section", ["AllowFunnel", "Foreground"])
+def test_tailnet_private_route_rejects_explicit_null_optional_sections(section: str) -> None:
+    host_port = "signet.example.ts.net:8443"
+    serve = {
+        "TCP": {"8443": {"HTTPS": True}},
+        "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+        section: None,
     }
 
     assert not setup_platform._serve_config_has_private_route(
@@ -4852,6 +6076,14 @@ def test_tailnet_apply_rejects_concurrent_route_drift_after_mutation(tmp_path: P
                 },
                 "AllowFunnel": {host_port: False},
             }
+            payload = {}
+        elif command[-1] == "off":
+            state["serve"] = setup_platform._serve_config_without_private_route(
+                state["serve"],
+                host_port=host_port,
+                port=8443,
+                target="http://127.0.0.1:8790",
+            )
             payload = {}
         else:  # pragma: no cover - protects the fake boundary
             raise AssertionError(command)
