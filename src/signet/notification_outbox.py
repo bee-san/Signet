@@ -16,6 +16,16 @@ from signet.notifications import NotificationDispatcher, NotificationKind, PushM
 
 _SAFE_ERROR_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.\-/]{0,511}$")
+_EXPIRY_SCAN_PAGE_SIZE = 256
+
+
+def _expiry_dedupe_key(user_id: str, request_id: str, version: int) -> str:
+    digest = hashlib.sha256()
+    for component in (user_id, request_id, str(version)):
+        encoded = component.encode()
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return f"approaching_expiry:v2:{digest.hexdigest()}"
 
 
 class NotificationOutboxError(RuntimeError):
@@ -284,39 +294,74 @@ class SQLiteNotificationOutbox:
         if limit <= 0 or limit > 10_000:
             raise ValueError("expiry notification limit is invalid")
         inserted = 0
-        dedupe_prefix = f"approaching_expiry:{hashlib.sha256(user_id.encode()).hexdigest()}:"
+        legacy_prefix = "approaching_expiry:"
+        previous_user_prefix = f"approaching_expiry:{hashlib.sha256(user_id.encode()).hexdigest()}:"
+        cursor_expires_at = now
+        cursor_request_id = ""
         with self.database.transaction() as connection:
-            rows = connection.execute(
-                """
-                SELECT request.request_id, request.downstream_alias,
-                       request.tool_name, request.current_version
-                FROM approval_requests AS request
-                WHERE request.state = 'pending_approval'
-                  AND request.expires_at > ? AND request.expires_at <= ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM notification_outbox AS outbox
-                      WHERE outbox.dedupe_key =
-                            ? || request.request_id || ':' || request.current_version
-                  )
-                ORDER BY request.expires_at, request.request_id LIMIT ?
-                """,
-                (now, now + horizon_seconds, dedupe_prefix, limit),
-            ).fetchall()
-            for row in rows:
-                inserted += int(
-                    enqueue_notification(
-                        connection,
-                        dedupe_key=(f"{dedupe_prefix}{row['request_id']}:{row['current_version']}"),
-                        user_id=user_id,
-                        message=PushMessage(
-                            NotificationKind.APPROACHING_EXPIRY,
-                            service=row["downstream_alias"],
-                            action=row["tool_name"],
-                        ),
-                        request_id=row["request_id"],
-                        created_at=now,
+            while inserted < limit:
+                rows = connection.execute(
+                    """
+                    SELECT request.request_id, request.downstream_alias,
+                           request.tool_name, request.current_version,
+                           request.expires_at
+                    FROM approval_requests AS request
+                    WHERE request.state = 'pending_approval'
+                      AND request.expires_at > ? AND request.expires_at <= ?
+                      AND (
+                          request.expires_at > ?
+                          OR (
+                              request.expires_at = ? AND request.request_id > ?
+                          )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM notification_outbox AS outbox
+                          WHERE outbox.user_id = ? AND (
+                              outbox.dedupe_key =
+                                  ? || request.request_id || ':' || request.current_version
+                              OR outbox.dedupe_key =
+                                  ? || request.request_id || ':' || request.current_version
+                          )
+                      )
+                    ORDER BY request.expires_at, request.request_id LIMIT ?
+                    """,
+                    (
+                        now,
+                        now + horizon_seconds,
+                        cursor_expires_at,
+                        cursor_expires_at,
+                        cursor_request_id,
+                        user_id,
+                        legacy_prefix,
+                        previous_user_prefix,
+                        _EXPIRY_SCAN_PAGE_SIZE,
+                    ),
+                ).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    inserted += int(
+                        enqueue_notification(
+                            connection,
+                            dedupe_key=_expiry_dedupe_key(
+                                user_id,
+                                str(row["request_id"]),
+                                int(row["current_version"]),
+                            ),
+                            user_id=user_id,
+                            message=PushMessage(
+                                NotificationKind.APPROACHING_EXPIRY,
+                                service=row["downstream_alias"],
+                                action=row["tool_name"],
+                            ),
+                            request_id=row["request_id"],
+                            created_at=now,
+                        )
                     )
-                )
+                    if inserted >= limit:
+                        break
+                cursor_expires_at = int(rows[-1]["expires_at"])
+                cursor_request_id = str(rows[-1]["request_id"])
         return inserted
 
     def schedule_daily_digest(self, *, user_id: str, now: int) -> bool:

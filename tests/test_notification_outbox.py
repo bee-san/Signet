@@ -430,6 +430,74 @@ def test_expiry_scheduler_paginates_independently_for_every_user(database: Datab
     assert {intent.user_id for intent in expiry_intents} == {"user:owner", "user:approver"}
 
 
+def test_expiry_scheduler_honors_legacy_dedupe_for_its_original_recipient(
+    database: Database,
+) -> None:
+    machine = ApprovalStateMachine(database)
+    machine.enqueue(_request("req_LegacyExpiry", expires_at=NOW + 30))
+    outbox = SQLiteNotificationOutbox(database)
+    outbox.enqueue(
+        dedupe_key="approaching_expiry:req_LegacyExpiry:1",
+        user_id="user:owner",
+        message=PushMessage(
+            NotificationKind.APPROACHING_EXPIRY,
+            service="fastmail",
+            action="send_email",
+        ),
+        request_id="req_LegacyExpiry",
+        created_at=NOW,
+    )
+
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 0
+    )
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:approver",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 1
+    )
+
+
+def test_expiry_scheduler_bounds_dedupe_keys_for_long_valid_request_ids(
+    database: Database,
+) -> None:
+    request_id = "r" * 450
+    ApprovalStateMachine(database).enqueue(_request(request_id, expires_at=NOW + 30))
+    outbox = SQLiteNotificationOutbox(database)
+
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 1
+    )
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 0
+    )
+    with database.read() as connection:
+        dedupe_key = str(
+            connection.execute(
+                "SELECT dedupe_key FROM notification_outbox WHERE kind = 'approaching_expiry'"
+            ).fetchone()[0]
+        )
+    assert len(dedupe_key) <= 512
+
+
 def test_state_enqueue_and_notification_intent_commit_or_rollback_together(
     database: Database,
 ) -> None:
