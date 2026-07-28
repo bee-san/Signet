@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 import signet.production as production_module
+import signet.setup_platform as setup_platform
 from signet.app import _parser, main
 from signet.setup_cli import (
     _discover_hermes_profiles,
@@ -61,8 +62,18 @@ def test_profile_discovery_includes_the_hermes_default_profile(
 
 
 def test_origin_discovery_uses_an_absolute_command_and_clean_environment(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reviewed_tailscale = tmp_path / "commands" / "tailscale"
+    reviewed_tailscale.parent.mkdir(mode=0o700)
+    reviewed_tailscale.write_bytes(b"#!/bin/sh\nexit 0\n")
+    reviewed_tailscale.chmod(0o700)
+    monkeypatch.setattr(
+        setup_platform,
+        "_REVIEWED_COMMAND_CANDIDATES",
+        {"tailscale": (reviewed_tailscale,)},
+    )
     observed: dict[str, Any] = {}
 
     def run(command: list[str], **kwargs: Any) -> SimpleNamespace:

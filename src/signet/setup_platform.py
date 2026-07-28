@@ -46,6 +46,7 @@ from signet.private_paths import (
     ensure_owned_directory,
     ensure_private_directory,
     exchange_entries,
+    open_directory_with_stable_ancestry,
     rename_entry_no_replace,
     require_no_acl_grants,
     require_owned_directory_identity,
@@ -94,6 +95,16 @@ _STORAGE_BACKUPS_HARD_BYTES = BACKUPS_HARD_BYTES
 _STORAGE_CACHE_HARD_BYTES = CACHE_HARD_BYTES
 _EXTERNAL_STORAGE_RECEIPT_PREFIX = ".signet-external-storage-"
 _EXTERNAL_STORAGE_MARKER = ".signet-storage-owner.json"
+_REVIEWED_COMMAND_CANDIDATES: Mapping[str, tuple[Path, ...]] = {
+    "launchctl": (Path("/bin/launchctl"),),
+    "systemctl": (Path("/usr/bin/systemctl"), Path("/bin/systemctl")),
+    "tailscale": (
+        Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
+        Path("/opt/homebrew/bin/tailscale"),
+        Path("/usr/local/bin/tailscale"),
+        Path("/usr/bin/tailscale"),
+    ),
+}
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -399,6 +410,119 @@ def _require_packaged_runtime(
                 )
 
 
+def _reviewed_command_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _require_stable_command_edge(
+    parent: os.stat_result,
+    child: os.stat_result,
+    *,
+    current_uid: int,
+) -> None:
+    parent_mode = stat.S_IMODE(parent.st_mode)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid not in {0, current_uid}
+        or (
+            parent_mode & 0o022 and not (parent_mode & stat.S_ISVTX and child.st_uid == current_uid)
+        )
+    ):
+        raise SetupError("external setup command has unsafe ancestry")
+
+
+def _require_reviewed_system_executable(candidate: Path) -> Path:
+    selected = Path(candidate)
+    try:
+        encoded = os.fsencode(selected)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise SetupError("external setup command is unavailable or unsafe") from exc
+    if (
+        not selected.is_absolute()
+        or not encoded
+        or b"\x00" in encoded
+        or ".." in selected.parts
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        raise SetupError("external setup command is unavailable or unsafe")
+
+    parent_descriptor = -1
+    descriptor = -1
+    try:
+        parent_descriptor = open_directory_with_stable_ancestry(selected.parent)
+        parent = os.fstat(parent_descriptor)
+        before = os.stat(
+            selected.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        descriptor = os.open(
+            selected.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        require_no_acl_grants(descriptor)
+        after = os.stat(
+            selected.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        _require_stable_command_edge(parent, opened, current_uid=current_uid)
+        opened_identity = _reviewed_command_file_identity(opened)
+        if (
+            (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid not in {0, current_uid}
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) & 0o022
+            or not os.access(
+                selected.name,
+                os.X_OK,
+                dir_fd=parent_descriptor,
+                effective_ids=True,
+                follow_symlinks=False,
+            )
+        ):
+            raise SetupError("external setup command is unavailable or unsafe")
+        current = os.stat(
+            selected.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        rechecked = os.fstat(descriptor)
+        resolved = selected.resolve(strict=True)
+        if (
+            resolved != selected
+            or _reviewed_command_file_identity(current) != opened_identity
+            or _reviewed_command_file_identity(rechecked) != opened_identity
+        ):
+            raise SetupError("external setup command changed during review")
+        return selected
+    except SetupError:
+        raise
+    except (OSError, PrivatePathError, RuntimeError, ValueError) as exc:
+        raise SetupError("external setup command is unavailable or unsafe") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
 def storage_status(
     spec: SetupSpec,
     *,
@@ -506,28 +630,16 @@ class ProductionSetupPlatform:
     def _reviewed_command(command: list[str]) -> list[str]:
         if not command or not command[0] or Path(command[0]).name != command[0]:
             raise SetupError("external setup command is not a reviewed system command")
-        candidates: dict[str, tuple[Path, ...]] = {
-            "launchctl": (Path("/bin/launchctl"),),
-            "systemctl": (Path("/usr/bin/systemctl"), Path("/bin/systemctl")),
-            "tailscale": (
-                Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
-                Path("/opt/homebrew/bin/tailscale"),
-                Path("/usr/local/bin/tailscale"),
-                Path("/usr/bin/tailscale"),
-            ),
-        }
-        available = candidates.get(command[0])
+        available = _REVIEWED_COMMAND_CANDIDATES.get(command[0])
         if available is None:
             raise SetupError("external setup command is not a reviewed system command")
-        selected = next(
-            (
-                candidate
-                for candidate in available
-                if candidate.is_file() and not candidate.is_symlink()
-            ),
-            available[0],
-        )
-        return [str(selected), *command[1:]]
+        for candidate in available:
+            try:
+                selected = _require_reviewed_system_executable(candidate)
+            except SetupError:
+                continue
+            return [str(selected), *command[1:]]
+        raise SetupError("external setup command is unavailable or unsafe")
 
     def _run_command(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         kwargs["env"] = self._service_manager_environment()
@@ -800,7 +912,7 @@ class ProductionSetupPlatform:
                         check=False,
                         env=self._service_manager_environment(),
                     )
-                except (OSError, subprocess.SubprocessError):
+                except (OSError, SetupError, subprocess.SubprocessError):
                     result[label] = "unavailable"
                     continue
                 result[label] = self._launchd_service_state(
@@ -828,7 +940,7 @@ class ProductionSetupPlatform:
                         check=False,
                         env=self._service_manager_environment(),
                     )
-                except (OSError, subprocess.SubprocessError):
+                except (OSError, SetupError, subprocess.SubprocessError):
                     result[name] = "unavailable"
                     continue
                 result[name] = self._systemd_service_state(status, unit=name)

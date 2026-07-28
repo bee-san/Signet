@@ -132,6 +132,22 @@ def _command_signature(command: list[str]) -> list[str]:
     return [Path(command[0]).name.lower(), *command[1:]]
 
 
+@pytest.fixture(autouse=True)
+def _reviewed_system_command_fixtures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_root = tmp_path / "reviewed-system-commands"
+    command_root.mkdir(mode=0o700)
+    candidates: dict[str, tuple[Path, ...]] = {}
+    for name in ("launchctl", "systemctl", "tailscale"):
+        executable = command_root / name
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+        candidates[name] = (executable,)
+    monkeypatch.setattr(setup_platform, "_REVIEWED_COMMAND_CANDIDATES", candidates)
+
+
 def test_plan_is_read_only_and_defaults_providers_to_disabled(tmp_path: Path) -> None:
     selected = spec(tmp_path / "signet")
     plan = SetupEngine(SetupJournalStore(selected.root), FakePlatform()).plan(selected)
@@ -2343,8 +2359,18 @@ def test_browser_assisted_setup_prints_exact_url_before_opening_without_printing
 
 
 def test_service_manager_commands_use_absolute_paths_and_a_minimal_environment(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reviewed_systemctl = tmp_path / "commands" / "systemctl"
+    reviewed_systemctl.parent.mkdir(mode=0o700)
+    reviewed_systemctl.write_bytes(b"#!/bin/sh\nexit 0\n")
+    reviewed_systemctl.chmod(0o700)
+    monkeypatch.setattr(
+        setup_platform,
+        "_REVIEWED_COMMAND_CANDIDATES",
+        {"systemctl": (reviewed_systemctl,)},
+    )
     monkeypatch.setenv("PYTHONPATH", "/tmp/attacker")
     monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/tmp/attacker.dylib")
     monkeypatch.setenv("SIGNET_PRODUCTION_CONFIG", "/tmp/attacker.json")
