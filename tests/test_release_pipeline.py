@@ -18,6 +18,7 @@ from packaging.specifiers import SpecifierSet
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_GATE = ROOT / "scripts" / "release_gate.py"
 REPRODUCIBLE_BUILD = ROOT / "scripts" / "reproducible_build.py"
+RUNTIME_MANIFEST = ROOT / "scripts" / "runtime_manifest.py"
 PINNED_ACTION = re.compile(r"^\s*uses:\s+[^\s]+@[0-9a-f]{40}(?:\s+#.*)?$")
 
 
@@ -276,6 +277,27 @@ packages = ["src/evidence_demo"]
         )
 
 
+def test_runtime_manifest_is_deterministic_and_source_bound() -> None:
+    namespace = _load_script(RUNTIME_MANIFEST)
+    build_manifest = namespace["build_manifest"]
+    error = namespace["RuntimeManifestError"]
+    source_sha = "b" * 40
+
+    first = build_manifest(source_sha=source_sha)
+    second = build_manifest(source_sha=source_sha)
+
+    assert first == second
+    assert first["schema"] == "signet-runtime-manifest-v1"
+    assert first["source_sha"] == source_sha
+    packages = first["packages"]
+    assert isinstance(packages, list)
+    names = [item["name"] for item in packages]
+    assert names == sorted(names, key=str.casefold)
+    assert any(item["name"] == "signet-gateway" for item in packages)
+    with pytest.raises(error, match="40 lowercase"):
+        build_manifest(source_sha="not-a-source-sha")
+
+
 def test_built_artifacts_contain_production_assets_and_metadata(tmp_path: Path) -> None:
     built = subprocess.run(  # nosec B603 B607
         ["uv", "build", "--no-cache", "--no-sources", "--out-dir", str(tmp_path)],
@@ -351,6 +373,7 @@ def test_release_workflow_is_exact_source_fail_closed_and_pinned() -> None:
         "fetch-depth: 0",
         "scripts/release_gate.py verify-ref",
         "git merge-base --is-ancestor",
+        "gh api --method GET",
         "head_sha=\"$GITHUB_SHA\"",
         "ubuntu-24.04-arm",
         "scripts/reproducible_build.py",
