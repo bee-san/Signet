@@ -235,7 +235,7 @@ class Database:
                     "the database parent must be an owned mode-0700 directory"
                 ) from exc
         self.path = parent / self.path.name
-        _require_local_filesystem(self.path.parent)
+        require_local_filesystem(self.path.parent)
         self._require_expected_identity()
         if self.path.is_symlink():
             raise DatabaseError("the approval database may not be a symbolic link")
@@ -1808,8 +1808,8 @@ def _sql_statements(script: str) -> Iterator[str]:
         raise MigrationIntegrityError("migration ends with incomplete SQL")
 
 
-def _require_local_filesystem(path: Path) -> None:
-    """Reject known network filesystems; SQLite WAL requires local locking."""
+def require_local_filesystem(path: Path) -> None:
+    """Reject known network filesystems; durable state requires local locking."""
 
     if sys.platform == "darwin" and hasattr(os, "ST_LOCAL"):
         if not os.statvfs(path).f_flag & os.ST_LOCAL:

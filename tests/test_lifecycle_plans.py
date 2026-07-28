@@ -12,6 +12,8 @@ from typing import Any, cast
 import pytest
 
 import signet.setup_operations as setup_operations
+from signet.credential_broker import CredentialError, Secret
+from signet.db import LATEST_SCHEMA_VERSION, Database
 from signet.lifecycle import LifecycleOperationStore, LifecyclePlan
 from signet.setup_operations import SetupOperations
 from signet.setup_platform import render_production_config
@@ -30,6 +32,7 @@ class FakeLifecyclePlatform:
     events: list[str] = field(default_factory=list)
     crash_after: str | None = None
     fail_partial_start: bool = False
+    fail_health: bool = False
 
     def apply(self, step: str, spec: SetupSpec, setup_id: str) -> None:
         del step, spec, setup_id
@@ -65,6 +68,8 @@ class FakeLifecyclePlatform:
     def verify_service_health(self, spec: SetupSpec) -> None:
         del spec
         self.events.append("health")
+        if self.fail_health:
+            raise RuntimeError("injected private endpoint detail")
 
 
 def installed_operations(
@@ -220,7 +225,7 @@ def test_service_plan_apply_is_review_bound_and_idempotent(tmp_path: Path) -> No
 
     with pytest.raises(SetupError, match="reviewed lifecycle plan"):
         operations.apply_service_plan("stop", "0" * 64)
-    assert platform.events == ["stop"]
+    assert platform.events == ["stop", "health"]
 
 
 def test_service_plan_apply_shares_the_setup_operation_lock(tmp_path: Path) -> None:
@@ -346,7 +351,7 @@ def test_failed_partial_service_apply_can_roll_back_to_the_reviewed_before_state
         "signet-web": "inactive",
         "tailscale:8443": "active",
     }
-    assert platform.events == ["start", "stop"]
+    assert platform.events == ["start", "health", "stop"]
 
 
 def test_upgrade_and_uninstall_plans_identify_mutation_and_destruction(
@@ -653,6 +658,65 @@ def test_default_backup_plan_binds_a_stable_destination_before_apply(
     accept_fake_backup_verification(monkeypatch, operations)
     assert operations.apply_backup(first.plan_id) == {"backup": str(destination)}
     assert calls == [destination]
+
+
+def test_backup_capacity_preflight_uses_the_selected_destination_filesystem(
+    tmp_path: Path,
+) -> None:
+    operations, platform, _ = installed_operations(tmp_path)
+    destination_root = tmp_path / "reviewed-external-backups"
+    destination_root.mkdir(mode=0o700)
+    destination = destination_root / "backup.signet-backup"
+    cast(Any, platform).disk_usage_provider = lambda _path: SimpleNamespace(
+        total=100 * 1024**3,
+        used=100 * 1024**3 - 1,
+        free=1,
+    )
+
+    class ForbiddenManager:
+        def create(self, *_args: Any, **_kwargs: Any) -> Path:
+            raise AssertionError("backup creation crossed the destination capacity preflight")
+
+    with pytest.raises(SetupError, match="backup storage budget"):
+        operations._backup(destination, manager=cast(Any, ForbiddenManager()))
+
+
+def test_operational_metrics_are_bounded_and_exclude_payload_data(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir(mode=0o700)
+    database = Database(data / "signet.db")
+    database.initialize()
+    storage = {
+        "policy": {
+            "database_hard_bytes": 100,
+            "attachments_hard_bytes": 200,
+            "backups_hard_bytes": 300,
+            "logs_hard_bytes": 400,
+            "cache_hard_bytes": 500,
+            "staging_hard_bytes": 600,
+        },
+        "roots": {
+            name: {"usage_bytes": index, "free_bytes": 1_000}
+            for index, name in enumerate(
+                ("data", "attachments", "backups", "logs", "cache", "staging"),
+                start=1,
+            )
+        },
+    }
+
+    metrics = setup_operations._bounded_operational_metrics(database, storage=storage)
+
+    assert metrics["schema_version"] == LATEST_SCHEMA_VERSION
+    assert metrics["requests_by_state"] == {}
+    assert metrics["reconciliation"] == {"pending": 0, "attempts": 0}
+    assert metrics["notification_outbox"] == {"pending": 0, "max_attempts": 0}
+    assert metrics["workers"] == {}
+    assert metrics["storage"]["data"] == {
+        "usage_bytes": 1,
+        "budget_headroom_bytes": 99,
+        "free_bytes": 1_000,
+    }
+    assert "path" not in repr(metrics)
 
 
 def test_interrupted_backup_and_restore_reject_unreviewed_resume_arguments(
@@ -1357,7 +1421,7 @@ def test_lifecycle_receipt_rejects_a_plan_changed_after_publication(tmp_path: Pa
         operations.apply_service_plan("stop", plan.plan_id)
 
 
-def test_doctor_does_not_read_secret_values_and_verification_classifies_follow_up(
+def test_doctor_resolves_secret_references_without_exposing_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1374,19 +1438,23 @@ def test_doctor_does_not_read_secret_values_and_verification_classifies_follow_u
     )
     config_path.chmod(0o600)
 
-    class ForbiddenSecretStore:
-        def __init__(self) -> None:
-            raise AssertionError("doctor read a secret store")
+    resolved: list[object] = []
 
-    monkeypatch.setattr(setup_operations, "KeychainSecretStore", ForbiddenSecretStore)
+    class AvailableSecretStore:
+        def get(self, reference: object) -> Secret:
+            resolved.append(reference)
+            return Secret("s" * 48)
+
+    monkeypatch.setattr(setup_operations, "KeychainSecretStore", AvailableSecretStore)
 
     doctor = operations.doctor()
     verification = operations.verify()
 
     assert doctor["checks"]["secret_references"] == {
         "ok": True,
-        "verification": "deferred_attended_check",
-        "remediation": "Run an attended backup verification before destructive maintenance.",
+        "verification": "resolved",
+        "configured_count": 5,
+        "remediation": "No action required.",
     }
     assert doctor["checks"]["services"]["remediation"] == (
         "Review the service plan, then apply a start or restart plan."
@@ -1402,3 +1470,54 @@ def test_doctor_does_not_read_secret_values_and_verification_classifies_follow_u
         "live_send",
     ]
     assert verification["gateway_restart"] is False
+    assert len(resolved) == 10
+    assert "s" * 48 not in repr(doctor)
+
+
+def test_doctor_is_unhealthy_when_owned_service_endpoints_fail(tmp_path: Path) -> None:
+    platform = FakeLifecyclePlatform(fail_health=True)
+    operations, _, _ = installed_operations(tmp_path, platform=platform)
+
+    doctor = operations.doctor()
+
+    assert doctor["healthy"] is False
+    assert doctor["checks"]["service_health"] == {
+        "ok": False,
+        "error_kind": "RuntimeError",
+        "remediation": "Inspect owned service logs, then apply a reviewed restart plan.",
+    }
+    assert "private endpoint detail" not in repr(doctor)
+
+
+def test_doctor_fails_closed_when_a_configured_secret_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations, _, selected = installed_operations(tmp_path)
+    config_path = selected.root / "production.json"
+    config_path.write_text(
+        json.dumps(
+            render_production_config(
+                selected,
+                setup_id=SetupJournalStore(selected.root).load().setup_id,
+            )
+        ),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+
+    class MissingSecretStore:
+        def get(self, _reference: object) -> Secret:
+            raise CredentialError("private backend detail")
+
+    monkeypatch.setattr(setup_operations, "KeychainSecretStore", MissingSecretStore)
+
+    doctor = operations.doctor()
+
+    assert doctor["healthy"] is False
+    assert doctor["checks"]["secret_references"] == {
+        "ok": False,
+        "error_kind": "CredentialError",
+        "remediation": "Restore the configured secret in the platform secret store.",
+    }
+    assert "private backend detail" not in repr(doctor)

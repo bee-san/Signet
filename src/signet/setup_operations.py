@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import stat
 import time
 from collections.abc import Callable, Iterator
@@ -20,7 +21,7 @@ from signet.backup import (
     RestoredBundle,
     remove_private_tree_checked,
 )
-from signet.credential_broker import KeychainSecretStore, SecretReference
+from signet.credential_broker import CredentialError, KeychainSecretStore, SecretReference
 from signet.crypto import PayloadCipher
 from signet.db import LATEST_SCHEMA_VERSION, Database, DatabaseError, MigrationBackupReceipt
 from signet.lifecycle import (
@@ -55,6 +56,8 @@ from signet.setup_platform import (
     ProductionSetupPlatform,
     _managed_tailnet_port,
     _replace_private_file,
+    storage_path_status,
+    storage_status,
     validate_active_database_runtime_ownership,
 )
 from signet.setup_state import (
@@ -66,6 +69,7 @@ from signet.setup_state import (
     SetupSpec,
 )
 from signet.staging import StagingStore
+from signet.storage_lifecycle import BACKUPS_HARD_BYTES
 
 
 class SetupOperations:
@@ -105,6 +109,17 @@ class SetupOperations:
                 executable=Path(document["executable"]),
                 open_browser=bool(document["open_browser"]),
                 policy_mode=cast(PolicyMode, document.get("policy_mode", "deny")),
+                data_root=(
+                    Path(str(document["data_root"]))
+                    if document.get("data_root") is not None
+                    else None
+                ),
+                backup_root=(
+                    Path(str(document["backup_root"]))
+                    if document.get("backup_root") is not None
+                    else None
+                ),
+                data_device=cast(int | None, document.get("data_device")),
             )
         except (KeyError, TypeError, ValueError):
             raise SetupError("setup journal specification is invalid") from None
@@ -112,6 +127,7 @@ class SetupOperations:
     def status(self) -> dict[str, Any]:
         journal = self.store.load()
         lifecycle = LifecycleOperationStore(self.root).load_optional()
+        spec = self.spec()
         result: dict[str, Any] = {
             "setup_id": journal.setup_id,
             "setup_status": journal.status,
@@ -120,8 +136,12 @@ class SetupOperations:
             "lifecycle_operation": (
                 None if lifecycle is None else _lifecycle_operation_metadata(lifecycle)
             ),
-            "services": self.platform.service_status(self.spec()),
+            "services": self.platform.service_status(spec),
         }
+        try:
+            result["storage"] = storage_status(spec)
+        except Exception as exc:
+            result["storage"] = {"available": False, "error_kind": type(exc).__name__}
         try:
             config = load_production_config(self.root / "production.json")
             database_path = config.storage.database_path
@@ -131,15 +151,18 @@ class SetupOperations:
                 validate_active_database_runtime_ownership(
                     database_path.parent,
                     setup_id=journal.setup_id,
+                    instance_root=self.root,
+                    require_external_storage=spec.data_root is not None,
                 )
             )
+            database = Database(
+                database_path,
+                expected_parent_identity=expected_parent_identity,
+                expected_identity=expected_identity,
+                expected_lock_identity=expected_lock_identity,
+            )
             production = ProductionStateStore(
-                Database(
-                    database_path,
-                    expected_parent_identity=expected_parent_identity,
-                    expected_identity=expected_identity,
-                    expected_lock_identity=expected_lock_identity,
-                ),
+                database,
                 provider_rollout_enabled=config.provider_rollout.state == "enabled",
             ).status(read_only=True)
             result["provider_rollout"] = config.provider_rollout.state
@@ -165,6 +188,24 @@ class SetupOperations:
                     for name, service in production.services.items()
                 },
             }
+            try:
+                result["metrics"] = {
+                    "available": True,
+                    **_bounded_operational_metrics(
+                        database,
+                        storage=(
+                            result["storage"]
+                            if isinstance(result.get("storage"), dict)
+                            and result["storage"].get("available") is not False
+                            else None
+                        ),
+                    ),
+                }
+            except Exception as exc:
+                result["metrics"] = {
+                    "available": False,
+                    "error_kind": type(exc).__name__,
+                }
         return result
 
     def doctor(self) -> dict[str, Any]:
@@ -219,25 +260,84 @@ class SetupOperations:
                 "connector_count": len(config.connectors),
                 "remediation": "No action required.",
             }
-            checks["secret_references"] = {
-                "ok": True,
-                "verification": "deferred_attended_check",
-                "remediation": (
-                    "Run an attended backup verification before destructive maintenance."
-                ),
-            }
-        services = self.platform.service_status(self.spec())
+            configured_references = tuple(
+                value for value in config.secrets.model_dump().values() if isinstance(value, str)
+            )
+            try:
+                secret_store = KeychainSecretStore()
+                for raw_reference in configured_references:
+                    secret = secret_store.get(SecretReference.parse(raw_reference))
+                    encoded = secret.reveal().encode("utf-8")
+                    if not 32 <= len(encoded) <= 4_096:
+                        raise CredentialError("the configured Keychain secret is unavailable")
+            except Exception as exc:
+                checks["secret_references"] = {
+                    **_failed_check(exc),
+                    "remediation": "Restore the configured secret in the platform secret store.",
+                }
+            else:
+                checks["secret_references"] = {
+                    "ok": True,
+                    "verification": "resolved",
+                    "configured_count": len(configured_references),
+                    "remediation": "No action required.",
+                }
+        spec = self.spec()
+        services = self.platform.service_status(spec)
         checks["services"] = {
             "ok": bool(services) and all(status == "active" for status in services.values()),
             "status": services,
             "remediation": "Review the service plan, then apply a start or restart plan.",
         }
+        try:
+            self.platform.verify_service_health(spec)
+        except Exception as exc:
+            checks["service_health"] = {
+                **_failed_check(exc),
+                "remediation": ("Inspect owned service logs, then apply a reviewed restart plan."),
+            }
+        else:
+            checks["service_health"] = {
+                "ok": True,
+                "remediation": "No action required.",
+            }
+        try:
+            storage = storage_status(spec)
+            policy = storage["policy"]
+            roots = storage["roots"]
+            bounded = {
+                "data": int(policy["database_hard_bytes"]),
+                "attachments": int(policy["attachments_hard_bytes"]),
+                "logs": int(policy["logs_hard_bytes"]),
+                "backups": int(policy["backups_hard_bytes"]),
+                "cache": int(policy["cache_hard_bytes"]),
+                "staging": int(policy["staging_hard_bytes"]),
+            }
+            storage_ok = all(
+                int(item["free_bytes"]) >= int(policy["minimum_reserve_bytes"])
+                for item in roots.values()
+            ) and all(int(roots[name]["usage_bytes"]) <= limit for name, limit in bounded.items())
+        except Exception as exc:
+            checks["storage"] = {
+                **_failed_check(exc),
+                "remediation": "Restore the reviewed storage roots and device identity.",
+            }
+        else:
+            checks["storage"] = {
+                "ok": storage_ok,
+                "status": storage,
+                "remediation": (
+                    "No action required."
+                    if storage_ok
+                    else "Stop new work, free reviewed storage, then rerun doctor."
+                ),
+            }
         checks["hermes_reload"] = {
             "ok": False,
             "manual_action": (
                 "Review each configured MCP entry, then run /reload-mcp in each profile."
             ),
-            "profiles": list(self.spec().hermes_profiles),
+            "profiles": list(spec.hermes_profiles),
         }
         return {
             "healthy": all(
@@ -279,8 +379,9 @@ class SetupOperations:
         if destination is not None and (not destination.is_absolute() or ".." in destination.parts):
             raise SetupError("backup destination must be an absolute lexical path")
         previous_plan_id = self._previous_lifecycle_plan_id()
+        spec = self.spec()
         selected_destination = destination or _default_reviewed_backup_destination(
-            self.root,
+            spec.backup_dir,
             setup_id=journal.setup_id,
             previous_plan_id=previous_plan_id,
         )
@@ -381,10 +482,9 @@ class SetupOperations:
             raise SetupError(
                 "a durable purge checkpoint exists; finish purge before creating another backup"
             )
-        manager = manager or self._backup_manager(journal)
+        spec = self.spec()
         selected = destination or (
-            self.root
-            / "backups"
+            spec.backup_dir
             / (
                 time.strftime("signet-%Y%m%dT%H%M%SZ-", time.gmtime())
                 + secrets.token_hex(4)
@@ -393,6 +493,31 @@ class SetupOperations:
         )
         if not selected.is_absolute() or ".." in selected.parts:
             raise SetupError("backup destination must be an absolute lexical path")
+        report = storage_status(spec)
+        roots = report["roots"]
+        policy = report["policy"]
+        estimated_bytes = max(
+            int(roots["data"]["usage_bytes"])
+            + int(roots["attachments"]["usage_bytes"])
+            + int(roots["staging"]["usage_bytes"]),
+            64 * 1024**2,
+        )
+        disk_usage_provider = getattr(
+            self.platform,
+            "disk_usage_provider",
+            shutil.disk_usage,
+        )
+        destination_status = storage_path_status(
+            selected.parent,
+            disk_usage_provider=disk_usage_provider,
+        )
+        if int(destination_status["usage_bytes"]) + estimated_bytes > int(
+            policy["backups_hard_bytes"]
+        ) or int(destination_status["free_bytes"]) - estimated_bytes < int(
+            policy["minimum_reserve_bytes"]
+        ):
+            raise SetupError("backup storage budget would exceed the reviewed hard limit")
+        manager = manager or self._backup_manager(journal)
         try:
             return manager.create(
                 selected,
@@ -821,6 +946,8 @@ class SetupOperations:
             validate_active_database_runtime_ownership(
                 manager.database.path.parent,
                 setup_id=plan.setup_id,
+                instance_root=self.root,
+                require_external_storage=self.spec().data_root is not None,
             )
         )
         source_device, source_inode = source_identity
@@ -1047,7 +1174,7 @@ class SetupOperations:
             ensure_private_directory(recovery_directory)
             _fsync_directory(recovery_directory.parent)
             database = manager.database
-            expected_database_path = (spec.root / "data" / "signet.db").absolute()
+            expected_database_path = (spec.data_dir / "signet.db").absolute()
             if database.path != expected_database_path:
                 raise SetupError("upgrade backup manager targets the wrong database")
             with database.read_only() as connection:
@@ -1294,7 +1421,7 @@ class SetupOperations:
             incomplete_install = (
                 journal.status != "uninstalled" and not all_non_service_steps_completed
             )
-            database_path = self.root / "data" / "signet.db"
+            database_path = spec.data_dir / "signet.db"
             if journal.purge_backup is None and incomplete_install and not database_path.exists():
                 removable = [
                     record.name
@@ -1625,13 +1752,16 @@ class SetupOperations:
 
     def _current_schema_version(self) -> int:
         journal = self._completed_journal()
-        database_path = self.root / "data" / "signet.db"
+        selected = self.spec()
+        database_path = selected.data_dir / "signet.db"
         if database_path.is_symlink() or not database_path.is_file():
             raise SetupError("upgrade planning requires the owned production database")
         expected_identity, expected_lock_identity, expected_parent_identity = (
             validate_active_database_runtime_ownership(
                 database_path.parent,
                 setup_id=journal.setup_id,
+                instance_root=self.root,
+                require_external_storage=selected.data_root is not None,
             )
         )
         database = Database(
@@ -1946,7 +2076,8 @@ class SetupOperations:
             attachment_secret = secret_store.get(attachment_reference)
         except Exception as exc:
             raise SetupError("backup recovery secrets are unavailable") from exc
-        database_path = self.root / "data" / "signet.db"
+        selected = self.spec()
+        database_path = selected.data_dir / "signet.db"
         ownership_marker = database_path.parent / ".signet-database-ownership.json"
         expected_identity = None
         expected_lock_identity = None
@@ -1964,6 +2095,8 @@ class SetupOperations:
             ) = validate_active_database_runtime_ownership(
                 database_path.parent,
                 setup_id=journal.setup_id,
+                instance_root=self.root,
+                require_external_storage=selected.data_root is not None,
             )
         database = Database(
             database_path,
@@ -1981,6 +2114,7 @@ class SetupOperations:
             database,
             staging=staging,
             encryption_key=encryption_key,
+            max_bundle_bytes=BACKUPS_HARD_BYTES,
             key_identity_resolver=lambda reference: secret_store.get(
                 SecretReference.parse(reference)
             ).reveal(),
@@ -2017,14 +2151,14 @@ def _backup_destination(plan: LifecyclePlan) -> Path:
 
 
 def _default_reviewed_backup_destination(
-    root: Path,
+    backup_root: Path,
     *,
     setup_id: str,
     previous_plan_id: str | None,
 ) -> Path:
     chain = previous_plan_id or "initial"
     suffix = hashlib.sha256(f"{setup_id}:{chain}:backup-v1".encode()).hexdigest()[:16]
-    return (root / "backups" / f"reviewed-{suffix}.signet-backup").absolute()
+    return (backup_root / f"reviewed-{suffix}.signet-backup").absolute()
 
 
 def _lifecycle_effect_receipt_path(root: Path, record: LifecycleOperationRecord) -> Path:
@@ -2653,3 +2787,82 @@ def _write_private_json(path: Path, document: dict[str, Any]) -> None:
 
 def _failed_check(exc: Exception) -> dict[str, Any]:
     return {"ok": False, "error_kind": type(exc).__name__}
+
+
+def _bounded_operational_metrics(
+    database: Database,
+    *,
+    storage: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Read bounded, non-secret operator counters from an initialized runtime."""
+
+    with database.read_only() as connection:
+        schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        request_rows = connection.execute(
+            """
+            SELECT state, count(*) AS count
+            FROM approval_requests GROUP BY state ORDER BY state LIMIT 32
+            """
+        ).fetchall()
+        reconciliation = connection.execute(
+            """
+            SELECT count(*) AS pending,
+                   coalesce(sum(reconciliation_attempt_count), 0) AS attempts
+            FROM execution_attempts WHERE phase = 'outcome_unknown'
+            """
+        ).fetchone()
+        notifications = connection.execute(
+            """
+            SELECT count(*) AS pending, coalesce(max(attempts), 0) AS max_attempts
+            FROM notification_outbox WHERE delivered_at IS NULL
+            """
+        ).fetchone()
+        service_rows = connection.execute(
+            """
+            SELECT service_name, state, updated_at
+            FROM production_services ORDER BY service_name LIMIT 32
+            """
+        ).fetchall()
+    storage_metrics: dict[str, dict[str, int]] = {}
+    if storage is not None:
+        policy = storage.get("policy")
+        roots = storage.get("roots")
+        if isinstance(policy, dict) and isinstance(roots, dict):
+            for name, policy_name in (
+                ("data", "database_hard_bytes"),
+                ("attachments", "attachments_hard_bytes"),
+                ("backups", "backups_hard_bytes"),
+                ("logs", "logs_hard_bytes"),
+                ("cache", "cache_hard_bytes"),
+                ("staging", "staging_hard_bytes"),
+            ):
+                item = roots.get(name)
+                limit = policy.get(policy_name)
+                if not isinstance(item, dict) or not isinstance(limit, int):
+                    continue
+                usage = int(item["usage_bytes"])
+                storage_metrics[name] = {
+                    "usage_bytes": usage,
+                    "budget_headroom_bytes": limit - usage,
+                    "free_bytes": int(item["free_bytes"]),
+                }
+    return {
+        "schema_version": schema_version,
+        "requests_by_state": {str(row["state"]): int(row["count"]) for row in request_rows},
+        "reconciliation": {
+            "pending": int(reconciliation["pending"]),
+            "attempts": int(reconciliation["attempts"]),
+        },
+        "notification_outbox": {
+            "pending": int(notifications["pending"]),
+            "max_attempts": int(notifications["max_attempts"]),
+        },
+        "workers": {
+            str(row["service_name"]): {
+                "state": str(row["state"]),
+                "updated_at": int(row["updated_at"]),
+            }
+            for row in service_rows
+        },
+        "storage": storage_metrics,
+    }

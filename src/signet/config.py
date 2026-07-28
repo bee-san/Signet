@@ -489,6 +489,7 @@ class ProductionConfig(BaseModel):
     mcp_port: int = Field(default=8789, ge=1024, le=65535)
     web_host: str = "127.0.0.1"
     web_port: int = Field(default=8790, ge=1024, le=65535)
+    instance_root: Path | None = None
     policy_path: Path
     storage: ProductionStorageConfig
     secrets: ProductionSecretsConfig
@@ -532,13 +533,15 @@ class ProductionConfig(BaseModel):
             raise ValueError("allowed_hosts must contain valid unique host labels")
         return value
 
-    @field_validator("policy_path", mode="before")
+    @field_validator("instance_root", "policy_path", mode="before")
     @classmethod
-    def policy_path_is_absolute_and_lexical(cls, value: Any) -> Any:
+    def root_paths_are_absolute_and_lexical(cls, value: Any) -> Any:
+        if value is None:
+            return value
         if isinstance(value, str):
             path = Path(value)
             if not path.is_absolute() or "\x00" in value or ".." in path.parts:
-                raise ValueError("policy_path must be an absolute lexical path")
+                raise ValueError("production root paths must be absolute lexical paths")
         return value
 
     @field_validator("connectors")
@@ -604,6 +607,10 @@ class ProductionConfig(BaseModel):
 
     @model_validator(mode="after")
     def production_shape_is_consistent(self) -> Self:
+        if self.instance_root is not None and (
+            not self.instance_root.is_absolute() or ".." in self.instance_root.parts
+        ):
+            raise ValueError("instance_root must be an absolute lexical path")
         if not self.policy_path.is_absolute() or ".." in self.policy_path.parts:
             raise ValueError("policy_path must be an absolute lexical path")
         if self.mcp_port == self.web_port:

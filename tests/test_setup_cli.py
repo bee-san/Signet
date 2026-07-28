@@ -250,6 +250,9 @@ def test_setup_plan_is_json_and_does_not_create_state(tmp_path: Path) -> None:
     document = json.loads("\n".join(output))
     assert document["provider_rollout"] == "disabled"
     assert document["policy_mode"] == "approval"
+    assert document["data_root"] == str(root / "data")
+    assert document["backup_root"] == str(root / "backups")
+    assert document["data_device"] is None
     assert document["steps"] == list(SETUP_STEPS)
     assert document["owner_setup_url"] == "https://signet.example/setup"
     assert document["automatic_steps"] == list(SETUP_STEPS[:-1])
@@ -263,6 +266,39 @@ def test_setup_plan_is_json_and_does_not_create_state(tmp_path: Path) -> None:
         "live_send",
     ]
     assert not root.exists()
+
+
+def test_setup_plan_records_external_storage_paths_and_device(tmp_path: Path) -> None:
+    root = tmp_path / "signet"
+    data_root = tmp_path / "external-data"
+    backup_root = tmp_path / "external-backups"
+    data_root.mkdir(mode=0o700)
+    backup_root.mkdir(mode=0o700)
+    args = _parser().parse_args(
+        [
+            "setup",
+            "--plan",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            "/opt/signet/bin/signet",
+            "--data-root",
+            str(data_root),
+            "--backup-root",
+            str(backup_root),
+        ]
+    )
+    output: list[str] = []
+
+    assert run_setup_command(args, output=output.append, platform=FakePlatform()) == 0
+    document = json.loads("\n".join(output))
+    assert document["data_root"] == str(data_root)
+    assert document["backup_root"] == str(backup_root)
+    assert document["data_device"] == data_root.stat().st_dev
 
 
 def test_setup_resume_restores_selected_policy_mode(tmp_path: Path) -> None:
@@ -349,6 +385,50 @@ def test_setup_resume_treats_pre_policy_journal_as_deny(tmp_path: Path) -> None:
     journal_path = root / ".setup-journal.json"
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     journal["spec"].pop("policy_mode")
+    digest_document = dict(journal["spec"])
+    digest_document.pop("open_browser")
+    legacy_digest = hashlib.sha256(
+        json.dumps(
+            digest_document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    journal["spec_digest"] = legacy_digest
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    owner_path = root / ".setup-owner.json"
+    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    owner["spec_digest"] = legacy_digest
+    owner_path.write_text(json.dumps(owner), encoding="utf-8")
+
+    resume_args = _parser().parse_args(["setup", "--yes", "--no-open-browser", "--root", str(root)])
+    assert run_setup_command(resume_args, output=lambda _: None, platform=platform) == 0
+
+
+def test_setup_resume_accepts_pre_storage_root_journal(tmp_path: Path) -> None:
+    root = tmp_path / "signet"
+    platform = FakePlatform()
+    apply_args = _parser().parse_args(
+        [
+            "setup",
+            "--yes",
+            "--root",
+            str(root),
+            "--origin",
+            "https://signet.example",
+            "--profile",
+            "personal",
+            "--executable",
+            "/opt/signet/bin/signet",
+        ]
+    )
+    assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
+
+    journal_path = root / ".setup-journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    for field in ("data_root", "backup_root", "data_device"):
+        journal["spec"].pop(field)
     digest_document = dict(journal["spec"])
     digest_document.pop("open_browser")
     legacy_digest = hashlib.sha256(

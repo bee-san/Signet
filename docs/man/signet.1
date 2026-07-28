@@ -47,6 +47,17 @@ profiles under ~/.hermes/profiles.
 Select the initial policy mode: deny, direct, approval, or approval_with_edit.
 Default: deny.
 .TP
+.BI --data-root " ABSOLUTE_DIRECTORY"
+Use a pre-created empty mode-0700 local directory instead of ROOT/data. The setup
+plan records and validates its filesystem device identity.
+.TP
+.BI --data-device " INTEGER"
+Require the external data root to remain on this exact filesystem device. If omitted
+with --data-root, setup reads the current device number and includes it in the plan.
+.TP
+.BI --backup-root " ABSOLUTE_DIRECTORY"
+Use a pre-created empty mode-0700 local directory instead of ROOT/backups.
+.TP
 .B --yes
 Confirm a reviewed plan non-interactively.
 .TP
@@ -134,6 +145,10 @@ Setup and lifecycle applies persist atomic journals or receipts. After interrupt
 run signet status and signet doctor, correct the reported condition, and rerun the same
 setup command or exact reviewed lifecycle PLAN_ID. Conflicting specifications and
 foreign owner markers are refused rather than adopted or overwritten.
+.PP
+Status and doctor include redacted storage usage, free-space warnings, hard-limit
+checks, and the effective data and backup device identities. Setup and backup fail
+closed before the configured write reserve or backup cap is exhausted.
 .PP
 Exit status 0 means the requested read-only operation, plan, or apply completed. Exit
 status 2 means invalid input, declined confirmation, safety refusal, conflict, or

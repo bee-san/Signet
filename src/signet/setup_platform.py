@@ -10,6 +10,7 @@ import os
 import plistlib
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import webbrowser
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import quote, urlsplit
 
 import keyring
@@ -32,8 +33,13 @@ from signet.browser_auth import (
     BootstrapService,
 )
 from signet.config import production_health_proof, production_instance_identity
-from signet.credential_broker import CredentialError, KeychainSecretStore, SecretReference
-from signet.db import Database
+from signet.credential_broker import (
+    CredentialError,
+    IssuedToken,
+    KeychainSecretStore,
+    SecretReference,
+)
+from signet.db import Database, DatabaseError, require_local_filesystem
 from signet.private_paths import (
     DirectoryIdentity,
     PrivatePathError,
@@ -52,6 +58,15 @@ from signet.production import (
     load_production_config,
 )
 from signet.setup_state import SetupError, SetupJournalStore, SetupSpec
+from signet.storage_lifecycle import (
+    ATTACHMENTS_HARD_BYTES,
+    BACKUPS_HARD_BYTES,
+    CACHE_HARD_BYTES,
+    DATABASE_HARD_BYTES,
+    LOGS_HARD_BYTES,
+    MINIMUM_FREE_BYTES,
+    STAGING_HARD_BYTES,
+)
 from signet.totp_enrollment import TotpEnrollmentService
 
 _CONFIG_NAME = "production.json"
@@ -71,6 +86,14 @@ _DATABASE_RUNTIME_NAMES = frozenset(
         "signet.db-journal",
     }
 )
+_STORAGE_MINIMUM_RESERVE_BYTES = MINIMUM_FREE_BYTES
+_STORAGE_WARNING_FREE_BYTES = 4 * 1024**3
+_STORAGE_WARNING_FREE_PERCENT = 15
+_STORAGE_LOGS_HARD_BYTES = LOGS_HARD_BYTES
+_STORAGE_BACKUPS_HARD_BYTES = BACKUPS_HARD_BYTES
+_STORAGE_CACHE_HARD_BYTES = CACHE_HARD_BYTES
+_EXTERNAL_STORAGE_RECEIPT_PREFIX = ".signet-external-storage-"
+_EXTERNAL_STORAGE_MARKER = ".signet-storage-owner.json"
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -107,6 +130,7 @@ def render_production_config(spec: SetupSpec, *, setup_id: str) -> dict[str, Any
     return {
         "version": 1,
         "mode": "production",
+        "instance_root": str(root),
         "owner_user_id": spec.owner_user_id,
         "public_origin": spec.public_origin,
         "rp_id": hostname,
@@ -117,8 +141,8 @@ def render_production_config(spec: SetupSpec, *, setup_id: str) -> dict[str, Any
         "web_port": 8790,
         "policy_path": str(root / _POLICY_NAME),
         "storage": {
-            "data_dir": str(root / "data"),
-            "backup_dir": str(root / "backups"),
+            "data_dir": str(spec.data_dir),
+            "backup_dir": str(spec.backup_dir),
             "restore_dir": str(root / "restore"),
             "attachment_staging_dir": str(root / "staging"),
             "attachment_source_roots": [str(root / "attachments")],
@@ -174,6 +198,7 @@ def render_launchd_services(spec: SetupSpec, *, active: bool = False) -> dict[st
             "ProcessType": "Background",
             "ThrottleInterval": 10,
             "Umask": 63,
+            "HardResourceLimits": {"NumberOfFiles": 1024},
             "StandardOutPath": str(logs / f"{component}.log"),
             "StandardErrorPath": str(logs / f"{component}-error.log"),
         }
@@ -199,6 +224,10 @@ def render_systemd_services(spec: SetupSpec, *, active: bool = False) -> dict[st
             "UMask=0077",
             "NoNewPrivileges=true",
             "PrivateTmp=true",
+            "MemoryMax=1G",
+            "MemorySwapMax=0",
+            "TasksMax=128",
+            "LimitNOFILE=1024",
         ]
         if active:
             lines.extend(["", "[Install]", "WantedBy=default.target"])
@@ -231,6 +260,151 @@ def browser_assisted_setup(
         raise SetupError("the browser did not accept the owner setup URL")
 
 
+def _nearest_existing_path(path: Path) -> Path:
+    current = path
+    while not current.exists():
+        if current.parent == current:
+            raise SetupError(f"storage path {path} has no available parent filesystem")
+        current = current.parent
+    if current.is_symlink():
+        raise SetupError(f"storage path {path} has a symlinked parent")
+    return current
+
+
+def _tree_usage_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_symlink() or not path.is_dir():
+        raise SetupError(f"storage path {path} is not an owned directory")
+    total = 0
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError as exc:
+            raise SetupError(f"storage usage for {path} is unavailable") from exc
+        for entry in entries:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise SetupError(f"storage usage for {path} is unavailable") from exc
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(Path(entry.path))
+            elif stat.S_ISREG(metadata.st_mode):
+                total += metadata.st_size
+    return total
+
+
+def _runtime_site_packages(executable: Path) -> tuple[Path, ...]:
+    try:
+        resolved = executable.resolve(strict=True)
+    except OSError as exc:
+        raise SetupError("the installed Signet executable is unavailable") from exc
+    if resolved.parent.name.lower() not in {"bin", "scripts"}:
+        return ()
+    environment = resolved.parent.parent
+    candidates = [
+        *environment.glob("lib/python*/site-packages"),
+        environment / "Lib" / "site-packages",
+    ]
+    return tuple(sorted(path for path in candidates if path.is_dir() and not path.is_symlink()))
+
+
+def _require_packaged_runtime(executable: Path) -> None:
+    try:
+        metadata = executable.lstat()
+        resolved = executable.resolve(strict=True)
+    except OSError as exc:
+        raise SetupError("the installed Signet executable is unavailable") from exc
+    if (
+        executable.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or not os.access(executable, os.X_OK)
+    ):
+        raise SetupError("the installed Signet executable is unavailable or unsafe")
+    for ancestor in resolved.parents:
+        if (ancestor / "pyproject.toml").is_file() and (ancestor / "src" / "signet").is_dir():
+            raise SetupError(
+                "the production runtime must not be an editable or source-tree installation"
+            )
+    for site_packages in _runtime_site_packages(executable):
+        for editable in site_packages.glob("*_editable*signet_gateway*.pth"):
+            metadata = editable.lstat()
+            if stat.S_ISREG(metadata.st_mode):
+                raise SetupError(
+                    "the production runtime must not be an editable or source-tree installation"
+                )
+        for distribution in site_packages.glob("signet_gateway-*.dist-info"):
+            direct_url = distribution / "direct_url.json"
+            if not direct_url.is_file() or direct_url.is_symlink():
+                continue
+            try:
+                metadata = direct_url.stat()
+                if metadata.st_size > 64 * 1024:
+                    raise SetupError("the installed Signet package metadata is invalid")
+                document = json.loads(direct_url.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise SetupError("the installed Signet package metadata is invalid") from exc
+            directory = document.get("dir_info") if isinstance(document, dict) else None
+            if isinstance(directory, dict) and directory.get("editable") is True:
+                raise SetupError(
+                    "the production runtime must not be an editable or source-tree installation"
+                )
+
+
+def storage_status(
+    spec: SetupSpec,
+    *,
+    disk_usage_provider: Callable[[Path], Any] = shutil.disk_usage,
+) -> dict[str, Any]:
+    paths = {
+        "data": spec.data_dir,
+        "attachments": spec.root / "attachments",
+        "backups": spec.backup_dir,
+        "logs": spec.root / "logs",
+        "cache": spec.root / "cache",
+        "staging": spec.root / "staging",
+    }
+    roots: dict[str, dict[str, Any]] = {}
+    for name, path in paths.items():
+        roots[name] = storage_path_status(path, disk_usage_provider=disk_usage_provider)
+    return {
+        "policy": {
+            "minimum_reserve_bytes": _STORAGE_MINIMUM_RESERVE_BYTES,
+            "warning_free_bytes": _STORAGE_WARNING_FREE_BYTES,
+            "warning_free_percent": _STORAGE_WARNING_FREE_PERCENT,
+            "logs_hard_bytes": _STORAGE_LOGS_HARD_BYTES,
+            "backups_hard_bytes": _STORAGE_BACKUPS_HARD_BYTES,
+            "cache_hard_bytes": _STORAGE_CACHE_HARD_BYTES,
+            "database_hard_bytes": DATABASE_HARD_BYTES,
+            "attachments_hard_bytes": ATTACHMENTS_HARD_BYTES,
+            "staging_hard_bytes": STAGING_HARD_BYTES,
+        },
+        "roots": roots,
+    }
+
+
+def storage_path_status(
+    path: Path,
+    *,
+    disk_usage_provider: Callable[[Path], Any] = shutil.disk_usage,
+) -> dict[str, Any]:
+    """Return non-secret capacity metadata for one exact destination filesystem."""
+
+    anchor = _nearest_existing_path(path)
+    usage = disk_usage_provider(anchor)
+    metadata = anchor.stat()
+    return {
+        "path": str(path),
+        "exists": path.exists() and path.is_dir() and not path.is_symlink(),
+        "usage_bytes": _tree_usage_bytes(path),
+        "device": metadata.st_dev,
+        "free_bytes": int(usage.free),
+        "total_bytes": int(usage.total),
+    }
+
+
 class ProductionSetupPlatform:
     """Concrete idempotent operations for a packaged Signet installation."""
 
@@ -241,11 +415,13 @@ class ProductionSetupPlatform:
         output: Callable[[str], None] = print,
         opener: Callable[[str], bool] = webbrowser.open,
         command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        disk_usage_provider: Callable[[Path], Any] = shutil.disk_usage,
     ) -> None:
         self.hermes_home = hermes_home or Path.home() / ".hermes" / "profiles"
         self.output = output
         self.opener = opener
         self.command_runner = command_runner
+        self.disk_usage_provider = disk_usage_provider
         self._database_override: Database | None = None
 
     @staticmethod
@@ -356,7 +532,7 @@ class ProductionSetupPlatform:
     def _owned_database(self, spec: SetupSpec, setup_id: str) -> Database | None:
         if self._database_override is not None:
             return self._database_override
-        database_path = spec.root / "data" / "signet.db"
+        database_path = spec.data_dir / "signet.db"
         marker = database_path.parent / _DATABASE_OWNERSHIP_MARKER
         if not (marker.exists() or marker.is_symlink()):
             if database_path.exists() or database_path.is_symlink():
@@ -366,6 +542,8 @@ class ProductionSetupPlatform:
             validate_active_database_runtime_ownership(
                 database_path.parent,
                 setup_id=setup_id,
+                instance_root=spec.root,
+                require_external_storage=spec.data_root is not None,
             )
         )
         return Database(
@@ -382,6 +560,67 @@ class ProductionSetupPlatform:
 
     def preflight(self, spec: SetupSpec) -> None:
         self._apply_preflight(spec, "preflight")
+
+    def _verify_configured_storage_roots(self, spec: SetupSpec) -> None:
+        identities: list[DirectoryIdentity] = []
+        for label, path in (("data", spec.data_root), ("backup", spec.backup_root)):
+            if path is None:
+                continue
+            try:
+                identity = require_private_directory_identity(path)
+                require_local_filesystem(path)
+            except (DatabaseError, PrivatePathError) as exc:
+                raise SetupError(
+                    f"external {label} root must be a pre-created owned mode-0700 local directory"
+                ) from exc
+            identities.append(identity)
+            if label == "data" and identity.device != spec.data_device:
+                raise SetupError("external data root device identity does not match the review")
+        if len({(item.device, item.inode) for item in identities}) != len(identities):
+            raise SetupError("external storage roots resolve to the same directory")
+
+    def _verify_storage_capacity(self, spec: SetupSpec) -> dict[str, Any]:
+        report = storage_status(spec, disk_usage_provider=self.disk_usage_provider)
+        policy = report["policy"]
+        for root_name, policy_name in (
+            ("data", "database_hard_bytes"),
+            ("attachments", "attachments_hard_bytes"),
+            ("logs", "logs_hard_bytes"),
+            ("backups", "backups_hard_bytes"),
+            ("cache", "cache_hard_bytes"),
+            ("staging", "staging_hard_bytes"),
+        ):
+            usage = int(report["roots"][root_name]["usage_bytes"])
+            limit = int(policy[policy_name])
+            if usage > limit:
+                raise SetupError(
+                    f"{root_name} exceed their hard storage limit; prune reviewed owned data first"
+                )
+        root_reports = tuple(report["roots"].values())
+        minimum_free = min(int(item["free_bytes"]) for item in root_reports)
+        if minimum_free < _STORAGE_MINIMUM_RESERVE_BYTES:
+            raise SetupError(
+                "storage reserve is exhausted; free space before setup, backup, or upgrade"
+            )
+        warning = any(
+            int(item["free_bytes"]) < _STORAGE_WARNING_FREE_BYTES
+            or (
+                int(item["total_bytes"]) > 0
+                and int(item["free_bytes"]) * 100
+                < int(item["total_bytes"]) * _STORAGE_WARNING_FREE_PERCENT
+            )
+            for item in root_reports
+        )
+        if warning:
+            self.output(
+                "Storage warning: free capacity is below 4 GiB or 15%; "
+                "new work will fail closed at the reviewed reserve."
+            )
+        return {
+            "free_bytes": minimum_free,
+            "warning": warning,
+            "minimum_reserve_bytes": _STORAGE_MINIMUM_RESERVE_BYTES,
+        }
 
     def apply(self, step: str, spec: SetupSpec, setup_id: str) -> None:
         operation = getattr(self, f"_apply_{step}", None)
@@ -548,11 +787,14 @@ class ProductionSetupPlatform:
             or stat.S_IMODE(metadata.st_mode) & 0o022
         ):
             raise SetupError("the installed Signet executable is not a reviewed executable file")
+        _require_packaged_runtime(spec.executable)
         if sys.platform == "linux":
             try:
                 render_systemd_services(spec)
             except ValueError as exc:
                 raise SetupError(str(exc)) from exc
+        self._verify_configured_storage_roots(spec)
+        self._verify_storage_capacity(spec)
         for profile in spec.hermes_profiles:
             directory = self._hermes_profile_directory(profile)
             if not directory.is_dir() or directory.is_symlink():
@@ -573,15 +815,12 @@ class ProductionSetupPlatform:
     def validate_private_paths(self, spec: SetupSpec, setup_id: str) -> None:
         try:
             root = require_private_directory_identity(spec.root)
-            for name in (
-                "data",
-                "backups",
-                "attachments",
-                "staging",
-                "services",
-                "logs",
-                "restore",
-            ):
+            local_names = ["attachments", "staging", "services", "logs", "cache", "restore"]
+            if spec.data_root is None:
+                local_names.append("data")
+            if spec.backup_root is None:
+                local_names.append("backups")
+            for name in local_names:
                 path = spec.root / name
                 _read_private_path_receipt(path, setup_id=setup_id)
                 pending = _private_path_pending_path(spec.root, name, setup_id)
@@ -589,6 +828,21 @@ class ProductionSetupPlatform:
                     raise SetupError(
                         f"private setup path {name!r} has an ambiguous pending publication"
                     )
+            if spec.data_root is not None:
+                _validate_external_storage_root(
+                    spec.root,
+                    spec.data_root,
+                    label="data",
+                    setup_id=setup_id,
+                    expected_device=spec.data_device,
+                )
+            if spec.backup_root is not None:
+                _validate_external_storage_root(
+                    spec.root,
+                    spec.backup_root,
+                    label="backup",
+                    setup_id=setup_id,
+                )
             revalidate_directory_identity(root, private=True)
         except PrivatePathError as exc:
             raise SetupError("private setup paths are unavailable or unsafe") from exc
@@ -596,16 +850,35 @@ class ProductionSetupPlatform:
     def _apply_private_paths(self, spec: SetupSpec, setup_id: str) -> None:
         try:
             root = ensure_private_directory(spec.root)
-            for path in (
-                spec.root / "data",
-                spec.root / "backups",
+            paths = [
                 spec.root / "restore",
                 spec.root / "logs",
+                spec.root / "cache",
                 spec.root / "services",
                 spec.root / "staging",
                 spec.root / "attachments",
-            ):
+            ]
+            if spec.data_root is None:
+                paths.append(spec.root / "data")
+            if spec.backup_root is None:
+                paths.append(spec.root / "backups")
+            for path in paths:
                 _create_or_verify_receipted_private_directory(root, path, setup_id=setup_id)
+            if spec.data_root is not None:
+                _apply_external_storage_root(
+                    root,
+                    spec.data_root,
+                    label="data",
+                    setup_id=setup_id,
+                    expected_device=spec.data_device,
+                )
+            if spec.backup_root is not None:
+                _apply_external_storage_root(
+                    root,
+                    spec.backup_root,
+                    label="backup",
+                    setup_id=setup_id,
+                )
         except PrivatePathError as exc:
             raise SetupError("private setup path could not be prepared safely") from exc
 
@@ -613,7 +886,17 @@ class ProductionSetupPlatform:
         try:
             root_identity = require_private_directory_identity(spec.root)
             owned: list[tuple[Path, DirectoryIdentity | None, Path, bytes]] = []
-            for name in reversed(("data", "attachments", "staging", "services", "logs", "restore")):
+            removable_names = [
+                "attachments",
+                "staging",
+                "services",
+                "logs",
+                "cache",
+                "restore",
+            ]
+            if spec.data_root is None:
+                removable_names.insert(0, "data")
+            for name in reversed(removable_names):
                 path = spec.root / name
                 pending = _private_path_pending_path(spec.root, name, setup_id)
                 path_exists = path.exists() or path.is_symlink()
@@ -684,6 +967,23 @@ class ProductionSetupPlatform:
                     expected_parent_identity=root_identity,
                     parent_private=True,
                 )
+            if spec.data_root is not None:
+                _rollback_external_storage_root(
+                    spec.root,
+                    spec.data_root,
+                    label="data",
+                    setup_id=setup_id,
+                    expected_device=spec.data_device,
+                    preserve=False,
+                )
+            if spec.backup_root is not None:
+                _rollback_external_storage_root(
+                    spec.root,
+                    spec.backup_root,
+                    label="backup",
+                    setup_id=setup_id,
+                    preserve=True,
+                )
         except (BackupError, PrivatePathError) as exc:
             raise SetupError("gateway-owned private data could not be removed safely") from exc
 
@@ -711,7 +1011,7 @@ class ProductionSetupPlatform:
                 raise SetupError(f"the {purpose} secret could not be verified")
 
     def _rollback_secrets(self, spec: SetupSpec, setup_id: str) -> None:
-        backup_root = spec.root / "backups"
+        backup_root = spec.backup_dir
         journal = SetupJournalStore(spec.root).load()
         preserve_backup = journal.purge_backup is not None or (
             backup_root.is_dir()
@@ -757,12 +1057,22 @@ class ProductionSetupPlatform:
             _remove_exact_owned_file(path, content)
 
     def _apply_database(self, spec: SetupSpec, setup_id: str) -> None:
-        database_path = spec.root / "data" / "signet.db"
+        database_path = spec.data_dir / "signet.db"
         maintenance_lock_path = database_path.with_name(f".{database_path.name}.maintenance.lock")
         marker = database_path.parent / _DATABASE_OWNERSHIP_MARKER
         if database_path.exists() and database_path.is_symlink():
             raise SetupError("the Signet database must not be a symbolic link")
         data_identity = require_private_directory_identity(database_path.parent)
+        ancillary_names: frozenset[str] = frozenset()
+        if spec.data_root is not None:
+            _validate_external_storage_root(
+                spec.root,
+                spec.data_root,
+                label="data",
+                setup_id=setup_id,
+                expected_device=spec.data_device,
+            )
+            ancillary_names = frozenset({_EXTERNAL_STORAGE_MARKER})
         unbound_initializing = {
             "format": 4,
             "setup_id": setup_id,
@@ -785,7 +1095,7 @@ class ProductionSetupPlatform:
             existing = {
                 child.name
                 for child in database_path.parent.iterdir()
-                if child.name != _DATABASE_OWNERSHIP_MARKER
+                if child.name != _DATABASE_OWNERSHIP_MARKER and child.name not in ancillary_names
             }
             if existing:
                 raise SetupError("refusing database adoption after unbound initialization")
@@ -895,7 +1205,7 @@ class ProductionSetupPlatform:
             existing = {
                 child.name
                 for child in database_path.parent.iterdir()
-                if child.name != _DATABASE_OWNERSHIP_MARKER
+                if child.name != _DATABASE_OWNERSHIP_MARKER and child.name not in ancillary_names
             }
             if existing != {"signet.db", maintenance_lock_path.name}:
                 raise SetupError("database directory contains an unowned runtime artifact")
@@ -906,6 +1216,8 @@ class ProductionSetupPlatform:
                 recorded,
                 setup_id=setup_id,
                 data_identity=data_identity,
+                instance_root=spec.root,
+                require_external_storage=spec.data_root is not None,
             )
             database_identity = recorded["runtime_files"]["signet.db"]
             expected_database_identity = (
@@ -934,6 +1246,7 @@ class ProductionSetupPlatform:
                 data_identity=data_identity,
                 setup_id=setup_id,
                 bound_initializing=bound_initializing,
+                ancillary_names=ancillary_names,
             )
         )
         # Assembly validates the deny-by-default policy, secret references, and setup state.
@@ -945,14 +1258,24 @@ class ProductionSetupPlatform:
         )
 
     def _rollback_database(self, spec: SetupSpec, setup_id: str) -> None:
-        data_directory = spec.root / "data"
+        data_directory = spec.data_dir
         marker = data_directory / _DATABASE_OWNERSHIP_MARKER
+        ancillary_names: frozenset[str] = frozenset()
+        if spec.data_root is not None:
+            _validate_external_storage_root(
+                spec.root,
+                spec.data_root,
+                label="data",
+                setup_id=setup_id,
+                expected_device=spec.data_device,
+            )
+            ancillary_names = frozenset({_EXTERNAL_STORAGE_MARKER})
         if not marker.exists() and not marker.is_symlink():
             try:
                 leftovers = tuple(data_directory.iterdir())
             except FileNotFoundError:
                 return
-            if leftovers:
+            if {path.name for path in leftovers} - ancillary_names:
                 raise SetupError("refusing database cleanup without an ownership receipt")
             return
         ownership = _read_owned_json(marker)
@@ -995,7 +1318,7 @@ class ProductionSetupPlatform:
                 raise SetupError("database directory changed after setup") from exc
             discovered_runtime_files = {}
             for child in data_directory.iterdir():
-                if child.name == _DATABASE_OWNERSHIP_MARKER:
+                if child.name == _DATABASE_OWNERSHIP_MARKER or child.name in ancillary_names:
                     continue
                 if child.name not in _DATABASE_RUNTIME_NAMES:
                     raise SetupError("database directory contains an unowned runtime artifact")
@@ -1137,6 +1460,7 @@ class ProductionSetupPlatform:
             present = set(os.listdir(descriptor))
             allowed = {
                 _DATABASE_OWNERSHIP_MARKER,
+                *ancillary_names,
                 *runtime_files,
                 *expected_quarantine.values(),
             }
@@ -1260,6 +1584,7 @@ class ProductionSetupPlatform:
 
     def _apply_services(self, spec: SetupSpec, setup_id: str) -> None:
         del setup_id
+        _require_packaged_runtime(spec.executable)
         plan_dir = spec.root / "services"
         self._preflight_tailnet_route(spec)
         if sys.platform == "darwin":
@@ -1602,7 +1927,12 @@ class ProductionSetupPlatform:
             after_content = _canonical_json_bytes({"format": 2, "serve": after})
             _create_or_verify_private_file(after_path, after_content)
         except SetupError:
-            self._restore_failed_tailnet_apply(host_port=host_port, port=port)
+            self._restore_failed_tailnet_apply(
+                host_port=host_port,
+                port=port,
+                target=target,
+                before_serve=before_serve,
+            )
             if after_content is not None and after_path.exists():
                 _remove_exact_owned_file(after_path, after_content)
             raise
@@ -1612,7 +1942,34 @@ class ProductionSetupPlatform:
         *,
         host_port: str,
         port: int,
+        target: str,
+        before_serve: Any,
     ) -> None:
+        current = _normalize_serve_config(
+            self._tailscale_json(
+                ["tailscale", "serve", "status", "--json"],
+                "Tailscale Serve failed apply rollback inspection failed",
+            )
+        )
+        if current == before_serve:
+            return
+        if not _serve_config_has_private_route(
+            current,
+            host_port=host_port,
+            port=port,
+            target=target,
+        ) or (
+            _serve_config_without_private_route(
+                current,
+                host_port=host_port,
+                port=port,
+                target=target,
+            )
+            != before_serve
+        ):
+            raise SetupError(
+                "refusing failed-apply rollback because the Tailscale configuration changed"
+            )
         self._run_checked(
             ["tailscale", "serve", f"--https={port}", "off"],
             "Tailscale Serve failed apply could not be rolled back",
@@ -1623,8 +1980,8 @@ class ProductionSetupPlatform:
                 "Tailscale Serve failed apply rollback verification failed",
             )
         )
-        if _serve_config_mentions_listener(restored, host_port=host_port, port=port):
-            raise SetupError("Tailscale Serve failed apply left its listener active")
+        if restored != before_serve:
+            raise SetupError("Tailscale Serve failed apply did not restore the exact baseline")
 
     def _rollback_tailnet_route(self, spec: SetupSpec) -> None:
         port = _managed_tailnet_port(spec)
@@ -1773,6 +2130,44 @@ class ProductionSetupPlatform:
                     raise SetupError("Hermes profile snapshot disappeared during setup")
                 snapshot_token_id = snapshot[3]
                 if snapshot_token_id is not None:
+                    snapshot_metadata = assembly.token_registry.metadata(snapshot_token_id)
+                    if snapshot_metadata is None or snapshot_metadata.revoked_at is not None:
+                        _clear_hermes_snapshot_token(
+                            spec,
+                            profile,
+                            profile_directory=profile_dir,
+                            token_id=snapshot_token_id,
+                        )
+                        snapshot_token_id = None
+                if snapshot_token_id is not None:
+                    assigned = _existing_profile_token(existing_env, token_name=token_name)
+                    assigned_id = (
+                        None if assigned is None else assigned.removeprefix("sgt_").split(".", 1)[0]
+                    )
+                    if assigned_id == snapshot_token_id:
+                        try:
+                            principal = assembly.token_registry.authenticate(
+                                f"Bearer {assigned}", alias="approvals"
+                            )
+                        except CredentialError:
+                            pass
+                        else:
+                            if principal.namespace == f"profile:{profile}":
+                                if (
+                                    _validated_hermes_profile_snapshot_restore(
+                                        spec,
+                                        profile,
+                                        profile_directory=profile_dir,
+                                        token_name=token_name,
+                                        setup_id=setup_id,
+                                    )
+                                    is None
+                                ):
+                                    raise SetupError(
+                                        "Hermes profile replay lost its rollback snapshot"
+                                    )
+                                continue
+                if snapshot_token_id is not None:
                     prior_revocations_unconfirmed.add(profile)
                     assembly.token_registry.revoke(snapshot_token_id)
                     metadata = assembly.token_registry.metadata(snapshot_token_id)
@@ -1801,19 +2196,45 @@ class ProductionSetupPlatform:
                     except CredentialError:
                         token = None
                 if token is None:
-                    issued = assembly.token_registry.issue(
-                        f"profile:{profile}",
-                        set(_PRODUCTION_MCP_ALIASES),
-                    )
+                    issued: IssuedToken
+                    issue_bound = getattr(assembly.token_registry, "issue_bound", None)
+                    if callable(issue_bound):
+
+                        def bind_snapshot_token(
+                            token_id: str,
+                            selected_profile: str = profile,
+                            selected_profile_dir: Path = profile_dir,
+                        ) -> None:
+                            _bind_hermes_snapshot_token(
+                                spec,
+                                selected_profile,
+                                profile_directory=selected_profile_dir,
+                                token_id=token_id,
+                            )
+
+                        issued = cast(
+                            IssuedToken,
+                            issue_bound(
+                                f"profile:{profile}",
+                                set(_PRODUCTION_MCP_ALIASES),
+                                before_commit=bind_snapshot_token,
+                            ),
+                        )
+                    else:  # pragma: no cover - compatibility for injected registry doubles
+                        issued = assembly.token_registry.issue(
+                            f"profile:{profile}",
+                            set(_PRODUCTION_MCP_ALIASES),
+                        )
                     token = issued.token
                     token_id = token.removeprefix("sgt_").split(".", 1)[0]
                     issued_token_ids.append(token_id)
-                    _bind_hermes_snapshot_token(
-                        spec,
-                        profile,
-                        profile_directory=profile_dir,
-                        token_id=token_id,
-                    )
+                    if not callable(issue_bound):
+                        _bind_hermes_snapshot_token(
+                            spec,
+                            profile,
+                            profile_directory=profile_dir,
+                            token_id=token_id,
+                        )
                 updated_env = _merge_profile_environment(
                     existing_env,
                     token_name=token_name,
@@ -1838,7 +2259,7 @@ class ProductionSetupPlatform:
                     expected_identity=environment_identity,
                     require_present=environment_exists,
                 )
-        except Exception:
+        except BaseException:
             try:
                 for token_id in reversed(issued_token_ids):
                     assembly.token_registry.revoke(token_id)
@@ -1865,6 +2286,13 @@ class ProductionSetupPlatform:
             "Hermes profiles staged with disabled Signet MCP entries. Signet did not restart "
             "the gateway; review and enable each entry, then run /reload-mcp in that profile."
         )
+        for profile in spec.hermes_profiles:
+            alias = f"signet_{profile}"
+            self.output(
+                f"Hermes profile {profile}: after enabling {alias}, run "
+                f"`hermes -p {profile} mcp test {alias}`, then `/reload-mcp` in an "
+                "attended session."
+            )
 
     def revoke_hermes_tokens_for_rollback(self, spec: SetupSpec, setup_id: str) -> None:
         """Durably revoke snapshot-bound callers before any enclosing DB rollback fence."""
@@ -2070,7 +2498,7 @@ class ProductionSetupPlatform:
                 encoded_handoff = _read_optional_private_file(handoff_path)
                 handoff_capability = _decode_owner_handoff(encoded_handoff)
                 if capability != handoff_capability and not BootstrapService(
-                    Database(spec.root / "data" / "signet.db"),
+                    Database(spec.data_dir / "signet.db"),
                     owner_user_id=spec.owner_user_id,
                 ).capability_is_recorded(handoff_capability):
                     raise SetupError("the private owner setup handoff is ambiguous")
@@ -2183,6 +2611,206 @@ def _json_bytes(document: Mapping[str, Any]) -> bytes:
     return (
         json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
     ).encode("utf-8")
+
+
+def _external_storage_receipt_path(root: Path, label: str) -> Path:
+    if label not in {"data", "backup"}:
+        raise ValueError("external storage label is invalid")
+    return root / f"{_EXTERNAL_STORAGE_RECEIPT_PREFIX}{label}.json"
+
+
+def _external_storage_document(
+    identity: DirectoryIdentity,
+    *,
+    label: str,
+    setup_id: str,
+) -> dict[str, Any]:
+    return {
+        "format": 1,
+        "setup_id": setup_id,
+        "label": label,
+        "path": str(identity.path),
+        "device": identity.device,
+        "inode": identity.inode,
+        "owner_uid": identity.owner_uid,
+    }
+
+
+def _validated_external_data_marker_names(
+    data_directory: Path,
+    *,
+    setup_id: str,
+    data_identity: DirectoryIdentity,
+    instance_root: Path | None,
+    require_publication: bool = False,
+) -> frozenset[str]:
+    marker_path = data_directory / _EXTERNAL_STORAGE_MARKER
+    marker_exists = marker_path.exists() or marker_path.is_symlink()
+    receipt_path = (
+        None if instance_root is None else _external_storage_receipt_path(instance_root, "data")
+    )
+    receipt_exists = receipt_path is not None and (
+        receipt_path.exists() or receipt_path.is_symlink()
+    )
+    if not marker_exists and not receipt_exists:
+        if require_publication:
+            raise SetupError("external data root ownership publication is incomplete")
+        return frozenset()
+    if not marker_exists or not receipt_exists or receipt_path is None or instance_root is None:
+        raise SetupError("external data root ownership publication is incomplete")
+    expected = _external_storage_document(
+        data_identity,
+        label="data",
+        setup_id=setup_id,
+    )
+    if _read_owned_json(marker_path) != expected or _read_owned_json(receipt_path) != expected:
+        raise SetupError("external data root ownership marker is invalid")
+    try:
+        instance_identity = require_private_directory_identity(instance_root)
+        revalidate_directory_identity(instance_identity, private=True)
+        revalidate_directory_identity(data_identity, private=True)
+    except PrivatePathError as exc:
+        raise SetupError("external data root ownership publication is unsafe") from exc
+    return frozenset({_EXTERNAL_STORAGE_MARKER})
+
+
+def _external_storage_identity(
+    path: Path,
+    *,
+    label: str,
+    expected_device: int | None,
+) -> DirectoryIdentity:
+    try:
+        identity = require_private_directory_identity(path)
+        require_local_filesystem(path)
+    except (DatabaseError, PrivatePathError) as exc:
+        raise SetupError(f"external {label} root is unavailable or unsafe") from exc
+    if expected_device is not None and identity.device != expected_device:
+        raise SetupError(f"external {label} root device identity changed")
+    return identity
+
+
+def _validate_external_storage_root(
+    root: Path,
+    path: Path,
+    *,
+    label: str,
+    setup_id: str,
+    expected_device: int | None = None,
+) -> DirectoryIdentity:
+    root_identity = require_private_directory_identity(root)
+    identity = _external_storage_identity(
+        path,
+        label=label,
+        expected_device=expected_device,
+    )
+    expected = _external_storage_document(identity, label=label, setup_id=setup_id)
+    receipt_path = _external_storage_receipt_path(root, label)
+    marker_path = path / _EXTERNAL_STORAGE_MARKER
+    if _read_owned_json(receipt_path) != expected or _read_owned_json(marker_path) != expected:
+        raise SetupError(f"external {label} root ownership receipt is invalid")
+    revalidate_directory_identity(root_identity, private=True)
+    revalidate_directory_identity(identity, private=True)
+    return identity
+
+
+def _apply_external_storage_root(
+    root: Path,
+    path: Path,
+    *,
+    label: str,
+    setup_id: str,
+    expected_device: int | None = None,
+) -> None:
+    root_identity = require_private_directory_identity(root)
+    identity = _external_storage_identity(
+        path,
+        label=label,
+        expected_device=expected_device,
+    )
+    expected = _external_storage_document(identity, label=label, setup_id=setup_id)
+    encoded = _json_bytes(expected)
+    receipt_path = _external_storage_receipt_path(root, label)
+    marker_path = path / _EXTERNAL_STORAGE_MARKER
+    marker_exists = marker_path.exists() or marker_path.is_symlink()
+    receipt_exists = receipt_path.exists() or receipt_path.is_symlink()
+    if not marker_exists and not receipt_exists:
+        if os.listdir(path):
+            raise SetupError(f"external {label} root must be empty before setup ownership")
+        _replace_private_file(
+            marker_path,
+            encoded,
+            require_absent=True,
+            expected_parent_identity=identity,
+        )
+        marker_exists = True
+    if marker_exists and _read_owned_json(marker_path) != expected:
+        raise SetupError(f"external {label} root ownership marker is invalid")
+    if receipt_exists and not marker_exists:
+        raise SetupError(f"external {label} root ownership publication is incomplete")
+    if not receipt_exists:
+        if set(os.listdir(path)) != {_EXTERNAL_STORAGE_MARKER}:
+            raise SetupError(f"external {label} root changed during ownership publication")
+        _replace_private_file(
+            receipt_path,
+            encoded,
+            require_absent=True,
+            expected_parent_identity=root_identity,
+        )
+    _validate_external_storage_root(
+        root,
+        path,
+        label=label,
+        setup_id=setup_id,
+        expected_device=expected_device,
+    )
+
+
+def _rollback_external_storage_root(
+    root: Path,
+    path: Path,
+    *,
+    label: str,
+    setup_id: str,
+    preserve: bool,
+    expected_device: int | None = None,
+) -> None:
+    root_identity = require_private_directory_identity(root)
+    identity = _external_storage_identity(
+        path,
+        label=label,
+        expected_device=expected_device,
+    )
+    expected = _external_storage_document(identity, label=label, setup_id=setup_id)
+    encoded = _json_bytes(expected)
+    receipt_path = _external_storage_receipt_path(root, label)
+    marker_path = path / _EXTERNAL_STORAGE_MARKER
+    marker_exists = marker_path.exists() or marker_path.is_symlink()
+    receipt_exists = receipt_path.exists() or receipt_path.is_symlink()
+    if not marker_exists and not receipt_exists:
+        return
+    if marker_exists and _read_owned_json(marker_path) != expected:
+        raise SetupError(f"external {label} root ownership marker is invalid")
+    if receipt_exists and _read_owned_json(receipt_path) != expected:
+        raise SetupError(f"external {label} root ownership receipt is invalid")
+    if preserve and marker_exists and receipt_exists:
+        return
+    if set(os.listdir(path)) - {_EXTERNAL_STORAGE_MARKER}:
+        raise SetupError(f"external {label} root contains unremoved runtime data")
+    if marker_exists:
+        _remove_exact_owned_file(
+            marker_path,
+            encoded,
+            expected_parent_identity=identity,
+            parent_private=True,
+        )
+    if receipt_exists:
+        _remove_exact_owned_file(
+            receipt_path,
+            encoded,
+            expected_parent_identity=root_identity,
+            parent_private=True,
+        )
 
 
 def _private_path_receipt_path(root: Path, name: str) -> Path:
@@ -2657,6 +3285,7 @@ def _publish_database_ownership(
     data_identity: DirectoryIdentity,
     setup_id: str,
     bound_initializing: dict[str, Any] | None,
+    ancillary_names: frozenset[str] = frozenset(),
 ) -> None:
     database_descriptor = -1
     try:
@@ -2684,7 +3313,7 @@ def _publish_database_ownership(
         raise SetupError("database ownership could not be recorded safely")
     runtime_files: dict[str, dict[str, int]] = {}
     for child in database_path.parent.iterdir():
-        if child.name == _DATABASE_OWNERSHIP_MARKER:
+        if child.name == _DATABASE_OWNERSHIP_MARKER or child.name in ancillary_names:
             continue
         if child.name not in _DATABASE_RUNTIME_NAMES:
             raise SetupError("database directory contains an unowned runtime artifact")
@@ -2725,7 +3354,16 @@ def _validate_active_database_ownership(
     *,
     setup_id: str,
     data_identity: DirectoryIdentity,
+    instance_root: Path | None = None,
+    require_external_storage: bool = False,
 ) -> None:
+    ancillary_names = _validated_external_data_marker_names(
+        data_directory,
+        setup_id=setup_id,
+        data_identity=data_identity,
+        instance_root=instance_root,
+        require_publication=require_external_storage,
+    )
     integer_fields = {
         "data_device",
         "data_inode",
@@ -2776,7 +3414,9 @@ def _validate_active_database_ownership(
     }:
         raise SetupError("database ownership receipt is invalid")
     current_names = {
-        child.name for child in data_directory.iterdir() if child.name != _DATABASE_OWNERSHIP_MARKER
+        child.name
+        for child in data_directory.iterdir()
+        if child.name != _DATABASE_OWNERSHIP_MARKER and child.name not in ancillary_names
     }
     allowed_names = {
         "signet.db",
@@ -2801,6 +3441,8 @@ def validate_active_database_runtime_ownership(
     data_directory: Path,
     *,
     setup_id: str,
+    instance_root: Path | None = None,
+    require_external_storage: bool = False,
 ) -> tuple[tuple[int, int], tuple[int, int], DirectoryIdentity]:
     """Validate the setup receipt and return bound database, lock, and parent identities."""
 
@@ -2816,6 +3458,8 @@ def validate_active_database_runtime_ownership(
         ownership,
         setup_id=setup_id,
         data_identity=data_identity,
+        instance_root=instance_root,
+        require_external_storage=require_external_storage,
     )
     database_identity = ownership["runtime_files"]["signet.db"]
     lock_identity = ownership["runtime_files"][".signet.db.maintenance.lock"]
@@ -2830,6 +3474,8 @@ def validate_active_database_ownership(
     data_directory: Path,
     *,
     setup_id: str,
+    instance_root: Path | None = None,
+    require_external_storage: bool = False,
 ) -> tuple[int, int]:
     """Validate the setup receipt and return the bound main-database identity."""
 
@@ -2837,6 +3483,8 @@ def validate_active_database_ownership(
         validate_active_database_runtime_ownership(
             data_directory,
             setup_id=setup_id,
+            instance_root=instance_root,
+            require_external_storage=require_external_storage,
         )
     )
     return database_identity

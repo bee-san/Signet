@@ -1526,6 +1526,42 @@ def test_build_production_runtime_stages_durable_provider_free_assembly(
     assert isinstance(assembly.provider_clients["mail"], ProductionDisabledProviderClient)
 
 
+def test_production_health_identity_uses_the_instance_root_with_external_data(
+    tmp_path: Path,
+) -> None:
+    instance_root = tmp_path / "instance"
+    instance_root.mkdir(mode=0o700)
+    payload = _production_payload(instance_root)
+    original_policy = Path(str(payload["policy_path"]))
+    policy_path = instance_root / "policy.yaml"
+    policy_path.write_bytes(original_policy.read_bytes())
+    policy_path.chmod(0o600)
+    external_data = tmp_path / "external-data"
+    external_data.mkdir(mode=0o700)
+    payload["instance_root"] = str(instance_root)
+    payload["policy_path"] = str(policy_path)
+    payload["storage"]["data_dir"] = str(external_data)
+    config = ProductionConfig.model_validate(payload)
+    secret_store = _secret_store()
+    challenge = "test-health-challenge-value-0123456789"
+    expected_identity = production_instance_identity(instance_root)
+
+    assembly = build_production_runtime(config, secret_store=secret_store, clock=lambda: 123)
+    assert assembly.web is not None
+    response = TestClient(
+        assembly.web,
+        base_url="https://signet.example.test",
+    ).get("/healthz", headers={"X-Signet-Health-Challenge": challenge})
+
+    assert response.headers["X-Signet-Instance"] == expected_identity
+    assert response.headers["X-Signet-Health-Proof"] == production_health_proof(
+        secret_store.get(SecretReference.parse(config.secrets.session_secret_ref)).reveal(),
+        identity=expected_identity,
+        component="web",
+        challenge=challenge,
+    )
+
+
 def test_disabled_runtime_requires_atomic_reviewed_connector_identity_rotation(
     tmp_path: Path,
 ) -> None:
@@ -1991,9 +2027,19 @@ def test_production_runtime_refuses_deleted_durable_identity_rows(
 
 
 @pytest.mark.asyncio
-async def test_production_maintenance_worker_has_explicit_lifecycle(tmp_path: Path) -> None:
+async def test_production_maintenance_worker_has_explicit_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
     assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    notification_runs: list[tuple[int, int]] = []
+
+    async def run_notifications(*, now: int, limit: int) -> None:
+        notification_runs.append((now, limit))
+
+    assert assembly.workers._notifications is not None
+    monkeypatch.setattr(assembly.workers._notifications, "run_due", run_notifications)
 
     await assembly.workers.run_once(now=124)
     stop = asyncio.Event()
@@ -2002,6 +2048,12 @@ async def test_production_maintenance_worker_has_explicit_lifecycle(tmp_path: Pa
 
     assert assembly.workers.running is False
     assert assembly.workers.healthy is False
+    assert notification_runs == [(124, 32)]
+    services = assembly.status().services
+    assert services["notifications"].state == "stopped"
+    assert services["retention"].state == "blocked"
+    assert services["delivery"].state == "blocked"
+    assert services["reconciliation"].state == "blocked"
 
 
 @pytest.mark.asyncio

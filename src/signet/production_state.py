@@ -296,12 +296,12 @@ class ProductionStateStore:
             changed = connection.execute(
                 """
                 UPDATE production_services SET state = ?, updated_at = ?
-                WHERE service_name = 'maintenance' AND service_kind = 'maintenance'
+                WHERE service_name = 'maintenance'
                 """,
                 (state, now),
             ).rowcount
             if changed != 1:
-                raise ProductionStateError("production maintenance service is unavailable")
+                raise ProductionStateError("production worker service inventory is unavailable")
             connection.execute(
                 """
                 UPDATE production_setup_state
@@ -313,6 +313,33 @@ class ProductionStateStore:
                     now,
                 ),
             )
+
+    def record_worker_component_states(
+        self,
+        state: Literal["ready", "blocked", "stopped"],
+        *,
+        enabled_services: frozenset[str],
+        now: int,
+    ) -> None:
+        known_services = frozenset({"delivery", "reconciliation", "retention", "notifications"})
+        if not isinstance(enabled_services, frozenset) or not enabled_services <= known_services:
+            raise ValueError("production worker component inventory is invalid")
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("production worker component state time is invalid")
+        with self.database.transaction() as connection:
+            for service_name in sorted(known_services):
+                component_state = state if service_name in enabled_services else "blocked"
+                changed = connection.execute(
+                    """
+                    UPDATE production_services SET state = ?, updated_at = ?
+                    WHERE service_name = ? AND service_kind = 'worker'
+                    """,
+                    (component_state, now, service_name),
+                ).rowcount
+                if changed != 1:
+                    raise ProductionStateError(
+                        "production worker component inventory is unavailable"
+                    )
 
     def record_provider_state(
         self,

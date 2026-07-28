@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -113,12 +114,16 @@ def _mock_purge_backup_manager(
 
 
 def spec(root: Path, *, profiles: tuple[str, ...] = ("personal", "work")) -> SetupSpec:
+    executable = root.parent / "packaged-runtime" / "bin" / "signet"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
     return SetupSpec(
         root=root,
         public_origin="https://signet.tailnet.example",
         owner_user_id="user:owner",
         hermes_profiles=profiles,
-        executable=Path("/opt/signet/bin/signet"),
+        executable=executable,
         open_browser=True,
     )
 
@@ -2449,10 +2454,10 @@ def test_service_plans_use_installed_executable_and_remain_inert(tmp_path: Path)
     systemd = render_systemd_services(selected)
 
     assert set(launchd) == {"ai.hermes.signet.mcp.plist", "ai.hermes.signet.web.plist"}
-    assert all(b"/opt/signet/bin/signet" in value for value in launchd.values())
+    assert all(str(selected.executable).encode() in value for value in launchd.values())
     assert all(b"RunAtLoad" in value and b"<false/>" in value for value in launchd.values())
     assert set(systemd) == {"signet-mcp.service", "signet-web.service"}
-    assert all("/opt/signet/bin/signet production serve-" in value for value in systemd.values())
+    assert all(f"{selected.executable} production serve-" in value for value in systemd.values())
     assert all("WantedBy" not in value for value in systemd.values())
 
 
@@ -5327,11 +5332,31 @@ def test_hermes_apply_binds_an_issued_token_to_its_rollback_snapshot(
         token = "sgt_0000000000000001." + "x" * 43
 
     class Registry:
+        issue_count = 0
+
         @staticmethod
-        def issue(namespace: str, aliases: set[str]) -> Issued:
+        def issue_bound(
+            namespace: str,
+            aliases: set[str],
+            *,
+            before_commit: Callable[[str], None],
+        ) -> Issued:
             assert namespace == "profile:work"
             assert aliases == {"approvals", "fastmail", "whatsapp"}
+            Registry.issue_count += 1
+            before_commit("0000000000000001")
             return Issued()
+
+        @staticmethod
+        def authenticate(authorization: str, *, alias: str) -> Any:
+            assert authorization == f"Bearer {Issued.token}"
+            assert alias == "approvals"
+            return type("Principal", (), {"namespace": "profile:work"})()
+
+        @staticmethod
+        def metadata(token_id: str) -> Any:
+            assert token_id == "0000000000000001"
+            return type("Metadata", (), {"revoked_at": None})()
 
         @staticmethod
         def revoke(token_id: str) -> None:
@@ -5355,6 +5380,14 @@ def test_hermes_apply_binds_an_issued_token_to_its_rollback_snapshot(
     )
     assert snapshot is not None
     assert snapshot[3] == "0000000000000001"
+    applied_config = (profile / "config.yaml").read_bytes()
+    applied_environment = (profile / ".env").read_bytes()
+
+    platform._apply_hermes_profiles(selected, setup_id)
+
+    assert Registry.issue_count == 1
+    assert (profile / "config.yaml").read_bytes() == applied_config
+    assert (profile / ".env").read_bytes() == applied_environment
     environment = profile / ".env"
     environment.write_bytes(environment.read_bytes() + b"FOREIGN_EDIT=changed\n")
     environment.chmod(0o600)
@@ -5470,6 +5503,11 @@ def test_hermes_apply_preserves_snapshot_when_prior_token_revocation_is_unconfir
     )
 
     class Registry:
+        @staticmethod
+        def metadata(token_id: str) -> Any:
+            assert token_id == "00000000000000aa"
+            return type("Metadata", (), {"revoked_at": None})()
+
         @staticmethod
         def revoke(token_id: str) -> None:
             assert token_id == "00000000000000aa"
@@ -5880,7 +5918,7 @@ def test_tailnet_private_route_rejects_foreground_funnel_permission() -> None:
     )
 
 
-def test_tailnet_apply_rejects_ambiguous_private_route_types_after_mutation(
+def test_tailnet_apply_preserves_ambiguous_private_route_types_after_mutation(
     tmp_path: Path,
 ) -> None:
     selected = SetupSpec(
@@ -5915,12 +5953,16 @@ def test_tailnet_apply_rejects_ambiguous_private_route_types_after_mutation(
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
     platform = ProductionSetupPlatform(command_runner=run)
-    with pytest.raises(SetupError, match="did not match the requested private route"):
+    with pytest.raises(SetupError, match="refusing failed-apply rollback"):
         platform._apply_tailnet_route(selected)
 
     assert any("--bg" in command for command in commands)
-    assert any(command[-1] == "off" for command in commands)
-    assert state["serve"] == {}
+    assert not any(command[-1] == "off" for command in commands)
+    assert state["serve"] == {
+        "TCP": {"8443": {"HTTPS": 1}},
+        "Web": {host_port: {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8790"}}}},
+        "AllowFunnel": {host_port: "true"},
+    }
     assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
 
 
@@ -6049,7 +6091,7 @@ def test_tailnet_apply_resume_rejects_unreceipted_configuration_drift(
     assert not any("--bg" in command for command in commands)
 
 
-def test_tailnet_apply_rejects_concurrent_route_drift_after_mutation(tmp_path: Path) -> None:
+def test_tailnet_apply_preserves_concurrent_route_drift_after_mutation(tmp_path: Path) -> None:
     selected = SetupSpec(
         root=tmp_path / "tailnet-apply-drift",
         public_origin="https://signet.example.ts.net:8443",
@@ -6090,9 +6132,13 @@ def test_tailnet_apply_rejects_concurrent_route_drift_after_mutation(tmp_path: P
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
     platform = ProductionSetupPlatform(command_runner=run)
-    with pytest.raises(SetupError, match="changed concurrently"):
+    with pytest.raises(SetupError, match="refusing failed-apply rollback"):
         platform._apply_tailnet_route(selected)
 
+    assert state["serve"]["TCP"] == {
+        "8443": {"HTTPS": True},
+        "9443": {"HTTPS": True},
+    }
     assert not (selected.root / "services" / "tailscale-serve-after.json").exists()
 
 
@@ -6458,6 +6504,7 @@ def test_real_platform_builds_a_provider_disabled_production_assembly(
     assert journal.status == "completed"
     assert external_calls == []
     assert any("did not restart the gateway" in message for message in output)
+    assert any("hermes -p work mcp test signet_work" in message for message in output)
     assert any("/reload-mcp" in message for message in output)
     config_path = selected.root / "production.json"
     config = load_production_config(config_path)

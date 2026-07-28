@@ -85,6 +85,21 @@ def add_setup_parsers(subcommands: Any) -> None:
         action="store_true",
         help="print the exact owner URL without opening a browser",
     )
+    setup.add_argument(
+        "--data-root",
+        type=Path,
+        help="pre-created private data directory, optionally on an external local SSD",
+    )
+    setup.add_argument(
+        "--data-device",
+        type=int,
+        help="reviewed st_dev identity for --data-root (auto-discovered when omitted)",
+    )
+    setup.add_argument(
+        "--backup-root",
+        type=Path,
+        help="pre-created private backup directory outside the default setup root",
+    )
     setup.add_argument("--executable", help=argparse.SUPPRESS)
 
     manage = subcommands.add_parser(
@@ -425,6 +440,9 @@ def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
         "owner_setup_url": f"{spec.public_origin}/setup",
         "provider_rollout": plan.provider_rollout,
         "policy_mode": spec.policy_mode,
+        "data_root": str(spec.data_dir),
+        "data_device": spec.data_device,
+        "backup_root": str(spec.backup_dir),
         "hermes_profiles": list(spec.hermes_profiles),
         "steps": [step.name for step in plan.steps],
         "automatic_steps": automatic_steps,
@@ -466,6 +484,29 @@ def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec
                 PolicyMode,
                 args.policy_mode or document.get("policy_mode", "deny"),
             ),
+            data_root=(
+                _absolute_path(args.data_root)
+                if args.data_root is not None
+                else (
+                    Path(str(document["data_root"]))
+                    if document.get("data_root") is not None
+                    else None
+                )
+            ),
+            backup_root=(
+                _absolute_path(args.backup_root)
+                if args.backup_root is not None
+                else (
+                    Path(str(document["backup_root"]))
+                    if document.get("backup_root") is not None
+                    else None
+                )
+            ),
+            data_device=(
+                args.data_device
+                if args.data_device is not None
+                else cast(int | None, document.get("data_device"))
+            ),
         )
     origin = args.origin or _discover_tailscale_origin()
     owner = args.owner or "user:owner"
@@ -473,6 +514,13 @@ def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec
     executable_text = args.executable or shutil.which("signet")
     if executable_text is None:
         raise ValueError("the installed signet executable is not on PATH")
+    data_root = _absolute_path(args.data_root) if args.data_root is not None else None
+    data_device = args.data_device
+    if data_root is not None and data_device is None:
+        try:
+            data_device = data_root.stat().st_dev
+        except OSError as exc:
+            raise ValueError("--data-root must exist before its device can be reviewed") from exc
     return SetupSpec(
         root=_absolute_path(args.root),
         public_origin=origin,
@@ -481,6 +529,9 @@ def _setup_spec(args: argparse.Namespace, store: SetupJournalStore) -> SetupSpec
         executable=_absolute_path(Path(executable_text)),
         open_browser=not args.no_open_browser,
         policy_mode=cast(PolicyMode, args.policy_mode or "deny"),
+        data_root=data_root,
+        backup_root=(_absolute_path(args.backup_root) if args.backup_root is not None else None),
+        data_device=data_device,
     )
 
 
@@ -607,12 +658,12 @@ def _run_production_service(
     *,
     runner: Callable[..., Any] | None,
 ) -> int:
+    config_path = _absolute_path(args.config)
+    component = args.production_command.removeprefix("serve-")
     import uvicorn
 
     from signet.production import create_owned_production_service
 
-    config_path = _absolute_path(args.config)
-    component = args.production_command.removeprefix("serve-")
     config, application = create_owned_production_service(
         config_path,
         component=component,

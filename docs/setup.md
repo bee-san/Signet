@@ -9,6 +9,8 @@ command, and Signet never restarts Hermes.
 The setup path changes real user resources. Read the plan and this guide before
 confirming it. For the repository-owned fake demo, use
 [`operator-runbook.md`](operator-runbook.md) instead.
+The cross-platform variants and their automated evidence are indexed in the
+[`production platform lifecycle matrix`](platform-lifecycle-matrix.md).
 
 ## Prerequisites
 
@@ -57,9 +59,31 @@ owner ID. The initial policy mode defaults to fail-closed `deny`; select `direct
 `approval`, or `approval_with_edit` with `--policy-mode` when the reviewed deployment
 requires a different baseline. The default root is `~/.local/share/signet`.
 
-Planning is read-only. The JSON plan names every step, the root, profiles, final owner
-URL, disabled provider state, browser behavior, and the fact that Hermes will not be
-restarted. It separates `automatic_steps`, `human_ceremonies`,
+Data and backups default to `ROOT/data` and `ROOT/backups`. To put either on a
+different local volume, create an empty directory owned by the service user with mode
+`0700`, then include its absolute path in the plan. Data is additionally bound to the
+reviewed filesystem device number; omit `--data-device` to have the plan read and
+display the current number, or provide the exact reviewed value to detect a mount
+replacement before setup writes anything:
+
+```console
+install -d -m 0700 /Volumes/PRIVATE/signet-data /Volumes/PRIVATE/signet-backups
+signet setup --plan \
+  --data-root /Volumes/PRIVATE/signet-data \
+  --data-device "$(stat -f %d /Volumes/PRIVATE/signet-data)" \
+  --backup-root /Volumes/PRIVATE/signet-backups
+```
+
+On Linux, use `stat -c %d`. External roots are not adopted: setup requires them to be
+empty and private, writes matching ownership markers inside the external directory and
+the main setup root, and validates both markers plus the data device on every resume.
+Do not move, copy, or hand-edit these markers. The data and backup roots must remain
+canonically disjoint from each other and from staging and restore roots.
+
+Planning is read-only. The JSON plan names every step, effective data and backup roots,
+the bound data device, profiles, final owner URL, disabled provider state, browser
+behavior, and the fact that Hermes will not be restarted. It separates
+`automatic_steps`, `human_ceremonies`,
 `deferred_provider_proof`, and `destructive_actions` so manual authentication,
 post-setup provider proof, and an empty destructive set are explicit before apply.
 
@@ -81,7 +105,8 @@ origin, owner, executable, profile set, or policy mode is refused rather than ad
 
 The ordered steps are:
 
-1. verify the installed executable, platform, selected profiles, and Tailscale node;
+1. verify the installed executable, platform, selected profiles, Tailscale node,
+   configured storage identities, and write-space reserve;
 2. create a marker-bound private root and private data directories;
 3. generate high-entropy secrets directly into the OS keyring;
 4. write the selected initial policy mode and a provider-disabled production config;
@@ -98,6 +123,27 @@ files, duplicate YAML keys, conflicting Hermes server/environment entries, chang
 service units, occupied Tailscale listeners, and a Funnel listener on the managed
 port. Generated service units execute the installed `signet` entry point; they do not
 reference a source checkout, `uv run`, or a package resolver.
+
+The launchd agents and systemd user units keep MCP and browser HTTP in separate
+loopback processes. The web process owns the bounded delivery, reconciliation,
+retention, storage-maintenance, and notification lifecycle workers. Generated units
+set restart throttles, file-descriptor/task limits, and memory limits without placing
+credentials in argv or environment. On launchd, worker maintenance copy-truncates each
+owned log at 25 MiB and keeps one 25 MiB rotation; systemd uses the user journal.
+Disposable cache files are pruned oldest-first above 1 GiB. Encrypted staging already
+has its own 50 MiB admission limit. The aggregate owned-log and backup limits are
+512 MiB and 8 GiB respectively; backup creation refuses to start when the reviewed
+bundle estimate would cross the backup cap or the required write reserve.
+The packaged setup leaves VAPID unset: the notification worker still drains
+subscription-free outbox intents, but an unexpected live subscription fails closed and
+is deferred rather than being reported as delivered. Browser push requires a later
+reviewed credential, public-key, subject, and endpoint-origin configuration slice.
+
+Storage preflight fails before mutation when less than 1 GiB plus one 100 MiB
+attachment batch and one 25 MiB log rotation remains. It emits a warning below either
+4 GiB free or 15 percent free, so an operator can expand or relocate storage before
+the hard refusal. These checks are capacity guards, not quota isolation from other
+processes on the same filesystem.
 
 ## Owner browser ceremony
 
@@ -232,8 +278,12 @@ signet doctor
 signet manage status
 ```
 
-`status` and `doctor` report metadata only. They do not print caller tokens, keyring
-values, browser capabilities, encrypted payloads, or authenticator material.
+`status` and `doctor` report metadata only. Their `storage` section reports each
+effective root, existence, device number, used/free/total bytes, warning state, and
+the fixed limits above. `doctor` fails the storage check at the write reserve or a
+hard-cap breach and otherwise gives an actionable low-space warning. They do not print
+caller tokens, keyring values, browser capabilities, encrypted payloads, or
+authenticator material.
 
 Plan an encrypted backup, then apply the exact reviewed plan:
 
@@ -242,8 +292,10 @@ signet backup --destination /absolute/private/path/archive.signet-backup
 signet backup --destination /absolute/private/path/archive.signet-backup --apply PLAN_ID
 ```
 
-Omit `--destination` from both commands to use the private default backup location
-recorded in the plan.
+Omit `--destination` from both commands to use the configured private backup root
+recorded in the plan. Backups are never silently deleted to make room; move a verified
+older bundle under the reviewed retention policy, then rerun the plan so the new
+capacity snapshot is explicit.
 
 Restore verifies and decrypts into a new private staging directory; it never replaces
 active state:
@@ -322,9 +374,10 @@ partial stdout; inspect the exit status and `signet status`.
 ## Installed files and package data
 
 The setup root contains the journal, owner marker, policy, production config,
-database, provider resources, encrypted attachment staging, restore staging, backups,
-logs, and reviewed service definitions. Modes are 0700 for private directories and
-0600 for private files. Launchd definitions are installed under
+provider resources, encrypted attachment staging, restore staging, cache, logs, and
+reviewed service definitions. By default it also contains the database and backups;
+with external roots it instead contains the matching external-storage receipts. Modes
+are 0700 for private directories and 0600 for private files. Launchd definitions are installed under
 `~/Library/LaunchAgents`; systemd user units are installed under
 `~/.config/systemd/user`.
 
