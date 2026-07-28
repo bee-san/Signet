@@ -40,6 +40,8 @@ from signet.setup_platform import (
     _remove_exact_owned_file,
     _remove_hermes_config,
     _remove_profile_environment,
+    _render_predecessor_launchd_services,
+    _render_predecessor_systemd_services,
     _replace_private_file,
     browser_assisted_setup,
     render_launchd_services,
@@ -3952,6 +3954,236 @@ def test_service_status_maps_tailscale_execution_failures_to_unavailable(
     assert all(
         value == "active" for name, value in status.items() if not name.startswith("tailscale:")
     )
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+@pytest.mark.parametrize("initial_state", ["active", "inactive"])
+def test_upgrade_migrates_only_the_reviewed_predecessor_units_while_quiesced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+    initial_state: str,
+) -> None:
+    home = ensure_private_directory(tmp_path / "home")
+    selected = replace(
+        spec(tmp_path / f"upgrade-predecessor-{platform_name}-{initial_state}"),
+        public_origin="https://example.com",
+    )
+    plan_dir = ensure_private_directory(selected.root / "services")
+    if platform_name == "darwin":
+        target = ensure_private_directory(home / "Library" / "LaunchAgents")
+        predecessor = _render_predecessor_launchd_services(selected, active=True)
+        current = render_launchd_services(selected, active=True)
+    else:
+        target = ensure_private_directory(home / ".config" / "systemd" / "user")
+        predecessor = {
+            name: content.encode("utf-8")
+            for name, content in _render_predecessor_systemd_services(
+                selected,
+                active=True,
+            ).items()
+        }
+        current = {
+            name: content.encode("utf-8")
+            for name, content in render_systemd_services(selected, active=True).items()
+        }
+    for name, content in predecessor.items():
+        for path in (plan_dir / name, target / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+
+    states = dict.fromkeys(predecessor, initial_state)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        signature = _command_signature(command)
+        commands.append(signature)
+        if signature[:2] == ["launchctl", "print"]:
+            label = signature[-1].rsplit("/", 1)[-1]
+            name = f"{label}.plist"
+            if states[name] == "active":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    f"{signature[-1]} = {{\n\tstate = running\n}}\n",
+                    "",
+                )
+            uid = signature[-1].split("/", 2)[1]
+            return subprocess.CompletedProcess(
+                command,
+                113,
+                "",
+                f'Bad request.\nCould not find service "{label}" in domain for user gui: {uid}',
+            )
+        if signature[:2] == ["launchctl", "bootout"]:
+            label = signature[-1].rsplit("/", 1)[-1]
+            states[f"{label}.plist"] = "inactive"
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if signature[:2] == ["launchctl", "bootstrap"]:
+            states[Path(signature[-1]).name] = "active"
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "is-active" in signature:
+            name = signature[-1]
+            state = states[name]
+            return subprocess.CompletedProcess(
+                command,
+                0 if state == "active" else 3,
+                f"{state}\n",
+                "",
+            )
+        if "stop" in signature:
+            for name in states:
+                states[name] = "inactive"
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "start" in signature:
+            for name in states:
+                states[name] = "active"
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if signature[-1] == "daemon-reload":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(signature)
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    platform = ProductionSetupPlatform(command_runner=run)
+
+    assert set(platform.service_status(selected).values()) == {"missing_or_changed"}
+    command_count = len(commands)
+    with pytest.raises(SetupError):
+        platform.manage_services(selected, "stop")
+    assert len(commands) == command_count
+
+    reviewed, generation = platform.review_upgrade_services(selected)
+    assert set(reviewed.values()) == {initial_state}
+    assert generation == "resource_limits_predecessor"
+    if initial_state == "active":
+        platform.stop_upgrade_services(
+            selected,
+            source_generation=generation,
+            allow_migrated=False,
+        )
+
+    original_replace = setup_platform._replace_private_file
+    replacement_states: list[set[str]] = []
+
+    def replace_while_quiesced(path: Path, content: bytes, **kwargs: object) -> None:
+        replacement_states.append(set(states.values()))
+        original_replace(path, content, **kwargs)
+
+    monkeypatch.setattr(setup_platform, "_replace_private_file", replace_while_quiesced)
+    platform.migrate_upgrade_service_units(
+        selected,
+        source_generation=generation,
+        allow_migrated=False,
+    )
+    assert replacement_states and set.union(*replacement_states) == {"inactive"}
+    assert all(
+        path.read_bytes() == current[name]
+        for name in current
+        for path in (plan_dir / name, target / name)
+    )
+
+    if initial_state == "active":
+        platform.manage_services(selected, "start")
+    assert set(platform.service_status(selected).values()) == {initial_state}
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+def test_upgrade_planning_rejects_arbitrary_unit_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+) -> None:
+    home = ensure_private_directory(tmp_path / "home")
+    selected = replace(
+        spec(tmp_path / f"upgrade-drift-{platform_name}"),
+        public_origin="https://example.com",
+    )
+    plan_dir = ensure_private_directory(selected.root / "services")
+    if platform_name == "darwin":
+        target = ensure_private_directory(home / "Library" / "LaunchAgents")
+        predecessor = _render_predecessor_launchd_services(selected, active=True)
+    else:
+        target = ensure_private_directory(home / ".config" / "systemd" / "user")
+        predecessor = {
+            name: content.encode("utf-8")
+            for name, content in _render_predecessor_systemd_services(
+                selected,
+                active=True,
+            ).items()
+        }
+    for name, content in predecessor.items():
+        for path in (plan_dir / name, target / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+    changed = plan_dir / next(iter(predecessor))
+    changed.write_bytes(changed.read_bytes() + b"# unrelated drift\n")
+
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "active\n", "")
+
+    monkeypatch.setattr(setup_platform.sys, "platform", platform_name)
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    platform = ProductionSetupPlatform(command_runner=run)
+
+    with pytest.raises(SetupError, match="changed or foreign"):
+        platform.review_upgrade_services(selected)
+    assert commands == []
+    assert "missing_or_changed" in platform.service_status(selected).values()
+
+
+def test_upgrade_reloads_systemd_when_a_retry_already_has_current_units(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = ensure_private_directory(tmp_path / "home")
+    selected = replace(
+        spec(tmp_path / "upgrade-current-systemd"),
+        public_origin="https://example.com",
+    )
+    plan_dir = ensure_private_directory(selected.root / "services")
+    target = ensure_private_directory(home / ".config" / "systemd" / "user")
+    current = {
+        name: content.encode("utf-8")
+        for name, content in render_systemd_services(selected, active=True).items()
+    }
+    for name, content in current.items():
+        for path in (plan_dir / name, target / name):
+            path.write_bytes(content)
+            path.chmod(0o600)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        signature = _command_signature(command)
+        commands.append(signature)
+        if "is-active" in signature:
+            return subprocess.CompletedProcess(command, 3, "inactive\n", "")
+        if signature[-1] == "daemon-reload":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(signature)
+
+    monkeypatch.setattr(setup_platform.sys, "platform", "linux")
+    monkeypatch.setattr(setup_platform.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(
+        setup_platform,
+        "_replace_private_file",
+        lambda *args, **kwargs: pytest.fail("current units must not be replaced"),
+    )
+    platform = ProductionSetupPlatform(command_runner=run)
+
+    reviewed, generation = platform.review_upgrade_services(selected)
+    assert set(reviewed.values()) == {"inactive"}
+    assert generation == "current"
+    platform.migrate_upgrade_service_units(
+        selected,
+        source_generation=generation,
+        allow_migrated=True,
+    )
+
+    assert ["systemctl", "--user", "daemon-reload"] in commands
 
 
 @pytest.mark.parametrize("platform_name", ["darwin", "linux"])

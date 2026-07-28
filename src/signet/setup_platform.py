@@ -94,6 +94,7 @@ _STORAGE_LOGS_HARD_BYTES = LOGS_HARD_BYTES
 _STORAGE_BACKUPS_HARD_BYTES = BACKUPS_HARD_BYTES
 _STORAGE_CACHE_HARD_BYTES = CACHE_HARD_BYTES
 _EXTERNAL_STORAGE_RECEIPT_PREFIX = ".signet-external-storage-"
+ServiceUnitGeneration = Literal["current", "resource_limits_predecessor"]
 _EXTERNAL_STORAGE_MARKER = ".signet-storage-owner.json"
 _REVIEWED_COMMAND_CANDIDATES: Mapping[str, tuple[Path, ...]] = {
     "launchctl": (Path("/bin/launchctl"),),
@@ -189,7 +190,53 @@ def render_production_config(spec: SetupSpec, *, setup_id: str) -> dict[str, Any
     }
 
 
+def setup_configuration_targets(spec: SetupSpec) -> tuple[Path, Path]:
+    """Return the exact production and policy files owned by setup."""
+
+    return spec.root / _CONFIG_NAME, spec.root / _POLICY_NAME
+
+
+def render_setup_configuration_files(
+    spec: SetupSpec,
+    *,
+    setup_id: str,
+) -> dict[Path, bytes]:
+    """Render the exact setup-owned configuration bytes for one setup identity."""
+
+    config_path, policy_path = setup_configuration_targets(spec)
+    policy = f"version: 1\ndefault_mode: {spec.policy_mode}\ndownstreams: {{}}\n".encode()
+    config = (
+        json.dumps(
+            render_production_config(spec, setup_id=setup_id),
+            sort_keys=True,
+            indent=2,
+            ensure_ascii=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return {config_path: config, policy_path: policy}
+
+
 def render_launchd_services(spec: SetupSpec, *, active: bool = False) -> dict[str, bytes]:
+    return _render_launchd_services(spec, active=active, resource_limits=True)
+
+
+def _render_predecessor_launchd_services(
+    spec: SetupSpec,
+    *,
+    active: bool = False,
+) -> dict[str, bytes]:
+    """Render the one reviewed unit shape immediately preceding resource limits."""
+
+    return _render_launchd_services(spec, active=active, resource_limits=False)
+
+
+def _render_launchd_services(
+    spec: SetupSpec,
+    *,
+    active: bool,
+    resource_limits: bool,
+) -> dict[str, bytes]:
     config = spec.root / _CONFIG_NAME
     logs = spec.root / "logs"
     result: dict[str, bytes] = {}
@@ -210,15 +257,39 @@ def render_launchd_services(spec: SetupSpec, *, active: bool = False) -> dict[st
             "ProcessType": "Background",
             "ThrottleInterval": 10,
             "Umask": 63,
-            "HardResourceLimits": {"NumberOfFiles": 1024},
-            "StandardOutPath": str(logs / f"{component}.log"),
-            "StandardErrorPath": str(logs / f"{component}-error.log"),
         }
+        if resource_limits:
+            document["HardResourceLimits"] = {"NumberOfFiles": 1024}
+        document.update(
+            {
+                "StandardOutPath": str(logs / f"{component}.log"),
+                "StandardErrorPath": str(logs / f"{component}-error.log"),
+            }
+        )
         result[name] = plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False)
     return result
 
 
 def render_systemd_services(spec: SetupSpec, *, active: bool = False) -> dict[str, str]:
+    return _render_systemd_services(spec, active=active, resource_limits=True)
+
+
+def _render_predecessor_systemd_services(
+    spec: SetupSpec,
+    *,
+    active: bool = False,
+) -> dict[str, str]:
+    """Render the one reviewed unit shape immediately preceding resource limits."""
+
+    return _render_systemd_services(spec, active=active, resource_limits=False)
+
+
+def _render_systemd_services(
+    spec: SetupSpec,
+    *,
+    active: bool,
+    resource_limits: bool,
+) -> dict[str, str]:
     config = _systemd_quote(str(spec.root / _CONFIG_NAME))
     executable = _systemd_executable(str(spec.executable))
     result: dict[str, str] = {}
@@ -236,11 +307,16 @@ def render_systemd_services(spec: SetupSpec, *, active: bool = False) -> dict[st
             "UMask=0077",
             "NoNewPrivileges=true",
             "PrivateTmp=true",
-            "MemoryMax=1G",
-            "MemorySwapMax=0",
-            "TasksMax=128",
-            "LimitNOFILE=1024",
         ]
+        if resource_limits:
+            lines.extend(
+                [
+                    "MemoryMax=1G",
+                    "MemorySwapMax=0",
+                    "TasksMax=128",
+                    "LimitNOFILE=1024",
+                ]
+            )
         if active:
             lines.extend(["", "[Install]", "WantedBy=default.target"])
         result[f"signet-{component}.service"] = "\n".join(lines) + "\n"
@@ -841,6 +917,109 @@ class ProductionSetupPlatform:
             operation(spec, setup_id)
 
     def manage_services(self, spec: SetupSpec, action: str) -> None:
+        self._manage_services(spec, action)
+
+    def review_upgrade_services(
+        self,
+        spec: SetupSpec,
+    ) -> tuple[dict[str, str], ServiceUnitGeneration]:
+        files = self._reviewed_upgrade_unit_files(spec)
+        generations = {generation for *_rest, generation in files}
+        if len(generations) != 1:
+            raise SetupError("owned service units are not one reviewed upgrade generation")
+        generation = generations.pop()
+        return self._service_status(spec, units_validated=True), generation
+
+    def upgrade_service_status(
+        self,
+        spec: SetupSpec,
+        *,
+        source_generation: ServiceUnitGeneration,
+        allow_migrated: bool,
+    ) -> dict[str, str]:
+        self._reviewed_upgrade_unit_files(
+            spec,
+            source_generation=source_generation,
+            allow_migrated=allow_migrated,
+        )
+        return self._service_status(spec, units_validated=True)
+
+    def stop_upgrade_services(
+        self,
+        spec: SetupSpec,
+        *,
+        source_generation: ServiceUnitGeneration,
+        allow_migrated: bool,
+    ) -> None:
+        self._reviewed_upgrade_unit_files(
+            spec,
+            source_generation=source_generation,
+            allow_migrated=allow_migrated,
+        )
+        self._manage_services(spec, "stop", units_validated=True)
+
+    def start_upgrade_services(
+        self,
+        spec: SetupSpec,
+        *,
+        source_generation: ServiceUnitGeneration,
+        allow_migrated: bool,
+    ) -> None:
+        self._reviewed_upgrade_unit_files(
+            spec,
+            source_generation=source_generation,
+            allow_migrated=allow_migrated,
+        )
+        self._manage_services(spec, "start", units_validated=True)
+
+    def migrate_upgrade_service_units(
+        self,
+        spec: SetupSpec,
+        *,
+        source_generation: ServiceUnitGeneration,
+        allow_migrated: bool,
+    ) -> None:
+        files = self._reviewed_upgrade_unit_files(
+            spec,
+            source_generation=source_generation,
+            allow_migrated=allow_migrated,
+        )
+        status = self._service_status(spec, units_validated=True)
+        local = {name: state for name, state in status.items() if not name.startswith("tailscale:")}
+        if len(local) != 2 or any(state != "inactive" for state in local.values()):
+            raise SetupError("upgrade unit migration requires every Signet service to be inactive")
+        for path, current, observed, parent_private, parent_identity, _generation in files:
+            if observed == current:
+                continue
+            _replace_private_file(
+                path,
+                current,
+                expected_content=observed,
+                expected_parent_identity=parent_identity,
+                require_present=True,
+                parent_private=parent_private,
+            )
+        if sys.platform != "darwin":
+            self._run_checked(
+                ["systemctl", "--user", "daemon-reload"],
+                "systemd reload failed during upgrade",
+            )
+        current_status = self.service_status(spec)
+        current_local = {
+            name: state
+            for name, state in current_status.items()
+            if not name.startswith("tailscale:")
+        }
+        if len(current_local) != 2 or any(state != "inactive" for state in current_local.values()):
+            raise SetupError("upgrade did not publish current inactive service units")
+
+    def _manage_services(
+        self,
+        spec: SetupSpec,
+        action: str,
+        *,
+        units_validated: bool = False,
+    ) -> None:
         if action not in {"start", "stop", "restart"}:
             raise SetupError("service action must be start, stop, or restart")
         if sys.platform == "darwin":
@@ -848,9 +1027,10 @@ class ProductionSetupPlatform:
             target = Path.home() / "Library" / "LaunchAgents"
             plan_dir = spec.root / "services"
             uid = os.getuid()
-            for name, content in rendered.items():
-                _require_exact_owned_file(plan_dir / name, content)
-                _require_exact_owned_file(target / name, content)
+            if not units_validated:
+                for name, content in rendered.items():
+                    _require_exact_owned_file(plan_dir / name, content)
+                    _require_exact_owned_file(target / name, content)
             for name in rendered:
                 path = target / name
                 label = name.removesuffix(".plist")
@@ -879,16 +1059,25 @@ class ProductionSetupPlatform:
             rendered = render_systemd_services(spec, active=True)
             target = Path.home() / ".config" / "systemd" / "user"
             plan_dir = spec.root / "services"
-            for name, content in rendered.items():
-                encoded = content.encode("utf-8")
-                _require_exact_owned_file(plan_dir / name, encoded)
-                _require_exact_owned_file(target / name, encoded)
+            if not units_validated:
+                for name, content in rendered.items():
+                    encoded = content.encode("utf-8")
+                    _require_exact_owned_file(plan_dir / name, encoded)
+                    _require_exact_owned_file(target / name, encoded)
             self._run_checked(
                 ["systemctl", "--user", action, *rendered],
                 f"systemd {action} failed for Signet",
             )
 
     def service_status(self, spec: SetupSpec) -> dict[str, str]:
+        return self._service_status(spec)
+
+    def _service_status(
+        self,
+        spec: SetupSpec,
+        *,
+        units_validated: bool = False,
+    ) -> dict[str, str]:
         result: dict[str, str] = {}
         if sys.platform == "darwin":
             rendered = render_launchd_services(spec, active=True)
@@ -898,12 +1087,13 @@ class ProductionSetupPlatform:
             for name, content in rendered.items():
                 path = target / name
                 label = name.removesuffix(".plist")
-                try:
-                    _require_exact_owned_file(plan_dir / name, content)
-                    _require_exact_owned_file(path, content)
-                except SetupError:
-                    result[label] = "missing_or_changed"
-                    continue
+                if not units_validated:
+                    try:
+                        _require_exact_owned_file(plan_dir / name, content)
+                        _require_exact_owned_file(path, content)
+                    except SetupError:
+                        result[label] = "missing_or_changed"
+                        continue
                 try:
                     status = self._run_command(
                         ["launchctl", "print", f"gui/{uid}/{label}"],
@@ -926,12 +1116,13 @@ class ProductionSetupPlatform:
             plan_dir = spec.root / "services"
             for name, content in rendered.items():
                 encoded = content.encode("utf-8")
-                try:
-                    _require_exact_owned_file(plan_dir / name, encoded)
-                    _require_exact_owned_file(target / name, encoded)
-                except SetupError:
-                    result[name] = "missing_or_changed"
-                    continue
+                if not units_validated:
+                    try:
+                        _require_exact_owned_file(plan_dir / name, encoded)
+                        _require_exact_owned_file(target / name, encoded)
+                    except SetupError:
+                        result[name] = "missing_or_changed"
+                        continue
                 try:
                     status = self._run_command(
                         ["systemctl", "--user", "is-active", name],
@@ -962,6 +1153,96 @@ class ProductionSetupPlatform:
                 )
                 result[f"tailscale:{port}"] = "active" if private_route else "missing_or_changed"
         return result
+
+    def _reviewed_upgrade_unit_files(
+        self,
+        spec: SetupSpec,
+        *,
+        source_generation: ServiceUnitGeneration | None = None,
+        allow_migrated: bool = False,
+    ) -> list[
+        tuple[
+            Path,
+            bytes,
+            bytes,
+            bool,
+            DirectoryIdentity,
+            ServiceUnitGeneration,
+        ]
+    ]:
+        if source_generation not in {
+            None,
+            "current",
+            "resource_limits_predecessor",
+        }:
+            raise SetupError("reviewed upgrade service-unit generation is invalid")
+        plan_dir = spec.root / "services"
+        if sys.platform == "darwin":
+            current = render_launchd_services(spec, active=True)
+            predecessor = _render_predecessor_launchd_services(spec, active=True)
+            target = Path.home() / "Library" / "LaunchAgents"
+        else:
+            current = {
+                name: content.encode("utf-8")
+                for name, content in render_systemd_services(spec, active=True).items()
+            }
+            predecessor = {
+                name: content.encode("utf-8")
+                for name, content in _render_predecessor_systemd_services(
+                    spec,
+                    active=True,
+                ).items()
+            }
+            target = Path.home() / ".config" / "systemd" / "user"
+        inspected: list[
+            tuple[
+                Path,
+                bytes,
+                bytes,
+                bool,
+                DirectoryIdentity,
+                ServiceUnitGeneration,
+            ]
+        ] = []
+        for name, current_content in current.items():
+            predecessor_content = predecessor[name]
+            accepted: tuple[bytes, ...]
+            if source_generation == "current":
+                accepted = (current_content,)
+            elif source_generation == "resource_limits_predecessor":
+                accepted = (
+                    (predecessor_content, current_content)
+                    if allow_migrated
+                    else (predecessor_content,)
+                )
+            else:
+                accepted = (current_content, predecessor_content)
+            for path, parent_private in (
+                (plan_dir / name, True),
+                (target / name, False),
+            ):
+                review = _inspect_reviewed_owned_file(
+                    path,
+                    accepted,
+                    parent_private=parent_private,
+                )
+                if review is None:
+                    raise SetupError(f"owned resource is unavailable: {path}")
+                _metadata, parent_identity, observed = review
+                generation: ServiceUnitGeneration = (
+                    "current" if observed == current_content else "resource_limits_predecessor"
+                )
+                inspected.append(
+                    (
+                        path,
+                        current_content,
+                        observed,
+                        parent_private,
+                        parent_identity,
+                        generation,
+                    )
+                )
+        return inspected
 
     def remove_setup_secrets(self, setup_id: str, *, preserve_backup: bool) -> None:
         purposes = (*_SECRET_PURPOSES, "browser-bootstrap", "fastmail")
@@ -1230,38 +1511,18 @@ class ProductionSetupPlatform:
         self.remove_setup_secrets(setup_id, preserve_backup=preserve_backup)
 
     def _apply_configuration(self, spec: SetupSpec, setup_id: str) -> None:
-        policy = f"version: 1\ndefault_mode: {spec.policy_mode}\ndownstreams: {{}}\n".encode()
-        config = (
-            json.dumps(
-                render_production_config(spec, setup_id=setup_id),
-                sort_keys=True,
-                indent=2,
-                ensure_ascii=True,
-            )
-            + "\n"
-        ).encode("utf-8")
-        _create_or_verify_private_file(spec.root / _POLICY_NAME, policy)
-        _create_or_verify_private_file(spec.root / _CONFIG_NAME, config)
+        config_path, policy_path = setup_configuration_targets(spec)
+        rendered = render_setup_configuration_files(spec, setup_id=setup_id)
+        _create_or_verify_private_file(policy_path, rendered[policy_path])
+        _create_or_verify_private_file(config_path, rendered[config_path])
         # Validate the exact persisted document before any database or service action.
-        load_production_config(spec.root / _CONFIG_NAME)
+        load_production_config(config_path)
 
     def _rollback_configuration(self, spec: SetupSpec, setup_id: str) -> None:
-        expected = {
-            spec.root / _POLICY_NAME: (
-                f"version: 1\ndefault_mode: {spec.policy_mode}\ndownstreams: {{}}\n".encode()
-            ),
-            spec.root / _CONFIG_NAME: (
-                json.dumps(
-                    render_production_config(spec, setup_id=setup_id),
-                    sort_keys=True,
-                    indent=2,
-                    ensure_ascii=True,
-                )
-                + "\n"
-            ).encode("utf-8"),
-        }
-        for path, content in expected.items():
-            _remove_exact_owned_file(path, content)
+        config_path, policy_path = setup_configuration_targets(spec)
+        rendered = render_setup_configuration_files(spec, setup_id=setup_id)
+        for path in (policy_path, config_path):
+            _remove_exact_owned_file(path, rendered[path])
 
     def _apply_database(self, spec: SetupSpec, setup_id: str) -> None:
         database_path = spec.data_dir / "signet.db"
@@ -4373,11 +4634,37 @@ def _inspect_exact_owned_file(
     expected_parent_identity: DirectoryIdentity | None = None,
     parent_private: bool = False,
 ) -> tuple[os.stat_result, DirectoryIdentity] | None:
+    inspected = _inspect_reviewed_owned_file(
+        path,
+        (expected,),
+        expected_parent_identity=expected_parent_identity,
+        parent_private=parent_private,
+    )
+    if inspected is None:
+        return None
+    metadata, parent_identity, _content = inspected
+    return metadata, parent_identity
+
+
+def _inspect_reviewed_owned_file(
+    path: Path,
+    accepted: tuple[bytes, ...],
+    *,
+    expected_parent_identity: DirectoryIdentity | None = None,
+    parent_private: bool = False,
+) -> tuple[os.stat_result, DirectoryIdentity, bytes] | None:
+    if not accepted:
+        raise ValueError("owned resource inspection requires reviewed content")
     if not path.exists() and not path.is_symlink():
         return None
     descriptor = -1
     try:
-        parent_identity = expected_parent_identity or require_owned_directory_identity(path.parent)
+        identity_reader = (
+            require_private_directory_identity
+            if parent_private
+            else require_owned_directory_identity
+        )
+        parent_identity = expected_parent_identity or identity_reader(path.parent)
         if expected_parent_identity is not None:
             revalidate_directory_identity(parent_identity, private=parent_private)
     except PrivatePathError as exc:
@@ -4389,7 +4676,7 @@ def _inspect_exact_owned_file(
         )
         metadata = os.fstat(descriptor)
         require_no_acl_grants(descriptor)
-        actual = _read_owned_descriptor(descriptor, len(expected) + 1)
+        actual = _read_owned_descriptor(descriptor, max(map(len, accepted)) + 1)
         current = path.lstat()
         revalidate_directory_identity(parent_identity, private=parent_private)
     except (OSError, PrivatePathError) as exc:
@@ -4403,11 +4690,11 @@ def _inspect_exact_owned_file(
         or metadata.st_nlink != 1
         or metadata.st_uid != current_uid
         or stat.S_IMODE(metadata.st_mode) != 0o600
-        or actual != expected
+        or actual not in accepted
         or (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
     ):
         raise SetupError(f"refusing to remove changed or foreign resource: {path}")
-    return metadata, parent_identity
+    return metadata, parent_identity, actual
 
 
 def _read_owned_descriptor(descriptor: int, limit: int) -> bytes:

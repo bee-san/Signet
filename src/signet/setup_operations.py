@@ -54,6 +54,7 @@ from signet.service_lifecycle import (
 )
 from signet.setup_platform import (
     ProductionSetupPlatform,
+    ServiceUnitGeneration,
     _managed_tailnet_port,
     _replace_private_file,
     storage_path_status,
@@ -790,7 +791,7 @@ class SetupOperations:
     def plan_upgrade(self) -> LifecyclePlan:
         journal = self._completed_journal()
         spec = self.spec()
-        services = self.platform.service_status(spec)
+        services, unit_generation = self._review_upgrade_services(spec)
         tailscale_port = _managed_tailnet_port(spec)
         validate_service_snapshot(
             services,
@@ -808,6 +809,7 @@ class SetupOperations:
                 "previous_lifecycle_plan_id": self._previous_lifecycle_plan_id(),
                 "tailscale_serve_port": tailscale_port,
                 "services": dict(sorted(services.items())),
+                "service_unit_generation": unit_generation,
                 "schema_version": schema_version,
                 "target_schema_version": LATEST_SCHEMA_VERSION,
             },
@@ -1110,7 +1112,8 @@ class SetupOperations:
         spec: SetupSpec,
     ) -> bool:
         before = service_observation(plan)
-        current = self.platform.service_status(spec)
+        generation = _upgrade_service_unit_generation(plan)
+        current = self._upgrade_service_status(spec, generation)
         validate_service_snapshot(
             current,
             allow_mixed=True,
@@ -1120,9 +1123,10 @@ class SetupOperations:
         prior_active = set(local_service_states(before).values()) == {"active"}
         if prior_active:
             if set(local_service_states(current).values()) != {"inactive"}:
-                self._stop_and_verify_services(spec)
+                self._stop_and_verify_services(spec, generation)
         elif current != before:
             raise SetupError("interrupted upgrade changed the reviewed inactive service state")
+        self._migrate_upgrade_service_units(spec, generation)
         return prior_active
 
     def _recover_reviewed_upgrade_services(
@@ -1131,7 +1135,8 @@ class SetupOperations:
         spec: SetupSpec,
     ) -> None:
         before = service_observation(plan)
-        current = self.platform.service_status(spec)
+        generation = _upgrade_service_unit_generation(plan)
+        current = self._upgrade_service_status(spec, generation)
         validate_service_snapshot(
             current,
             allow_mixed=True,
@@ -1142,11 +1147,13 @@ class SetupOperations:
         if not prior_active:
             if current != before:
                 raise SetupError("completed upgrade changed the reviewed inactive service state")
+            self._migrate_upgrade_service_units(spec, generation)
             return
         if current == before:
             self.platform.verify_service_health(spec)
             return
-        self._stop_and_verify_services(spec)
+        self._stop_and_verify_services(spec, generation)
+        self._migrate_upgrade_service_units(spec, generation)
         self._restart_services_after_upgrade(spec)
 
     def upgrade(self) -> dict[str, Any]:
@@ -1159,8 +1166,8 @@ class SetupOperations:
         if reviewed_plan is None:
             self.platform.preflight(spec)
         SetupEngine(self.store, self.platform).validate_private_paths(spec, journal=journal)
-        initial_status = self.platform.service_status(spec)
         if reviewed_plan is None:
+            initial_status, unit_generation = self._review_upgrade_services(spec)
             local_services = local_service_states(initial_status)
             if len(local_services) != 2 or any(
                 state not in {"active", "inactive"} for state in local_services.values()
@@ -1172,6 +1179,8 @@ class SetupOperations:
             services_quiesced = False
         else:
             _require_upgrade_target(reviewed_plan)
+            unit_generation = _upgrade_service_unit_generation(reviewed_plan)
+            initial_status = self._upgrade_service_status(spec, unit_generation)
             prior_active, services_quiesced = _reviewed_upgrade_service_state(
                 reviewed_plan,
                 initial_status,
@@ -1187,7 +1196,8 @@ class SetupOperations:
                 self.platform.preflight(spec)
             if prior_active and not services_quiesced:
                 stop_attempted = True
-                self._stop_and_verify_services(spec)
+                self._stop_and_verify_services(spec, unit_generation)
+            self._migrate_upgrade_service_units(spec, unit_generation)
             manager = self._backup_manager(journal)
             recovery_directory.mkdir(mode=0o700, exist_ok=True)
             ensure_private_directory(recovery_directory)
@@ -1274,16 +1284,21 @@ class SetupOperations:
                         )
             if stop_attempted and migration_receipt is None:
                 try:
+                    self._migrate_upgrade_service_units(spec, unit_generation)
                     self._restart_services_after_upgrade(spec)
-                except BaseException as recovery_exc:
-                    if isinstance(exc, Exception):
-                        exc.add_note(
-                            "The pre-upgrade service state could not be restored; Signet may be "
-                            "partially stopped."
-                        )
-                    raise SetupError(
-                        "upgrade failed before migration, and services could not be safely resumed"
-                    ) from recovery_exc
+                except BaseException:
+                    try:
+                        self._restart_upgrade_source_services(spec, unit_generation)
+                    except BaseException as source_recovery_exc:
+                        if isinstance(exc, Exception):
+                            exc.add_note(
+                                "The pre-upgrade service state could not be restored; Signet may "
+                                "be partially stopped."
+                            )
+                        raise SetupError(
+                            "upgrade failed before migration, and services could not be safely "
+                            "resumed"
+                        ) from source_recovery_exc
             if isinstance(exc, (BackupError, ProductionAssemblyError)):
                 raise SetupError(str(exc)) from exc
             raise
@@ -1306,9 +1321,21 @@ class SetupOperations:
             "provider_rollout": assembly.config.provider_rollout.state,
         }
 
-    def _stop_and_verify_services(self, spec: SetupSpec) -> None:
-        self.platform.manage_services(spec, "stop")
-        stopped = self.platform.service_status(spec)
+    def _stop_and_verify_services(
+        self,
+        spec: SetupSpec,
+        unit_generation: ServiceUnitGeneration,
+    ) -> None:
+        stop = self._concrete_upgrade_service_method("stop_upgrade_services")
+        if stop is None:
+            self.platform.manage_services(spec, "stop")
+        else:
+            stop(
+                spec,
+                source_generation=unit_generation,
+                allow_migrated=True,
+            )
+        stopped = self._upgrade_service_status(spec, unit_generation)
         local_services = {
             name: state for name, state in stopped.items() if not name.startswith("tailscale:")
         }
@@ -1316,6 +1343,82 @@ class SetupOperations:
             state != "inactive" for state in local_services.values()
         ):
             raise SetupError("upgrade requires every Signet service to be inactive")
+
+    def _review_upgrade_services(
+        self,
+        spec: SetupSpec,
+    ) -> tuple[dict[str, str], ServiceUnitGeneration]:
+        review = self._concrete_upgrade_service_method("review_upgrade_services")
+        if review is None:
+            return self.platform.service_status(spec), "current"
+        return cast(
+            tuple[dict[str, str], ServiceUnitGeneration],
+            review(spec),
+        )
+
+    def _upgrade_service_status(
+        self,
+        spec: SetupSpec,
+        unit_generation: ServiceUnitGeneration,
+    ) -> dict[str, str]:
+        status = self._concrete_upgrade_service_method("upgrade_service_status")
+        if status is None:
+            return self.platform.service_status(spec)
+        return cast(
+            dict[str, str],
+            status(
+                spec,
+                source_generation=unit_generation,
+                allow_migrated=True,
+            ),
+        )
+
+    def _migrate_upgrade_service_units(
+        self,
+        spec: SetupSpec,
+        unit_generation: ServiceUnitGeneration,
+    ) -> None:
+        migrate = self._concrete_upgrade_service_method("migrate_upgrade_service_units")
+        if migrate is not None:
+            migrate(
+                spec,
+                source_generation=unit_generation,
+                allow_migrated=True,
+            )
+
+    def _restart_upgrade_source_services(
+        self,
+        spec: SetupSpec,
+        unit_generation: ServiceUnitGeneration,
+    ) -> None:
+        start = self._concrete_upgrade_service_method("start_upgrade_services")
+        if start is None:
+            self._restart_services_after_upgrade(spec)
+            return
+        start(
+            spec,
+            source_generation=unit_generation,
+            allow_migrated=True,
+        )
+        started = self._upgrade_service_status(spec, unit_generation)
+        local_services = {
+            name: state for name, state in started.items() if not name.startswith("tailscale:")
+        }
+        if (
+            len(local_services) != 2
+            or any(state != "active" for state in local_services.values())
+            or any(state != "active" for state in started.values())
+        ):
+            raise SetupError("pre-upgrade Signet services did not resume")
+        self.platform.verify_service_health(spec)
+
+    def _concrete_upgrade_service_method(self, name: str) -> Callable[..., Any] | None:
+        if (
+            getattr(type(self.platform), "service_status", None)
+            is not ProductionSetupPlatform.service_status
+        ):
+            return None
+        return cast(Callable[..., Any] | None, getattr(self.platform, name, None))
 
     def _restart_services_after_upgrade(self, spec: SetupSpec) -> None:
         try:
@@ -2420,6 +2523,14 @@ def _require_upgrade_target(plan: LifecyclePlan) -> None:
     target = plan.observed.get("target_schema_version")
     if not isinstance(target, int) or isinstance(target, bool) or target != LATEST_SCHEMA_VERSION:
         raise SetupError("upgrade target no longer matches the reviewed schema version")
+    _upgrade_service_unit_generation(plan)
+
+
+def _upgrade_service_unit_generation(plan: LifecyclePlan) -> ServiceUnitGeneration:
+    generation = plan.observed.get("service_unit_generation")
+    if generation not in {"current", "resource_limits_predecessor"}:
+        raise SetupError("reviewed upgrade service-unit generation is invalid")
+    return cast(ServiceUnitGeneration, generation)
 
 
 def _reviewed_upgrade_service_state(
