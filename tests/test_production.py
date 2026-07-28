@@ -331,6 +331,40 @@ def test_production_config_digest_migrates_caller_human_binding(
         ).fetchone()["config_digest"] == production_config_digest(config)
 
 
+def test_production_config_digest_migrates_pre_instance_root_state(
+    tmp_path: Path,
+) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+    predecessor = config.model_dump(mode="json")
+    predecessor.pop("instance_root")
+    predecessor_digest = hashlib.sha256(canonical_json(predecessor)).hexdigest()
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_setup_state SET config_digest = ? WHERE state_id = 1",
+            (predecessor_digest,),
+        )
+        connection.execute(
+            "UPDATE production_services SET config_digest = ?",
+            (predecessor_digest,),
+        )
+
+    migrated = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        components=frozenset(),
+    )
+
+    with migrated.database.read() as connection:
+        assert connection.execute(
+            "SELECT config_digest FROM production_setup_state WHERE state_id = 1"
+        ).fetchone()["config_digest"] == production_config_digest(config)
+
+
 def test_production_config_digest_composes_empty_callers_with_legacy_predecessor(
     tmp_path: Path,
 ) -> None:
@@ -2097,6 +2131,19 @@ def test_production_runtime_accepts_a_durable_approver_user(
         ("user:approver", "approver"),
         (config.owner_user_id, "owner"),
     ]
+
+
+def test_production_runtime_refuses_a_disabled_durable_owner(tmp_path: Path) -> None:
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
+    with assembly.database.transaction() as connection:
+        connection.execute(
+            "UPDATE production_users SET state = 'disabled' WHERE user_id = ?",
+            (config.owner_user_id,),
+        )
+
+    with pytest.raises(ProductionAssemblyError, match="durable production owner"):
+        build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 124)
 
 
 @pytest.mark.asyncio

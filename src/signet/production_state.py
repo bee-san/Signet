@@ -120,6 +120,11 @@ class ProductionStateStore:
                 }
                 compatible_digests = {
                     transition_digest,
+                    _pre_instance_root_production_config_digest(config),
+                    _pre_instance_root_production_config_digest(
+                        config,
+                        rollout_state=opposite_rollout,
+                    ),
                     _pre_caller_user_binding_production_config_digest(config),
                     _pre_caller_user_binding_production_config_digest(
                         config,
@@ -214,15 +219,20 @@ class ProductionStateStore:
             ).fetchall()
             owners = [row for row in users if row["role"] == "owner"]
             if setup is not None and (
-                len(owners) != 1 or owners[0]["user_id"] != config.owner_user_id
+                len(owners) != 1
+                or owners[0]["user_id"] != config.owner_user_id
+                or owners[0]["state"] not in {"staged", "active"}
             ):
-                raise ProductionStateError("durable production owner differs from configured owner")
+                raise ProductionStateError(
+                    "durable production owner differs from configured or authorized owner"
+                )
             if setup is None and users:
                 raise ProductionStateError("durable production owner differs from configured owner")
             authorized_users = {
                 str(row["user_id"]) for row in users if row["state"] in {"staged", "active"}
             }
-            authorized_users.add(config.owner_user_id)
+            if setup is None:
+                authorized_users.add(config.owner_user_id)
             authenticator_users = {
                 str(row["user_id"])
                 for row in connection.execute(
@@ -1054,6 +1064,21 @@ def production_config_digest(
 
 
 def _connector_config_digest(document: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _pre_instance_root_production_config_digest(
+    config: ProductionConfig,
+    *,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
+) -> str:
+    """Reconstruct the digest emitted before the instance root was explicit."""
+
+    document = config.model_dump(mode="json")
+    document.pop("instance_root")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
 

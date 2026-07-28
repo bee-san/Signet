@@ -1945,6 +1945,8 @@ def test_initial_owner_setup_is_browser_only_resumable_and_one_time(
         assert page.status_code == 200 and token
         assert "Set up Signet" in page.text
         assert "Setup is locked" in page.text
+        assert "capability file" in page.text
+        assert "private URL" not in page.text
         assert "Create your password" not in page.text
 
         unclaimed_options = setup_client.post(
