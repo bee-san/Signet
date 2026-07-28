@@ -376,6 +376,31 @@ class ProductionStateStore:
                 ),
             )
 
+    def record_storage_state(self, *, ready: bool, now: int) -> None:
+        if not isinstance(ready, bool):
+            raise ValueError("production storage readiness is invalid")
+        if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+            raise ValueError("production storage state time is invalid")
+        with self.database.transaction() as connection:
+            setup = connection.execute(
+                "SELECT capability_status_json FROM production_setup_state WHERE state_id = 1"
+            ).fetchone()
+            if setup is None:
+                raise ProductionStateError("production setup state is unavailable")
+            capabilities = self._parse_capabilities(setup["capability_status_json"])
+            capabilities["storage_ready"] = ready
+            connection.execute(
+                """
+                UPDATE production_setup_state
+                SET capability_status_json = ?, updated_at = ?
+                WHERE state_id = 1
+                """,
+                (
+                    json.dumps(capabilities, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
+
     def record_worker_component_states(
         self,
         state: Literal["ready", "blocked", "stopped"],

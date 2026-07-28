@@ -64,6 +64,7 @@ from signet.production_connectors import (
 from signet.production_state import ProductionStateError, production_config_digest
 from signet.setup_platform import ProductionSetupPlatform
 from signet.setup_state import SetupEngine, SetupError, SetupJournalStore, SetupSpec
+from signet.storage_lifecycle import StoragePolicyError
 from signet.totp_enrollment import (
     InvalidTotpEnrollment,
     IssuedTotpEnrollment,
@@ -2159,6 +2160,128 @@ async def test_production_maintenance_worker_has_explicit_lifecycle(
     assert services["retention"].state == "blocked"
     assert services["delivery"].state == "blocked"
     assert services["reconciliation"].state == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_storage_block_does_not_terminate_the_shared_production_worker_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_time = 123
+    config = ProductionConfig.model_validate(_production_payload(tmp_path))
+    assembly = build_production_runtime(
+        config,
+        secret_store=_secret_store(),
+        clock=lambda: current_time,
+    )
+    calls: list[str] = []
+    storage_attempts = 0
+
+    async def dispatch(request_id: str, **_kwargs: Any) -> None:
+        calls.append(f"delivery:{request_id}")
+
+    async def reconcile(request_id: str, **_kwargs: Any) -> None:
+        calls.append(f"reconciliation:{request_id}")
+
+    def retain(**_kwargs: Any) -> None:
+        calls.append("retention")
+
+    async def notify(**_kwargs: Any) -> None:
+        calls.append("notifications")
+
+    def maintain_storage() -> Mapping[str, Any]:
+        nonlocal storage_attempts
+        storage_attempts += 1
+        calls.append("storage")
+        if storage_attempts == 1:
+            raise StoragePolicyError("owned logs exceed their hard storage limit")
+        return {}
+
+    notification_outbox = SimpleNamespace(
+        schedule_approaching_expiry=lambda **_kwargs: 0,
+        schedule_daily_digest=lambda **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_delivery",
+        SimpleNamespace(dispatch=dispatch),
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_reconciliation",
+        SimpleNamespace(
+            due_request_ids=lambda **_kwargs: ("request:reconciliation",),
+            reconcile_once=reconcile,
+        ),
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_retention",
+        SimpleNamespace(run_due=retain),
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_notifications",
+        SimpleNamespace(run_due=notify),
+    )
+    monkeypatch.setattr(
+        assembly.workers,
+        "_notification_outbox",
+        notification_outbox,
+    )
+    monkeypatch.setattr(assembly.workers, "_storage_maintenance", maintain_storage)
+    monkeypatch.setattr(
+        assembly.workers,
+        "_due_delivery_request_ids",
+        lambda _now: ("request:delivery",),
+    )
+    enabled_workers = frozenset({"delivery", "reconciliation", "retention", "notifications"})
+    assembly.state.record_worker_component_states(
+        "ready",
+        enabled_services=enabled_workers,
+        now=current_time,
+    )
+    assembly.state.record_worker_state("ready", ready=True, now=current_time)
+    assert assembly.web is not None
+    health = TestClient(assembly.web, base_url=config.public_origin)
+
+    current_time += 1
+    await assembly.workers.run_once(now=current_time)
+
+    blocked = assembly.status()
+    assert storage_attempts == 1
+    assert calls == [
+        "delivery:request:delivery",
+        "reconciliation:request:reconciliation",
+        "retention",
+        "storage",
+        "notifications",
+    ]
+    assert "storage_ready" in blocked.missing_prerequisites
+    assert "workers_ready" not in blocked.missing_prerequisites
+    assert blocked.services["maintenance"].state == "ready"
+    assert all(blocked.services[name].state == "ready" for name in enabled_workers)
+    assert health.get("/healthz").status_code == 503
+
+    current_time += 1
+    await assembly.workers.run_once(now=current_time)
+
+    recovered = assembly.status()
+    assert storage_attempts == 2
+    assert (
+        calls
+        == [
+            "delivery:request:delivery",
+            "reconciliation:request:reconciliation",
+            "retention",
+            "storage",
+            "notifications",
+        ]
+        * 2
+    )
+    assert "storage_ready" not in recovered.missing_prerequisites
+    assert all(recovered.services[name].state == "ready" for name in enabled_workers)
+    assert health.get("/healthz").status_code == 200
 
 
 @pytest.mark.asyncio

@@ -60,6 +60,39 @@ def test_storage_maintenance_rotates_logs_without_losing_concurrent_appends(
     assert report["rotated_logs"] == 1
 
 
+def test_storage_maintenance_repeatedly_blocks_on_an_active_old_writer_archive(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "signet"
+    logs = root / "logs"
+    cache = root / "cache"
+    logs.mkdir(parents=True, mode=0o700)
+    cache.mkdir(mode=0o700)
+    active = logs / "workers.log"
+    active.write_bytes(b"a" * 80)
+    active.chmod(0o600)
+    maintenance = StorageMaintenance(
+        root,
+        log_file_bytes=32,
+        logs_hard_bytes=96,
+        cache_hard_bytes=64,
+    )
+
+    with active.open("ab", buffering=0) as writer:
+        assert maintenance.run_once()["rotated_logs"] == 1
+        writer.write(b"b" * 32)
+        for _attempt in range(2):
+            with pytest.raises(StoragePolicyError, match="logs exceed"):
+                maintenance.run_once()
+            assert active.read_bytes() == b""
+            assert (logs / "workers.log.1").read_bytes() == b"a" * 80 + b"b" * 32
+
+    (logs / "workers.log.1").unlink()
+    recovered = maintenance.run_once()
+    assert recovered["logs_bytes"] == 0
+    assert recovered["rotated_logs"] == 0
+
+
 def test_storage_maintenance_prunes_oldest_owned_cache_files(tmp_path: Path) -> None:
     root = tmp_path / "signet"
     logs = root / "logs"

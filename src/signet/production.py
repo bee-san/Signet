@@ -116,7 +116,7 @@ from signet.staging import (
     read_verified_descriptor,
 )
 from signet.state_machine import ApprovalStateMachine
-from signet.storage_lifecycle import StorageMaintenance
+from signet.storage_lifecycle import StorageMaintenance, StoragePolicyError
 from signet.totp import SQLiteTotpCredentialRepository, TotpVerifier
 from signet.totp_enrollment import TotpEnrollmentService
 from signet.web import CsrfManager, WebSettings, create_web_app
@@ -351,6 +351,8 @@ class ProductionWorkers:
         stop: asyncio.Event | None = None,
     ) -> None:
         selected_now = self._maintenance_time(now)
+        storage_checked = False
+        storage_blocked = False
         try:
             await self._policy_promotions.publish_pending(now=selected_now)
             await _run_sync(self._approvals.sweep_expired, now=selected_now, limit=100)
@@ -391,7 +393,15 @@ class ProductionWorkers:
                     limit=100,
                 )
             if self._storage_maintenance is not None and (stop is None or not stop.is_set()):
-                await _run_sync(self._storage_maintenance)
+                storage_checked = True
+                try:
+                    await _run_sync(self._storage_maintenance)
+                except StoragePolicyError:
+                    storage_blocked = True
+                    self._state.record_storage_state(
+                        ready=False,
+                        now=self._maintenance_time(now),
+                    )
             if self._notifications is not None and (stop is None or not stop.is_set()):
                 if self._notification_outbox is None:
                     raise AssertionError("notification worker is missing its outbox")
@@ -414,6 +424,11 @@ class ProductionWorkers:
             if self._running:
                 self._record_worker_state("blocked", ready=False, now=selected_now)
             raise
+        if storage_checked and not storage_blocked:
+            self._state.record_storage_state(
+                ready=True,
+                now=completed_now,
+            )
         if self._running:
             self._healthy = True
             self._record_worker_state("ready", ready=True, now=completed_now)
@@ -1144,6 +1159,7 @@ def build_production_runtime(
         heartbeat_age = now() - maintenance.updated_at
         return (
             maintenance.state == "ready"
+            and "storage_ready" not in status.missing_prerequisites
             and "workers_ready" not in status.missing_prerequisites
             and (provider_sessions is None or provider_sessions.active)
             and 0 <= heartbeat_age <= workers.heartbeat_lease_seconds
