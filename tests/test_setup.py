@@ -6435,13 +6435,7 @@ def test_real_purge_holds_the_database_write_fence_through_deletion(
         path = profile_directory / name
         path.write_bytes(content)
         path.chmod(0o600)
-    selected = SetupSpec(
-        root=tmp_path / "fenced-purge",
-        public_origin="https://signet.tailnet.example",
-        owner_user_id="user:owner",
-        hermes_profiles=("personal",),
-        executable=Path("/bin/echo"),
-    )
+    selected = spec(tmp_path / "fenced-purge", profiles=("personal",))
 
     rollback_errors: list[tuple[str, str]] = []
 
@@ -6551,13 +6545,7 @@ def test_real_platform_builds_a_provider_disabled_production_assembly(
             del spec
             assert getattr(self, "services_active", True)
 
-    selected = SetupSpec(
-        root=tmp_path / "owned-root",
-        public_origin="https://signet.tailnet.example",
-        owner_user_id="user:owner",
-        hermes_profiles=("personal", "work"),
-        executable=Path("/bin/echo"),
-    )
+    selected = spec(tmp_path / "owned-root")
     output: list[str] = []
     external_calls: list[list[str]] = []
 
