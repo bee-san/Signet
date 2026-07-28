@@ -249,6 +249,8 @@ class ProductionWorkers:
         reconciliation: ReconciliationCoordinator | None = None,
         retention: RetentionManager | None = None,
         notifications: NotificationOutboxWorker | None = None,
+        notification_outbox: SQLiteNotificationOutbox | None = None,
+        notification_user_ids: tuple[str, ...] = (),
         provider_sessions: ProviderSessionPool | None = None,
         storage_maintenance: Callable[[], Mapping[str, Any]] | None = None,
         interval_seconds: float = 5.0,
@@ -267,11 +269,17 @@ class ProductionWorkers:
             delivery is not None or retention is not None or notifications is not None
         ) and database is None:
             raise ValueError("production background workers require the database")
+        if (notifications is None) != (notification_outbox is None) or (
+            notification_user_ids and notification_outbox is None
+        ):
+            raise ValueError("production notification worker dependencies must be complete")
         self._database = database
         self._delivery = delivery
         self._reconciliation = reconciliation
         self._retention = retention
         self._notifications = notifications
+        self._notification_outbox = notification_outbox
+        self._notification_user_ids = notification_user_ids
         self._provider_sessions = provider_sessions
         self._storage_maintenance = storage_maintenance
         self._interval_seconds = interval_seconds
@@ -385,7 +393,21 @@ class ProductionWorkers:
             if self._storage_maintenance is not None and (stop is None or not stop.is_set()):
                 await _run_sync(self._storage_maintenance)
             if self._notifications is not None and (stop is None or not stop.is_set()):
-                await self._notifications.run_due(now=self._maintenance_time(now), limit=32)
+                if self._notification_outbox is None:
+                    raise AssertionError("notification worker is missing its outbox")
+                notification_now = self._maintenance_time(now)
+                for user_id in self._notification_user_ids:
+                    await _run_sync(
+                        self._notification_outbox.schedule_approaching_expiry,
+                        user_id=user_id,
+                        now=notification_now,
+                    )
+                    await _run_sync(
+                        self._notification_outbox.schedule_daily_digest,
+                        user_id=user_id,
+                        now=notification_now,
+                    )
+                await self._notifications.run_due(now=notification_now, limit=32)
             completed_now = self._maintenance_time(now)
         except BaseException:
             self._healthy = False
@@ -1090,8 +1112,9 @@ def build_production_runtime(
         if (storage_root / "logs").is_dir() and (storage_root / "cache").is_dir()
         else None
     )
+    notification_outbox = SQLiteNotificationOutbox(database)
     notification_worker = NotificationOutboxWorker(
-        SQLiteNotificationOutbox(database),
+        notification_outbox,
         NotificationDispatcher(SQLitePushRepository(database), ProductionDisabledPushTransport()),
         worker_id="production:notifications",
     )
@@ -1105,6 +1128,8 @@ def build_production_runtime(
         reconciliation=reconciliation,
         retention=retention,
         notifications=notification_worker,
+        notification_outbox=notification_outbox,
+        notification_user_ids=tuple(human_roles),
         provider_sessions=provider_sessions,
         storage_maintenance=storage_maintenance,
     )

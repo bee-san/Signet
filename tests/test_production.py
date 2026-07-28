@@ -2124,12 +2124,25 @@ async def test_production_maintenance_worker_has_explicit_lifecycle(
     config = ProductionConfig.model_validate(_production_payload(tmp_path))
     assembly = build_production_runtime(config, secret_store=_secret_store(), clock=lambda: 123)
     notification_runs: list[tuple[int, int]] = []
+    expiry_schedules: list[tuple[str, int]] = []
+    digest_schedules: list[tuple[str, int]] = []
 
     async def run_notifications(*, now: int, limit: int) -> None:
         notification_runs.append((now, limit))
 
     assert assembly.workers._notifications is not None
+    assert assembly.workers._notification_outbox is not None
     monkeypatch.setattr(assembly.workers._notifications, "run_due", run_notifications)
+    monkeypatch.setattr(
+        assembly.workers._notification_outbox,
+        "schedule_approaching_expiry",
+        lambda *, user_id, now: expiry_schedules.append((user_id, now)),
+    )
+    monkeypatch.setattr(
+        assembly.workers._notification_outbox,
+        "schedule_daily_digest",
+        lambda *, user_id, now: digest_schedules.append((user_id, now)),
+    )
 
     await assembly.workers.run_once(now=124)
     stop = asyncio.Event()
@@ -2138,6 +2151,8 @@ async def test_production_maintenance_worker_has_explicit_lifecycle(
 
     assert assembly.workers.running is False
     assert assembly.workers.healthy is False
+    assert expiry_schedules == [(config.owner_user_id, 124)]
+    assert digest_schedules == [(config.owner_user_id, 124)]
     assert notification_runs == [(124, 32)]
     services = assembly.status().services
     assert services["notifications"].state == "stopped"
