@@ -299,8 +299,8 @@ class SQLiteNotificationOutbox:
         previous_user_prefix = f"approaching_expiry:{hashlib.sha256(user_id.encode()).hexdigest()}:"
         cursor_expires_at = now
         cursor_request_id = ""
-        with self.database.transaction() as connection:
-            while inserted < limit:
+        while inserted < limit:
+            with self.database.transaction() as connection:
                 rows = connection.execute(
                     """
                     SELECT request.request_id, request.downstream_alias,
@@ -344,8 +344,6 @@ class SQLiteNotificationOutbox:
                         _EXPIRY_SCAN_PAGE_SIZE,
                     ),
                 ).fetchall()
-                if not rows:
-                    break
                 for row in rows:
                     inserted += int(
                         enqueue_notification(
@@ -367,8 +365,12 @@ class SQLiteNotificationOutbox:
                     )
                     if inserted >= limit:
                         break
-                cursor_expires_at = int(rows[-1]["expires_at"])
-                cursor_request_id = str(rows[-1]["request_id"])
+            if not rows:
+                break
+            cursor_expires_at = int(rows[-1]["expires_at"])
+            cursor_request_id = str(rows[-1]["request_id"])
+            if len(rows) < _EXPIRY_SCAN_PAGE_SIZE:
+                break
         return inserted
 
     def schedule_daily_digest(self, *, user_id: str, now: int) -> bool:

@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from collections.abc import Mapping
+import sqlite3
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -601,6 +603,17 @@ def test_expiry_scheduler_excludes_existing_v2_rows_before_bounded_pagination(
     for index in range(257):
         machine.enqueue(_request(f"req_Existing{index:03d}", expires_at=NOW + 30))
     outbox = SQLiteNotificationOutbox(database)
+    transaction_count = 0
+    original_transaction = database.transaction
+
+    @contextmanager
+    def counting_transaction() -> Iterator[sqlite3.Connection]:
+        nonlocal transaction_count
+        transaction_count += 1
+        with original_transaction() as connection:
+            yield connection
+
+    monkeypatch.setattr(database, "transaction", counting_transaction)
     assert (
         outbox.schedule_approaching_expiry(
             user_id="user:owner",
@@ -609,6 +622,18 @@ def test_expiry_scheduler_excludes_existing_v2_rows_before_bounded_pagination(
             limit=1_000,
         )
         == 257
+    )
+    assert transaction_count == 2
+
+    machine.enqueue(_request("req_ZLater", expires_at=NOW + 30))
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id="user:owner",
+            now=NOW,
+            horizon_seconds=60,
+            limit=1,
+        )
+        == 1
     )
 
     def unexpected_enqueue(*_args: Any, **_kwargs: Any) -> bool:
