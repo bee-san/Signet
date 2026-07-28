@@ -60,9 +60,7 @@ def test_wheel_policy_rejects_unsupported_platforms() -> None:
     assert supported_wheel_tag("darwin", "arm64", "macosx-14.0-arm64") == (
         "py3-none-macosx_11_0_arm64"
     )
-    assert supported_wheel_tag("linux", "x86_64", "linux-x86_64") == (
-        "py3-none-linux_x86_64"
-    )
+    assert supported_wheel_tag("linux", "x86_64", "linux-x86_64") == ("py3-none-linux_x86_64")
     assert supported_wheel_tag("linux", "aarch64", "linux-aarch64") == "py3-none-linux_aarch64"
     with pytest.raises(RuntimeError, match="unsupported release platform"):
         supported_wheel_tag("darwin", "x86_64", "macosx-10.9-x86_64")
@@ -136,7 +134,11 @@ def test_release_gate_rejects_archive_traversal_and_incomplete_sbom(tmp_path: Pa
                 "version": "0.1.0",
                 "requires_dist": ["alpha==1.0", "bravo==2.0"],
             },
-            {"name": "alpha", "version": "1.0", "requires_dist": ["bravo==2.0"]},
+            {
+                "name": "alpha",
+                "version": "1.0",
+                "requires_dist": ["bravo==2.0; extra == 'optional'"],
+            },
             {"name": "bravo", "version": "2.0", "requires_dist": []},
         ],
     }
@@ -333,9 +335,7 @@ def test_built_artifacts_contain_production_assets_and_metadata(tmp_path: Path) 
         assert any(name.endswith("/share/man/man1/signet.1") for name in names)
         assert "Name: signet-gateway\n" in metadata
         assert "Version: 0.1.0\n" in metadata
-        assert SpecifierSet(parsed_metadata["Requires-Python"]) == SpecifierSet(
-            ">=3.12,<3.13"
-        )
+        assert SpecifierSet(parsed_metadata["Requires-Python"]) == SpecifierSet(">=3.12,<3.13")
         assert "License-Expression: MIT\n" in metadata
 
     with tarfile.open(sdist, "r:gz") as archive:
@@ -374,7 +374,7 @@ def test_release_workflow_is_exact_source_fail_closed_and_pinned() -> None:
         "scripts/release_gate.py verify-ref",
         "git merge-base --is-ancestor",
         "gh api --method GET",
-        "head_sha=\"$GITHUB_SHA\"",
+        'head_sha="$GITHUB_SHA"',
         "ubuntu-24.04-arm",
         "scripts/reproducible_build.py",
         "cyclonedx-py environment",

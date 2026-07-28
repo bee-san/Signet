@@ -151,12 +151,8 @@ def build_reproducibly(
     )
     temporary_parent = os.environ.get("RUNNER_TEMP")
     with (
-        tempfile.TemporaryDirectory(
-            prefix="signet-build-a-", dir=temporary_parent
-        ) as first_raw,
-        tempfile.TemporaryDirectory(
-            prefix="signet-build-b-", dir=temporary_parent
-        ) as second_raw,
+        tempfile.TemporaryDirectory(prefix="signet-build-a-", dir=temporary_parent) as first_raw,
+        tempfile.TemporaryDirectory(prefix="signet-build-b-", dir=temporary_parent) as second_raw,
     ):
         first = Path(first_raw)
         second = Path(second_raw)
@@ -188,9 +184,7 @@ def build_reproducibly(
             first_digest != second_digest
             or first_artifact.read_bytes() != second_artifact.read_bytes()
         ):
-            raise ReproducibleBuildError(
-                "distribution rebuild was not byte-for-byte reproducible"
-            )
+            raise ReproducibleBuildError("distribution rebuild was not byte-for-byte reproducible")
 
         output_directory.mkdir(parents=True, exist_ok=True)
         destination = output_directory / first_artifact.name
@@ -198,9 +192,7 @@ def build_reproducibly(
             raise ReproducibleBuildError("refusing to replace existing release output")
         shutil.copyfile(first_artifact, destination)
 
-    uv_output = _run(
-        [uv_executable, "--version"], cwd=repository, environment=environment
-    )
+    uv_output = _run([uv_executable, "--version"], cwd=repository, environment=environment)
     uv_match = re.match(r"^uv (\d+\.\d+\.\d+)(?:\s|$)", uv_output)
     if uv_match is None or uv_match.group(1) != "0.11.28":
         raise ReproducibleBuildError(f"release build requires uv 0.11.28; found {uv_output}")

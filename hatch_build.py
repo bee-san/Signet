@@ -30,9 +30,7 @@ def supported_wheel_tag(system: str, machine: str, sysconfig_platform: str) -> s
         else observed == platform_tag
     )
     if not valid_observed:
-        raise RuntimeError(
-            f"unsupported release platform tag {observed}; expected {platform_tag}"
-        )
+        raise RuntimeError(f"unsupported release platform tag {observed}; expected {platform_tag}")
     return f"py3-none-{platform_tag}"
 
 

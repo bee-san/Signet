@@ -240,9 +240,7 @@ def _assert_metadata(raw: bytes, *, project: Mapping[str, Any]) -> None:
     for key, value in expected.items():
         if metadata.get(key) != value:
             raise ReleaseGateError(f"distribution metadata {key} does not match {value}")
-    if SpecifierSet(str(metadata.get("Requires-Python", ""))) != SpecifierSet(
-        EXPECTED_PYTHON
-    ):
+    if SpecifierSet(str(metadata.get("Requires-Python", ""))) != SpecifierSet(EXPECTED_PYTHON):
         raise ReleaseGateError("distribution metadata Requires-Python does not match policy")
     if _metadata_requirements(raw) != _expected_requirements(project):
         raise ReleaseGateError("wheel dependency metadata does not match the reviewed closure")
@@ -448,18 +446,15 @@ def _runtime_dependency_graph(
     environment_value = manifest.get("marker_environment")
     packages_value = manifest.get("packages")
     if not isinstance(environment_value, dict) or not all(
-        isinstance(key, str) and isinstance(value, str)
-        for key, value in environment_value.items()
+        isinstance(key, str) and isinstance(value, str) for key, value in environment_value.items()
     ):
         raise ReleaseGateError("runtime manifest marker environment is malformed")
     environment = dict(environment_value)
     if (
         environment.get("python_full_version") != "3.12.13"
         or environment.get("python_version") != "3.12"
-        or environment.get("sys_platform") != "linux"
-        or environment.get("platform_machine") not in {"x86_64", "amd64"}
     ):
-        raise ReleaseGateError("runtime manifest was not produced on reviewed Linux x86_64")
+        raise ReleaseGateError("runtime manifest environment is outside release policy")
     if not isinstance(packages_value, list):
         raise ReleaseGateError("runtime manifest package inventory is absent")
 
@@ -507,13 +502,17 @@ def _runtime_dependency_graph(
         for parent, requirements in package_requirements.items():
             marker_extras = {"", *active_extras[parent]}
             for requirement in requirements:
+                target = canonicalize_name(requirement.name)
+                # cyclonedx-py records every declared edge whose target is installed,
+                # including optional edges satisfied elsewhere in the locked closure.
+                if target in expected_versions:
+                    graph[parent].add(target)
                 applies = requirement.marker is None or any(
                     requirement.marker.evaluate({**environment, "extra": extra})
                     for extra in marker_extras
                 )
                 if not applies:
                     continue
-                target = canonicalize_name(requirement.name)
                 if target not in expected_versions:
                     raise ReleaseGateError(
                         f"runtime manifest dependency is outside reviewed closure: {target}"
@@ -524,7 +523,6 @@ def _runtime_dependency_graph(
                     raise ReleaseGateError(
                         f"runtime manifest dependency constraint excludes {target}"
                     )
-                graph[parent].add(target)
                 new_extras = set(requirement.extras) - active_extras[target]
                 if new_extras:
                     active_extras[target].update(new_extras)
@@ -558,9 +556,7 @@ def _verify_sbom(
         or not isinstance(components, list)
     ):
         raise ReleaseGateError("runtime SBOM dependency graph is absent")
-    expected_versions, expected_graph = _runtime_dependency_graph(
-        runtime_manifest, project=project
-    )
+    expected_versions, expected_graph = _runtime_dependency_graph(runtime_manifest, project=project)
     expected_versions.pop(canonicalize_name(EXPECTED_DISTRIBUTION))
     components_by_name: dict[str, Mapping[str, Any]] = {}
     component_refs: set[str] = set()
@@ -588,8 +584,10 @@ def _verify_sbom(
             raise ReleaseGateError("runtime SBOM dependency edge is malformed")
         reference = item["ref"]
         depends_on = item.get("dependsOn", [])
-        if reference in edges or not isinstance(depends_on, list) or not all(
-            isinstance(dependency, str) for dependency in depends_on
+        if (
+            reference in edges
+            or not isinstance(depends_on, list)
+            or not all(isinstance(dependency, str) for dependency in depends_on)
         ):
             raise ReleaseGateError("runtime SBOM dependency edge is missing or duplicated")
         edges[reference] = set(depends_on)
@@ -604,9 +602,7 @@ def _verify_sbom(
     for parent, children in expected_graph.items():
         expected_children = {references_by_name[child] for child in children}
         if edges[references_by_name[parent]] != expected_children:
-            raise ReleaseGateError(
-                f"runtime SBOM dependency graph differs for package: {parent}"
-            )
+            raise ReleaseGateError(f"runtime SBOM dependency graph differs for package: {parent}")
 
 
 def _verify_licenses(path: Path, *, project: Mapping[str, Any]) -> None:
@@ -626,9 +622,7 @@ def _verify_licenses(path: Path, *, project: Mapping[str, Any]) -> None:
         if name in reported:
             raise ReleaseGateError(f"duplicate license report entry for {name}")
         reported[name] = version
-    expected: dict[str, str] = {
-        canonicalize_name(EXPECTED_DISTRIBUTION): str(project["version"])
-    }
+    expected: dict[str, str] = {canonicalize_name(EXPECTED_DISTRIBUTION): str(project["version"])}
     expected.update(
         {
             name: _exact_requirement_version(requirement)
@@ -651,9 +645,7 @@ def _unsigned_artifacts(directory: Path) -> set[Path]:
         and (
             path.suffix == ".whl"
             or path.name.endswith(".tar.gz")
-            or path.name.endswith(
-                (".build.json", ".cdx.json", ".licenses.json", ".runtime.json")
-            )
+            or path.name.endswith((".build.json", ".cdx.json", ".licenses.json", ".runtime.json"))
         )
     }
 
@@ -661,9 +653,7 @@ def _unsigned_artifacts(directory: Path) -> set[Path]:
 def _verify_directory_members(directory: Path, *, require_signatures: bool) -> None:
     unsigned = _unsigned_artifacts(directory)
     checksum = directory / "SHA256SUMS"
-    signatures = {
-        path for path in directory.iterdir() if path.name.endswith(".sigstore.json")
-    }
+    signatures = {path for path in directory.iterdir() if path.name.endswith(".sigstore.json")}
     allowed = unsigned | signatures
     if checksum.exists():
         allowed.add(checksum)
@@ -746,6 +736,12 @@ def verify_artifacts(
             raise ReleaseGateError("runtime manifest root is not an object")
         if manifest_value.get("source_sha") != source_sha:
             raise ReleaseGateError("runtime manifest source SHA does not match")
+        environment = manifest_value.get("marker_environment")
+        if not isinstance(environment, dict) or (
+            environment.get("sys_platform") != "linux"
+            or environment.get("platform_machine") not in {"x86_64", "amd64"}
+        ):
+            raise ReleaseGateError("release SBOM must describe the Linux x86_64 runtime")
         runtime_manifest = manifest_value
     for sbom in sboms:
         if runtime_manifest is None:
