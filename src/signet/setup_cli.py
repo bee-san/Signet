@@ -18,13 +18,16 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO, cast
 
+from signet.canonical import canonical_json
 from signet.lifecycle import lifecycle_recovery_directory, setup_lifecycle_lock
 from signet.provider_setup import ProviderSetupOperations
 from signet.setup_operations import SetupOperations
 from signet.setup_platform import (
     ProductionSetupPlatform,
     render_launchd_services,
+    render_setup_configuration_files,
     render_systemd_services,
+    setup_configuration_targets,
 )
 from signet.setup_state import (
     ExecutableIdentity,
@@ -61,6 +64,8 @@ _SETUP_COMMANDS = frozenset(
         "production",
     }
 )
+_SETUP_PLAN_ID_PLACEHOLDER = "{reviewed-setup-plan-id}"
+_SETUP_ID_PLACEHOLDER = "{reviewed-setup-id}"
 
 
 def add_setup_parsers(subcommands: Any) -> None:
@@ -357,7 +362,7 @@ def run_setup_command(
         if args.apply is not None:
             if re.fullmatch(r"[0-9a-f]{64}", args.apply) is None:
                 raise SetupError("setup plan ID must be a lowercase SHA-256 digest")
-            if not hmac.compare_digest(args.apply, plan.spec.digest):
+            if not hmac.compare_digest(args.apply, _setup_plan_id(plan)):
                 raise SetupError("setup plan no longer matches; print and review a new plan")
             if spec.executable_identity is None:
                 raise SetupError("the installed signet executable must exist before apply")
@@ -467,6 +472,18 @@ def run_setup_command(
 
 
 def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
+    payload = _setup_plan_payload(plan)
+    plan_id = hashlib.sha256(canonical_json(payload)).hexdigest()
+    document = {"plan_id": plan_id, **payload}
+    document["next_commands"] = [_setup_apply_command(plan.spec, plan_id)]
+    return document
+
+
+def _setup_plan_id(plan: SetupPlan) -> str:
+    return hashlib.sha256(canonical_json(_setup_plan_payload(plan))).hexdigest()
+
+
+def _setup_plan_payload(plan: SetupPlan) -> dict[str, Any]:
     spec = plan.spec
     automatic_steps = [step.name for step in plan.steps if step.name != "owner_bootstrap"]
     executable: dict[str, int | str] = {"path": str(spec.executable)}
@@ -474,8 +491,12 @@ def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
         executable.update(spec.executable_identity.document())
     launchd = render_launchd_services(spec, active=True)
     systemd = render_systemd_services(spec, active=True)
+    config_path, policy_path = setup_configuration_targets(spec)
+    configuration = render_setup_configuration_files(
+        spec,
+        setup_id=_SETUP_ID_PLACEHOLDER,
+    )
     return {
-        "plan_id": spec.digest,
         "setup_spec_digest": spec.digest,
         "root": str(spec.root),
         "owner_setup_url": f"{spec.public_origin}/setup",
@@ -495,9 +516,16 @@ def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
             "staging_hard_bytes": STAGING_HARD_BYTES,
         },
         "configuration_files": [
-            str(spec.root / "production.json"),
-            str(spec.root / "policy.yaml"),
+            str(config_path),
+            str(policy_path),
         ],
+        "configuration_effects": {
+            str(path): {
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "setup_id_normalized": path == config_path,
+            }
+            for path, content in configuration.items()
+        },
         "service_effects": {
             "launchd": {
                 name: {"sha256": hashlib.sha256(content).hexdigest()}
@@ -522,13 +550,13 @@ def _setup_plan_document(plan: SetupPlan) -> dict[str, Any]:
             "command": shlex.join(("signet", "setup", "--rollback", "--root", str(spec.root))),
             "preserves": ["verified_backups"],
         },
-        "next_commands": [_setup_apply_command(spec)],
+        "next_commands": [_setup_apply_command(spec, _SETUP_PLAN_ID_PLACEHOLDER)],
         "browser_will_open": spec.open_browser,
         "gateway_restart": False,
     }
 
 
-def _setup_apply_command(spec: SetupSpec) -> str:
+def _setup_apply_command(spec: SetupSpec, plan_id: str) -> str:
     command = [
         "signet",
         "setup",
@@ -550,7 +578,7 @@ def _setup_apply_command(spec: SetupSpec) -> str:
         command.extend(("--backup-root", str(spec.backup_dir)))
     if not spec.open_browser:
         command.append("--no-open-browser")
-    command.extend(("--apply", spec.digest))
+    command.extend(("--apply", plan_id))
     return shlex.join(command)
 
 
