@@ -17,6 +17,7 @@ from signet.notifications import NotificationDispatcher, NotificationKind, PushM
 _SAFE_ERROR_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.\-/]{0,511}$")
 _EXPIRY_SCAN_PAGE_SIZE = 256
+_EXPIRY_DEDUPE_V2_PREFIX = "approaching_expiry:v2:"
 
 
 def _expiry_dedupe_key(user_id: str, request_id: str, version: int) -> str:
@@ -25,7 +26,7 @@ def _expiry_dedupe_key(user_id: str, request_id: str, version: int) -> str:
         encoded = component.encode()
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
-    return f"approaching_expiry:v2:{digest.hexdigest()}"
+    return f"{_EXPIRY_DEDUPE_V2_PREFIX}{digest.hexdigest()}:{version}"
 
 
 class NotificationOutboxError(RuntimeError):
@@ -316,11 +317,16 @@ class SQLiteNotificationOutbox:
                       )
                       AND NOT EXISTS (
                           SELECT 1 FROM notification_outbox AS outbox
-                          WHERE outbox.user_id = ? AND (
+                          WHERE outbox.user_id = ?
+                            AND outbox.kind = 'approaching_expiry'
+                            AND outbox.request_id = request.request_id
+                            AND (
                               outbox.dedupe_key =
                                   ? || request.request_id || ':' || request.current_version
                               OR outbox.dedupe_key =
                                   ? || request.request_id || ':' || request.current_version
+                              OR outbox.dedupe_key LIKE
+                                  ? || '%' || ':' || request.current_version
                           )
                       )
                     ORDER BY request.expires_at, request.request_id LIMIT ?
@@ -334,6 +340,7 @@ class SQLiteNotificationOutbox:
                         user_id,
                         legacy_prefix,
                         previous_user_prefix,
+                        _EXPIRY_DEDUPE_V2_PREFIX,
                         _EXPIRY_SCAN_PAGE_SIZE,
                     ),
                 ).fetchall()
