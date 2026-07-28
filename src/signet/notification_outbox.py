@@ -17,7 +17,7 @@ from signet.notifications import NotificationDispatcher, NotificationKind, PushM
 _SAFE_ERROR_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.\-/]{0,511}$")
 _EXPIRY_SCAN_PAGE_SIZE = 256
-_EXPIRY_DEDUPE_V2_PREFIX = "approaching_expiry:v2:"
+_EXPIRY_DEDUPE_V2_PREFIX = "approaching_expiry_v2:"
 
 
 def _expiry_dedupe_key(user_id: str, request_id: str, version: int) -> str:

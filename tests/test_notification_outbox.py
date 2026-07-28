@@ -541,6 +541,50 @@ def test_expiry_scheduler_disambiguates_overlapping_legacy_namespaces(
     assert request_ids == {legacy_request_id, "req_Other"}
 
 
+def test_expiry_scheduler_v2_namespace_cannot_collide_with_legacy_request_ids(
+    database: Database,
+) -> None:
+    user_id = "user:owner"
+    target_request_id = "req_Target"
+    target_key = notification_outbox_module._expiry_dedupe_key(user_id, target_request_id, 1)
+    digest = target_key.split(":")[-2]
+    legacy_request_id = f"v2:{digest}"
+    legacy_key = f"approaching_expiry:{legacy_request_id}:1"
+    assert target_key != legacy_key
+    machine = ApprovalStateMachine(database)
+    machine.enqueue(_request(legacy_request_id, expires_at=NOW + 30))
+    machine.enqueue(_request(target_request_id, expires_at=NOW + 30))
+    outbox = SQLiteNotificationOutbox(database)
+    outbox.enqueue(
+        dedupe_key=legacy_key,
+        user_id=user_id,
+        message=PushMessage(
+            NotificationKind.APPROACHING_EXPIRY,
+            service="fastmail",
+            action="send_email",
+        ),
+        request_id=legacy_request_id,
+        created_at=NOW,
+    )
+
+    assert (
+        outbox.schedule_approaching_expiry(
+            user_id=user_id,
+            now=NOW,
+            horizon_seconds=60,
+        )
+        == 1
+    )
+    with database.read() as connection:
+        target_rows = int(
+            connection.execute(
+                "SELECT count(*) FROM notification_outbox WHERE request_id = ?",
+                (target_request_id,),
+            ).fetchone()[0]
+        )
+    assert target_rows == 1
+
+
 def test_expiry_scheduler_excludes_existing_v2_rows_before_bounded_pagination(
     database: Database,
     monkeypatch: pytest.MonkeyPatch,
