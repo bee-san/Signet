@@ -1353,7 +1353,7 @@ def test_installed_cli_reports_distribution_version(capsys: pytest.CaptureFixtur
         main(["--version"])
 
     assert exited.value.code == 0
-    assert capsys.readouterr().out == "signet 0.1.0b1\n"
+    assert capsys.readouterr().out == "signet 0.1.0\n"
 
 
 def test_internal_production_service_uses_installed_factory_and_restores_environment(

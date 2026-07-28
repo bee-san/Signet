@@ -15,19 +15,19 @@ modes, immutable payloads are encrypted, approval transitions are persisted in
 SQLite, dispatch is fenced, ambiguous delivery enters bounded reconciliation, and
 the authenticated web app presents the private review queue.
 
-## Public beta
+## Stable 0.1 release
 
-Signet `0.1.0b1` ships a complete packaged setup path and guided provider setup.
+Signet `0.1.0` ships a complete packaged setup path and guided provider setup.
 `signet setup` creates the private installation, services, Hermes entries, and owner
 ceremony. Providers start disabled. A separate `signet provider setup` command then
 stores the credential, discovers schemas, sends one test message, writes the generated
 configuration and policy, and enables the rollout.
 
-Fastmail is supported on Linux x86_64 and macOS arm64. WhatsApp is supported on Linux
-x86_64 through the pinned `wacli 0.12.0` release; it is not available on macOS.
-This is a public beta, so take a backup before upgrading and verify the test message
-before relying on a provider. Read the [packaged setup guide](docs/setup.md) for the
-full flow.
+Fastmail is supported on Linux x86_64, Linux arm64, and macOS arm64. WhatsApp is
+supported on Linux x86_64 through the pinned `wacli 0.12.0` release; it is not
+available on Linux arm64 or macOS. Take a verified backup before upgrading and verify
+the test message before relying on a provider. Read the
+[packaged setup guide](docs/setup.md) for the full flow.
 
 The files under `deploy/` remain inert review templates. Their placeholders prevent
 installation without review. The older installed `signet deployment` commands provide
@@ -73,7 +73,8 @@ browser sessions, webhooks, or other paths that bypass Signet. See
 
 ## Packaged setup
 
-With Python 3.12 selected for `pipx`, install the beta and run the one-command setup:
+With Python 3.12 selected for `pipx`, install the reviewed release and run the
+one-command setup:
 
 ```console
 pipx install signet-gateway
@@ -113,12 +114,16 @@ remain `signet`. The complete supported-platform runtime dependency closure and
 build backend closure are pinned to the reviewed versions. The supported platforms
 are Linux and macOS; the CLI fails closed elsewhere.
 
-Version tags matching the project version wait for successful main-branch CI on the
-exact tagged commit, then trigger native Linux x86_64 and macOS arm64 wheel builds
-plus a source distribution. The release workflow emits a reproducible CycloneDX
-runtime SBOM and checksums, signs the artifacts with Sigstore OIDC, records GitHub
-provenance and SBOM attestations, and publishes only after those steps succeed.
-Release actions and release tooling are commit- or lock-pinned.
+Stable version tags matching the project version must point to reviewed `main`
+history with successful exact-commit CI, then trigger reproducible native Linux
+x86_64, Linux arm64, and macOS arm64 wheel builds plus a source distribution. The
+release workflow inspects the exact package and dependency closure, emits CycloneDX
+runtime SBOM, license, build-evidence, and checksum artifacts, verifies Sigstore OIDC
+signatures and GitHub provenance/SBOM attestations, and reaches PyPI trusted
+publishing only through a protected environment. Release actions and tooling are
+commit- or lock-pinned. Maintainers must follow the
+[release procedure](docs/releasing.md); its dry run never publishes or consumes a
+package-index version.
 
 Signet requires Python 3.12 and exact `uv` version `0.11.28`. Install that version
 with `pipx install 'uv==0.11.28'` or the official versioned
