@@ -562,7 +562,7 @@ def test_setup_resume_restores_selected_policy_mode(tmp_path: Path) -> None:
             "--policy-mode",
             "approval_with_edit",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
@@ -588,7 +588,7 @@ def test_setup_resume_merges_explicit_policy_with_persisted_spec(tmp_path: Path)
             "--policy-mode",
             "approval",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
@@ -622,7 +622,7 @@ def test_setup_resume_treats_pre_policy_journal_as_deny(tmp_path: Path) -> None:
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
@@ -665,7 +665,7 @@ def test_setup_resume_accepts_pre_storage_root_journal(tmp_path: Path) -> None:
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
@@ -712,7 +712,7 @@ def test_setup_apply_is_resumable_and_prints_reload_instruction(tmp_path: Path) 
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     output: list[str] = []
@@ -743,7 +743,7 @@ def test_setup_rollback_routes_database_removal_through_verified_purge(
             "--profile",
             "work",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(apply_args, output=lambda _: None, platform=platform) == 0
@@ -916,7 +916,7 @@ def test_setup_apply_requires_confirmation_without_yes(tmp_path: Path) -> None:
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
 
@@ -941,7 +941,7 @@ def test_setup_apply_prints_review_boundaries_before_confirmation(tmp_path: Path
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     events: list[tuple[str, str]] = []
@@ -991,7 +991,7 @@ def test_authenticator_management_prints_exact_url_before_browser_open(tmp_path:
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
         ]
     )
     assert run_setup_command(setup_args, output=lambda _: None, platform=platform) == 0
@@ -1055,7 +1055,7 @@ def test_setup_failure_uses_stable_exit_code_and_actionable_redacted_recovery(
                 "--profile",
                 "personal",
                 "--executable",
-                "/opt/signet/bin/signet",
+                str(_installed_test_executable(tmp_path)),
             ]
         )
 
@@ -1217,7 +1217,7 @@ def test_completed_setup_rollback_creates_backup_first(tmp_path: Path) -> None:
             "--profile",
             "personal",
             "--executable",
-            "/opt/signet/bin/signet",
+            str(_installed_test_executable(tmp_path)),
             "--yes",
         ]
     )
