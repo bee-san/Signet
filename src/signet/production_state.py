@@ -115,54 +115,95 @@ class ProductionStateStore:
                     rollout_state=opposite_rollout,
                 )
                 attachment_inventory_predecessors = {
-                    _legacy_production_config_digest(config),
-                    _rollout_preparation_base_digest(config),
+                    digest
+                    for without_instance_root in (False, True)
+                    for digest in (
+                        _legacy_production_config_digest(
+                            config,
+                            without_instance_root=without_instance_root,
+                        ),
+                        _rollout_preparation_base_digest(
+                            config,
+                            without_instance_root=without_instance_root,
+                        ),
+                    )
                 }
                 compatible_digests = {
                     transition_digest,
-                    _pre_caller_user_binding_production_config_digest(config),
-                    _pre_caller_user_binding_production_config_digest(
-                        config,
-                        rollout_state=opposite_rollout,
-                    ),
-                    _pre_identity_hardening_production_config_digest(config),
-                    _pre_identity_hardening_production_config_digest(
+                    _pre_instance_root_production_config_digest(config),
+                    _pre_instance_root_production_config_digest(
                         config,
                         rollout_state=opposite_rollout,
                     ),
                     *attachment_inventory_predecessors,
                 }
-                if not config.caller_principals:
-                    callerless_attachment_predecessors = {
-                        _legacy_production_config_digest(
-                            config,
-                            without_caller_principals=True,
-                        ),
-                        _rollout_preparation_base_digest(
-                            config,
-                            without_caller_principals=True,
-                        ),
-                    }
-                    attachment_inventory_predecessors.update(callerless_attachment_predecessors)
+                for without_instance_root in (False, True):
                     compatible_digests.update(
                         {
-                            _pre_caller_principals_production_config_digest(config),
-                            _pre_caller_principals_production_config_digest(
+                            _pre_caller_user_binding_production_config_digest(
                                 config,
+                                without_instance_root=without_instance_root,
+                            ),
+                            _pre_caller_user_binding_production_config_digest(
+                                config,
+                                without_instance_root=without_instance_root,
                                 rollout_state=opposite_rollout,
                             ),
                             _pre_identity_hardening_production_config_digest(
                                 config,
-                                without_caller_principals=True,
+                                without_instance_root=without_instance_root,
                             ),
                             _pre_identity_hardening_production_config_digest(
                                 config,
-                                without_caller_principals=True,
+                                without_instance_root=without_instance_root,
                                 rollout_state=opposite_rollout,
                             ),
-                            *callerless_attachment_predecessors,
                         }
                     )
+                if not config.caller_principals:
+                    callerless_attachment_predecessors = {
+                        digest
+                        for without_instance_root in (False, True)
+                        for digest in (
+                            _legacy_production_config_digest(
+                                config,
+                                without_caller_principals=True,
+                                without_instance_root=without_instance_root,
+                            ),
+                            _rollout_preparation_base_digest(
+                                config,
+                                without_caller_principals=True,
+                                without_instance_root=without_instance_root,
+                            ),
+                        )
+                    }
+                    attachment_inventory_predecessors.update(callerless_attachment_predecessors)
+                    for without_instance_root in (False, True):
+                        compatible_digests.update(
+                            {
+                                _pre_caller_principals_production_config_digest(
+                                    config,
+                                    without_instance_root=without_instance_root,
+                                ),
+                                _pre_caller_principals_production_config_digest(
+                                    config,
+                                    without_instance_root=without_instance_root,
+                                    rollout_state=opposite_rollout,
+                                ),
+                                _pre_identity_hardening_production_config_digest(
+                                    config,
+                                    without_caller_principals=True,
+                                    without_instance_root=without_instance_root,
+                                ),
+                                _pre_identity_hardening_production_config_digest(
+                                    config,
+                                    without_caller_principals=True,
+                                    without_instance_root=without_instance_root,
+                                    rollout_state=opposite_rollout,
+                                ),
+                            }
+                        )
+                    compatible_digests.update(callerless_attachment_predecessors)
                 if setup["config_digest"] not in compatible_digests:
                     raise ProductionStateError(
                         "staged production config differs from durable state"
@@ -1054,6 +1095,21 @@ def production_config_digest(
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
 
+def _pre_instance_root_production_config_digest(
+    config: ProductionConfig,
+    *,
+    rollout_state: Literal["disabled", "enabled"] | None = None,
+) -> str:
+    """Reconstruct a config digest emitted before instance-root binding."""
+
+    document = config.model_dump(mode="json")
+    document.pop("instance_root")
+    if rollout_state is not None:
+        document["provider_rollout"]["state"] = rollout_state
+        document["capabilities"]["live_providers_ready"] = rollout_state == "enabled"
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
 def _connector_config_digest(document: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(document)).hexdigest()
 
@@ -1061,11 +1117,14 @@ def _connector_config_digest(document: dict[str, Any]) -> str:
 def _pre_caller_principals_production_config_digest(
     config: ProductionConfig,
     *,
+    without_instance_root: bool = False,
     rollout_state: Literal["disabled", "enabled"] | None = None,
 ) -> str:
     """Reconstruct the digest emitted before caller authorization joined the config."""
 
     document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
     document.pop("caller_principals")
     if rollout_state is not None:
         document["provider_rollout"]["state"] = rollout_state
@@ -1076,11 +1135,14 @@ def _pre_caller_principals_production_config_digest(
 def _pre_caller_user_binding_production_config_digest(
     config: ProductionConfig,
     *,
+    without_instance_root: bool = False,
     rollout_state: Literal["disabled", "enabled"] | None = None,
 ) -> str:
     """Reconstruct the digest emitted before callers recorded their human user."""
 
     document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
     for principal in document["caller_principals"]:
         principal.pop("user_id", None)
     if rollout_state is not None:
@@ -1093,11 +1155,14 @@ def _pre_identity_hardening_production_config_digest(
     config: ProductionConfig,
     *,
     without_caller_principals: bool = False,
+    without_instance_root: bool = False,
     rollout_state: Literal["disabled", "enabled"] | None = None,
 ) -> str:
     """Reconstruct the immediately preceding provider-config document shape."""
 
     document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
     if without_caller_principals:
         document.pop("caller_principals")
     if rollout_state is not None:
@@ -1123,10 +1188,13 @@ def _legacy_production_config_digest(
     config: ProductionConfig,
     *,
     without_caller_principals: bool = False,
+    without_instance_root: bool = False,
 ) -> str:
     """Reconstruct the pre-SP17 digest while allowing only new rollout fields to change."""
 
     document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
     if without_caller_principals:
         document.pop("caller_principals")
     document["storage"].pop("attachment_staging_dir", None)
@@ -1153,10 +1221,13 @@ def _rollout_preparation_base_digest(
     config: ProductionConfig,
     *,
     without_caller_principals: bool = False,
+    without_instance_root: bool = False,
 ) -> str:
     """Reconstruct the disabled digest emitted before rollout prerequisites were staged."""
 
     document = config.model_dump(mode="json")
+    if without_instance_root:
+        document.pop("instance_root")
     if without_caller_principals:
         document.pop("caller_principals")
     document["storage"]["attachment_staging_dir"] = None

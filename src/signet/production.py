@@ -1319,9 +1319,7 @@ def _production_human_roles(database: Database, owner_user_id: str) -> dict[str,
     users: dict[str, str] = {}
     with database.read() as connection:
         setup_exists = (
-            connection.execute(
-                "SELECT 1 FROM production_setup_state WHERE state_id = 1"
-            ).fetchone()
+            connection.execute("SELECT 1 FROM production_setup_state WHERE state_id = 1").fetchone()
             is not None
         )
         columns = {

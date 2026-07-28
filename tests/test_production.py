@@ -1972,6 +1972,7 @@ def test_production_config_digest_composes_rollout_and_identity_predecessors(
         components=frozenset(),
     )
     predecessor = config.model_dump(mode="json")
+    predecessor.pop("instance_root")
     predecessor["provider_rollout"]["state"] = "enabled"
     predecessor["capabilities"]["live_providers_ready"] = True
     for connector in predecessor["connectors"].values():
