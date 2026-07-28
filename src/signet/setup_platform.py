@@ -333,6 +333,24 @@ def _require_packaged_runtime(
         raise SetupError(
             "the installed Signet executable is unavailable, unsafe, or has a symlinked ancestor"
         )
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    child_metadata = metadata
+    for ancestor in executable.parents:
+        try:
+            ancestor_metadata = ancestor.stat()
+        except OSError as exc:
+            raise SetupError("the installed Signet executable has unsafe ancestry") from exc
+        ancestor_mode = stat.S_IMODE(ancestor_metadata.st_mode)
+        if (
+            not stat.S_ISDIR(ancestor_metadata.st_mode)
+            or ancestor_metadata.st_uid not in {0, current_uid}
+            or (
+                ancestor_mode & 0o022
+                and not (ancestor_mode & stat.S_ISVTX and child_metadata.st_uid == current_uid)
+            )
+        ):
+            raise SetupError("the installed Signet executable has unsafe ancestry")
+        child_metadata = ancestor_metadata
     if expected_identity is not None:
         try:
             digest = hashlib.sha256(executable.read_bytes()).hexdigest()
