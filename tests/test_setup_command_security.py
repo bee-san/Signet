@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ def _candidates(
         "_REVIEWED_COMMAND_CANDIDATES",
         {"systemctl": tuple(paths)},
     )
+    monkeypatch.setattr(setup_platform, "_REVIEWED_COMMAND_OWNER_UID", os.geteuid())
 
 
 def test_reviewed_command_uses_first_safe_absolute_candidate_not_path(
@@ -197,3 +199,34 @@ def test_reviewed_command_rejects_final_name_replacement_during_review(
 
     with pytest.raises(SetupError, match="unavailable or unsafe"):
         ProductionSetupPlatform._reviewed_command(["systemctl", "--user", "status"])
+
+
+def test_run_command_rejects_a_current_user_owned_executable_before_the_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("requires a non-root test user")
+    target = _executable(tmp_path / "private" / "systemctl")
+    monkeypatch.setattr(
+        setup_platform,
+        "_REVIEWED_COMMAND_CANDIDATES",
+        {"systemctl": (target,)},
+    )
+    called = False
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal called
+        del command, kwargs
+        called = True
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    with pytest.raises(SetupError, match="unavailable or unsafe"):
+        ProductionSetupPlatform(command_runner=run)._run_command(
+            ["systemctl", "--user", "status"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    assert called is False

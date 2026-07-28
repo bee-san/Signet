@@ -2242,8 +2242,17 @@ async def test_storage_block_does_not_terminate_the_shared_production_worker_cyc
         now=current_time,
     )
     assembly.state.record_worker_state("ready", ready=True, now=current_time)
+    assembly.state.record_service_state(
+        "mcp",
+        "ready",
+        capability="mcp_ready",
+        ready=True,
+        now=current_time,
+    )
     assert assembly.web is not None
+    assert assembly.mcp is not None
     health = TestClient(assembly.web, base_url=config.public_origin)
+    mcp_health = TestClient(assembly.mcp.app, base_url="http://127.0.0.1:8789")
 
     current_time += 1
     await assembly.workers.run_once(now=current_time)
@@ -2262,6 +2271,8 @@ async def test_storage_block_does_not_terminate_the_shared_production_worker_cyc
     assert blocked.services["maintenance"].state == "ready"
     assert all(blocked.services[name].state == "ready" for name in enabled_workers)
     assert health.get("/healthz").status_code == 503
+    assert mcp_health.get("/healthz").status_code == 503
+    assert mcp_health.get("/readyz").status_code == 503
 
     current_time += 1
     await assembly.workers.run_once(now=current_time)
@@ -2282,6 +2293,8 @@ async def test_storage_block_does_not_terminate_the_shared_production_worker_cyc
     assert "storage_ready" not in recovered.missing_prerequisites
     assert all(recovered.services[name].state == "ready" for name in enabled_workers)
     assert health.get("/healthz").status_code == 200
+    assert mcp_health.get("/healthz").status_code == 200
+    assert mcp_health.get("/readyz").status_code == 200
 
 
 @pytest.mark.asyncio

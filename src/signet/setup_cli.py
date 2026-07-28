@@ -840,8 +840,9 @@ def _reviewed_executable(path: Path | str) -> tuple[Path, ExecutableIdentity | N
 
 def _discover_tailscale_origin() -> str:
     try:
-        result = subprocess.run(
-            ProductionSetupPlatform._reviewed_command(["tailscale", "status", "--json"]),
+        result = ProductionSetupPlatform._execute_reviewed_command(
+            ["tailscale", "status", "--json"],
+            command_runner=subprocess.run,
             text=True,
             capture_output=True,
             check=False,

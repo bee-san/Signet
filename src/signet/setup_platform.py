@@ -96,6 +96,7 @@ _STORAGE_CACHE_HARD_BYTES = CACHE_HARD_BYTES
 _EXTERNAL_STORAGE_RECEIPT_PREFIX = ".signet-external-storage-"
 ServiceUnitGeneration = Literal["current", "resource_limits_predecessor"]
 _EXTERNAL_STORAGE_MARKER = ".signet-storage-owner.json"
+_REVIEWED_COMMAND_OWNER_UID = 0
 _REVIEWED_COMMAND_CANDIDATES: Mapping[str, tuple[Path, ...]] = {
     "launchctl": (Path("/bin/launchctl"),),
     "systemctl": (Path("/usr/bin/systemctl"), Path("/bin/systemctl")),
@@ -517,6 +518,14 @@ def _require_stable_command_edge(
         raise SetupError("external setup command has unsafe ancestry")
 
 
+def _require_trusted_command_ancestry(selected: Path, *, trusted_uid: int) -> None:
+    child = selected.stat(follow_symlinks=False)
+    for ancestor in selected.parents:
+        parent = ancestor.stat(follow_symlinks=False)
+        _require_stable_command_edge(parent, child, current_uid=trusted_uid)
+        child = parent
+
+
 def _require_reviewed_system_executable(candidate: Path) -> Path:
     selected = Path(candidate)
     try:
@@ -555,14 +564,21 @@ def _require_reviewed_system_executable(candidate: Path) -> Path:
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
-        current_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
-        _require_stable_command_edge(parent, opened, current_uid=current_uid)
+        _require_trusted_command_ancestry(
+            selected,
+            trusted_uid=_REVIEWED_COMMAND_OWNER_UID,
+        )
+        _require_stable_command_edge(
+            parent,
+            opened,
+            current_uid=_REVIEWED_COMMAND_OWNER_UID,
+        )
         opened_identity = _reviewed_command_file_identity(opened)
         if (
             (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
             or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
             or not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid not in {0, current_uid}
+            or opened.st_uid != _REVIEWED_COMMAND_OWNER_UID
             or opened.st_nlink != 1
             or stat.S_IMODE(opened.st_mode) & 0o022
             or not os.access(
@@ -717,10 +733,24 @@ class ProductionSetupPlatform:
             return [str(selected), *command[1:]]
         raise SetupError("external setup command is unavailable or unsafe")
 
+    @classmethod
+    def _execute_reviewed_command(
+        cls,
+        command: list[str],
+        *,
+        command_runner: Callable[..., subprocess.CompletedProcess[str]],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        return command_runner(cls._reviewed_command(command), **kwargs)
+
     def _run_command(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         kwargs["env"] = self._service_manager_environment()
         kwargs.setdefault("cwd", "/")
-        return self.command_runner(self._reviewed_command(command), **kwargs)
+        return self._execute_reviewed_command(
+            command,
+            command_runner=self.command_runner,
+            **kwargs,
+        )
 
     @classmethod
     def _launchd_result_means_already_loaded(

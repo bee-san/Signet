@@ -148,6 +148,7 @@ def _reviewed_system_command_fixtures(
         executable.chmod(0o700)
         candidates[name] = (executable,)
     monkeypatch.setattr(setup_platform, "_REVIEWED_COMMAND_CANDIDATES", candidates)
+    monkeypatch.setattr(setup_platform, "_REVIEWED_COMMAND_OWNER_UID", os.geteuid())
 
 
 def test_plan_is_read_only_and_defaults_providers_to_disabled(tmp_path: Path) -> None:

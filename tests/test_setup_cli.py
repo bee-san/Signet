@@ -100,6 +100,7 @@ def test_origin_discovery_uses_an_absolute_command_and_clean_environment(
         "_REVIEWED_COMMAND_CANDIDATES",
         {"tailscale": (reviewed_tailscale,)},
     )
+    monkeypatch.setattr(setup_platform, "_REVIEWED_COMMAND_OWNER_UID", os.geteuid())
     observed: dict[str, Any] = {}
 
     def run(command: list[str], **kwargs: Any) -> SimpleNamespace:

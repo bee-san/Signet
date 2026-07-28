@@ -994,9 +994,12 @@ def build_production_runtime(
     runtime_states: list[ProductionStateStore] = []
 
     def mcp_readiness() -> bool:
-        return bool(
-            runtime_states
-            and runtime_states[0].status().services["mcp"].state == "ready"
+        if not runtime_states:
+            return False
+        status = runtime_states[0].status()
+        return (
+            status.services["mcp"].state == "ready"
+            and "storage_ready" not in status.missing_prerequisites
             and (provider_sessions is None or provider_sessions.active)
         )
 
