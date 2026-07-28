@@ -422,3 +422,26 @@ def test_preflight_rejects_reviewed_executable_drift_and_symlinked_ancestors(
             spec(tmp_path / "linked", executable=linked_environment / "bin" / "signet"),
             "setup_0123456789abcdef",
         )
+
+
+def test_preflight_rejects_runtime_below_a_nonsticky_world_writable_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writable = tmp_path / "writable"
+    writable.mkdir(mode=0o700)
+    writable.chmod(0o777)
+    executable = writable / "runtime" / "bin" / "signet"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    platform = ProductionSetupPlatform()
+    monkeypatch.setattr(setup_platform.sys, "platform", "darwin")
+    monkeypatch.setattr(platform, "_verify_configured_storage_roots", lambda _spec: None)
+    monkeypatch.setattr(platform, "_verify_storage_capacity", lambda _spec: {})
+
+    with pytest.raises(SetupError, match="unsafe ancestry"):
+        platform._apply_preflight(
+            spec(tmp_path / "writable-runtime", executable=executable),
+            "setup_0123456789abcdef",
+        )
