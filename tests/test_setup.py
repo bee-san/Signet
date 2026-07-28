@@ -6,7 +6,6 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
@@ -4362,13 +4361,7 @@ def test_preflight_resolves_the_hermes_default_profile_to_the_hermes_home(
     hermes_home = tmp_path / ".hermes"
     profiles_root = hermes_home / "profiles"
     profiles_root.mkdir(parents=True, mode=0o700)
-    selected = SetupSpec(
-        root=tmp_path / "signet",
-        public_origin="https://signet.example",
-        owner_user_id="user:owner",
-        hermes_profiles=("default",),
-        executable=Path(sys.executable).resolve(),
-    )
+    selected = spec(tmp_path / "signet", profiles=("default",))
 
     ProductionSetupPlatform(hermes_home=profiles_root)._apply_preflight(
         selected,
