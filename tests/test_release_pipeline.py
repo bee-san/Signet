@@ -4,6 +4,7 @@ import json
 import re
 import runpy
 import subprocess  # nosec B404
+import sys
 import tarfile
 import tomllib
 import zipfile
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RELEASE_GATE = ROOT / "scripts" / "release_gate.py"
 REPRODUCIBLE_BUILD = ROOT / "scripts" / "reproducible_build.py"
 RUNTIME_MANIFEST = ROOT / "scripts" / "runtime_manifest.py"
+WORKFLOW_CONTRACT = ROOT / "scripts" / "workflow_contract.py"
 PINNED_ACTION = re.compile(r"^\s*uses:\s+[^\s]+@[0-9a-f]{40}(?:\s+#.*)?$")
 
 
@@ -98,6 +100,91 @@ def test_release_ref_policy_rejects_mismatches_and_non_stable_tags() -> None:
         }
         with pytest.raises(error):
             validate_release_identity(**values)
+
+
+def test_release_ref_requires_exact_current_main_tip(tmp_path: Path) -> None:
+    namespace = _load_script(RELEASE_GATE)
+    verify_ref = namespace["verify_ref"]
+    error = namespace["ReleaseGateError"]
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    for command in (
+        ["git", "init", "--quiet", "--initial-branch=main"],
+        ["git", "config", "user.name", "Release Test"],
+        ["git", "config", "user.email", "release-test@example.invalid"],
+    ):
+        subprocess.run(command, cwd=repository, check=True, timeout=60)  # nosec B603 B607
+    (repository / "pyproject.toml").write_text(
+        '[project]\nname = "signet-gateway"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+    subprocess.run(  # nosec B603 B607
+        ["git", "add", "pyproject.toml"], cwd=repository, check=True, timeout=60
+    )
+    subprocess.run(  # nosec B603 B607
+        ["git", "commit", "--quiet", "-m", "release source"],
+        cwd=repository,
+        check=True,
+        timeout=60,
+    )
+    release_sha = subprocess.run(  # nosec B603 B607
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    ).stdout.strip()
+    subprocess.run(  # nosec B603 B607
+        ["git", "tag", "-a", "v0.1.0", "-m", "release"],
+        cwd=repository,
+        check=True,
+        timeout=60,
+    )
+    (repository / "security-fix.txt").write_text("newer reviewed source\n", encoding="utf-8")
+    subprocess.run(  # nosec B603 B607
+        ["git", "add", "security-fix.txt"], cwd=repository, check=True, timeout=60
+    )
+    subprocess.run(  # nosec B603 B607
+        ["git", "commit", "--quiet", "-m", "security fix"],
+        cwd=repository,
+        check=True,
+        timeout=60,
+    )
+    subprocess.run(  # nosec B603 B607
+        ["git", "checkout", "--quiet", "--detach", release_sha],
+        cwd=repository,
+        check=True,
+        timeout=60,
+    )
+
+    with pytest.raises(error, match="exact current main tip"):
+        verify_ref(
+            root=repository,
+            tag="v0.1.0",
+            sha=release_sha,
+            event_name="push",
+            ref_type="tag",
+            repository="bee-san/Signet",
+            main_ref="main",
+        )
+
+    subprocess.run(  # nosec B603 B607
+        ["git", "branch", "--force", "main", release_sha],
+        cwd=repository,
+        check=True,
+        timeout=60,
+    )
+    verify_ref(
+        root=repository,
+        tag="v0.1.0",
+        sha=release_sha,
+        event_name="push",
+        ref_type="tag",
+        repository="bee-san/Signet",
+        main_ref="main",
+    )
 
 
 def test_release_gate_rejects_archive_traversal_and_incomplete_sbom(tmp_path: Path) -> None:
@@ -253,7 +340,7 @@ packages = ["src/evidence_demo"]
         evidence_path=tmp_path / "dist" / "source.build.json",
         source_sha=source_sha,
         platform_name="source",
-        uv_executable="uv",
+        uv_executable=str(Path(sys.executable).with_name("uv")),
     )
 
     artifact = tmp_path / "dist" / str(evidence["artifact"])
@@ -275,7 +362,7 @@ packages = ["src/evidence_demo"]
             evidence_path=tmp_path / "dirty-dist" / "source.build.json",
             source_sha=source_sha,
             platform_name="source",
-            uv_executable="uv",
+            uv_executable=str(Path(sys.executable).with_name("uv")),
         )
 
 
@@ -333,6 +420,21 @@ def test_built_artifacts_contain_production_assets_and_metadata(tmp_path: Path) 
         ):
             assert required in names
         assert any(name.endswith("/share/man/man1/signet.1") for name in names)
+        for guide in (
+            "README.md",
+            "setup.md",
+            "setup-resume.md",
+            "provider-setup.md",
+            "health-and-doctor.md",
+            "backup-and-restore.md",
+            "upgrade-and-rollback.md",
+            "uninstall.md",
+            "recovery.md",
+            "storage.md",
+            "security.md",
+            "troubleshooting.md",
+        ):
+            assert any(name.endswith(f"/share/doc/signet/{guide}") for name in names)
         assert "Name: signet-gateway\n" in metadata
         assert "Version: 0.1.0\n" in metadata
         assert SpecifierSet(parsed_metadata["Requires-Python"]) == SpecifierSet(">=3.12,<3.13")
@@ -346,13 +448,23 @@ def test_built_artifacts_contain_production_assets_and_metadata(tmp_path: Path) 
             "LICENSE",
             "README.md",
             "SECURITY.md",
+            "docs/README.md",
+            "docs/backup-and-restore.md",
             "docs/man/signet.1",
+            "docs/provider-setup.md",
             "docs/releasing.md",
+            "docs/security.md",
+            "docs/setup-resume.md",
+            "docs/storage.md",
+            "docs/troubleshooting.md",
+            "docs/uninstall.md",
+            "docs/upgrade-and-rollback.md",
             "hatch_build.py",
             "pyproject.toml",
             "scripts/release_gate.py",
             "scripts/reproducible_build.py",
             "scripts/runtime_manifest.py",
+            "scripts/workflow_contract.py",
             "src/signet/static/app.css",
             "tests/test_release_pipeline.py",
             "uv.lock",
@@ -364,40 +476,113 @@ def test_built_artifacts_contain_production_assets_and_metadata(tmp_path: Path) 
             assert ".." not in Path(member.name).parts
 
 
-def test_release_workflow_is_exact_source_fail_closed_and_pinned() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+def test_release_workflow_semantic_contract_rejects_comment_decoys(tmp_path: Path) -> None:
+    namespace = _load_script(WORKFLOW_CONTRACT)
+    validate_release_workflow = namespace["validate_release_workflow"]
+    error = namespace["WorkflowContractError"]
 
-    uses_lines = [line for line in workflow.splitlines() if re.match(r"^\s*uses:", line)]
-    assert uses_lines and all(PINNED_ACTION.fullmatch(line) for line in uses_lines)
-    for required in (
-        "fetch-depth: 0",
-        "scripts/release_gate.py verify-ref",
-        "git merge-base --is-ancestor",
-        "gh api --method GET",
-        'head_sha="$GITHUB_SHA"',
-        "ubuntu-24.04-arm",
-        "scripts/reproducible_build.py",
-        "cyclonedx-py environment",
-        "scripts/runtime_manifest.py",
-        "pip-audit",
-        "pip-licenses",
-        "bandit",
-        "SHA256SUMS",
-        "sigstore/gh-action-sigstore-python@",
-        "verify: true",
-        "actions/attest@",
-        "gh attestation verify",
-        "name: pypi",
-        "uv publish --trusted-publishing always",
-    ):
-        assert required in workflow
-    assert "head_branch" in workflow and "main" in workflow
-    assert re.search(r"scripts/release_gate\.py\s+verify-artifacts", workflow)
-    assert "id-token: write" in workflow
-    assert "PYPI_API_TOKEN" not in workflow
-    assert "secrets." not in workflow
-    assert "pull_request_target" not in workflow
-    assert "continue-on-error" not in workflow
+    validate_release_workflow(ROOT / ".github" / "workflows" / "release.yml")
+
+    unsafe = tmp_path / "unsafe-release.yml"
+    unsafe.write_text(
+        """name: Unsafe manual publisher
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - run: uv publish --trusted-publishing always dist/*
+# fetch-depth: 0
+# scripts/release_gate.py verify-ref
+# name: pypi
+# gh attestation verify
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(error):
+        validate_release_workflow(unsafe)
+
+    release_text = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    comment_decoys = (
+        (
+            "gate",
+            "          git fetch --force --no-tags origin \\\n",
+            "          # git fetch --force --no-tags origin \\\n",
+        ),
+        (
+            "publish",
+            "          uv publish --trusted-publishing always dist/*.whl dist/*.tar.gz\n",
+            "          # uv publish --trusted-publishing always dist/*.whl dist/*.tar.gz\n",
+        ),
+        (
+            "printf",
+            "          git fetch --force --no-tags origin \\\n",
+            "          printf '%s' 'git fetch --force --no-tags origin' \\\n",
+        ),
+    )
+    for label, active, commented in comment_decoys:
+        assert active in release_text
+        decoy = tmp_path / f"{label}-comment-decoy.yml"
+        decoy.write_text(release_text.replace(active, commented), encoding="utf-8")
+        with pytest.raises(error):
+            validate_release_workflow(decoy)
+
+    structural_decoys = (
+        (
+            "post-verification-mutation",
+            "      - name: Publish distributions with PyPI trusted publishing\n",
+            "      - name: Replace verified distributions\n"
+            "        run: printf tampered > dist/signet_gateway-0.1.0.tar.gz\n"
+            "      - name: Publish distributions with PyPI trusted publishing\n",
+        ),
+        (
+            "disabled-gate",
+            "      - name: Reverify exact tag and current main after approval\n"
+            "        shell: bash\n",
+            "      - name: Reverify exact tag and current main after approval\n"
+            "        if: ${{ false }}\n"
+            "        shell: bash\n",
+        ),
+        (
+            "publish-container",
+            "  publish:\n    name: Publish approved trusted release\n    needs: verify-release\n",
+            "  publish:\n"
+            "    name: Publish approved trusted release\n"
+            "    needs: verify-release\n"
+            "    container: attacker-controlled.example/release:latest\n",
+        ),
+        (
+            "publication-working-directory",
+            "      - name: Publish distributions with PyPI trusted publishing\n        run: >-\n",
+            "      - name: Publish distributions with PyPI trusted publishing\n"
+            "        working-directory: attacker-controlled\n"
+            "        run: >-\n",
+        ),
+    )
+    for label, active, replacement in structural_decoys:
+        assert active in release_text
+        decoy = tmp_path / f"{label}.yml"
+        decoy.write_text(release_text.replace(active, replacement), encoding="utf-8")
+        with pytest.raises(error):
+            validate_release_workflow(decoy)
+
+
+def test_publish_revalidates_tag_and_current_main_after_environment_approval() -> None:
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    reverify = "- name: Reverify exact tag and current main after approval"
+    artifacts = "- name: Reverify approved release identity and artifacts"
+
+    assert release.index(reverify) < release.index(artifacts)
+    assert "+refs/heads/main:refs/remotes/origin/main" in release[release.index(reverify) :]
+    assert (
+        "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+        in release[release.index(reverify) :]
+    )
+    assert "verify-ref" in release[release.index(reverify) : release.index(artifacts)]
 
 
 def test_release_dry_run_uses_an_isolated_index_without_publication() -> None:
@@ -421,6 +606,8 @@ def test_release_dry_run_uses_an_isolated_index_without_publication() -> None:
     assert "id-token: write" not in workflow
     assert "contents: write" not in workflow
     assert "secrets." not in workflow
+    assert '- "scripts/runtime_manifest.py"' in workflow
+    assert '- "docs/**"' in workflow
 
 
 def test_release_documentation_defines_support_verification_and_compromise_response() -> None:
@@ -447,3 +634,7 @@ def test_release_documentation_defines_support_verification_and_compromise_respo
         "never reuse",
     ):
         assert required in release
+    assert "for artifact in signet_gateway-*.whl signet_gateway-*.tar.gz" in release
+    assert release.count('gh attestation verify "$artifact"') == 2
+    assert "--predicate-type https://cyclonedx.org/bom" in release
+    assert "gh attestation verify signet_gateway-*.whl signet_gateway-*.tar.gz" not in release

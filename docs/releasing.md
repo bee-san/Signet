@@ -25,18 +25,23 @@ The complete Linux/macOS runtime dependency closure is exact-pinned in package m
 `uv.lock`; the build and release tool closures are exact-pinned as well.
 
 Wheels contain the `signet` modules, type marker, migrations, browser templates and static
-assets, reference manifests, MIT license, and installed manpage. They intentionally exclude
-tests, repository automation, and source-only tooling. The source distribution contains the
-reviewed source, tests, documentation, workflows, lock, build hook, and release tools needed
-to reproduce and inspect it. The build hook refuses Windows, macOS x86_64, and unreviewed
-platform tags instead of emitting a misleading universal wheel.
+assets, reference manifests, MIT license, installed manpage, and offline user/operator guides
+under `share/doc/signet`. They intentionally exclude tests, repository automation, and
+source-only tooling. The source distribution contains the reviewed source, tests,
+documentation, workflows, lock, build hook, and release tools needed to reproduce and inspect
+it. The build hook refuses Windows, macOS x86_64, and unreviewed platform tags instead of
+emitting a misleading universal wheel.
 
 ## One-time GitHub and PyPI configuration
 
 Create a protected `pypi` environment in GitHub before enabling stable publication. Configure
 required reviewers, disallow self-review, prevent administrator bypass, and restrict
-deployments to protected stable tags. Repository rules must protect `main` and require every
-CI job. These controls live in GitHub settings; the workflow deliberately cannot weaken them.
+deployments to protected stable tags. Repository rules must protect `main`, require pull
+request and Code Owner review, require conversation resolution, and require both source-CI
+jobs plus all three `Isolated index ...` release-dry-run jobs (or one equivalent aggregate
+gate). Protect `v*.*.*` tags against creation outside the reviewed release path, update, and
+deletion. Restrict Actions to reviewed actions and require full-SHA pins. These controls live
+in GitHub settings; the workflow deliberately cannot weaken them.
 
 Configure the PyPI trusted publisher with this exact identity:
 
@@ -49,8 +54,12 @@ The publish command is `uv publish --trusted-publishing always`; `always` makes 
 mismatched OIDC context a hard failure rather than falling back to a token.
 
 After configuring the environment and publisher, verify both settings through their read-only
-APIs. A repository transfer, workflow rename, environment rename, or package-name change
-invalidates the trusted publisher and requires a new review before another tag.
+APIs. The environments API must return `pypi` with the intended protection rules; a missing
+environment or HTTP 404 is a release blocker, not permission to let the workflow create an
+unprotected environment implicitly. Independently verify the exact pending PyPI trusted
+publisher identity in PyPI's control plane. A repository transfer, workflow rename,
+environment rename, or package-name change invalidates the trusted publisher and requires a
+new review before another tag.
 
 ## Dry run without consuming a version
 
@@ -125,7 +134,10 @@ did not succeed.
 
 - the tag peels to the exact event SHA and matches the stable project version;
 - the checked-out source is byte-identical to that commit;
-- the commit is an ancestor of fetched `origin/main`;
+- the commit equals the exact current tip of fetched `origin/main` (a historical ancestor is
+  rejected even if its old CI was green);
+- the protected publication job force-refetches both the tag and `main` after environment
+  approval, then reruns the exact-tip gate before it can publish;
 - the exact SHA has a completed successful `main` push run of `ci.yml`;
 - package, build backend, release tools, Python, SQLite, and `uv` constraints match;
 - all external actions are pinned to full commit SHAs.
@@ -159,16 +171,25 @@ Download into a new empty directory. Do not verify in a source checkout or mix f
 multiple runs.
 
 ```console
-gh release download vMAJOR.MINOR.PATCH --repo bee-san/Signet --dir signet-release
+TAG=vMAJOR.MINOR.PATCH
+gh release download "$TAG" --repo bee-san/Signet --dir signet-release
 cd signet-release
+SOURCE_SHA="$(gh api "repos/bee-san/Signet/commits/$TAG" --jq .sha)"
 shasum -a 256 -c SHA256SUMS
 sigstore verify identity \
   --cert-identity \
-  "https://github.com/bee-san/Signet/.github/workflows/release.yml@refs/tags/vMAJOR.MINOR.PATCH" \
+  "https://github.com/bee-san/Signet/.github/workflows/release.yml@refs/tags/$TAG" \
   --cert-oidc-issuer https://token.actions.githubusercontent.com \
   signet_gateway-*.whl signet_gateway-*.tar.gz
-gh attestation verify signet_gateway-*.whl signet_gateway-*.tar.gz \
-  --repo bee-san/Signet
+for artifact in signet_gateway-*.whl signet_gateway-*.tar.gz; do
+  gh attestation verify "$artifact" --repo bee-san/Signet \
+    --signer-workflow bee-san/Signet/.github/workflows/release.yml \
+    --source-ref "refs/tags/$TAG" --source-digest "$SOURCE_SHA"
+  gh attestation verify "$artifact" --repo bee-san/Signet \
+    --predicate-type https://cyclonedx.org/bom \
+    --signer-workflow bee-san/Signet/.github/workflows/release.yml \
+    --source-ref "refs/tags/$TAG" --source-digest "$SOURCE_SHA"
+done
 ```
 
 Also compare PyPI file hashes with `SHA256SUMS`, inspect the CycloneDX root name/version and

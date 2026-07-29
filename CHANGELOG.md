@@ -23,10 +23,16 @@ artifacts, attestations, and publication have completed.
 
 ### Security
 
-- Exact stable tag, project version, repository identity, main ancestry, and successful
-  exact-commit CI are required before release artifacts can be built.
+- Exact stable tag, project version, repository identity, current `main` tip, and successful
+  exact-commit CI are required before release artifacts can be built. An older ancestor is
+  rejected after `main` advances. The tag and `main` are force-refetched and rechecked after
+  protected-environment approval immediately before publication.
 - Release artifacts are rebuilt byte-for-byte, inspected for the reviewed package contents
   and dependency closure, scanned, signed, attested, and re-verified before publication.
+- Release workflow tests parse the job graph, permissions, protected environment, ordered
+  verification steps, current-run artifacts, and publication command instead of accepting
+  security phrases in comments. Packaging changes to runtime manifests and offline guides
+  trigger the isolated multi-platform release dry run.
 - PyPI publication uses short-lived GitHub OIDC in the protected `pypi` environment; no
   long-lived package index token is accepted by the release workflow.
 

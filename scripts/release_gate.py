@@ -165,16 +165,8 @@ def verify_ref(
         raise ReleaseGateError("stable releases require an annotated Git tag")
     if _git(root, "rev-parse", f"refs/tags/{tag}^{{commit}}") != sha:
         raise ReleaseGateError("tag does not peel to the exact event commit")
-    completed = subprocess.run(  # nosec B603
-        ["git", "merge-base", "--is-ancestor", sha, main_ref],
-        cwd=root,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if completed.returncode != 0 or completed.stdout or completed.stderr:
-        raise ReleaseGateError("tagged commit is not an ancestor of origin/main")
+    if _git(root, "rev-parse", main_ref) != sha:
+        raise ReleaseGateError("tagged commit is not the exact current main tip")
     if not _git_is_clean(root, "diff", "--quiet") or not _git_is_clean(
         root, "diff", "--cached", "--quiet"
     ):
