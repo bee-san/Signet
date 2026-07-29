@@ -661,10 +661,10 @@ def test_setup_fragment_is_scrubbed_without_consuming_a_bootstrap_capability(
 
             expect(page.get_by_role("heading", name="Set up Signet")).to_be_visible()
             expect(
-                page.get_by_text(
-                    "Open the private owner setup capability file printed by signet setup, "
-                    "copy the one-time value, and paste it below before it expires."
-                )
+                page.get_by_text("Only the intended owner should open the private capability file")
+            ).to_be_visible()
+            expect(
+                page.get_by_text("Never place it in a URL, YAML, shell history, or chat.")
             ).to_be_visible()
             expect(page.get_by_label("One-time bootstrap capability")).to_have_value("")
             expect(page).to_have_url(f"{live.origin}/setup")

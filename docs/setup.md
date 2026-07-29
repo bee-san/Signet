@@ -1,4 +1,4 @@
-# Packaged setup and lifecycle guide
+# Install and first setup
 
 `signet setup` is the packaged, resumable installation path for macOS and Linux. It
 creates production state with every provider disabled, installs two loopback-only
@@ -7,8 +7,9 @@ owner ceremony at the final private HTTPS origin. Provider setup is a separate g
 command, and Signet never restarts Hermes.
 
 The setup path changes real user resources. Read the plan and this guide before
-confirming it. For the repository-owned fake demo, use
-[`operator-runbook.md`](operator-runbook.md) instead.
+confirming it. Focused follow-up guides are collected in the
+[documentation map](README.md); the source-checkout [operator runbook](operator-runbook.md)
+is for expert audits and the fake demo, not normal installation.
 The cross-platform variants and their automated evidence are indexed in the
 [`production platform lifecycle matrix`](platform-lifecycle-matrix.md).
 
@@ -18,8 +19,8 @@ The cross-platform variants and their automated evidence are indexed in the
 - Python 3.12 with SQLite 3.51.3 or newer;
 - macOS launchd or a Linux user systemd session;
 - an available OS Keychain/keyring backend;
-- every selected Hermes profile already present under
-  `~/.hermes/profiles/PROFILE` and not group/world writable;
+- the default Hermes profile at `~/.hermes`, or each selected named profile under
+  `~/.hermes/profiles/PROFILE`, already present and not group/world writable;
 - for automatic private HTTPS, Tailscale logged in with MagicDNS and the intended
   `*.ts.net` node name. Signet manages HTTPS port 8443 only and refuses an existing
   Serve or Funnel listener there;
@@ -33,8 +34,11 @@ With Python 3.12 selected for `pipx`, install the reviewed package without a sou
 checkout or `uv`:
 
 ```console
-pipx install signet-gateway
+pipx install 'signet-gateway==0.1.0'
 ```
+
+For a later release, substitute only the exact version named in its signed release
+notes. Do not replace the reviewed pin with an unqualified latest package.
 
 ## Review the read-only plan
 
@@ -55,9 +59,16 @@ Without `--origin`, Signet derives `https://NODE.ts.net:8443` from `tailscale st
 --json`. Without `--profile`, it selects the Hermes default profile plus all
 syntactically valid named profile directories.
 The default owner is `user:owner`; use `--owner user:NAME` to choose another canonical
-owner ID. The initial policy mode defaults to fail-closed `deny`; select `direct`,
-`approval`, or `approval_with_edit` with `--policy-mode` when the reviewed deployment
-requires a different baseline. The default root is `~/.local/share/signet`.
+owner ID. Every selected profile receives a distinct caller namespace and credential
+but is bound to that one owner. Version 0.1 has no supported cross-user onboarding or
+role-management command; do not add users by editing generated files or the database.
+Use a separate operating-system account or host for a hard isolation boundary.
+
+The initial policy mode defaults to fail-closed `deny`; keep that default for the
+packaged quick start. The other CLI labels are for separately reviewed advanced
+deployments and are not the packaged provider's tool-policy vocabulary. Guided
+provider setup later installs explicit reviewed `approval`, `passthrough`, and `deny`
+rules. The default root is `~/.local/share/signet`.
 
 Data and backups default to `ROOT/data` and `ROOT/backups`. To put either on a
 different local volume, create an empty directory owned by the service user with mode
@@ -165,14 +176,15 @@ factors.
 If browser opening is cancelled or unavailable, resume without opening it:
 
 ```console
-signet setup --no-open-browser --yes
+signet setup --no-open-browser
 ```
 
-The command prints the public setup URL; continue in the browser that owns any
+The command prints the private setup URL; continue in the browser that owns any
 in-progress claimant cookie. Owner setup supports password plus multiple separately
-named TOTP and passkey authenticators. Passkeys must be enrolled by a real browser and
-authenticator at the final HTTPS origin. Do not try to generate or transfer a passkey
-through the CLI.
+named TOTP and passkey authenticators. Each TOTP device must use a separately enrolled
+seed and record; copying one seed to multiple devices does not create independent
+recovery factors. Passkeys must be enrolled by a real browser and authenticator at the
+final HTTPS origin. Do not try to generate or transfer a passkey through the CLI.
 
 After setup, print that final private management URL before reopening the authenticated
 named passkey/TOTP ceremony:
@@ -229,24 +241,24 @@ never edits gateway tokens, and never assumes that editing one profile reloads a
 
 ## Configure a provider
 
-Fastmail setup prompts for the API token, discovers the live MCP schemas, sends one
-test email, saves the generated policy, and enables the provider:
+Fastmail setup prompts for the API token, sender, and test recipient; discovers the
+live MCP schemas; sends one test email; saves the generated policy; and enables the
+provider:
 
 ```console
-signet provider setup fastmail \
-  --from you@example.com \
-  --to you@example.com
+signet provider setup fastmail
 ```
 
-For non-interactive secret-broker integration, pass one token line on standard input
-with `--token-stdin`; do not put the token in an argument.
+Use the normal hidden prompt. A reviewed private secret-broker integration may pass one
+token line on standard input with `--token-stdin`; never put the token in an argument,
+YAML, shell history, logs, or chat.
 
 WhatsApp setup is available on Linux x86_64. It downloads the pinned
 `wacli 0.12.0` archive, verifies its SHA-256, opens the pairing flow, sends one test
 message, and enables the provider:
 
 ```console
-signet provider setup whatsapp --to +447700900123
+signet provider setup whatsapp
 ```
 
 Inspect or control the rollout with:
@@ -259,11 +271,21 @@ signet provider enable fastmail
 
 The rollout gate is shared by all configured providers; enable and disable output
 lists every affected alias. If startup health verification fails, Signet restores the
-disabled configuration. Re-running setup with the same provider is idempotent.
+disabled configuration. Re-running provider setup converges generated configuration,
+but it is not a harmless status check: after confirmation it can perform another live
+test send. Use `signet provider status` for inspection.
 The lower-level connector contract remains documented in
 [`production-connectors.md`](production-connectors.md).
+The attended workflow and transparent approval semantics are explained in
+[`provider-setup.md`](provider-setup.md).
 
 ## Lifecycle commands
+
+Use the focused [status and doctor](health-and-doctor.md),
+[backup and restore](backup-and-restore.md),
+[upgrade and rollback](upgrade-and-rollback.md), [storage](storage.md), and
+[uninstall](uninstall.md) guides for routine operations. The reference below records
+the exact plan/apply shape.
 
 All commands accept `--root`; examples below use the default root.
 

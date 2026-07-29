@@ -1,0 +1,159 @@
+name: Release dry run
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release*.yml"
+      - "CHANGELOG.md"
+      - "README.md"
+      - "SECURITY.md"
+      - "docs/**"
+      - "hatch_build.py"
+      - "pyproject.toml"
+      - "scripts/release*.py"
+      - "scripts/reproducible_build.py"
+      - "scripts/runtime_manifest.py"
+      - "scripts/workflow_contract.py"
+      - "src/signet/migrations/**"
+      - "src/signet/reference_plugins/**"
+      - "src/signet/static/**"
+      - "src/signet/templates/**"
+      - "tests/test_release_pipeline.py"
+      - "tests/test_setup_wheel_e2e.py"
+      - "uv.lock"
+
+permissions:
+  contents: read
+
+env:
+  UV_MANAGED_PYTHON: "true"
+  UV_PYTHON: "3.12.13"
+
+concurrency:
+  group: release-dry-run-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  isolated-index:
+    name: Isolated index ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-x86-64
+            gate-platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            gate-platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            gate-platform: macos-arm64
+            runner: macos-15
+    steps:
+      - name: Check out pull request source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: false
+          version: "0.11.28"
+      - name: Install pinned managed Python
+        run: uv python install 3.12.13
+      - name: Install locked validation environment
+        run: uv sync --frozen --group release
+      - name: Run release contract and installed-wheel tests
+        run: >-
+          uv run --frozen --group release pytest -q
+          tests/test_release_pipeline.py tests/test_setup_wheel_e2e.py
+      - name: Rebuild native artifacts twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/index-root"
+          mkdir -p "$root/dist"
+          uv run --frozen --group release python scripts/reproducible_build.py \
+            --kind sdist --source . --output-directory "$root/dist" \
+            --evidence "$root/dist/source.build.json" \
+            --source-sha "$GITHUB_SHA" --platform source
+          sdist="$(find "$root/dist" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          uv run --frozen --group release python scripts/reproducible_build.py \
+            --kind wheel --source "$sdist" \
+            --source-evidence "$root/dist/source.build.json" \
+            --output-directory "$root/dist" \
+            --evidence "$root/dist/${{ matrix.platform }}.build.json" \
+            --source-sha "$GITHUB_SHA" --platform "${{ matrix.platform }}"
+          uv run --frozen --group release python scripts/release_gate.py \
+            verify-artifacts --directory "$root/dist" --source-sha "$GITHUB_SHA" \
+            --platform "${{ matrix.gate-platform }}" --expect-sdist --require-evidence
+      - name: Verify Linux runtime SBOM and license closure
+        if: matrix.platform == 'linux-x86-64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/index-root"
+          runtime="$RUNNER_TEMP/security-runtime"
+          uv export --quiet --frozen --no-dev --no-emit-project \
+            --format requirements-txt --output-file "$RUNNER_TEMP/runtime.txt"
+          uv venv --python 3.12.13 "$runtime"
+          uv pip install --python "$runtime/bin/python" --require-hashes \
+            -r "$RUNNER_TEMP/runtime.txt"
+          uv pip install --python "$runtime/bin/python" --no-deps "$root"/dist/*.tar.gz
+          "$runtime/bin/python" scripts/runtime_manifest.py \
+            --source-sha "$GITHUB_SHA" \
+            --output "$root/dist/signet-gateway.runtime.json"
+          uv run --frozen --group release cyclonedx-py environment \
+            "$runtime/bin/python" --pyproject pyproject.toml \
+            --mc-type application --output-reproducible --spec-version 1.6 \
+            --output-format JSON \
+            --output-file "$root/dist/signet-gateway.cdx.json"
+          uv run --frozen --group release pip-licenses \
+            --python "$runtime/bin/python" --format=json --with-urls \
+            --output-file "$root/dist/signet-gateway.licenses.json"
+          uv run --frozen --group release python scripts/release_gate.py \
+            verify-artifacts --directory "$root/dist" --source-sha "$GITHUB_SHA" \
+            --platform linux-x86_64 --expect-sdist --require-evidence \
+            --require-sbom --require-license-report
+      - name: Upload to and install from isolated PyPI-compatible index
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/index-root"
+          runtime="$RUNNER_TEMP/signet-index-runtime"
+          uv export --quiet --frozen --no-dev --no-emit-project \
+            --format requirements-txt --output-file "$RUNNER_TEMP/runtime.txt"
+          uv venv --python 3.12.13 "$runtime"
+          uv pip install --python "$runtime/bin/python" --require-hashes \
+            -r "$RUNNER_TEMP/runtime.txt"
+          mkdir "$root/packages"
+          uv run --frozen --group release pypi-server run \
+            --interface 127.0.0.1 --port 8765 \
+            --authenticate . --passwords . --disable-fallback \
+            --health-endpoint /health "$root/packages" \
+            >"$RUNNER_TEMP/index.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            if curl --fail --silent --show-error \
+              http://127.0.0.1:8765/health >/dev/null; then
+              break
+            fi
+            kill -0 "$server_pid"
+            sleep 0.25
+          done
+          version="$(uv version --short)"
+          uv publish --publish-url http://127.0.0.1:8765 \
+            --username local --password local \
+            "$root"/dist/*.whl "$root"/dist/*.tar.gz
+          uv pip install --python "$runtime/bin/python" --no-deps \
+            --index-url http://127.0.0.1:8765/simple \
+            "signet-gateway==$version"
+          test "$("$runtime/bin/signet" --version)" = "signet $version"
+          "$runtime/bin/signet" --help >/dev/null
+          "$runtime/bin/signet" setup --help >/dev/null
+          "$runtime/bin/signet" doctor --help >/dev/null
+          "$runtime/bin/signet" status --help >/dev/null

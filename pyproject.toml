@@ -10,18 +10,24 @@ build-backend = "hatchling.build"
 
 [project]
 name = "signet-gateway"
-version = "0.1.0b1"
+version = "0.1.0"
 description = "Provider-neutral MCP human approval gateway"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Signet contributors" }]
+keywords = ["human-in-the-loop", "mcp", "security", "workflow-approval"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Framework :: FastAPI",
+  "License :: OSI Approved :: MIT License",
   "Operating System :: MacOS :: MacOS X",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
   "Typing :: Typed",
 ]
 dependencies = [
@@ -98,15 +104,18 @@ dependencies = [
 ]
 
 [project.urls]
+Changelog = "https://github.com/bee-san/Signet/blob/main/CHANGELOG.md"
 Documentation = "https://github.com/bee-san/Signet/tree/main/docs"
 Issues = "https://github.com/bee-san/Signet/issues"
 Repository = "https://github.com/bee-san/Signet"
+Security = "https://github.com/bee-san/Signet/security/policy"
 
 [project.scripts]
 signet = "signet.app:main"
 
 [dependency-groups]
 dev = [
+  "hatchling==1.31.0",
   "httpx>=0.28,<1",
   "mypy>=2.3.0,<3",
   "playwright==1.61.0",
@@ -118,7 +127,33 @@ dev = [
   "types-pyyaml>=6.0,<7",
 ]
 release = [
-  "cyclonedx-bom==7.3.0",
+  "bandit==1.9.4",
+  "cyclonedx-bom==7.3.1",
+  "pip-audit==2.10.1",
+  "pip-licenses==5.5.5",
+  "pypiserver==2.4.1",
+  "sigstore==4.5.0",
+  "twine==7.0.0",
+  "uv==0.11.28",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/.github/dependabot.yml",
+  "/.github/workflows/**",
+  "/CHANGELOG.md",
+  "/LICENSE",
+  "/README.md",
+  "/SECURITY.md",
+  "/deploy/**",
+  "/docs/**",
+  "/hatch_build.py",
+  "/pyproject.toml",
+  "/scripts/**",
+  "/spec/**",
+  "/src/**",
+  "/tests/**",
+  "/uv.lock",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -126,6 +161,7 @@ packages = ["src/signet"]
 
 [tool.hatch.build.targets.wheel.shared-data]
 "docs/man/signet.1" = "share/man/man1/signet.1"
+"docs" = "share/doc/signet"
 
 [tool.hatch.build.targets.wheel.hooks.custom]
 
