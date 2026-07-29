@@ -221,6 +221,11 @@ def build_reproducibly(
     return evidence
 
 
+def _default_uv_executable(python_executable: Path | None = None) -> str:
+    sibling = (python_executable or Path(sys.executable)).with_name("uv")
+    return str(sibling) if sibling.is_file() and os.access(sibling, os.X_OK) else "uv"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", type=Path, default=Path.cwd())
@@ -231,7 +236,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--platform", required=True)
-    parser.add_argument("--uv", default=str(Path(sys.executable).with_name("uv")))
+    parser.add_argument("--uv", default=_default_uv_executable())
     return parser
 
 

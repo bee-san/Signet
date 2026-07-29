@@ -4,7 +4,6 @@ import json
 import re
 import runpy
 import subprocess  # nosec B404
-import sys
 import tarfile
 import tomllib
 import zipfile
@@ -283,6 +282,7 @@ def test_release_gate_rejects_archive_traversal_and_incomplete_sbom(tmp_path: Pa
 def test_release_build_evidence_is_reproducible_and_source_bound(tmp_path: Path) -> None:
     namespace = _load_script(REPRODUCIBLE_BUILD)
     build_reproducibly = namespace["build_reproducibly"]
+    default_uv_executable = namespace["_default_uv_executable"]
     error = namespace["ReproducibleBuildError"]
     repository = tmp_path / "repository"
     package = repository / "src" / "evidence_demo"
@@ -340,7 +340,7 @@ packages = ["src/evidence_demo"]
         evidence_path=tmp_path / "dist" / "source.build.json",
         source_sha=source_sha,
         platform_name="source",
-        uv_executable=str(Path(sys.executable).with_name("uv")),
+        uv_executable=default_uv_executable(),
     )
 
     artifact = tmp_path / "dist" / str(evidence["artifact"])
@@ -362,8 +362,24 @@ packages = ["src/evidence_demo"]
             evidence_path=tmp_path / "dirty-dist" / "source.build.json",
             source_sha=source_sha,
             platform_name="source",
-            uv_executable=str(Path(sys.executable).with_name("uv")),
+            uv_executable=default_uv_executable(),
         )
+
+
+def test_reproducible_build_falls_back_when_the_environment_has_no_uv_sibling(
+    tmp_path: Path,
+) -> None:
+    namespace = _load_script(REPRODUCIBLE_BUILD)
+    default_uv_executable = namespace["_default_uv_executable"]
+    python = tmp_path / "venv" / "bin" / "python"
+
+    assert default_uv_executable(python) == "uv"
+
+    sibling = python.with_name("uv")
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("#!/bin/sh\n", encoding="utf-8")
+    sibling.chmod(0o755)
+    assert default_uv_executable(python) == str(sibling)
 
 
 def test_runtime_manifest_is_deterministic_and_source_bound() -> None:
