@@ -77,6 +77,11 @@ def add_setup_parsers(subcommands: Any) -> None:
     setup = subcommands.add_parser(
         "setup",
         help="print, apply, resume, or roll back a private installation plan",
+        description=(
+            "Install or resume one owner with one or more independent Hermes profile callers. "
+            "Automatic steps are resumable; only the human owner can complete authentication "
+            "in a browser at the final private HTTPS origin."
+        ),
     )
     _root_argument(setup)
     setup.add_argument("--origin", help="canonical private HTTPS origin")
@@ -90,7 +95,7 @@ def add_setup_parsers(subcommands: Any) -> None:
     setup.add_argument(
         "--policy-mode",
         choices=("deny", "direct", "approval", "approval_with_edit"),
-        help="default policy mode (default: deny)",
+        help="advanced initial baseline; keep the fail-closed deny default for packaged setup",
     )
     setup_mode = setup.add_mutually_exclusive_group()
     setup_mode.add_argument(
@@ -111,12 +116,12 @@ def add_setup_parsers(subcommands: Any) -> None:
     setup.add_argument(
         "--yes",
         action="store_true",
-        help="confirm the reviewed plan non-interactively",
+        help="bypass CLI confirmation; this does not automate the human-only browser ceremony",
     )
     setup.add_argument(
         "--no-open-browser",
         action="store_true",
-        help="print the exact owner URL without opening a browser",
+        help="print the private owner setup URL without opening a browser",
     )
     setup.add_argument(
         "--data-root",
@@ -170,7 +175,11 @@ def add_setup_parsers(subcommands: Any) -> None:
         help="backup plan or apply a verified encrypted backup",
     )
     _root_argument(backup)
-    backup.add_argument("--destination", type=Path)
+    backup.add_argument(
+        "--destination",
+        type=Path,
+        help="absolute private output path; defaults under the configured backup root",
+    )
     backup.add_argument(
         "--apply",
         metavar="PLAN_ID",
@@ -182,7 +191,7 @@ def add_setup_parsers(subcommands: Any) -> None:
         help="restore plan or apply verification into a new staging root",
     )
     _root_argument(restore)
-    restore.add_argument("bundle", type=Path)
+    restore.add_argument("bundle", type=Path, help="encrypted backup bundle to verify and stage")
     restore.add_argument(
         "--apply",
         metavar="PLAN_ID",
@@ -244,26 +253,47 @@ def add_setup_parsers(subcommands: Any) -> None:
         help="configure and control Fastmail or WhatsApp",
     )
     provider_commands = provider.add_subparsers(dest="provider_command", required=True)
-    provider_setup = provider_commands.add_parser("setup", help="configure and test a provider")
+    provider_setup = provider_commands.add_parser(
+        "setup",
+        help="run human-attended credentials, pairing, and one live provider test",
+    )
     setup_commands = provider_setup.add_subparsers(dest="provider_name", required=True)
-    fastmail = setup_commands.add_parser("fastmail", help="configure Fastmail")
+    fastmail = setup_commands.add_parser(
+        "fastmail",
+        help="configure Fastmail and send one attended live test email",
+        description=(
+            "Human-only live setup: collect the Fastmail credential and addresses, discover "
+            "schemas, send one attended live test email, then enable the reviewed rollout."
+        ),
+    )
     _root_argument(fastmail)
     fastmail.add_argument("--from", dest="sender", help="sender email address")
     fastmail.add_argument("--to", dest="recipient", help="test recipient email address")
     fastmail.add_argument(
         "--token-stdin",
         action="store_true",
-        help="read the Fastmail API token from standard input",
+        help="read one Fastmail token line from a reviewed private secret broker",
     )
-    fastmail.add_argument("--yes", action="store_true", help="confirm the test send")
+    fastmail.add_argument(
+        "--yes",
+        action="store_true",
+        help="bypass confirmation; one live test still occurs, so keep the ceremony attended",
+    )
 
-    whatsapp = setup_commands.add_parser("whatsapp", help="configure WhatsApp on Linux")
+    whatsapp = setup_commands.add_parser(
+        "whatsapp",
+        help="pair WhatsApp on Linux x86_64 and send one attended live test",
+        description=(
+            "Human-only live setup on Linux x86_64: verify wacli, pair WhatsApp, send one "
+            "attended live test message, then enable the reviewed rollout."
+        ),
+    )
     _root_argument(whatsapp)
     whatsapp.add_argument("--to", dest="recipient", help="test phone number or JID")
     whatsapp.add_argument(
         "--yes",
         action="store_true",
-        help="confirm the verified wacli download, pairing, and test send",
+        help="bypass confirmation; pairing and one live test still require attendance",
     )
 
     provider_status = provider_commands.add_parser("status", help="show provider status")

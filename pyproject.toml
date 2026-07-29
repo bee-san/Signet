@@ -134,6 +134,7 @@ release = [
   "pypiserver==2.4.1",
   "sigstore==4.5.0",
   "twine==7.0.0",
+  "uv==0.11.28",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -160,6 +161,7 @@ packages = ["src/signet"]
 
 [tool.hatch.build.targets.wheel.shared-data]
 "docs/man/signet.1" = "share/man/man1/signet.1"
+"docs" = "share/doc/signet"
 
 [tool.hatch.build.targets.wheel.hooks.custom]
 

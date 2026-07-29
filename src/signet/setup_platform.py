@@ -343,6 +343,10 @@ def browser_assisted_setup(
             "The one-time capability expires after 10 minutes. If it expires, rerun the same "
             "signet setup command to issue a replacement without losing enrollment progress."
         )
+        output(
+            "Human-only: enter the capability only in the Signet form at the URL above; "
+            "never place it in a URL, YAML, shell history, or chat."
+        )
     if not open_browser:
         return
     if not opener(public_url):
@@ -2785,11 +2789,11 @@ class ProductionSetupPlatform:
             "the gateway; review and enable each entry, then run /reload-mcp in that profile."
         )
         for profile in spec.hermes_profiles:
-            alias = f"signet_{profile}"
             self.output(
-                f"Hermes profile {profile}: after enabling {alias}, run "
-                f"`hermes -p {profile} mcp test {alias}`, then `/reload-mcp` in an "
-                "attended session."
+                f"Hermes profile {profile}: after enabling signet_approvals, run "
+                f"`hermes -p {profile} mcp test signet_approvals`; enable and test only "
+                "the configured signet_fastmail or signet_whatsapp entry, then run "
+                "`/reload-mcp` in an attended session."
             )
 
     def revoke_hermes_tokens_for_rollback(self, spec: SetupSpec, setup_id: str) -> None:
