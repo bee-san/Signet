@@ -153,9 +153,19 @@ def _sequence(value: Any, label: str) -> Sequence[Any]:
     return value
 
 
+class _WorkflowLoader(yaml.SafeLoader):
+    """Safe scalar-preserving loader for GitHub Actions' YAML dialect."""
+
+    yaml_implicit_resolvers = {}
+
+
 def _load(path: Path) -> Mapping[str, Any]:
     try:
-        value = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        loader = _WorkflowLoader(path.read_text(encoding="utf-8"))
+        try:
+            value = loader.get_single_data()
+        finally:
+            loader.dispose()
     except (OSError, yaml.YAMLError) as exc:
         raise WorkflowContractError(f"cannot parse release workflow: {exc}") from exc
     return _mapping(value, "workflow")
