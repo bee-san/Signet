@@ -28,7 +28,7 @@ dependencies = [
   # Keep the complete Linux/macOS runtime closure exact so installing the wheel
   # cannot resolve transitive versions outside the reviewed lock.
   "aiohappyeyeballs==2.7.1",
-  "aiohttp==3.14.1",
+  "aiohttp==3.14.3",
   "aiosignal==1.4.0",
   "annotated-doc==0.0.4",
   "annotated-types==0.7.0",
