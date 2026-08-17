@@ -32,6 +32,7 @@ from signet.adapters.base import (
     conservative_outcome,
     copy_json_object,
     redact_json,
+    staging_account_scope,
 )
 from signet.models import AttachmentReference
 from signet.staging import StagedFile, StagingError, StagingStore
@@ -197,7 +198,12 @@ class WhatsAppAdapter:
         self.validate(arguments)
         return copy_json_object(arguments)
 
-    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
+    def freeze_attachments(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        caller_namespace: str | None = None,
+    ) -> tuple[AttachmentReference, ...]:
         canonical = self.canonicalize(arguments)
         if self.tool_name == "send_text":
             return ()
@@ -207,7 +213,7 @@ class WhatsAppAdapter:
         record = self.staging_store.resolve(
             cast(str, reference["staged_id"]),
             adapter=self.downstream_alias,
-            account=self.account,
+            account=staging_account_scope(self.account, caller_namespace),
         )
         if self._media_reference(record) != reference:
             raise StagingError("frozen media metadata no longer matches staging")
@@ -228,6 +234,7 @@ class WhatsAppAdapter:
         *,
         filename: str,
         mime_type: str,
+        caller_namespace: str | None = None,
     ) -> dict[str, Any]:
         """Create a local media reference without invoking ``wacli``."""
         if self.staging_store is None:
@@ -235,7 +242,7 @@ class WhatsAppAdapter:
         record = self.staging_store.stage_path(
             source,
             adapter=self.downstream_alias,
-            account=self.account,
+            account=staging_account_scope(self.account, caller_namespace),
             filename=filename,
             declared_mime=mime_type,
         )
@@ -330,7 +337,7 @@ class WhatsAppAdapter:
             record = self.staging_store.resolve(
                 cast(str, reference["staged_id"]),
                 adapter=self.downstream_alias,
-                account=self.account,
+                account=staging_account_scope(self.account, request.caller_namespace),
             )
             if self._media_reference(record) != reference:
                 raise StagingError("frozen media metadata no longer matches staging")
@@ -341,6 +348,10 @@ class WhatsAppAdapter:
                     "mime_type": record.declared_mime,
                     "expected_size": record.size,
                     "expected_sha256": record.sha256,
+                    "_signet_staging_account": staging_account_scope(
+                        self.account,
+                        request.caller_namespace,
+                    ),
                 }
             )
         return payload

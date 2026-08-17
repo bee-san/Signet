@@ -215,12 +215,16 @@ class ProductionStateStore:
             changed = connection.execute(
                 """
                 UPDATE production_services SET state = ?, updated_at = ?
-                WHERE service_name = 'maintenance' AND service_kind = 'maintenance'
+                WHERE service_name IN ('maintenance', 'delivery', 'reconciliation', 'retention')
+                AND (
+                    (service_name = 'maintenance' AND service_kind = 'maintenance')
+                    OR (service_name != 'maintenance' AND service_kind = 'worker')
+                )
                 """,
                 (state, now),
             ).rowcount
-            if changed != 1:
-                raise ProductionStateError("production maintenance service is unavailable")
+            if changed != 4:
+                raise ProductionStateError("production worker services are unavailable")
             connection.execute(
                 """
                 UPDATE production_setup_state

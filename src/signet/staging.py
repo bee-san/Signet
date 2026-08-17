@@ -1035,6 +1035,50 @@ class StagingStore:
                 raise StagingError("plaintext descriptor failed integrity verification")
             yield record, temporary.fileno()
 
+    def unconsumed_usage(self, *, adapter: str, account: str) -> tuple[int, int]:
+        """Return bounded-scope object and plaintext-byte usage before enqueue."""
+
+        with self.database.read() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS object_count, COALESCE(SUM(size_bytes), 0) AS total_bytes
+                FROM staged_objects
+                WHERE adapter = ? AND account = ?
+                  AND consumed_request_id IS NULL AND purged_at IS NULL
+                """,
+                (adapter, account),
+            ).fetchone()
+        if row is None:
+            raise StagingError("staged object usage is unavailable")
+        return int(row["object_count"]), int(row["total_bytes"])
+
+    def purge_unconsumed(self, *, before: int, limit: int = 256) -> int:
+        """Purge a bounded batch of abandoned, never-enqueued staged objects."""
+
+        if not isinstance(before, int) or isinstance(before, bool) or before < 0:
+            raise ValueError("unconsumed staging cutoff is invalid")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1_000:
+            raise ValueError("unconsumed staging purge limit is invalid")
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """
+                SELECT attachment_id FROM staged_objects
+                WHERE consumed_request_id IS NULL AND purged_at IS NULL
+                  AND created_at <= ?
+                ORDER BY created_at, attachment_id
+                LIMIT ?
+                """,
+                (before, limit),
+            ).fetchall()
+        purged = 0
+        for row in rows:
+            try:
+                self.purge(str(row["attachment_id"]))
+            except StagingError:
+                continue
+            purged += 1
+        return purged
+
     def purge(
         self,
         opaque_id: str,

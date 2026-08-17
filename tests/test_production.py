@@ -2184,7 +2184,10 @@ async def test_worker_startup_failure_is_unhealthy_and_persisted_fail_closed(
     status = assembly.status()
     assert assembly.workers.running is False
     assert assembly.workers.healthy is False
-    assert status.services["maintenance"].state == "blocked"
+    assert all(
+        status.services[name].state == "blocked"
+        for name in ("maintenance", "delivery", "reconciliation", "retention")
+    )
     assert "workers_ready" in status.missing_prerequisites
 
 

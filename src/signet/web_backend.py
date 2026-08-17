@@ -429,7 +429,10 @@ class EncryptedPayloadReviewer:
             if canonical_json(canonical_arguments) != canonical_json(arguments):
                 raise ValueError
             summary = adapter.summarize_for_web(canonical_arguments)
-            frozen_attachments = adapter.freeze_attachments(canonical_arguments)
+            frozen_attachments = adapter.freeze_attachments(
+                canonical_arguments,
+                caller_namespace=caller_namespace,
+            )
         except Exception:
             raise WebPayloadError("private payload failed reviewed adapter validation") from None
         try:
@@ -480,7 +483,10 @@ class EncryptedPayloadReviewer:
         prospective = _strict_json_object(prospective_arguments_json)
         try:
             arguments = reviewed.adapter.canonicalize(prospective)
-            edited_attachments = reviewed.adapter.freeze_attachments(arguments)
+            edited_attachments = reviewed.adapter.freeze_attachments(
+                arguments,
+                caller_namespace=reviewed.caller_namespace,
+            )
             if tuple(
                 _attachment_identity(attachment) for attachment in edited_attachments
             ) != tuple(_attachment_identity(attachment) for attachment in reviewed.attachments):

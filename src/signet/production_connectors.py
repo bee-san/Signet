@@ -660,6 +660,7 @@ def _build_whatsapp(
         delegate = WacliWrapper(
             WacliConfig(
                 account=boundary.account,
+                staging_account=policy_account,
                 expected_linked_jid=boundary.linked_jid,
                 executable=Path(connector.command[0]),
                 expected_version=boundary.expected_version,

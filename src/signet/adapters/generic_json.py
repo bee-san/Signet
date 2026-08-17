@@ -104,7 +104,12 @@ class GenericJSONAdapter:
             raise AdapterValidationError("arguments must be a JSON object")
         return value
 
-    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
+    def freeze_attachments(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        caller_namespace: str | None = None,
+    ) -> tuple[AttachmentReference, ...]:
         self.validate(arguments)
         return ()
 

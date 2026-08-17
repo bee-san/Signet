@@ -45,6 +45,7 @@ from signet.adapters.base import (
     conservative_outcome,
     copy_json_object,
     redact_json,
+    staging_account_scope,
 )
 from signet.models import AttachmentReference
 from signet.staging import StagedFile, StagingError, StagingStore
@@ -583,7 +584,12 @@ class FastmailAdapter:
         canonical.setdefault("attachments", [])
         return canonical
 
-    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
+    def freeze_attachments(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        caller_namespace: str | None = None,
+    ) -> tuple[AttachmentReference, ...]:
         canonical = self.canonicalize(arguments)
         references = cast(list[dict[str, Any]], canonical["attachments"])
         if references and self.staging_store is None:
@@ -596,7 +602,7 @@ class FastmailAdapter:
             record = store.resolve(
                 cast(str, reference["staged_id"]),
                 adapter=self.downstream_alias,
-                account=self.account,
+                account=staging_account_scope(self.account, caller_namespace),
             )
             if self._attachment_reference(record) != reference:
                 raise StagingError("frozen attachment metadata no longer matches staging")
@@ -618,6 +624,7 @@ class FastmailAdapter:
         *,
         filename: str,
         mime_type: str,
+        caller_namespace: str | None = None,
     ) -> dict[str, Any]:
         """Create an opaque local reference without any provider call."""
         if self.staging_store is None:
@@ -625,7 +632,7 @@ class FastmailAdapter:
         record = self.staging_store.stage_path(
             source,
             adapter=self.downstream_alias,
-            account=self.account,
+            account=staging_account_scope(self.account, caller_namespace),
             filename=filename,
             declared_mime=mime_type,
         )
@@ -736,7 +743,7 @@ class FastmailAdapter:
             record, content = store.read_verified(
                 cast(str, reference["staged_id"]),
                 adapter=self.downstream_alias,
-                account=self.account,
+                account=staging_account_scope(self.account, request.caller_namespace),
             )
             if self._attachment_reference(record) != reference:
                 raise StagingError("frozen attachment metadata no longer matches staging")

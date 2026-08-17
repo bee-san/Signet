@@ -39,6 +39,7 @@ from signet.staging import StagingError, StagingStore
 REVIEWED_WACLI_VERSION = "0.12.0"
 DEFAULT_WACLI_EXECUTABLE = Path(f"/opt/homebrew/Cellar/wacli/{REVIEWED_WACLI_VERSION}/bin/wacli")
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_STAGING_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$")
 _HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _ExecutableSignature = tuple[int, int, int, int, str]
 _MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
@@ -92,6 +93,7 @@ class WacliConfig:
     """Reviewed executable and resource limits for one WhatsApp account."""
 
     account: str
+    staging_account: str | None = None
     executable: Path = DEFAULT_WACLI_EXECUTABLE
     expected_version: str = REVIEWED_WACLI_VERSION
     expected_linked_jid: str | None = None
@@ -111,6 +113,10 @@ class WacliConfig:
             raise ValueError("wacli executable must be an absolute pinned path")
         if not _ACCOUNT_RE.fullmatch(self.account):
             raise ValueError("wacli account name is invalid")
+        if self.staging_account is not None and not _STAGING_ACCOUNT_RE.fullmatch(
+            self.staging_account
+        ):
+            raise ValueError("wacli staging account scope is invalid")
         if (
             self.expected_linked_jid is not None
             and re.fullmatch(
@@ -749,6 +755,7 @@ class WacliWrapper:
             "reply_to_sender",
             "expected_size",
             "expected_sha256",
+            "_signet_staging_account",
         }
         required = {
             "to",
@@ -790,6 +797,11 @@ class WacliWrapper:
         staged_id = arguments.get("staged_id")
         expected_size = arguments.get("expected_size")
         expected_sha256 = arguments.get("expected_sha256")
+        configured_staging_account = self.config.staging_account or self.config.account
+        staging_account = arguments.get("_signet_staging_account", configured_staging_account)
+        scoped_staging_account_re = re.compile(
+            rf"{re.escape(configured_staging_account)}:caller:[a-f0-9]{{64}}"
+        )
         if (
             not isinstance(staged_id, str)
             or not isinstance(expected_size, int)
@@ -797,6 +809,11 @@ class WacliWrapper:
             or expected_size < 0
             or not isinstance(expected_sha256, str)
             or not _HASH_RE.fullmatch(expected_sha256)
+            or not isinstance(staging_account, str)
+            or (
+                staging_account != configured_staging_account
+                and not scoped_staging_account_re.fullmatch(staging_account)
+            )
             or self._staging_store is None
         ):
             raise WacliError("invalid_media_integrity", dispatch_may_have_occurred=False)
@@ -804,7 +821,7 @@ class WacliWrapper:
             plaintext = self._staging_store.plaintext_descriptor(
                 staged_id,
                 adapter="whatsapp",
-                account=self.config.account,
+                account=staging_account,
                 expected_size=expected_size,
                 expected_sha256=expected_sha256,
             )

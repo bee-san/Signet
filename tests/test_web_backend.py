@@ -141,7 +141,12 @@ class ReviewOnlyAdapter:
             raise ValueError("fake arguments are invalid")
         return {"body": body, "recipient": recipient}
 
-    def freeze_attachments(self, arguments: Mapping[str, Any]) -> tuple[AttachmentReference, ...]:
+    def freeze_attachments(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        caller_namespace: str | None = None,
+    ) -> tuple[AttachmentReference, ...]:
         self.canonicalize(arguments)
         return ()
 

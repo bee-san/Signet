@@ -275,7 +275,10 @@ class FrozenRequestLoader:
             canonical_arguments = adapter.canonicalize(cast(dict[str, Any], arguments))
             if canonical_json(canonical_arguments) != canonical_json(arguments):
                 raise ValueError
-            frozen_attachments = adapter.freeze_attachments(canonical_arguments)
+            frozen_attachments = adapter.freeze_attachments(
+                canonical_arguments,
+                caller_namespace=caller_namespace,
+            )
             stored_attachments = self.state_machine.get_attachment_references(
                 lease.request_id,
                 version=lease.version,
@@ -306,6 +309,7 @@ class FrozenRequestLoader:
                 version=lease.version,
                 idempotency_key=lease.downstream_idempotency_key,
                 created_at=datetime.fromtimestamp(payload_row["created_at"], tz=UTC),
+                caller_namespace=caller_namespace,
             ),
         )
 

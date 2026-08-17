@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -559,18 +560,23 @@ async def test_whatsapp_media_is_decrypted_only_to_an_inherited_anonymous_descri
     source.write_bytes(b"inert jpeg fixture")
     adapter = WhatsAppFileAdapter(
         staging_store=store,
-        account="personal",
+        account="account:personal",
         reviewed_dispatch_enabled=True,
     )
     reference = adapter.stage_media(source, filename="photo.jpg", mime_type="image/jpeg")
     arguments = {"to": "+15550102030", "caption": "inert caption", "media": reference}
-    payload = adapter.prepare_for_execution(adapter_request("send_file", arguments))
+    request = replace(adapter_request("send_file", arguments), account="account:personal")
+    payload = adapter.prepare_for_execution(request)
     assert payload["expected_size"] == len(b"inert jpeg fixture")
     assert len(payload["expected_sha256"]) == 64
 
     fd_report = tmp_path / "inherited-fds.log"
     executable, log = make_fake_wacli(tmp_path, fd_report=fd_report)
-    wrapper = _make_test_wrapper(wrapper_config(executable, tmp_path), staging_store=store)
+    config = replace(
+        wrapper_config(executable, tmp_path),
+        staging_account="account:personal",
+    )
+    wrapper = _make_test_wrapper(config, staging_store=store)
     result = await adapter.execute(wrapper, payload)
 
     assert result["sent"] is True

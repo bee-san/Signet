@@ -89,6 +89,10 @@ from signet.production_connectors import (
     build_review_only_provider_adapters,
     provider_execution_identity_digest,
 )
+from signet.production_staging_handlers import (
+    ProductionStagingHandlerError,
+    build_production_staging_handlers,
+)
 from signet.production_state import (
     ProductionServiceRecord,
     ProductionStateStore,
@@ -745,10 +749,17 @@ def build_production_runtime(
         if verified_backup_version is not None:
             raise _post_migration_startup_failure(verified_backup_version) from None
         raise
+    try:
+        local_handlers = build_production_staging_handlers(
+            policy,
+            reviewer_provider_adapters,
+        )
+    except ProductionStagingHandlerError as exc:
+        raise ProductionAssemblyError(str(exc)) from None
     pipeline = GatewayCallPipeline(
         mirror=mirror,
         downstream_clients=cast(Mapping[str, RawDownstreamClient], clients),
-        local_handlers={},
+        local_handlers=local_handlers,
         adapters={adapter.adapter_id: adapter for adapter in provider_adapters.values()},
         execution_scopes=execution_scopes,
         freezer=freezer,

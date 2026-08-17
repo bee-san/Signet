@@ -697,6 +697,10 @@ class RetentionManager:
         _validate_time(now, "purge run time")
         if limit <= 0 or limit > 1_000:
             raise ValueError("purge batch limit is invalid")
+        self.staging.purge_unconsumed(
+            before=max(0, now - _ONE_DAY),
+            limit=limit,
+        )
         scheduled = self.schedule(now=now, limit=limit)
         claimed = completed = failed = 0
         for _ in range(limit):

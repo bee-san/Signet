@@ -334,6 +334,7 @@ class GatewayCallPipeline:
                 _prepare_approval_arguments,
                 adapter,
                 arguments,
+                namespace,
             )
         except (TypeError, ValueError):
             raise DomainToolError(
@@ -405,12 +406,17 @@ def _invoke_local_handler(
 def _prepare_approval_arguments(
     adapter: ApprovalAdapter,
     arguments: Mapping[str, Any],
+    caller_namespace: str,
 ) -> tuple[dict[str, Any], tuple[AttachmentReference, ...]]:
     adapter.validate(arguments)
     canonical = adapter.canonicalize(arguments)
     canonical_arguments = copy_json_object(canonical)
     attachment_freezer = getattr(adapter, "freeze_attachments", None)
-    attachments = attachment_freezer(canonical_arguments) if callable(attachment_freezer) else ()
+    attachments = (
+        attachment_freezer(canonical_arguments, caller_namespace=caller_namespace)
+        if callable(attachment_freezer)
+        else ()
+    )
     return canonical_arguments, attachments
 
 

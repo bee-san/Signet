@@ -34,6 +34,17 @@ _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
+def staging_account_scope(account: str, caller_namespace: str | None) -> str:
+    """Derive a non-secret staging scope that cannot cross caller namespaces."""
+
+    if caller_namespace is None:
+        return account
+    if not caller_namespace or "\x00" in caller_namespace:
+        raise AdapterValidationError("caller namespace is invalid")
+    namespace_digest = hashlib.sha256(caller_namespace.encode("utf-8")).hexdigest()
+    return f"{account}:caller:{namespace_digest}"
+
+
 class AdapterError(RuntimeError):
     """Base class for adapter boundary failures."""
 
@@ -154,6 +165,7 @@ class AdapterRequest:
     version: int = 1
     idempotency_key: str | None = None
     created_at: datetime | None = None
+    caller_namespace: str | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id or not self.downstream_alias or not self.tool_name:
@@ -247,7 +259,10 @@ class ApprovalAdapter(Protocol):
     def canonicalize(self, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def freeze_attachments(
-        self, arguments: Mapping[str, Any]
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        caller_namespace: str | None = None,
     ) -> tuple[AttachmentReference, ...]: ...
 
     def summarize_for_web(self, arguments: Mapping[str, Any]) -> ApprovalSummary: ...

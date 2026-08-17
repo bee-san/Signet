@@ -99,6 +99,13 @@ expired or cancelled requests, and after seven days for failures. Sensitive
 payload rows are retained for seven days in terminal states; ambiguous outcomes
 are not auto-purged.
 
+Policies may expose reviewed `virtualize_local` routes with adapters
+`fastmail.stage_attachment` and `whatsapp.stage_media`. Each route accepts exactly
+`source_path`, `filename`, and `mime_type`; its account scope must match the
+corresponding `send_email` or `send_file` adapter. The source path is still confined
+to an operator-configured source root, and the returned reference remains encrypted
+and account-scoped in the staging store.
+
 ## WhatsApp prerequisites and host blocker
 
 The connector alias must be exactly `whatsapp` and use one hash-pinned stdio
