@@ -1945,6 +1945,8 @@ def test_initial_owner_setup_is_browser_only_resumable_and_one_time(
         assert page.status_code == 200 and token
         assert "Set up Signet" in page.text
         assert "Setup is locked" in page.text
+        assert "Human-only private owner setup" in page.text
+        assert "Never place it in a URL, YAML, shell history, or chat" in page.text
         assert "Create your password" not in page.text
 
         unclaimed_options = setup_client.post(
@@ -1975,6 +1977,8 @@ def test_initial_owner_setup_is_browser_only_resumable_and_one_time(
         assert page.status_code == 200 and token
         assert "Create your password" in page.text
         assert "Add an authenticator" in page.text
+        assert "multiple independently enrolled, named authenticators" in page.text
+        assert "password alone cannot replace a lost final factor" in page.text
 
         wrong_origin = setup_client.post(
             "/setup/password",

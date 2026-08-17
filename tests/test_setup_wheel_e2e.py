@@ -69,6 +69,17 @@ def test_installed_wheel_setup_interruption_resume_rerun_and_conflict_refusal(
     )
     assert installed.returncode == 0, installed.stderr
     assert (environment_dir / "share" / "man" / "man1" / "signet.1").is_file()
+    for guide in (
+        "README.md",
+        "setup.md",
+        "provider-setup.md",
+        "health-and-doctor.md",
+        "backup-and-restore.md",
+        "recovery.md",
+        "security.md",
+        "troubleshooting.md",
+    ):
+        assert (environment_dir / "share" / "doc" / "signet" / guide).is_file()
 
     fakes = tmp_path / "fakes"
     fakes.mkdir()
@@ -193,3 +204,27 @@ setup_cli.ProductionSetupPlatform = InstalledFakePlatform
     )
     assert help_result.returncode == 0, help_result.stderr
     assert "named passkey and TOTP" in help_result.stdout
+
+    setup_help = _run(
+        [str(environment_dir / "bin" / "signet"), "setup", "--help"],
+        cwd=home,
+        environment=environment,
+    )
+    assert setup_help.returncode == 0, setup_help.stderr
+    assert "one owner with one or more independent Hermes profile" in setup_help.stdout
+    assert "human-only browser ceremony" in setup_help.stdout
+
+    provider_help = _run(
+        [
+            str(environment_dir / "bin" / "signet"),
+            "provider",
+            "setup",
+            "fastmail",
+            "--help",
+        ],
+        cwd=home,
+        environment=environment,
+    )
+    assert provider_help.returncode == 0, provider_help.stderr
+    assert "one attended live test email" in provider_help.stdout
+    assert "one live test still occurs" in provider_help.stdout

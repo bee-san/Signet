@@ -15,35 +15,135 @@ modes, immutable payloads are encrypted, approval transitions are persisted in
 SQLite, dispatch is fenced, ambiguous delivery enters bounded reconciliation, and
 the authenticated web app presents the private review queue.
 
-## Stable 0.1 release
+## Production quick start
 
-Signet `0.1.0` ships a complete packaged setup path and guided provider setup.
-`signet setup` creates the private installation, services, Hermes entries, and owner
-ceremony. Providers start disabled. A separate `signet provider setup` command then
-stores the credential, discovers schemas, sends one test message, writes the generated
-configuration and policy, and enables the rollout.
+The normal installation does not require a source checkout, `uv`, hand-edited YAML,
+or a bearer token copied into a shell command. It requires Python 3.12, `pipx`, a
+logged-in Tailscale node with MagicDNS, and Hermes Agent. Signet installs user
+services: launchd on macOS or systemd on Linux.
 
-Fastmail is supported on Linux x86_64, Linux arm64, and macOS arm64. WhatsApp is
-supported on Linux x86_64 through the pinned `wacli 0.12.0` release; it is not
-available on Linux arm64 or macOS. Take a verified backup before upgrading and verify
-the test message before relying on a provider. Read the
-[packaged setup guide](docs/setup.md) for the full flow.
+Supported package targets are macOS arm64, Linux x86_64, and Linux arm64. Fastmail
+is available on all three. WhatsApp is available only on Linux x86_64 through the
+reviewed `wacli 0.12.0` artifact. See the [setup guide](docs/setup.md) for the full
+prerequisite and storage checklist.
 
-The files under `deploy/` remain inert review templates. Their placeholders prevent
-installation without review. The older installed `signet deployment` commands provide
-a runnable downstream-disabled staging assembly: it has no provider transport,
-credential resolver, dispatch worker, or downstream MCP alias. Its authenticated
-`approvals` tools all return `deployment_disabled`. Use `signet setup`, not those
-staging helpers, for the resumable packaged owner setup path.
+1. Install the reviewed package and confirm its version:
 
-The generic plugin surface is staged-only as well. Local, hash-pinned manifests
-can describe MCP connectors and propose effects, but installation, discovery, and
-authenticated effect review never enable `tools/call` or provider dispatch. Read
-the [plugin integration guide](docs/plugin-integrations.md) and the explicit
-[plugin readiness boundary](docs/plugin-readiness.md) before handling a manifest
-or connector configuration.
+   ```console
+   pipx install 'signet-gateway==0.1.0'
+   signet --version
+   ```
 
-## Guarantees
+   This command names the stable release reviewed by this documentation. For a later
+   release, substitute only the exact version named in its signed release notes; do not
+   install an unreviewed latest build.
+
+2. Run setup as the operating-system user who will own the services and secrets:
+
+   ```console
+   signet setup
+   ```
+
+   Signet prints a read-only plan before asking permission to apply it. It then prints
+   the exact private HTTPS address, normally
+   `https://<tailscale-node-name>:8443/setup`, and opens it. That address is clickable
+   in capable terminals. If no browser opens, copy only the URL into a browser on the
+   same tailnet; never copy the capability value into YAML, shell history, or chat.
+
+3. **Human-only:** at that exact URL, unlock owner setup from the private capability
+   file named by the CLI, create a password, and enroll a passkey or a fresh TOTP
+   authenticator. Finish setup only after reviewing the owner, origin, and profiles.
+
+   One user may manage multiple independently enrolled, named TOTP authenticators and
+   multiple named passkeys. Do not scan one TOTP seed onto several devices and treat
+   them as independent recovery factors. After first setup, use this command to reach
+   authenticator management:
+
+   ```console
+   signet authenticators open
+   ```
+
+4. Review the generated MCP entries, then run `/reload-mcp` in each selected Hermes
+   profile. Signet never restarts the Hermes gateway. Verify the installation:
+
+   ```console
+   signet status
+   signet doctor
+   signet provider status
+   ```
+
+`doctor` exits nonzero if a required check fails. Providers remain disabled until a
+separate attended setup.
+
+### Choose the owner and Hermes profiles
+
+An installation has one owner identity. When options are omitted, Signet uses
+`user:owner` and discovers the default and named Hermes profiles. To integrate only
+selected profiles, repeat `--profile`:
+
+```console
+signet setup --owner user:owner --profile personal --profile work
+```
+
+Each profile receives a separate private caller credential and namespace, but this
+packaged setup binds every selected profile to the same owner. Version 0.1 does not
+ship a supported cross-user enrollment or role-management command; do not add users
+by editing the database or generated configuration. Use a separate operating-system
+account or host when people require a hard isolation boundary.
+
+### Connect a provider
+
+Provider setup is intentionally separate because it crosses a live-effect boundary:
+
+```console
+signet provider setup fastmail
+signet provider status
+```
+
+**Human-only and live:** Fastmail setup prompts without echo for the API token, asks
+for the sender and test recipient, performs one test send, installs reviewed schemas
+and policy, and enables the provider rollout. On supported Linux x86_64 hosts,
+`signet provider setup whatsapp` downloads the reviewed artifact, requires an
+attended pairing ceremony, and sends one test message. Do not put provider tokens in
+arguments, YAML, command history, logs, or chat. Read the
+[provider setup guide](docs/provider-setup.md) before confirming either command.
+
+### Understand approval results
+
+The packaged provider policy is **transparent approval** for sends: the agent receives
+an honest `pending_approval` result after durable queueing, and the provider mutation
+does not occur until a human approves the frozen request. `approval_optimistic` is a
+different, conditional contract in which a proven upstream-compatible success-shaped
+acknowledgement may be returned while the real mutation remains pending. It is not a
+selectable packaged-provider mode in 0.1. Unknown, dangerous, or dependency-heavy
+tools must deny or use transparent approval. `virtualize_local` is separate and never
+performs a provider effect. See the [plain-language security guide](docs/security.md)
+and [policy guide](docs/policy-guide.md).
+
+### User and operator guides
+
+- [Documentation map](docs/README.md)
+- [Install and first setup](docs/setup.md)
+- [Resume interrupted setup](docs/setup-resume.md)
+- [Provider connection and review](docs/provider-setup.md)
+- [Status and doctor](docs/health-and-doctor.md)
+- [Backup and restore](docs/backup-and-restore.md)
+- [Upgrade and safe rollback boundaries](docs/upgrade-and-rollback.md)
+- [Uninstall or purge](docs/uninstall.md)
+- [Lost authenticators and recovery](docs/recovery.md)
+- [Low disk and external state roots](docs/storage.md)
+- [Security model](docs/security.md)
+- [Troubleshooting](docs/troubleshooting.md)
+
+The [expert operator runbook](docs/operator-runbook.md),
+[production runtime contract](docs/production-runtime.md), and
+[connector boundary](docs/production-connectors.md) remain available for audits and
+incident work. Generic connectors remain staged behind the
+[plugin integration contract](docs/plugin-integrations.md) and
+[plugin readiness boundary](docs/plugin-readiness.md). None of these expert references
+is a prerequisite for a normal package installation.
+
+## Production guarantees
 
 - Unknown tools resolve to `deny`. A tool is exposed only after exact schema
   capture, policy configuration, and digest review.
@@ -70,42 +170,6 @@ running as the same operating-system user from reading that user's files, memory
 or Keychain items, and they cannot govern direct provider scripts, native adapters,
 browser sessions, webhooks, or other paths that bypass Signet. See
 [`docs/security-model.md`](docs/security-model.md).
-
-## Packaged setup
-
-With Python 3.12 selected for `pipx`, install the reviewed release and run the
-one-command setup:
-
-```console
-pipx install signet-gateway
-signet setup
-```
-
-Setup prints the automatic safe steps, human ceremonies, deferred provider proofs,
-and destructive-action set before confirmation. `signet setup --plan` exits after
-that read-only review and emits the exact `signet setup --apply PLAN_ID` command.
-`signet --version` reports the installed distribution version. Configure only the
-provider you use after setup completes:
-
-```console
-signet provider setup fastmail --from you@example.com --to you@example.com
-signet provider status
-```
-
-Fastmail prompts for its API token without echoing it. On Linux x86_64, use
-`signet provider setup whatsapp --to PHONE_OR_JID` instead; Signet downloads the
-verified binary, opens the pairing flow, and sends one test message. The provider
-rollout gate is shared, so `provider enable` and `provider disable` report every
-configured alias they affect.
-
-The default private origin is the current Tailscale node on HTTPS 8443. Review the
-generated Hermes entries, enable approvals and the providers you configured, then
-run `/reload-mcp`; Signet never restarts Hermes itself. Use
-`signet authenticators open` to print the exact private URL before opening named
-passkey/TOTP management. See
-[`docs/setup.md`](docs/setup.md) for prerequisites, browser setup, backup/restore,
-reviewed Hermes testing, crash recovery, plan/apply lifecycle commands, stable exit
-codes, upgrade, uninstall, and rollback.
 
 ## Development
 

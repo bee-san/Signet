@@ -2175,6 +2175,8 @@ def test_no_open_browser_outputs_the_private_claim_handoff_without_opening() -> 
         f"Private owner setup capability file: {handoff}",
         "The one-time capability expires after 10 minutes. If it expires, rerun the same "
         "signet setup command to issue a replacement without losing enrollment progress.",
+        "Human-only: enter the capability only in the Signet form at the URL above; "
+        "never place it in a URL, YAML, shell history, or chat.",
     ]
     assert "secret-capability-value" not in "\n".join(output)
 
@@ -2357,7 +2359,12 @@ def test_browser_assisted_setup_prints_exact_url_before_opening_without_printing
         "The one-time capability expires after 10 minutes. If it expires, rerun the same "
         "signet setup command to issue a replacement without losing enrollment progress.",
     )
-    assert events[3] == ("open", "https://signet.tailnet.example/setup")
+    assert events[3] == (
+        "output",
+        "Human-only: enter the capability only in the Signet form at the URL above; "
+        "never place it in a URL, YAML, shell history, or chat.",
+    )
+    assert events[4] == ("open", "https://signet.tailnet.example/setup")
     assert all("secret-capability-value" not in value for _kind, value in events)
 
 
@@ -6820,7 +6827,8 @@ def test_real_platform_builds_a_provider_disabled_production_assembly(
     assert journal.status == "completed"
     assert external_calls == []
     assert any("did not restart the gateway" in message for message in output)
-    assert any("hermes -p work mcp test signet_work" in message for message in output)
+    assert any("hermes -p work mcp test signet_approvals" in message for message in output)
+    assert any("configured signet_fastmail or signet_whatsapp" in message for message in output)
     assert any("/reload-mcp" in message for message in output)
     config_path = selected.root / "production.json"
     config = load_production_config(config_path)

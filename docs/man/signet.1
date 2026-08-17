@@ -1,4 +1,4 @@
-.TH SIGNET 1 "July 2026" "signet-gateway 0.1.0b1" "User Commands"
+.TH SIGNET 1 "July 2026" "signet-gateway 0.1.0" "User Commands"
 .SH NAME
 signet \- provider-neutral MCP human approval gateway
 .SH SYNOPSIS
@@ -24,6 +24,10 @@ loopback-only services, and can prepare multiple named Hermes profiles without
 restarting Hermes. The default apply path prints the automatic safe steps, human
 ceremonies, deferred provider proofs, and destructive-action set before confirmation.
 .PP
+One installation has one human owner. Each selected Hermes profile receives a distinct
+caller namespace and token bound to that owner. Version 0.1 does not provide a
+cross-user enrollment command.
+.PP
 The default root is
 .IR ~/.local/share/signet .
 Setup refuses ambiguous or foreign resources rather than adopting them.
@@ -47,8 +51,8 @@ Hermes profile to prepare. Repeat for multiple profiles. If omitted, discover na
 profiles under ~/.hermes/profiles.
 .TP
 .BI --policy-mode " MODE"
-Select the initial policy mode: deny, direct, approval, or approval_with_edit.
-Default: deny.
+Select an advanced initial baseline. Keep the fail-closed deny default for normal
+packaged setup; guided provider setup later installs explicit reviewed tool policy.
 .TP
 .BI --data-root " ABSOLUTE_DIRECTORY"
 Use a pre-created empty mode-0700 local directory instead of ROOT/data. The setup
@@ -62,7 +66,8 @@ with --data-root, setup reads the current device number and includes it in the p
 Use a pre-created empty mode-0700 local directory instead of ROOT/backups.
 .TP
 .B --yes
-Confirm a reviewed plan non-interactively.
+Confirm the reviewed CLI plan non-interactively. Labelled browser ceremonies remain
+human-only.
 .TP
 .B --no-open-browser
 Print the owner setup URL without asking the operating system to open it. This may be
@@ -119,13 +124,13 @@ Enrollment, naming, reauthentication, and deletion remain browser ceremonies;
 credential material never crosses the CLI.
 .SH PROVIDER COMMANDS
 .TP
-.B signet provider setup fastmail --from ADDRESS --to ADDRESS
-Prompt for a Fastmail API token, send one test email, save the generated policy and
-schemas, and enable the configured provider rollout.
+.B signet provider setup fastmail
+Prompt for the Fastmail API token, sender, and recipient; send one human-attended live
+test email; save the generated policy and schemas; and enable provider rollout.
 .TP
-.B signet provider setup whatsapp --to PHONE_OR_JID
+.B signet provider setup whatsapp
 On Linux x86_64, install the pinned wacli release if needed, pair the account, send
-one test message, and enable the configured provider rollout.
+one human-attended live test message, and enable the configured provider rollout.
 .TP
 .B signet provider status
 Show platform support, configuration, credential readiness, and rollout state.
@@ -139,12 +144,14 @@ written to private profile environment files and are never printed or accepted o
 argv. Review the entries, enable approvals and configured providers, then run
 /reload-mcp in that profile. Signet never restarts the Hermes gateway.
 .SH BROWSER SETUP
-The public /setup URL is printed before browser launch. The one-time capability never
+The private /setup URL is printed before browser launch. The one-time capability never
 crosses the browser opener or appears in a URL. It is retained in the operating-system
-keyring and a private mode-0600 handoff file; paste it into the setup form. It expires
+keyring and a private mode-0600 handoff file; the intended human owner enters it only
+in the Signet form. It expires
 after ten minutes, and rerunning the same setup command safely replaces an expired
-ceremony. Password setup supports multiple named TOTP and passkey authenticators;
-passkeys require a real browser ceremony at the final HTTPS origin.
+ceremony. Password setup supports multiple independently enrolled, named TOTP and
+passkey authenticators. A password alone cannot replace a lost final factor; passkeys
+require a real browser ceremony at the final HTTPS origin.
 .SH RECOVERY AND EXIT STATUS
 Setup and lifecycle applies persist atomic journals or receipts. After interruption,
 run signet status and signet doctor, correct the reported condition, and rerun the same
@@ -179,6 +186,8 @@ HTTPS 8443 Serve listener and refuses Funnel. Provider enablement is a separate
 reviewed cutover. Do not paste tokens, capabilities, authenticator values, or provider
 credentials into arguments, logs, chat, or documentation.
 .SH SEE ALSO
-The packaged setup guide is docs/setup.md in the source distribution and online
-project documentation. See also docs/security-model.md and
-docs/production-connectors.md.
+The user documentation map is installed under share/doc/signet/README.md and included
+as docs/README.md in the source distribution. Start with setup.md, then see
+provider-setup.md, health-and-doctor.md, backup-and-restore.md, recovery.md, and
+security.md. Expert contracts remain in security-model.md and
+production-connectors.md.

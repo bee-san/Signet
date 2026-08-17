@@ -333,6 +333,21 @@ def test_built_artifacts_contain_production_assets_and_metadata(tmp_path: Path) 
         ):
             assert required in names
         assert any(name.endswith("/share/man/man1/signet.1") for name in names)
+        for guide in (
+            "README.md",
+            "setup.md",
+            "setup-resume.md",
+            "provider-setup.md",
+            "health-and-doctor.md",
+            "backup-and-restore.md",
+            "upgrade-and-rollback.md",
+            "uninstall.md",
+            "recovery.md",
+            "storage.md",
+            "security.md",
+            "troubleshooting.md",
+        ):
+            assert any(name.endswith(f"/share/doc/signet/{guide}") for name in names)
         assert "Name: signet-gateway\n" in metadata
         assert "Version: 0.1.0\n" in metadata
         assert SpecifierSet(parsed_metadata["Requires-Python"]) == SpecifierSet(">=3.12,<3.13")
@@ -346,8 +361,17 @@ def test_built_artifacts_contain_production_assets_and_metadata(tmp_path: Path) 
             "LICENSE",
             "README.md",
             "SECURITY.md",
+            "docs/README.md",
+            "docs/backup-and-restore.md",
             "docs/man/signet.1",
+            "docs/provider-setup.md",
             "docs/releasing.md",
+            "docs/security.md",
+            "docs/setup-resume.md",
+            "docs/storage.md",
+            "docs/troubleshooting.md",
+            "docs/uninstall.md",
+            "docs/upgrade-and-rollback.md",
             "hatch_build.py",
             "pyproject.toml",
             "scripts/release_gate.py",

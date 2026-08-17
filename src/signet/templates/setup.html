@@ -4,10 +4,10 @@
 {% block scripts %}<script src="{{ url_for('static', path='authenticators.js') }}" defer></script>{% endblock %}
 {% block content %}
 <section class="panel setup-panel" aria-labelledby="setup-title">
-  <p class="eyebrow">Private owner setup</p>
+  <p class="eyebrow">Human-only private owner setup</p>
   <h1 id="setup-title">Set up Signet</h1>
   {% if not setup.claimed %}
-  <p>Setup is locked. Open the private owner setup capability file printed by <code>signet setup</code>, copy the one-time value, and paste it below before it expires.</p>
+  <p>Setup is locked. Only the intended owner should open the private capability file printed by <code>signet setup</code> and enter its one-time value here before it expires. Never place it in a URL, YAML, shell history, or chat.</p>
   <form action="/setup/claim" method="post" class="stack-form">
     <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
     <label for="bootstrap-capability">One-time bootstrap capability</label>
@@ -15,7 +15,7 @@
     <button class="button button-primary" type="submit">Unlock owner setup</button>
   </form>
   {% else %}
-  <p>This one-time flow stays at this exact HTTPS address. It can be resumed after a reload or restart until you finish.</p>
+  <p>This one-time flow stays at this exact HTTPS address. Your completed progress is saved, so you can safely reload or return after a restart until you finish.</p>
 
   <ol class="setup-progress" aria-label="Setup progress">
     <li{% if setup.has_password %} class="complete"{% endif %}>Create password</li>
@@ -41,7 +41,7 @@
 
   <section id="passkey" aria-labelledby="passkey-title">
     <h2 id="passkey-title">2. Add an authenticator</h2>
-    <p>A passkey or TOTP authenticator is required in addition to your password. This browser flow requires user verification.</p>
+    <p>A passkey or fresh TOTP authenticator is required in addition to your password. You may add multiple independently enrolled, named authenticators. Do not reuse one TOTP setup key on several devices and treat them as separate recovery factors. This browser flow requires user verification.</p>
     {% if setup.factor_labels %}
       <p role="status">Added: {{ setup.factor_labels|join(", ") }}</p>
     {% endif %}
@@ -81,7 +81,7 @@
       <dt>Password</dt><dd>{{ "Ready" if setup.has_password else "Required" }}</dd>
       <dt>Passkey or TOTP</dt><dd>{{ "Ready" if setup.has_authenticator else "Required" }}</dd>
     </dl>
-    <p>Finishing is one-time. Stale tabs cannot reopen or replay this setup.</p>
+    <p>Finishing is one-time. Stale tabs cannot reopen or replay this setup. When possible, add a second independent authenticator after finishing; the password alone cannot replace a lost final factor.</p>
     <form action="/setup/complete" method="post">
       <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
       <button class="button button-primary" type="submit"{% if not setup.can_complete %} disabled aria-describedby="setup-requirements"{% endif %}>Finish setup</button>
