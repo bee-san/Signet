@@ -4,6 +4,7 @@ import json
 import re
 import runpy
 import subprocess  # nosec B404
+import sys
 import tarfile
 import tomllib
 import zipfile
@@ -253,7 +254,7 @@ packages = ["src/evidence_demo"]
         evidence_path=tmp_path / "dist" / "source.build.json",
         source_sha=source_sha,
         platform_name="source",
-        uv_executable="uv",
+        uv_executable=str(Path(sys.executable).with_name("uv")),
     )
 
     artifact = tmp_path / "dist" / str(evidence["artifact"])
@@ -275,7 +276,7 @@ packages = ["src/evidence_demo"]
             evidence_path=tmp_path / "dirty-dist" / "source.build.json",
             source_sha=source_sha,
             platform_name="source",
-            uv_executable="uv",
+            uv_executable=str(Path(sys.executable).with_name("uv")),
         )
 
 

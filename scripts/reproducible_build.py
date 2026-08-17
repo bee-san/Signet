@@ -231,7 +231,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--platform", required=True)
-    parser.add_argument("--uv", default="uv")
+    parser.add_argument("--uv", default=str(Path(sys.executable).with_name("uv")))
     return parser
 
 
