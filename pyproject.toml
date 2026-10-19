@@ -60,7 +60,7 @@ dependencies = [
   "jsonschema-specifications==2025.9.1",
   "keyring==25.7.0",
   "markupsafe==3.0.3",
-  "mcp==1.28.1",
+  "mcp==1.30.0",
   "more-itertools==11.1.0",
   "multidict==6.7.1",
   "propcache==0.5.2",
