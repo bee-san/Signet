@@ -1,6 +1,6 @@
 # Signet
 
-[![CI](https://github.com/bee-san/Signet/actions/workflows/ci.yml/badge.svg)](https://github.com/bee-san/Signet/actions/workflows/ci.yml)
+[![CI](https://github.com/bee-san/Signet/actions/workflows/ci.yml/badge.svg)](https://github.com/bee-san/Signet/actions/workflows/ci.yml) [![Discord](https://img.shields.io/discord/754001738184392704?logo=discord&label=Discord)](https://discord.skerritt.blog)
 
 Signet is a provider-neutral MCP human approval gateway. A configured write call
 returns an honest `pending_approval` result only after the exact executable
